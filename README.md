@@ -3,9 +3,9 @@
 This repo contains the binary release of Metax, a command-line tool for taxonomic profiling of metagenomic sequences.
 
 ## Installation
-- Install the package from the bioconda channel:
+- Install the package using conda:
    ```shell
-   conda install -c bioconda metax
+   conda install -c zldeng metax
    ```
 <!-- - Alternatively, you can install it manually
    
@@ -39,7 +39,7 @@ A customized reference database can be created by following steps:
 
 2. Run the following command to build the database:
     
-    Download and use the `build_db` tool provided in the `utils/` directory in this repository:
+    <!-- Download and use the `build_db` tool provided in the `utils/` directory in this repository: -->
     ```shell
     build_db <fasta_file> -o <database_dir>
     ```

@@ -39,4 +39,4 @@ requirements:
 about:
   home: https://github.com/dawnmy/Metax
   license: ASL
-  summary: "Metax CLI packaged for Conda"
+  summary: "Improved taxonomy profiling using a reference coverage-informed statistical approach"
