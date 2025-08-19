@@ -62,4 +62,43 @@ metax --dmp_dir <dump_dir> \
     -i <r1>[,<r2>] \
     -o <output_prefix> \
     [other options ...]
-``` 
+```
+
+## Output
+
+- Final taxonomy profile: `*.profile.txt` and raw (unfiltered) taxonomy profile: `*.rprofile.txt`
+```
+column 1: Taxon name
+column 2: Taxon ID
+column 3: Taxon rank
+column 4: Number reads
+column 5: Depth of coverage
+column 6: Abundance
+column 7: Breadth of coverage (B)
+column 8: Expected breadth of coverage (EB)
+column 9: Likelihood of presence based on breadth
+column 10: Fixed chunk breadth of coverage
+column 11: Flex chunk breadth of coverage
+column 12: Expected flex chunk breadth of coverage (ECB)
+column 13: Likelihood of presence based on flex chunk breadth
+```
+
+If pathogen detection mode is enabled, the output profile will also include 3 extra columns as below:
+
+```
+column 14: The host names
+column 15: The host taxonomy IDs
+column 16: The relevant diseases
+```
+
+- Reads taxonomy classification: `*.classify.txt`
+
+```
+column 1: Read name
+column 2: Name of the most likely taxon
+column 3: taxonomy ID of the taxon
+column 4: Rank of the taxon
+column 5: Names of all possible taxa that the reads originated from
+column 6: Taxonomy IDs of all possible taxa
+column 7: Likelihood for each of those taxa
+```
