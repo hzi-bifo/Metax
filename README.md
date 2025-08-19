@@ -20,14 +20,13 @@ This repo contains the binary release of Metax, a command-line tool for taxonomi
 
 - Taxonmy dmp files
   1. Create a `Metax/data/` directory.  
-  2. Download the NCBI taxonomy dump (`taxdump.tar.gz`) from:  
-     [here]([placeholder](https://research.bifo.helmholtz-hzi.de/downloads/cami/taxdump.tar.gz)) or the latest from [NCBI](https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz).
+  2. Download the NCBI taxonomy dump (`taxdump.tar.gz`) from: [NCBI](https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz).
   3. Extract its contents directly into `Metax/data/`.  
   4. _Optional:_ To use an alternative taxonomy source (e.g. GTDB or ICTV), replace the extracted `taxdump` files in `Metax/data/` with your own dmp files.
   
 - Reference database
 
-A pre-built reference database is available at [here](https://research.bifo.helmholtz-hzi.de/downloads/cami/metax_db.tar.xz). It is based on the RefSeq snapshot of 10 August 2022 and includes top genomes for each NCBI taxonomic identifier (txid), prioritizing assemblies flagged as “representative” or “reference” and then selecting the highest assembly level (Complete Genome > Chromosome > Scaffold > Contig). In total, it contains 33,143 genomes from bacteria, archaea, viruses, fungi, protozoa, and Homo sapiens.
+A pre-built reference database is available at [here](https://research.bifo.helmholtz-hzi.de/downloads/metax/metax_db.tar.xz). It is based on the RefSeq snapshot of 10 August 2022 and includes top genomes for each NCBI taxonomic identifier (txid), prioritizing assemblies flagged as “representative” or “reference” and then selecting the highest assembly level (Complete Genome > Chromosome > Scaffold > Contig). In total, it contains 33,143 genomes from bacteria, archaea, viruses, fungi, protozoa, and Homo sapiens (bavfph).
 
 A customized reference database can be created by following steps:
 
@@ -58,11 +57,12 @@ You must specify the dump directory and the reference database directory when ru
 
 ```shell
 metax --dmp_dir <dump_dir> \
-    --db <reference_db_dir> \
+    --db <reference_db_prefix> \
     -i <r1>[,<r2>] \
     -o <output_prefix> \
     [other options ...]
 ```
+`<reference_db_prefix>` is the database file path without extension (e.g. `metax_bavfph/metax_db`)
 
 ## Output
 
