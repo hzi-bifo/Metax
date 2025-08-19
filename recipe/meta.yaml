@@ -1,22 +1,10 @@
 package:
   name: metax
-  version: "0.0.0"                # placeholder; CI will replace this  [oai_citation:5‡Conda Documentation](https://docs.conda.io/projects/conda-build/en/stable/resources/define-metadata.html?utm_source=chatgpt.com)
+  version: "0.0.0"                # placeholder; CI will replace this 
 
 source:
   url: https://github.com/dawnmy/Metax/releases/download/v0.0.0/metax.tar.gz
-  sha256: 0000000000000000000000000000000000000000000000000000000000000000  # placeholder  [oai_citation:6‡Stack Overflow](https://stackoverflow.com/questions/65209682/what-is-sha256-and-what-should-i-put-as-its-value-in-a-meta-yaml-file-of-an?utm_source=chatgpt.com)
-
-# build:
-#   script:
-#     - mkdir -p $PREFIX/bin       # prepare the install location  [oai_citation:7‡Conda Documentation](https://docs.conda.io/projects/conda-build/en/stable/resources/define-metadata.html?utm_source=chatgpt.com)
-#     - tar -xzf $SRC_DIR/metax.tar.gz -C $SRC_DIR
-#     - cp $SRC_DIR/Metax/metax $PREFIX/bin/metax
-#     - chmod +x $PREFIX/bin/metax
-# build:
-#   script:
-#     - mkdir -p $PREFIX/bin
-#     - cp -R Metax/metax $PREFIX/bin/metax
-#     - chmod +x $PREFIX/bin/metax
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000  # placeholder 
 
 build:
   script:
@@ -34,7 +22,7 @@ requirements:
   host: 
     - python >=3.8,<3.11
   run:
-    - ma ==1.1.4                # your binary’s only runtime dependency  [oai_citation:8‡bioconda.github.io](https://bioconda.github.io/contributor/build-system.html?utm_source=chatgpt.com)
+    - ma ==1.1.4
 
 about:
   home: https://github.com/dawnmy/Metax
