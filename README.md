@@ -53,6 +53,52 @@ You can get the help message by:
 metax --help
 ```
 
+```shell
+ Usage: metax [OPTIONS] [EXTRA_ARGS]...
+
+ A taxonomy profiler for metagenomic data
+
+╭─ Options ──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│    --db                 PATH                                 The reference database file.                          │
+│    --dmp_dir            PATH                                 The directory of dmp files.                           │
+│    --in_seq         -i  TEXT                                 The input read files separated with comma.            │
+│ *  --outprefix      -o  TEXT                                 The prefix of output files. [required]                │
+│    --threads        -t  INTEGER                              Number of threads to use.                             │
+│    --resume         -r                                       Resume from the last run.                             │
+│    --reuse_sam          PATH                                 The sam file to reuse for profiling.                  │
+│    --sequencer          [Illumina|Nanopore|PacBio|assembly]  Sequencer used to generate the reads. Default:        │
+│                                                              Illumina                                              │
+│    --is_paired      -p                                       Whether the reads are paired or not?                  │
+│    --strain                                                  Whether profile on strain level? (experimental)       │
+│    --mode               [recall|precision|default]           The mode of the profiler. recall: ensure high recall, │
+│                                                              precision: ensure high precision, default: use the    │
+│                                                              default mode.                                         │
+│    --batch_size         INTEGER                              Reduce memory consumption with smaller batch size.    │
+│                                                              (Default: 5000 for short, 1000 for long reads)        │
+│    --identity           FLOAT                                The sequence identity (matched bases/gap compressed   │
+│                                                              len) cutoff to consider a valid assignment. (Default: │
+│                                                              0.95 for short, 0.86 for long reads)                  │
+│    --mapped_len     -m  INTEGER                              The mapped length cutoff to consider a valid          │
+│                                                              assignment. (Default: 50 for short, 250 for long      │
+│                                                              reads)                                                │
+│    --breadth        -b  FLOAT                                The genome breadth coverage cutoff to consider the    │
+│                                                              presence of a genome.                                 │
+│    --chunk_breadth      FLOAT                                The genome chunk breadth coverage cutoff to consider  │
+│                                                              the presence of a genome.                             │
+│    --fraction       -f  FLOAT                                The fraction of matched based in a read to consider a │
+│                                                              valid alignment. (Default: 0.6)                       │
+│    --lowbiomass     -l                                       Is a low biomass sample? (No coverage filter by       │
+│                                                              default for low biomass sample)                       │
+│    --keep_raw       -k                                       Keep raw profiling file without statistical           │
+│                                                              filtering.                                            │
+│    --pathogen_host      PATH                                 The pathogen host table file                          │
+│    --host               TEXT                                 The host taxid for pathogen detection                 │
+│    --version                                                 Show the version and exit.                            │
+│    --help           -h                                       Show this message and exit.                           │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+```
+
 You must specify the dump directory and the reference database directory when running Metax:
 
 ```shell
