@@ -1,30 +1,24 @@
 package:
   name: metax
-  version: "0.0.0"                # placeholder; CI will replace this 
-
-source:
-  url: https://github.com/dawnmy/Metax/releases/download/v0.0.0/metax.tar.gz
-  sha256: 0000000000000000000000000000000000000000000000000000000000000000  # placeholder 
+  version: "0.9.12"            # change to your actual version
 
 build:
-  script:
-    - mkdir -p $PREFIX/bin
-    - |
-      BIN_PATH=$(find . -maxdepth 2 -type f -name metax | head -n1)
-      if [ -z "$BIN_PATH" ]; then
-        echo "ERROR: metax binary not found in source!" >&2
-        exit 1
-      fi
-    - cp "$BIN_PATH" $PREFIX/bin/metax
-    - chmod +x $PREFIX/bin/metax
+  number: 0
+  # noarch: generic
+
+source:
+  # Use the current recipe directory as source (contains the binary)
+  path: .
 
 requirements:
-  host: 
-    - python >=3.8,<3.11
   run:
     - ma ==1.1.4
 
 about:
-  home: https://github.com/dawnmy/Metax
+  home: https://github.com/hzi-bifo/Metax
   license: ASL
-  summary: "Improved taxonomy profiling using a reference coverage-informed statistical approach"
+  summary: "A Coverage-Informed Probabilistic Framework for Accurate Cross-Domain Taxon Profiling"
+
+extra:
+  recipe-maintainers:
+    - zldeng
