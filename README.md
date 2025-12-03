@@ -40,7 +40,7 @@ By unifying coverage‑informed presence probability estimation with EM‑based 
     conda install -c bioconda ma=1.1.4
     ``` -->
 
-## Download databases:
+## Download databases
 
 - Taxonmy dmp files
   1. Create a `metax_dmp` directory.  
