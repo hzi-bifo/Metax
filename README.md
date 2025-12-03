@@ -17,9 +17,20 @@ By unifying coverage‑informed presence probability estimation with EM‑based 
 
 ## Installation
 - Install the package using conda:
+
+  Ensure that `bioconda` is included in the Conda channel source file (`~/.condarc`):
+  ```
+  channels:
+     - conda-forge
+     - bioconda
+  channel_priority: strict
+  ```
+  
    ```shell
    conda install -c zldeng metax
    ```
+   
+  
 <!-- - Alternatively, you can install it manually
    
    Download the pre-built binary from the [releases page](https://github.com/dawnmy/Metax/releases), unpack it, and add the directory to your PATH.
