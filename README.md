@@ -1,6 +1,19 @@
 # Metax
 
-This repo contains the binary release of Metax, a command-line tool for taxonomic profiling of metagenomic sequences.
+Metax is a cross‑domain metagenomic taxonomic profiler designed to deliver accurate, robust, and interpretable community composition analyses across bacteria, archaea, eukaryotes, and viruses. Unlike existing profilers, Metax integrates probabilistic modeling of genome coverage to distinguish true community members from artifacts caused by reference contamination, local genomic similarity, or reagent‑derived DNA fragments.
+
+Through comprehensive benchmarks on more than 500 samples, Metax demonstrated:
+
+🧬 Species‑level accuracy across all domains of life
+
+⚡ Robustness to shallow sequencing and low‑biomass, host‑dominated samples
+
+🔍 Contamination detection, including reagent‑borne DNA and reference misassemblies
+
+🦠 Clinical and environmental relevance, e.g. enables identifying cross kingdom interactions and clarifying tumor microbiome signals
+
+By unifying coverage‑informed presence probability estimation with EM‑based abundance refinement, Metax overcomes challenges of ambiguous read mapping, database contamination and kitome DNA fragments. These properties make it a powerful tool for microbiome research, clinical metagenomics, and identifying genome misassemblies.
+
 
 ## Installation
 - Install the package using conda:
@@ -19,14 +32,17 @@ This repo contains the binary release of Metax, a command-line tool for taxonomi
 ## Download databases:
 
 - Taxonmy dmp files
-  1. Create a `Metax/data/` directory.  
+  1. Create a `metax_dmp` directory.  
   2. Download the NCBI taxonomy dump (`taxdump.tar.gz`) from: [NCBI](https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz).
-  3. Extract its contents directly into `Metax/data/`.  
-  4. _Optional:_ To use an alternative taxonomy source (e.g. GTDB or ICTV), replace the extracted `taxdump` files in `Metax/data/` with your own dmp files.
+  3. Extract its contents directly into `metax_dmp`.  
+  4. _Optional:_ To use an alternative taxonomy source (e.g. GTDB or ICTV), replace the extracted `taxdump` files in `metax_dmp` with your own dmp files.
   
 - Reference database
 
 A pre-built reference database is available at [here](https://research.bifo.helmholtz-hzi.de/downloads/metax/metax_db.tar.xz). It is based on the RefSeq snapshot of 10 August 2022 and includes top genomes for each NCBI taxonomic identifier (txid), prioritizing assemblies flagged as “representative” or “reference” and then selecting the highest assembly level (Complete Genome > Chromosome > Scaffold > Contig). In total, it contains 33,143 genomes from bacteria, archaea, viruses, fungi, protozoa, and Homo sapiens (bavfph).
+
+Another pre-built reference [database](https://research.bifo.helmholtz-hzi.de/downloads/cami/metax_db.tar.xz) is available for CAMI II data benchmarks.
+
 
 A customized reference database can be created by following steps:
 
@@ -34,24 +50,92 @@ A customized reference database can be created by following steps:
     ```
     >genome_id|txid|species_txid|sequence_id[|genome_size]
     ```
-    Each genome must have a unique genome_id, and each sequence a unique sequence_id. The genome_size field is optional. When using the NCBI taxonomy, txid should be the genome’s NCBI Taxonomy ID, and species_txid the species’ NCBI Taxonomy ID. If you choose a different taxonomy source (e.g. GTDB, ICTV), use the corresponding IDs from your taxonomy dump files.
+    Each genome must have a unique genome_id, and each sequence a unique sequence_id. The genome_size field is optional but necessary for subsampled reference database creation using `metax index`. When using the NCBI taxonomy, `txid` should be the genome’s NCBI taxonomy ID, and `species_txid` the species’ NCBI taxonomy ID. If you choose a different taxonomy source (e.g. GTDB, ICTV), use the corresponding IDs from your taxonomy dump files.
 
 2. Run the following command to build the database:
+
+    It may take long to complete, please run it in a Tmux session or screen.
+
+    ### For metax version >=0.9.12:
+
+    ```shell
+    metax index <fasta_file> -o <database_dir>
+    ```
+    This command produces a database named `metax_db` in `<database_dir>`.
+
+    To subsample each genome before indexing, provide `-f <fraction>` (where `0 < fraction < 1`). This enables the creation of a database that uses less space and memory while also reducing profiling runtime. But it might      be less sensitive for low read count taxa. The CLI will extract
+    evenly distributed, non-overlapping segments of length `-l/--segment-length` (50 Kbp by default) across each genome
+    until at least the requested fraction is collected, write a subsampled FASTA alongside the index, and skip generating
+    read-level classifications while scaling reported counts during profiling to account for the reduced genome size.
+    Use `-s/--seed` (default `42`) to make the segment selection reproducible, and `-m/--min-length` (default 3 Kbp) to
+    discard subsampled segments shorter than the threshold for genomes more than ten times longer than that value. Supply
+    `-t/--threads` to subsample genomes in parallel; omit it (or set it to 1) to run sequentially. Add `-z/--compress` to
+    gzip the subsampled FASTA once it finishes building the index (the uncompressed file is removed after compression).
+
     
-    <!-- Download and use the `build_db` tool provided in the `utils/` directory in this repository: -->
+    ### For metax version <0.9.12:
     ```shell
     build_db <fasta_file> -o <database_dir>
     ```
     
-    It may take long to complete, please run it in a Tmux session or screen.
+3. Test data
+   - [CAMI II marine](https://frl.publisso.de/data/frl:6425521/marine/short_read/)
+   - [CAMI II pathogen detecton](https://frl.publisso.de/data/frl:6425521/patmgCAMI2.tar.gz)
+
 
 ## How to run
 
-You can get the help message by:
+
+### For version >=0.9.12
 
 ```shell
-metax --help
+Usage: metax profile [OPTIONS] --outprefix <PREFIX> [-- <EXTRA_ARGS>...]
+
+Arguments:
+  [EXTRA_ARGS]...  Additional arguments passed directly to maCMD (use after `--`).
+
+Options:
+      --db <DB>                   Path to the maCMD reference database (metax_db.json).
+      --dmp-dir <DMP_DIR>         Directory containing the NCBI-style taxonomy dump (dmp files).
+  -i, --in-seq <READS>            Comma-separated list of input read files (one or two for Illumina paired-end).
+  -o, --outprefix <PREFIX>        Prefix for output files.
+  -t, --threads <THREADS>         Number of threads to use for alignment and profiling. [default: 20]
+  -r, --resume                    Resume profiling by reusing existing alignment output if present.
+      --reuse-sam <SAM>           Existing SAM (or compressed SAM) file to reuse instead of running maCMD.
+      --sequencer <TYPE>          Sequencer type (e.g. Nanopore, PacBio, Illumina). [default: Illumina]
+  -p, --is-paired                 Treat Illumina inputs as paired-end reads (expects two files).
+      --strain                    Enable strain-level profiling outputs.
+      --mode <MODE>               Alignment mode preset: default, recall, or precision. [default: default] [possible values: recall, precision, default]
+      --batch-size <N>            Maximum number of reads to process per batch.
+      --identity <FLOAT>          Minimum alignment identity threshold for retaining a read.
+  -m, --mapped-len <LEN>          Minimum mapped read length threshold.
+  -b, --breadth <FRACTION>        Minimum breadth of coverage required to report a genome.
+      --chunk-breadth <FRACTION>  Manually set the minimum chunk breadth (overrides automatic estimate).
+  -f, --fraction <FRACTION>       Minimum aligned fraction a read must cover to be considered.
+  -l, --lowbiomass                Apply heuristics tuned for low biomass samples.
+  -k, --keep-raw                  Retain the unfiltered rprofile.txt output alongside the final profile.
+      --by-aligned                Estimate the minimum chunk breadth using the number of aligned reads.
+  -z, --compress-sam              Compress the generated SAM file after profiling completes.
+      --pathogen-host <TSV>       Optional TSV mapping pathogen taxids to host metadata for annotation.
+      --host <TAXID>              NCBI taxid of the host organism (enables pathogen-specific profiling).
+      --verbose                   Log the full command line parameters.
+  -h, --help                      Print help
+  -V, --version                   Print version
 ```
+
+```shell
+metax --dmp-dir <dump_dir> \
+    --db <reference_db> \
+    -i <r1>[,<r2>] \
+    -o <output_prefix> \
+    [other options ...]
+```
+`<dump_dir>`: path to the `metax_dmp` folder where the dump files located.
+`<reference_db>`: path to the json file of the database (e.g. `metax_bavfph/metax_db.json`)
+
+
+  
+### For version <0.9.12
 
 ```shell
  Usage: metax [OPTIONS] [EXTRA_ARGS]...
@@ -99,20 +183,21 @@ metax --help
 
 ```
 
-You must specify the dump directory and the reference database directory when running Metax:
-
 ```shell
 metax --dmp_dir <dump_dir> \
-    --db <reference_db_prefix> \
+    --db <reference_db> \
     -i <r1>[,<r2>] \
     -o <output_prefix> \
     [other options ...]
 ```
-`<reference_db_prefix>` is the database file path without extension (e.g. `metax_bavfph/metax_db`)
+
+`<dump_dir>`: path to the `metax_dmp` folder where the dump files located.
+`<reference_db>`: path to the json file of the database (e.g. `metax_bavfph/metax_db.json`)
+
 
 ## Output
 
-- Final taxonomy profile: `*.profile.txt` and raw (unfiltered) taxonomy profile: `*.rprofile.txt`
+- Final taxonomy profile: `*.profile.txt`
 ```
 column 1: Taxon name
 column 2: Taxon ID
