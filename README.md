@@ -27,7 +27,8 @@ By unifying coverage‑informed presence probability estimation with EM‑based 
   ```
   
    ```shell
-   conda install -c zldeng metax
+   conda create -n metax -c zldeng metax
+   conda activate metax
    ```
    
   
