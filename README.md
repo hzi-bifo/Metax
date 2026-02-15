@@ -144,7 +144,7 @@ metax --dmp-dir <dump_dir> \
 ```
 `<dump_dir>`: path to the `metax_dmp` folder where the dump files located.
 `<reference_db>`: path to the json file of the database (e.g. `metax_bavfph/metax_db.json`)
-
+The first run (sample) takes a bit longer; subsequent runs will be substantially faster by using the cached database.
 
   
 ### For version <0.9.12
