@@ -239,9 +239,30 @@ column 16: The relevant diseases
 ```
 column 1: Read name
 column 2: Name of the most likely taxon
-column 3: taxonomy ID of the taxon
+column 3: taxonomy ID of the most likely taxon
 column 4: Rank of the taxon
 column 5: Names of all possible taxa that the reads originated from
 column 6: Taxonomy IDs of all possible taxa
-column 7: Likelihood for each of those taxa
+column 7: Likelihood for each of those possible taxa
 ```
+
+column 2 and column 5 are not included in the version >=9.12
+
+
+## FAQ
+
+1. What platforms and operating systems does Metax support?
+
+Metax currently supports Linux on x86-64 (64-bit Intel/AMD) systems. Other architectures (e.g., ARM/macOS) are not yet officially supported.
+
+2. Why do I get the error: “Processor 6174 is not supported by this build”?
+
+This error indicates that your CPU does not support some modern instruction sets required by Metax.
+
+
+## Acknowledgement
+
+We thank Gary Robertson for IT support, Dr. Mohammad-Hadi Foroughmand-Araabi for advice on statistical formulations, and Hesham Almessady for software testing.
+
+
+
