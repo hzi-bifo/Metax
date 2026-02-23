@@ -89,7 +89,17 @@ A customized reference database can be created by following steps:
     ```shell
     build_db <fasta_file> -o <database_dir>
     ```
-    
+
+- Pathogen host map file for pathogen detection mode
+
+You may optionally provide a custom pathogen host mapping file to enable Metax to prioritize detection of microorganisms relevant to a specific host of interest.
+The mapping file should be a tab-delimited table containing the following columns (see the format of `data/pathogen_host_disease.txt`):
+txid (microbial taxon ID), host_txids (associated host taxon IDs), host (host name or label) and diseases (asociated diseases). 
+
+The diseases column can be left blank.
+
+For convenience, we also provide a precompiled virus host mapping file (`data/pathogen_host_disease.txt`) generated from the Virus-Host Database.
+
 3. Test data
    - [CAMI II marine](https://frl.publisso.de/data/frl:6425521/marine/short_read/)
    - [CAMI II pathogen detecton](https://frl.publisso.de/data/frl:6425521/patmgCAMI2.tar.gz)
