@@ -146,7 +146,7 @@ Options:
 ```
 
 ```shell
-metax --dmp-dir <dump_dir> \
+metax profile --dmp-dir <dump_dir> \
     --db <reference_db> \
     -i <r1>[,<r2>] \
     -o <output_prefix> \
