@@ -6,3 +6,4 @@ target
 .codex
 .cargo
 *.log
+.gitignore
