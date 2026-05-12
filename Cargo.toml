@@ -1,0 +1,29 @@
+[package]
+name = "metax"
+version = "0.9.23-beta"
+edition = "2021"
+description = "Metax taxonomy profiler"
+authors = ["Z.-L. Deng"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+rayon = "1.7"
+regex = "1.10"
+indexmap = "2.2"
+log = "0.4"
+env_logger = "0.11"
+once_cell = "1.19"
+statrs = "0.16"
+csv = "1.3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+crossbeam-channel = "0.5"
+indicatif = { version = "0.17", features = ["rayon"] }
+rust-htslib = { version = "0.43", default-features = false, features = ["bzip2", "lzma"] }
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+xz2 = { version = "0.1", default-features = false }
+rand = "0.8"
+gzp = { version = "1.0", default-features = false, features = ["deflate_rust"] }
+
+[dev-dependencies]
+assert_cmd = "2.0"
