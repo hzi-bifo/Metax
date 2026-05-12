@@ -1,9 +1,0 @@
-test
-target
-*.zip
-*.gz
-.DS_Store
-.codex
-.cargo
-*.log
-.gitignore
