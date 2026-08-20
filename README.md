@@ -181,3 +181,8 @@ This error indicates that your CPU does not support some modern instruction sets
 ## Acknowledgement
 
 We thank Gary Robertson for IT support, Dr. Mohammad-Hadi Foroughmand-Araabi for advice on statistical formulations, and Hesham Almessady for software testing.
+
+
+## AI-assisted development
+
+AI coding agents were used to assist with code refinement, comments, and documentation. The design and implementation of the software remain the responsibility of the authors, and all AI-assisted changes were reviewed and tested by the authors.
