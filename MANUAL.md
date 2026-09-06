@@ -237,10 +237,10 @@ metax profile -d db --dmp-dir taxonomy -i pacbio_reads.fastq.gz -s PacBio -o sam
 | Input and profile | Recall | Default | Precision | Gate |
 | --- | --- | --- | --- | --- |
 | Illumina community | identity 0.96; 50 bases; fraction 0.60 | identity 0.97; 50 bases; fraction 0.70 | identity 0.98; 50 bases; fraction 0.80 | length AND fraction |
-| Illumina strain | identity 0.96; 40 bases; fraction 0.60 | identity 0.97; 50 bases; fraction 0.80 | identity 0.98; 60 bases; fraction 0.80 | length AND fraction |
-| Nanopore/PacBio community | identity 0.92; 300 bases; fraction 0.20 | identity 0.92; 500 bases; fraction 0.20 | identity 0.94; 500 bases; fraction 0.30 | length OR fraction |
+| Illumina strain | identity 0.96; 50 bases; fraction 0.65 | identity 0.97; 50 bases; fraction 0.80 | identity 0.98; 60 bases; fraction 0.80 | length AND fraction |
+| Nanopore/PacBio community | identity 0.90; 300 bases; fraction 0.20 | identity 0.92; 500 bases; fraction 0.20 | identity 0.94; 500 bases; fraction 0.30 | length OR fraction |
 | Nanopore/PacBio strain | identity 0.90; 500 bases; fraction 0.30 | identity 0.92; 500 bases; fraction 0.30 | identity 0.94; 500 bases; fraction 0.30 | length OR fraction |
-| Assembly | identity 0.90; 200 bases; fraction 0.55 | identity 0.93; 250 bases; fraction 0.60 | identity 0.95; 300 bases; fraction 0.70 | length AND fraction |
+| Assembly | identity 0.92; 400 bases; fraction 0.55 | identity 0.93; 500 bases; fraction 0.60 | identity 0.95; 600 bases; fraction 0.70 | length AND fraction |
 
 Override any of them explicitly:
 

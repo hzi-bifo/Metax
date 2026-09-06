@@ -9,7 +9,7 @@
 # the package's info/licenses/ metadata, which is where conda expects them.
 
 context:
-  version: "2.0.1"
+  version: "2.0.2"
 
 package:
   name: metax
@@ -23,7 +23,7 @@ build:
   # Bump on every rebuild whose contents change: the build string is derived
   # from the variant config, not from the files, so it will not change on its
   # own and a stale cache would otherwise shadow the new package.
-  number: 1
+  number: 0
   # The executable statically links its C dependencies and embeds no conda
   # prefix, so there is nothing to relocate. Relocation would rewrite the
   # Mach-O and invalidate the ad-hoc signature that arm64 macOS requires.

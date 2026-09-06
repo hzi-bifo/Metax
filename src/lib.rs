@@ -688,8 +688,8 @@ impl MetaxApp {
                     ProfileMode::Recall => {
                         if self.config.strain {
                             identity.get_or_insert(0.96);
-                            mapped_len.get_or_insert(40);
-                            fraction.get_or_insert(0.6);
+                            mapped_len.get_or_insert(50);
+                            fraction.get_or_insert(0.65);
                         } else {
                             identity.get_or_insert(0.96);
                             mapped_len.get_or_insert(50);
@@ -739,9 +739,9 @@ impl MetaxApp {
                 } else {
                     let (default_identity, default_mapped, default_fraction) =
                         match self.config.mode {
-                            // Recall relaxes the absolute-length gate rather
-                            // than identity.
-                            ProfileMode::Recall => (0.92, 300, 0.20),
+                            // Recall relaxes both identity and the
+                            // absolute-length gate.
+                            ProfileMode::Recall => (0.90, 300, 0.20),
                             ProfileMode::Default => (0.92, 500, 0.20),
                             ProfileMode::Precision => (0.94, 500, 0.30),
                         };
@@ -788,18 +788,18 @@ impl MetaxApp {
                 }
                 match self.config.mode {
                     ProfileMode::Recall => {
-                        identity.get_or_insert(0.90);
-                        mapped_len.get_or_insert(200);
+                        identity.get_or_insert(0.92);
+                        mapped_len.get_or_insert(400);
                         fraction.get_or_insert(0.55);
                     }
                     ProfileMode::Precision => {
                         identity.get_or_insert(0.95);
-                        mapped_len.get_or_insert(300);
+                        mapped_len.get_or_insert(600);
                         fraction.get_or_insert(0.70);
                     }
                     ProfileMode::Default => {
                         identity.get_or_insert(0.93);
-                        mapped_len.get_or_insert(250);
+                        mapped_len.get_or_insert(500);
                         fraction.get_or_insert(0.60);
                     }
                 }
@@ -1345,8 +1345,8 @@ mod tests {
         cfg_recall.mode = ProfileMode::Recall;
         let (_, identity, mapped_len, fraction) = resolve(cfg_recall);
         assert!((identity - 0.96).abs() < 1e-12);
-        assert_eq!(mapped_len, 40);
-        assert!((fraction - 0.60).abs() < 1e-12);
+        assert_eq!(mapped_len, 50);
+        assert!((fraction - 0.65).abs() < 1e-12);
     }
 
     #[test]
@@ -1397,7 +1397,7 @@ mod tests {
             let mut cfg_recall = cfg;
             cfg_recall.mode = ProfileMode::Recall;
             let (_, identity, mapped_len, fraction) = resolve(cfg_recall);
-            assert!((identity - 0.92).abs() < 1e-12, "{}", seq);
+            assert!((identity - 0.90).abs() < 1e-12, "{}", seq);
             assert_eq!(mapped_len, 300, "{}", seq);
             assert!((fraction - 0.20).abs() < 1e-12, "{}", seq);
         }

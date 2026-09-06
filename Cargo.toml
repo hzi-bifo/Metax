@@ -1,6 +1,6 @@
 [package]
 name = "metax"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2021"
 rust-version = "1.89"
 description = "Coverage-aware taxonomic profiler for metagenomic sequencing data"
