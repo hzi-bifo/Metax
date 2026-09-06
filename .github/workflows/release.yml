@@ -1,0 +1,131 @@
+name: release
+
+# Builds `metax` on native runners for the three supported platforms, packages
+# each as a conda package, and publishes them to a personal anaconda.org
+# channel. Nothing is compiled inside the conda recipe: it only wraps binaries
+# that were already built and smoke-tested here.
+#
+# Requires the ANACONDA_API_TOKEN secret and the CONDA_CHANNEL variable.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Upload to anaconda.org"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.conda_platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - conda_platform: linux-64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - conda_platform: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          # Native Apple Silicon. This is the only runner that can execute the
+          # arm64 binary, which is why it is worth the cost on a private repo
+          # (macOS minutes bill at 10x). Cross-compiling with cargo-zigbuild on
+          # Linux also works, but ships a binary that was never run.
+          - conda_platform: osx-arm64
+            target: aarch64-apple-darwin
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Set macOS deployment target
+        if: runner.os == 'macOS'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked --bin metax --target ${{ matrix.target }}
+
+      - name: Smoke test
+        run: ./target/${{ matrix.target }}/release/metax --version
+
+      - name: Stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir=dist/conda/staging/${{ matrix.conda_platform }}
+          mkdir -p "$dir"
+          cp target/${{ matrix.target }}/release/metax "$dir/metax"
+          strip "$dir/metax" || true
+          chmod 755 "$dir/metax"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: staging-${{ matrix.conda_platform }}
+          path: dist/conda/staging/${{ matrix.conda_platform }}
+          retention-days: 7
+
+  package:
+    name: conda packages
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/conda/staging
+          pattern: staging-*
+
+      - name: Flatten artifact directories
+        run: |
+          set -euo pipefail
+          cd dist/conda/staging
+          for d in staging-*; do mv "$d" "${d#staging-}"; done
+          ls -R
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: build
+          create-args: rattler-build anaconda-client zstandard python=3.12
+          init-shell: bash
+
+      - name: Add licence texts to the recipe directory
+        run: cp LICENSE THIRD_PARTY_NOTICES.md dist/conda/
+
+      # Cross-packaging all three platforms from Linux is safe because the
+      # recipe only copies files; build-conda.sh verifies afterwards that each
+      # package holds the exact bytes that were built and tested upstream.
+      - name: Build conda packages
+        shell: bash -el {0}
+        run: dist/conda/build-conda.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conda-packages
+          path: dist/conda/output/**/*.conda
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/') || inputs.publish
+        shell: bash -el {0}
+        env:
+          ANACONDA_API_TOKEN: ${{ secrets.ANACONDA_API_TOKEN }}
+          CHANNEL: ${{ vars.CONDA_CHANNEL }}
+        run: |
+          set -euo pipefail
+          : "${ANACONDA_API_TOKEN:?missing ANACONDA_API_TOKEN secret}"
+          : "${CHANNEL:?missing CONDA_CHANNEL variable}"
+          find dist/conda/output -name '*.conda' \
+            -exec anaconda upload --user "$CHANNEL" --label main {} +

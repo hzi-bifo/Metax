@@ -1,0 +1,56 @@
+# rattler-build recipe: packages a prebuilt `metax` executable.
+#
+# Nothing is compiled here. The binary is produced by the release workflow (or
+# dist/build-release.sh) and staged into ./staging/<target-platform>/. The same
+# recipe serves every platform; select one with --target-platform.
+#
+# The install prefix holds the executable plus the licence, so users can read
+# the terms without unpacking the package. Both licence texts also travel in
+# the package's info/licenses/ metadata, which is where conda expects them.
+
+context:
+  version: "2.0.1"
+
+package:
+  name: metax
+  version: ${{ version }}
+
+source:
+  - path: staging/${{ target_platform }}
+  - path: LICENSE
+
+build:
+  # Bump on every rebuild whose contents change: the build string is derived
+  # from the variant config, not from the files, so it will not change on its
+  # own and a stale cache would otherwise shadow the new package.
+  number: 1
+  # The executable statically links its C dependencies and embeds no conda
+  # prefix, so there is nothing to relocate. Relocation would rewrite the
+  # Mach-O and invalidate the ad-hoc signature that arm64 macOS requires.
+  dynamic_linking:
+    binary_relocation: false
+  prefix_detection:
+    ignore: true
+  script:
+    - mkdir -p ${{ PREFIX }}/bin
+    - cp metax ${{ PREFIX }}/bin/metax
+    - chmod 755 ${{ PREFIX }}/bin/metax
+    - mkdir -p ${{ PREFIX }}/share/metax
+    - cp LICENSE ${{ PREFIX }}/share/metax/LICENSE
+
+tests:
+  - script:
+      - metax --version
+
+about:
+  summary: Metax taxonomic profiler for metagenomic sequencing data
+  description: |
+    Metax profiles microbial communities from Illumina or Nanopore reads using
+    a compiled-in mapper, coverage breadth/depth evidence, EM-based abundance
+    refinement, and rank-aware taxonomic aggregation.
+  license: AGPL-3.0-or-later
+  # Both texts are copied here from the repository root by stage-from-dist.sh
+  # (or by the release workflow) so the package carries them in info/licenses/.
+  license_file:
+    - LICENSE
+    - THIRD_PARTY_NOTICES.md

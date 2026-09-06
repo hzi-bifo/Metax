@@ -1,0 +1,31 @@
+# Build output
+/target/
+
+# Run outputs
+*.log
+*.tmp
+*.mapping.tsv
+*.mapping.tsv.gz
+*.mapping.profile.json
+*.sam
+*.sam.gz
+*.bam
+*.bai
+
+# Generated packaging artefacts (the recipe and scripts are tracked)
+/dist/conda/staging/
+/dist/conda/output/
+/dist/conda/LICENSE
+/dist/conda/THIRD_PARTY_NOTICES.md
+__pycache__/
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+.idea/
+.vscode/
