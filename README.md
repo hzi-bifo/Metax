@@ -59,8 +59,13 @@ conda activate metax
   
 ### Reference database
 
-A pre-built reference database is available at [here](https://research.bifo.helmholtz-hzi.de/downloads/metax/metax_db.tar.xz). It is based on the RefSeq snapshot of 10 August 2022 and includes top genomes (selected with [genome_updater](https://github.com/pirovc/genome_updater)) for each species, prioritizing assemblies flagged as “representative” or “reference” and then selecting the highest assembly level (Complete Genome > Chromosome > Scaffold > Contig). In total, it contains 33,143 genomes from bacteria, archaea, viruses, fungi, protozoa, and Homo sapiens. Another pre-built reference [database](https://research.bifo.helmholtz-hzi.de/downloads/cami/metax_db.tar.xz) is available for CAMI II data benchmarks.
+Several pre-built **cross-domain reference databases** generated from different NCBI RefSeq snapshots are available. They include genomes from bacteria, archaea, viruses, eukaryotic microbes, and the human reference genome where applicable. Reference genomes were selected using [genome_updater](https://github.com/pirovc/genome_updater), with database composition adapted to the corresponding RefSeq snapshot and benchmark setting.
 
+- **2025 RefSeq database**: A pre-built database based on the **July 30, 2025 NCBI RefSeq snapshot** is available [here](https://s3.bi.denbi.de/swift/v1/cami3/metax/metax_newdb.tar.gz). It contains **33,533 genomes**.
+
+- **2022 RefSeq database**: The database is available [here](https://research.bifo.helmholtz-hzi.de/downloads/metax/metax_db.tar.xz). It is based on the **August 10, 2022 RefSeq snapshot** and contains the top three genomes per species for prokaryotes, all viral genomes, fungal and protozoan genomes with an assembly level of scaffold or higher, and GRCh38. In total, it contains **33,143 genomes**.
+
+- **CAMI II reference database**: The database used for the CAMI II marine and pathogen-detection benchmarks is available [here](https://research.bifo.helmholtz-hzi.de/downloads/cami/metax_db.tar.xz). It corresponds to the **January 8, 2019 RefSeq snapshot** provided through CAMI II. The top five genomes per species were selected using the `-A` option of `genome_updater`, resulting in **18,098 genomes**.
 
 Users can also build a customized reference database by following steps:
 
