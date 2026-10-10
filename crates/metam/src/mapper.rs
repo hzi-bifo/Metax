@@ -2962,14 +2962,16 @@ pub fn rescue_mate_with_workspace(
 /// `own` those of `read`. A taxon is unpaired when none of its placements in
 /// `mate_mappings` forms a proper pair with a placement in `own`. Ordinary
 /// mate rescue never looks at such a taxon once any other taxon pairs
-/// properly, and concordant-only emission then drops it. Here, for up to
+/// properly, and concordant-only emission then drops it. Here, for the first
 /// `max_taxa` unpaired taxa, `read` is searched beside the taxon's best
 /// placement. A recovered mate is returned only when its pair matches at
 /// least as many bases as the best pair that seeding placed on one reference:
 /// the search may add an explanation of the fragment that is as good as the
 /// seeded one, never a worse one.
 ///
-/// The read is seeded once, and only if some taxon is unpaired.
+/// A taxon whose placement is too weak for that even with a perfectly
+/// matching mate is not searched, and the read is seeded only when a search
+/// takes place.
 #[allow(clippy::too_many_arguments)]
 pub fn rescue_competing_mates_with_workspace(
     read_id: &str,
@@ -2988,7 +2990,8 @@ pub fn rescue_competing_mates_with_workspace(
     if read.is_empty() || max_taxa == 0 {
         return rescued;
     }
-    let mut searched = 0usize;
+    let mut considered = 0usize;
+    let mut seeded = false;
     let mut seeded_matches = None;
     for (rank, mate) in mate_mappings.iter().enumerate() {
         let taxon = mate.candidate_groups.profile_taxon;
@@ -3001,13 +3004,19 @@ pub fn rescue_competing_mates_with_workspace(
         {
             continue;
         }
-        if searched == max_taxa {
+        if considered == max_taxa {
             break;
         }
-        if searched == 0 {
-            prepare_mate_rescue_hits(read, index, params, profile, &mut workspace.mate_rescue);
+        considered += 1;
+        let seeded_matches =
+            *seeded_matches.get_or_insert_with(|| best_same_reference_matches(mate_mappings, own));
+        if mate.matched_bases + read.len() < seeded_matches {
+            continue;
         }
-        searched += 1;
+        if !seeded {
+            prepare_mate_rescue_hits(read, index, params, profile, &mut workspace.mate_rescue);
+            seeded = true;
+        }
 
         let mut candidate = None;
         rescue_beside_mate(
@@ -3022,13 +3031,10 @@ pub fn rescue_competing_mates_with_workspace(
             workspace,
             &mut candidate,
         );
-        let Some(candidate) = candidate else {
-            continue;
-        };
-        let seeded_matches =
-            *seeded_matches.get_or_insert_with(|| best_same_reference_matches(mate_mappings, own));
-        if candidate.matched_bases + mate.matched_bases >= seeded_matches {
-            rescued.push(candidate);
+        if let Some(candidate) = candidate {
+            if candidate.matched_bases + mate.matched_bases >= seeded_matches {
+                rescued.push(candidate);
+            }
         }
     }
     rescued
@@ -4382,6 +4388,34 @@ mod tests {
         assert_eq!(rescued.len(), 1, "{rescued:?}");
         assert_eq!(rescued[0].ref_id, "b");
         assert_eq!(rescued[0].matched_bases, 97);
+    }
+
+    #[test]
+    fn taxon_that_cannot_match_the_seeded_pair_is_not_searched() {
+        let fragment = deterministic_read(300);
+        let index = rescue_runtime_index(&[("a", &fragment), ("b", &fragment), ("c", &fragment)]);
+        let read2 = revcomp(&fragment[200..]);
+        let (a1, a2) = fragment_placements("a", 0);
+        let (mut b1, _) = fragment_placements("b", 1);
+        let (c1, _) = fragment_placements("c", 2);
+        // The seeded pair matches 200 bases. With 99 matched bases on "b", a
+        // perfect 100-base mate would still leave that pair one base short.
+        b1.matched_bases = 99;
+        let own = [a2];
+
+        let mut profile = MapProfile::default();
+        let mates = [a1, b1, c1];
+        let rescued = rescue_competing(&read2, &index, &mates[..2], &own, 8, &mut profile);
+        assert!(rescued.is_empty(), "{rescued:?}");
+        assert_eq!(profile.total_query_seeds, 0, "the read was never seeded");
+
+        // Such a taxon still counts towards the limit, as it did when every
+        // unpaired taxon was searched.
+        let rescued = rescue_competing(&read2, &index, &mates, &own, 1, &mut profile);
+        assert!(rescued.is_empty(), "{rescued:?}");
+        let rescued = rescue_competing(&read2, &index, &mates, &own, 2, &mut profile);
+        assert_eq!(rescued.len(), 1, "{rescued:?}");
+        assert_eq!(rescued[0].ref_id, "c");
     }
 
     #[test]
