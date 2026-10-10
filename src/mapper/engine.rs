@@ -1716,6 +1716,8 @@ fn map_record_pair(
         map_read_with_workspace(&r1.id, &r1.seq, index, config.params, &mut local, workspace);
     let mut m2 =
         map_read_with_workspace(&r2.id, &r2.seq, index, config.params, &mut local, workspace);
+    let mut late1 = Vec::new();
+    let mut late2 = Vec::new();
 
     if config.pair_aware {
         if m1.is_empty() && !m2.is_empty() {
@@ -1744,34 +1746,42 @@ fn map_record_pair(
                 workspace,
             );
         }
-        if !m1.is_empty()
-            && !m2.is_empty()
-            && !has_proper_pair(&m1, &m2, config.min_insert, config.max_insert)
-        {
-            let mut rescued1 = rescue_mate_with_workspace(
-                &r1.id,
-                &r1.seq,
-                index,
-                &m2,
-                config.params,
-                config.min_insert,
-                config.max_insert,
-                &mut local,
-                workspace,
-            );
-            let mut rescued2 = rescue_mate_with_workspace(
-                &r2.id,
-                &r2.seq,
-                index,
-                &m1,
-                config.params,
-                config.min_insert,
-                config.max_insert,
-                &mut local,
-                workspace,
-            );
-            m1.append(&mut rescued1);
-            m2.append(&mut rescued2);
+        if !m1.is_empty() && !m2.is_empty() {
+            if !has_proper_pair(&m1, &m2, config.min_insert, config.max_insert) {
+                let mut rescued1 = rescue_mate_with_workspace(
+                    &r1.id,
+                    &r1.seq,
+                    index,
+                    &m2,
+                    config.params,
+                    config.min_insert,
+                    config.max_insert,
+                    &mut local,
+                    workspace,
+                );
+                let mut rescued2 = rescue_mate_with_workspace(
+                    &r2.id,
+                    &r2.seq,
+                    index,
+                    &m1,
+                    config.params,
+                    config.min_insert,
+                    config.max_insert,
+                    &mut local,
+                    workspace,
+                );
+                m1.append(&mut rescued1);
+                m2.append(&mut rescued2);
+            } else {
+                // A proper pair on one taxon must not hide a
+                // pair on another taxon that is at least as good. Search for the
+                // mate of every taxon placed on one mate only, and keep it only
+                // if that pair matches no fewer bases than the best pair found
+                // by seeding.
+                let best = best_same_reference_pair_matches(&m1, &m2);
+                late1 = rescue_competitive_mates(&r1, &m2, &m1, best, index, config, &mut local, workspace);
+                late2 = rescue_competitive_mates(&r2, &m1, &m2, best, index, config, &mut local, workspace);
+            }
         }
     }
 
@@ -1784,6 +1794,10 @@ fn map_record_pair(
     );
     limit_mappings_with_workspace(&mut m1, config.params.top_n, workspace);
     limit_mappings_with_workspace(&mut m2, config.params.top_n, workspace);
+    // Added after the top-n cut and behind the seeded placements, so a rescued
+    // mate (scored on the rescue scale) never evicts or outranks one of them.
+    m1.append(&mut late1);
+    m2.append(&mut late2);
     set_mate_status(&mut m1, &mut m2);
 
     let mappings = prepare_paired_mappings(
@@ -1794,6 +1808,75 @@ fn map_record_pair(
         config.max_insert,
     );
     (mappings, local)
+}
+
+/// At most this many unpaired taxa are tried per mate.
+const MAX_RESCUE_ANCHORS: usize = 8;
+
+/// Matched bases of the best placement pair seeding found on one reference.
+fn best_same_reference_pair_matches(m1: &[Mapping], m2: &[Mapping]) -> usize {
+    let mut best = 0;
+    for a in m1 {
+        for b in m2 {
+            if a.ref_id == b.ref_id {
+                best = best.max(a.matched_bases + b.matched_bases);
+            }
+        }
+    }
+    best
+}
+
+/// For the best placement of every taxon that `anchors` holds without a proper
+/// partner in `own`, search for this read near it; keep the result only when
+/// the pair it forms matches at least `best` bases.
+#[allow(clippy::too_many_arguments)]
+fn rescue_competitive_mates(
+    read: &Record,
+    anchors: &[Mapping],
+    own: &[Mapping],
+    best: usize,
+    index: &RuntimeIndex,
+    config: &MappingConfig,
+    local: &mut MapProfile,
+    workspace: &mut MappingWorkspace,
+) -> Vec<Mapping> {
+    let has_partner = |a: &Mapping| {
+        own.iter().any(|b| {
+            pair_compatibility(a, b, config.min_insert, config.max_insert).relation
+                == metam::mapper::PairRelation::ProperPair
+        })
+    };
+    let mut done = std::collections::HashSet::new();
+    for a in anchors.iter().filter(|a| has_partner(a)) {
+        done.insert(a.candidate_groups.profile_taxon);
+    }
+    let mut rescued = Vec::new();
+    let mut tried = 0;
+    for anchor in anchors {
+        if !done.insert(anchor.candidate_groups.profile_taxon) {
+            continue;
+        }
+        if tried == MAX_RESCUE_ANCHORS {
+            break;
+        }
+        tried += 1;
+        for mate in rescue_mate_with_workspace(
+            &read.id,
+            &read.seq,
+            index,
+            std::slice::from_ref(anchor),
+            config.params,
+            config.min_insert,
+            config.max_insert,
+            local,
+            workspace,
+        ) {
+            if mate.matched_bases + anchor.matched_bases >= best {
+                rescued.push(mate);
+            }
+        }
+    }
+    rescued
 }
 
 fn map_paired(
