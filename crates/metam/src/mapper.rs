@@ -2661,10 +2661,33 @@ pub fn has_proper_pair(
     min_insert: usize,
     max_insert: usize,
 ) -> bool {
-    r1.iter().any(|a| {
-        r2.iter()
-            .any(|b| pair_compatibility(a, b, min_insert, max_insert).relation == PairRelation::ProperPair)
+    r1.iter()
+        .any(|a| has_proper_mate(a, r2, min_insert, max_insert))
+}
+
+/// Whether `mapping` forms a proper pair with any of `mates`.
+fn has_proper_mate(
+    mapping: &Mapping,
+    mates: &[Mapping],
+    min_insert: usize,
+    max_insert: usize,
+) -> bool {
+    mates.iter().any(|mate| {
+        pair_compatibility(mapping, mate, min_insert, max_insert).relation
+            == PairRelation::ProperPair
     })
+}
+
+/// Most matched bases over the R1/R2 placement pairs that share a reference.
+fn best_same_reference_matches(r1: &[Mapping], r2: &[Mapping]) -> usize {
+    r1.iter()
+        .flat_map(|a| {
+            r2.iter()
+                .filter(move |b| b.ref_id == a.ref_id)
+                .map(move |b| a.matched_bases + b.matched_bases)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 pub fn limit_mappings(mappings: &mut Vec<Mapping>, top_n: usize) {
@@ -2923,140 +2946,241 @@ pub fn rescue_mate_with_workspace(
         return Vec::new();
     }
     prepare_mate_rescue_hits(read, index, params, profile, &mut workspace.mate_rescue);
-    let mut best: Option<Mapping> = None;
+    let mut best = None;
     for mate in mate_mappings {
-        let Some(ref_id) = index.reference_index_by_id(&mate.ref_id) else {
-            continue;
-        };
-        let reference = index.reference(ref_id);
-        if reference.is_empty() {
+        rescue_beside_mate(
+            read_id, read, index, mate, params, min_insert, max_insert, profile, workspace,
+            &mut best,
+        );
+    }
+    best.into_iter().collect()
+}
+
+/// Recover the mates of taxa that seeding placed on one mate only.
+///
+/// `mate_mappings` are the placements of the other mate, best first, and
+/// `own` those of `read`. A taxon is unpaired when none of its placements in
+/// `mate_mappings` forms a proper pair with a placement in `own`. Ordinary
+/// mate rescue never looks at such a taxon once any other taxon pairs
+/// properly, and concordant-only emission then drops it. Here, for up to
+/// `max_taxa` unpaired taxa, `read` is searched beside the taxon's best
+/// placement. A recovered mate is returned only when its pair matches at
+/// least as many bases as the best pair that seeding placed on one reference:
+/// the search may add an explanation of the fragment that is as good as the
+/// seeded one, never a worse one.
+///
+/// The read is seeded once, and only if some taxon is unpaired.
+#[allow(clippy::too_many_arguments)]
+pub fn rescue_competing_mates_with_workspace(
+    read_id: &str,
+    read: &[u8],
+    index: &RuntimeIndex,
+    mate_mappings: &[Mapping],
+    own: &[Mapping],
+    params: MapParams,
+    min_insert: usize,
+    max_insert: usize,
+    max_taxa: usize,
+    profile: &mut MapProfile,
+    workspace: &mut MappingWorkspace,
+) -> Vec<Mapping> {
+    let mut rescued = Vec::new();
+    if read.is_empty() || max_taxa == 0 {
+        return rescued;
+    }
+    let mut searched = 0usize;
+    let mut seeded_matches = None;
+    for (rank, mate) in mate_mappings.iter().enumerate() {
+        let taxon = mate.candidate_groups.profile_taxon;
+        let same_taxon = |other: &Mapping| other.candidate_groups.profile_taxon == taxon;
+        // Each taxon is considered once, at its best placement.
+        if mate_mappings[..rank].iter().any(same_taxon)
+            || mate_mappings[rank..].iter().any(|other| {
+                same_taxon(other) && has_proper_mate(other, own, min_insert, max_insert)
+            })
+        {
             continue;
         }
-        let window_start = (mate.ref_start as usize).saturating_sub(max_insert);
-        let window_end = (mate.ref_end as usize)
-            .saturating_add(max_insert)
-            .min(reference.len());
+        if searched == max_taxa {
+            break;
+        }
+        if searched == 0 {
+            prepare_mate_rescue_hits(read, index, params, profile, &mut workspace.mate_rescue);
+        }
+        searched += 1;
 
-        let mut candidates = collect_cached_rescue_candidates(
-            read.len(),
+        let mut candidate = None;
+        rescue_beside_mate(
+            read_id,
+            read,
+            index,
+            mate,
+            params,
+            min_insert,
+            max_insert,
+            profile,
+            workspace,
+            &mut candidate,
+        );
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        let seeded_matches =
+            *seeded_matches.get_or_insert_with(|| best_same_reference_matches(mate_mappings, own));
+        if candidate.matched_bases + mate.matched_bases >= seeded_matches {
+            rescued.push(candidate);
+        }
+    }
+    rescued
+}
+
+/// Search the insert window around one mate placement for `read`, replacing
+/// `best` when the placement found there scores higher.
+///
+/// The seed hits of `read` must already be prepared in `workspace`.
+#[allow(clippy::too_many_arguments)]
+fn rescue_beside_mate(
+    read_id: &str,
+    read: &[u8],
+    index: &RuntimeIndex,
+    mate: &Mapping,
+    params: MapParams,
+    min_insert: usize,
+    max_insert: usize,
+    profile: &mut MapProfile,
+    workspace: &mut MappingWorkspace,
+    best: &mut Option<Mapping>,
+) {
+    let Some(ref_id) = index.reference_index_by_id(&mate.ref_id) else {
+        return;
+    };
+    let reference = index.reference(ref_id);
+    if reference.is_empty() {
+        return;
+    }
+    let window_start = (mate.ref_start as usize).saturating_sub(max_insert);
+    let window_end = (mate.ref_end as usize)
+        .saturating_add(max_insert)
+        .min(reference.len());
+
+    let mut candidates = collect_cached_rescue_candidates(
+        read.len(),
+        ref_id,
+        window_start,
+        window_end,
+        index,
+        params,
+        profile,
+        &mut workspace.mate_rescue,
+    );
+    candidates.sort_unstable_by(|a, b| b.score.cmp(&a.score));
+    for candidate in candidates.into_iter().take(params.top_n.max(4)) {
+        let query = if candidate.strand == 1 {
+            read
+        } else {
+            workspace.mate_rescue.reverse_complement.as_slice()
+        };
+        let (seed_start, seed_end) = if params.full_read_interval {
+            (0, query.len())
+        } else {
+            (candidate.query_seed_start, candidate.query_seed_end)
+        };
+        let Some((qs, qe, rs, re)) = refine_interval(
+            query,
+            &reference,
+            candidate.diag,
+            seed_start,
+            seed_end,
+            params.extension_max_mismatches,
+        ) else {
+            continue;
+        };
+        if re <= window_start || rs >= window_end {
+            continue;
+        }
+        let ident = identity(
+            query,
+            &reference,
+            rs,
+            re,
+            params.ignore_n,
+            params.identity_mode,
+            params.fast_long_read_identity,
+            &mut workspace.edit_distance,
+        );
+        profile.identity_comparisons += 1;
+        let mapped_frac = ident.compared as f64 / read.len() as f64;
+        let passes = params.no_identity_filter
+            || (ident.compared > 0
+                && ident.value >= params.min_identity
+                && mapped_frac >= params.min_mapped_frac);
+        if !passes {
+            continue;
+        }
+        let base_score = candidate.score + (ident.value * 1000.0) as i64;
+        let mut mapping = Mapping {
+            read_id: read_id.to_string(),
+            ref_id: index.reference_id(ref_id).to_string(),
+            ref_start: rs as u32,
+            ref_end: re as u32,
+            identity: ident.value,
+            read_len: read.len(),
+            mapped_bases: ident.compared,
+            mate_ref_status: MateRefStatus::NotApplicable,
+            strand: candidate.strand,
+            seed_count: candidate.seed_count,
+            score: base_score,
+            second_score: 0,
+            rank: 1,
+            num_mappings: 1,
+            matched_bases: ident.matches,
+            query_start: qs,
+            query_end: qe,
+            pair_score: 0,
+            adjusted_score: base_score,
+            template_length: 0,
+            pair_status: PairStatus::Single,
+            mate_number: 0,
+            pair_id: 0,
+            candidate_groups: index.reference_candidate_groups(ref_id),
+            candidate_boundary: CandidateBoundary::COMPLETE,
+        };
+        let pair = pair_compatibility(&mapping, mate, min_insert, max_insert);
+        mapping.pair_score = pair.score.max(0);
+        mapping.template_length = pair.template_length;
+        mapping.pair_status = PairStatus::Rescued(pair.relation);
+        mapping.score = base_score + mapping.pair_score;
+        mapping.adjusted_score = mapping.score;
+        if best
+            .as_ref()
+            .map(|prev| {
+                mapping.score > prev.score
+                    || (mapping.score == prev.score && mapping.identity > prev.identity)
+            })
+            .unwrap_or(true)
+        {
+            *best = Some(mapping);
+        }
+    }
+
+    if best.is_none() && window_end.saturating_sub(window_start) <= 256 {
+        *best = brute_force_rescue(
+            read_id,
+            read,
+            &workspace.mate_rescue.reverse_complement,
+            &reference,
             ref_id,
+            mate,
+            params,
+            min_insert,
+            max_insert,
             window_start,
             window_end,
             index,
-            params,
             profile,
-            &mut workspace.mate_rescue,
+            &mut workspace.edit_distance,
         );
-        candidates.sort_unstable_by(|a, b| b.score.cmp(&a.score));
-        for candidate in candidates.into_iter().take(params.top_n.max(4)) {
-            let query = if candidate.strand == 1 {
-                read
-            } else {
-                workspace.mate_rescue.reverse_complement.as_slice()
-            };
-            let (seed_start, seed_end) = if params.full_read_interval {
-                (0, query.len())
-            } else {
-                (candidate.query_seed_start, candidate.query_seed_end)
-            };
-            let Some((qs, qe, rs, re)) = refine_interval(
-                query,
-                &reference,
-                candidate.diag,
-                seed_start,
-                seed_end,
-                params.extension_max_mismatches,
-            ) else {
-                continue;
-            };
-            if re <= window_start || rs >= window_end {
-                continue;
-            }
-            let ident = identity(
-                query,
-                &reference,
-                rs,
-                re,
-                params.ignore_n,
-                params.identity_mode,
-                params.fast_long_read_identity,
-                &mut workspace.edit_distance,
-            );
-            profile.identity_comparisons += 1;
-            let mapped_frac = ident.compared as f64 / read.len() as f64;
-            let passes = params.no_identity_filter
-                || (ident.compared > 0
-                    && ident.value >= params.min_identity
-                    && mapped_frac >= params.min_mapped_frac);
-            if !passes {
-                continue;
-            }
-            let base_score = candidate.score + (ident.value * 1000.0) as i64;
-            let mut mapping = Mapping {
-                read_id: read_id.to_string(),
-                ref_id: index.reference_id(ref_id).to_string(),
-                ref_start: rs as u32,
-                ref_end: re as u32,
-                identity: ident.value,
-                read_len: read.len(),
-                mapped_bases: ident.compared,
-                mate_ref_status: MateRefStatus::NotApplicable,
-                strand: candidate.strand,
-                seed_count: candidate.seed_count,
-                score: base_score,
-                second_score: 0,
-                rank: 1,
-                num_mappings: 1,
-                matched_bases: ident.matches,
-                query_start: qs,
-                query_end: qe,
-                pair_score: 0,
-                adjusted_score: base_score,
-                template_length: 0,
-                pair_status: PairStatus::Single,
-                mate_number: 0,
-                pair_id: 0,
-                candidate_groups: index.reference_candidate_groups(ref_id),
-                candidate_boundary: CandidateBoundary::COMPLETE,
-            };
-            let pair = pair_compatibility(&mapping, mate, min_insert, max_insert);
-            mapping.pair_score = pair.score.max(0);
-            mapping.template_length = pair.template_length;
-            mapping.pair_status = PairStatus::Rescued(pair.relation);
-            mapping.score = base_score + mapping.pair_score;
-            mapping.adjusted_score = mapping.score;
-            if best
-                .as_ref()
-                .map(|prev| {
-                    mapping.score > prev.score
-                        || (mapping.score == prev.score && mapping.identity > prev.identity)
-                })
-                .unwrap_or(true)
-            {
-                best = Some(mapping);
-            }
-        }
-
-        if best.is_none() && window_end.saturating_sub(window_start) <= 256 {
-            best = brute_force_rescue(
-                read_id,
-                read,
-                &workspace.mate_rescue.reverse_complement,
-                &reference,
-                ref_id,
-                mate,
-                params,
-                min_insert,
-                max_insert,
-                window_start,
-                window_end,
-                index,
-                profile,
-                &mut workspace.edit_distance,
-            );
-        }
     }
-    best.into_iter().collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4099,6 +4223,212 @@ mod tests {
             pair_compatibility(&left, &right, 0, 1_000).relation,
             PairRelation::ProperPair
         );
+    }
+
+    /// Index the given references in full; each one is its own taxon.
+    fn rescue_runtime_index(references: &[(&str, &[u8])]) -> RuntimeIndex {
+        let mut seed_rows = Vec::new();
+        for (ref_id, (_, sequence)) in references.iter().enumerate() {
+            for seed in seeds(sequence, 8, 4, SeedMode::Minimizer) {
+                seed_rows.push((
+                    seed.hash,
+                    SeedOccurrence {
+                        ref_id: ref_id as u32,
+                        pos: seed.pos,
+                    },
+                ));
+            }
+        }
+        seed_rows
+            .sort_unstable_by_key(|(hash, occurrence)| (*hash, occurrence.ref_id, occurrence.pos));
+        let mut seed_table = SeedTable::default();
+        for group in seed_rows.chunk_by(|a, b| a.0 == b.0) {
+            let occurrences = group
+                .iter()
+                .map(|(_, occurrence)| *occurrence)
+                .collect::<Vec<_>>();
+            seed_table
+                .push_occurrence_group(group[0].0, &occurrences)
+                .expect("valid rescue seed group");
+        }
+        seed_table.rebuild_lookup_index();
+        let references = references
+            .iter()
+            .map(|(id, sequence)| owned_reference(id, sequence))
+            .collect::<Vec<_>>();
+        RuntimeIndex::new(Index {
+            header: IndexHeader {
+                magic: INDEX_MAGIC,
+                version: INDEX_VERSION,
+                metam_version: "test".to_string(),
+                k: 8,
+                w: 4,
+                seed_mode: SeedMode::Minimizer,
+                max_occ: 100,
+                hash_bits: 64,
+                exact_randstrobe_match: false,
+                strobe_start_dist: None,
+                reference_count: references.len(),
+                total_reference_bases: references.iter().map(|r| r.len).sum(),
+                indexed_seed_hashes: seed_table.group_count() as u64,
+                indexed_seed_occurrences: seed_table.occurrence_count() as u64,
+                filtered_seed_hashes: 0,
+                reference_storage_bytes: 0,
+                created_unix_seconds: 0,
+            },
+            references,
+            seed_table,
+        })
+    }
+
+    /// The placements of a 300-base fragment's mates on `ref_id`: R1 forward on
+    /// the first 100 bases, R2 reverse on the last 100.
+    fn fragment_placements(ref_id: &str, taxon: u32) -> (Mapping, Mapping) {
+        let r1 = test_mapping("pair", ref_id, 0, 100, 100, 1.0, 100);
+        let mut r2 = test_mapping("pair", ref_id, 200, 300, 100, 1.0, 100);
+        r2.strand = -1;
+        (with_groups(r1, taxon, taxon), with_groups(r2, taxon, taxon))
+    }
+
+    fn rescue_competing(
+        read: &[u8],
+        index: &RuntimeIndex,
+        mates: &[Mapping],
+        own: &[Mapping],
+        max_taxa: usize,
+        profile: &mut MapProfile,
+    ) -> Vec<Mapping> {
+        rescue_competing_mates_with_workspace(
+            "pair",
+            read,
+            index,
+            mates,
+            own,
+            short_test_params(),
+            0,
+            1_000,
+            max_taxa,
+            profile,
+            &mut MappingWorkspace::default(),
+        )
+    }
+
+    #[test]
+    fn competing_taxon_is_rescued_when_its_pair_is_as_good() {
+        let fragment = deterministic_read(300);
+        let index = rescue_runtime_index(&[("a", &fragment), ("b", &fragment)]);
+        let read2 = revcomp(&fragment[200..]);
+        let (a1, a2) = fragment_placements("a", 0);
+        let (b1, _) = fragment_placements("b", 1);
+        let mates = [a1, b1];
+        let own = [a2];
+        let mut profile = MapProfile::default();
+
+        // Taxon 0 pairs properly; taxon 1 was seeded on R1 only.
+        let rescued = rescue_competing(&read2, &index, &mates, &own, 8, &mut profile);
+        assert_eq!(rescued.len(), 1, "{rescued:?}");
+        let mate = &rescued[0];
+        assert_eq!(mate.ref_id, "b");
+        assert_eq!((mate.ref_start, mate.ref_end, mate.strand), (200, 300, -1));
+        assert_eq!(mate.matched_bases, 100);
+        assert_eq!(
+            mate.pair_status,
+            PairStatus::Rescued(PairRelation::ProperPair)
+        );
+
+        // Ordinary rescue still returns one placement for the whole mate.
+        let single = rescue_mate_with_workspace(
+            "pair",
+            &read2,
+            &index,
+            &mates,
+            short_test_params(),
+            0,
+            1_000,
+            &mut profile,
+            &mut MappingWorkspace::default(),
+        );
+        assert_eq!(single.len(), 1, "{single:?}");
+        assert_eq!(single[0].ref_id, "a");
+    }
+
+    #[test]
+    fn competing_taxon_is_dropped_when_its_pair_is_worse() {
+        let fragment = deterministic_read(300);
+        let mut diverged = fragment.clone();
+        for position in [220, 250, 280] {
+            diverged[position] = match diverged[position] {
+                b'A' => b'C',
+                b'C' => b'G',
+                b'G' => b'T',
+                _ => b'A',
+            };
+        }
+        let index = rescue_runtime_index(&[("a", &fragment), ("b", &diverged)]);
+        let read2 = revcomp(&fragment[200..]);
+        let (a1, mut a2) = fragment_placements("a", 0);
+        let (b1, _) = fragment_placements("b", 1);
+        let mates = [a1, b1];
+        let mut profile = MapProfile::default();
+
+        // The seeded pair matches 200 bases, the pair on "b" only 197.
+        let rescued = rescue_competing(&read2, &index, &mates, &[a2.clone()], 8, &mut profile);
+        assert!(rescued.is_empty(), "{rescued:?}");
+        assert!(profile.identity_comparisons > 0, "the mate was searched");
+
+        // Against a weaker seeded pair the same placement is kept.
+        a2.matched_bases = 96;
+        let rescued = rescue_competing(&read2, &index, &mates, &[a2], 8, &mut profile);
+        assert_eq!(rescued.len(), 1, "{rescued:?}");
+        assert_eq!(rescued[0].ref_id, "b");
+        assert_eq!(rescued[0].matched_bases, 97);
+    }
+
+    #[test]
+    fn properly_paired_taxa_are_not_searched() {
+        let fragment = deterministic_read(300);
+        let index = rescue_runtime_index(&[("a", &fragment), ("b", &fragment)]);
+        let read2 = revcomp(&fragment[200..]);
+        // Both references belong to one taxon, which pairs properly on "a".
+        let (a1, a2) = fragment_placements("a", 7);
+        let (b1, _) = fragment_placements("b", 7);
+        let mut profile = MapProfile::default();
+
+        let rescued = rescue_competing(&read2, &index, &[b1, a1], &[a2], 8, &mut profile);
+        assert!(rescued.is_empty(), "{rescued:?}");
+        assert_eq!(profile.total_query_seeds, 0, "the read was never seeded");
+    }
+
+    #[test]
+    fn competing_rescue_is_bounded_and_seeds_the_read_once() {
+        let fragment = deterministic_read(300);
+        let index = rescue_runtime_index(&[("a", &fragment), ("b", &fragment), ("c", &fragment)]);
+        let read2 = revcomp(&fragment[200..]);
+        let (a1, a2) = fragment_placements("a", 0);
+        let (b1, _) = fragment_placements("b", 1);
+        let (c1, _) = fragment_placements("c", 2);
+        let mates = [a1, b1, c1];
+        let own = [a2];
+        let refs = |rescued: &[Mapping]| {
+            rescued
+                .iter()
+                .map(|mapping| mapping.ref_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let mut disabled = MapProfile::default();
+        assert!(rescue_competing(&read2, &index, &mates, &own, 0, &mut disabled).is_empty());
+        assert_eq!(disabled.total_query_seeds, 0);
+
+        let mut one = MapProfile::default();
+        let rescued = rescue_competing(&read2, &index, &mates, &own, 1, &mut one);
+        assert_eq!(refs(&rescued), ["b"]);
+
+        let mut all = MapProfile::default();
+        let rescued = rescue_competing(&read2, &index, &mates, &own, 8, &mut all);
+        assert_eq!(refs(&rescued), ["b", "c"]);
+        assert!(one.total_query_seeds > 0);
+        assert_eq!(all.total_query_seeds, one.total_query_seeds);
     }
 
     #[test]

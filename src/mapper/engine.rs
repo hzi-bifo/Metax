@@ -20,10 +20,10 @@ use metam::index::{read_index_with_cache_progress, IndexCacheBuildProgress, Load
 use metam::io::{Record, SequenceReader};
 use metam::mapper::{
     apply_pair_awareness, has_proper_pair, limit_mappings_with_workspace, map_read_with_workspace,
-    pair_compatibility, rescue_mate_with_workspace, set_mate_status, CandidateBoundary,
-    PairStatus,
-    IdentityMode, LongReadExtension, MapParams, MapProfile, Mapping, MappingWorkspace,
-    ReferenceCandidateGroups, RuntimeIndex, RuntimeIndexOptions,
+    pair_compatibility, rescue_competing_mates_with_workspace, rescue_mate_with_workspace,
+    set_mate_status, CandidateBoundary, IdentityMode, LongReadExtension, MapParams, MapProfile,
+    Mapping, MappingWorkspace, PairStatus, ReferenceCandidateGroups, RuntimeIndex,
+    RuntimeIndexOptions,
 };
 
 use crate::db::DatabaseMetadata;
@@ -50,6 +50,9 @@ const DEFAULT_STREAMED_MAPPING_PROGRESS_SECS: u64 = 10;
 const DEFAULT_CACHE_BUILD_PROGRESS_SECS: u64 = 10;
 const DEFAULT_MIN_INSERT: usize = 0;
 const DEFAULT_MAX_INSERT: usize = 1000;
+/// Taxa placed on one mate only whose missing mate is searched for, per mate,
+/// when another taxon already forms a proper pair.
+const DEFAULT_MATE_RESCUE_TAXA: usize = 8;
 // Rendezvous channels provide double buffering without permitting an
 // unbounded queue: while one batch maps, exactly one next input batch may be
 // under construction and exactly one previous result batch may be written.
@@ -804,6 +807,7 @@ impl Mapper {
                  \tpaired_emission           {:?}\n\
                  \tmin_insert                {}\n\
                  \tmax_insert                {}\n\
+                 \tmate_rescue_taxa          {}\n\
                  \textra_mapper_args         {}",
                 index_path,
                 index_cache,
@@ -847,6 +851,7 @@ impl Mapper {
                 config.paired_emission,
                 config.min_insert,
                 config.max_insert,
+                config.mate_rescue_taxa,
                 extra_args_display,
             );
         }
@@ -1009,6 +1014,7 @@ struct MappingConfig {
     paired_emission: PairedEmissionPolicy,
     min_insert: usize,
     max_insert: usize,
+    mate_rescue_taxa: usize,
     index_cache: Option<String>,
 }
 
@@ -1035,6 +1041,7 @@ struct MapArgOverrides {
     paired_emission: Option<PairedEmissionPolicy>,
     min_insert: Option<usize>,
     max_insert: Option<usize>,
+    mate_rescue_taxa: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1130,6 +1137,9 @@ impl MappingConfig {
             }),
             min_insert: overrides.min_insert.unwrap_or(DEFAULT_MIN_INSERT),
             max_insert: overrides.max_insert.unwrap_or(DEFAULT_MAX_INSERT),
+            mate_rescue_taxa: overrides
+                .mate_rescue_taxa
+                .unwrap_or(DEFAULT_MATE_RESCUE_TAXA),
             index_cache: overrides
                 .index_cache
                 .unwrap_or_else(|| Some("auto".to_string())),
@@ -1175,7 +1185,8 @@ Resolved defaults (before mapper overrides):
     top-n={pe_top_n}, score-ratio={pe_score_ratio:.2}, min-seeds={pe_min_seeds},
     min-identity={pe_identity:.2}, min-mapped-frac={pe_fraction:.2},
     single-strobe-matches={pe_single_strobe}, pair-aware={pe_pair_aware},
-    paired-emission=concordant-only, batch-size={pe_batch_size}
+    mate-rescue-taxa={mate_rescue_taxa}, paired-emission=concordant-only,
+    batch-size={pe_batch_size}
   Nanopore / PacBio:
     top-n={long_top_n}, score-ratio={long_score_ratio:.2}, min-seeds={long_min_seeds},
     min-identity={long_identity:.2}, min-mapped-frac={long_fraction:.2},
@@ -1229,6 +1240,11 @@ Paired-end mapping:
       Minimum proper-pair template span (default {min_insert}).
   --max-insert <BASES>
       Maximum proper-pair template span (default {max_insert}).
+  --mate-rescue-taxa <N>
+      When one taxon already forms a proper pair, also search for the missing
+      mate of up to N other taxa placed on one mate only, and keep it if that
+      pair matches at least as many bases. With 0, mate rescue is limited to
+      fragments without any proper pair (default {mate_rescue_taxa}).
 
 Long-read mapping:
   --identity-mode <MODE>
@@ -1286,6 +1302,7 @@ Example:
         recall_score_ratio = illumina_recall.params.score_ratio,
         min_insert = illumina_pe.min_insert,
         max_insert = illumina_pe.max_insert,
+        mate_rescue_taxa = illumina_pe.mate_rescue_taxa,
     )
 }
 
@@ -1391,6 +1408,10 @@ impl MapArgOverrides {
                     let value = next_arg_value(args, &mut i, arg)?;
                     parsed.max_insert = Some(parse_usize(value, arg)?);
                 }
+                "--mate-rescue-taxa" => {
+                    let value = next_arg_value(args, &mut i, arg)?;
+                    parsed.mate_rescue_taxa = Some(parse_usize(value, arg)?);
+                }
                 "--progress-interval" => {
                     let _ = next_arg_value(args, &mut i, arg)?;
                 }
@@ -1422,6 +1443,9 @@ impl MapArgOverrides {
                             "--batch-size" => parsed.batch_size = Some(parse_positive_usize(value, name)?),
                             "--min-insert" => parsed.min_insert = Some(parse_usize(value, name)?),
                             "--max-insert" => parsed.max_insert = Some(parse_usize(value, name)?),
+                            "--mate-rescue-taxa" => {
+                                parsed.mate_rescue_taxa = Some(parse_usize(value, name)?)
+                            }
                             "--progress-interval" => {}
                             "--index" | "--reads" | "--reads2" | "--out" | "--profile-out"
                             | "--threads" => bail!(
@@ -1716,71 +1740,34 @@ fn map_record_pair(
         map_read_with_workspace(&r1.id, &r1.seq, index, config.params, &mut local, workspace);
     let mut m2 =
         map_read_with_workspace(&r2.id, &r2.seq, index, config.params, &mut local, workspace);
-    let mut late1 = Vec::new();
-    let mut late2 = Vec::new();
+    // Mates recovered for taxa that compete with a seeded proper pair.
+    let mut competing1 = Vec::new();
+    let mut competing2 = Vec::new();
 
     if config.pair_aware {
+        let mut rescue = MateRescue {
+            index,
+            config,
+            profile: &mut local,
+            workspace: &mut *workspace,
+        };
         if m1.is_empty() && !m2.is_empty() {
-            m1 = rescue_mate_with_workspace(
-                &r1.id,
-                &r1.seq,
-                index,
-                &m2,
-                config.params,
-                config.min_insert,
-                config.max_insert,
-                &mut local,
-                workspace,
-            );
+            m1 = rescue.beside_any(r1, &m2);
         }
         if m2.is_empty() && !m1.is_empty() {
-            m2 = rescue_mate_with_workspace(
-                &r2.id,
-                &r2.seq,
-                index,
-                &m1,
-                config.params,
-                config.min_insert,
-                config.max_insert,
-                &mut local,
-                workspace,
-            );
+            m2 = rescue.beside_any(r2, &m1);
         }
         if !m1.is_empty() && !m2.is_empty() {
-            if !has_proper_pair(&m1, &m2, config.min_insert, config.max_insert) {
-                let mut rescued1 = rescue_mate_with_workspace(
-                    &r1.id,
-                    &r1.seq,
-                    index,
-                    &m2,
-                    config.params,
-                    config.min_insert,
-                    config.max_insert,
-                    &mut local,
-                    workspace,
-                );
-                let mut rescued2 = rescue_mate_with_workspace(
-                    &r2.id,
-                    &r2.seq,
-                    index,
-                    &m1,
-                    config.params,
-                    config.min_insert,
-                    config.max_insert,
-                    &mut local,
-                    workspace,
-                );
+            if has_proper_pair(&m1, &m2, config.min_insert, config.max_insert) {
+                // A proper pair on one taxon must not hide a taxon that
+                // explains the fragment as well but was seeded on one mate only.
+                competing1 = rescue.for_unpaired_taxa(r1, &m2, &m1);
+                competing2 = rescue.for_unpaired_taxa(r2, &m1, &m2);
+            } else {
+                let mut rescued1 = rescue.beside_any(r1, &m2);
+                let mut rescued2 = rescue.beside_any(r2, &m1);
                 m1.append(&mut rescued1);
                 m2.append(&mut rescued2);
-            } else {
-                // A proper pair on one taxon must not hide a
-                // pair on another taxon that is at least as good. Search for the
-                // mate of every taxon placed on one mate only, and keep it only
-                // if that pair matches no fewer bases than the best pair found
-                // by seeding.
-                let best = best_same_reference_pair_matches(&m1, &m2);
-                late1 = rescue_competitive_mates(&r1, &m2, &m1, best, index, config, &mut local, workspace);
-                late2 = rescue_competitive_mates(&r2, &m1, &m2, best, index, config, &mut local, workspace);
             }
         }
     }
@@ -1794,10 +1781,10 @@ fn map_record_pair(
     );
     limit_mappings_with_workspace(&mut m1, config.params.top_n, workspace);
     limit_mappings_with_workspace(&mut m2, config.params.top_n, workspace);
-    // Added after the top-n cut and behind the seeded placements, so a rescued
-    // mate (scored on the rescue scale) never evicts or outranks one of them.
-    m1.append(&mut late1);
-    m2.append(&mut late2);
+    // Rescue scores are not on the seed-score scale, so these mates join behind
+    // the retained placements instead of competing with them for top-n slots.
+    m1.append(&mut competing1);
+    m2.append(&mut competing2);
     set_mate_status(&mut m1, &mut m2);
 
     let mappings = prepare_paired_mappings(
@@ -1810,73 +1797,52 @@ fn map_record_pair(
     (mappings, local)
 }
 
-/// At most this many unpaired taxa are tried per mate.
-const MAX_RESCUE_ANCHORS: usize = 8;
-
-/// Matched bases of the best placement pair seeding found on one reference.
-fn best_same_reference_pair_matches(m1: &[Mapping], m2: &[Mapping]) -> usize {
-    let mut best = 0;
-    for a in m1 {
-        for b in m2 {
-            if a.ref_id == b.ref_id {
-                best = best.max(a.matched_bases + b.matched_bases);
-            }
-        }
-    }
-    best
+/// The mate searches of one read pair and the context they share.
+struct MateRescue<'a> {
+    index: &'a RuntimeIndex,
+    config: &'a MappingConfig,
+    profile: &'a mut MapProfile,
+    workspace: &'a mut MappingWorkspace,
 }
 
-/// For the best placement of every taxon that `anchors` holds without a proper
-/// partner in `own`, search for this read near it; keep the result only when
-/// the pair it forms matches at least `best` bases.
-#[allow(clippy::too_many_arguments)]
-fn rescue_competitive_mates(
-    read: &Record,
-    anchors: &[Mapping],
-    own: &[Mapping],
-    best: usize,
-    index: &RuntimeIndex,
-    config: &MappingConfig,
-    local: &mut MapProfile,
-    workspace: &mut MappingWorkspace,
-) -> Vec<Mapping> {
-    let has_partner = |a: &Mapping| {
-        own.iter().any(|b| {
-            pair_compatibility(a, b, config.min_insert, config.max_insert).relation
-                == metam::mapper::PairRelation::ProperPair
-        })
-    };
-    let mut done = std::collections::HashSet::new();
-    for a in anchors.iter().filter(|a| has_partner(a)) {
-        done.insert(a.candidate_groups.profile_taxon);
-    }
-    let mut rescued = Vec::new();
-    let mut tried = 0;
-    for anchor in anchors {
-        if !done.insert(anchor.candidate_groups.profile_taxon) {
-            continue;
-        }
-        if tried == MAX_RESCUE_ANCHORS {
-            break;
-        }
-        tried += 1;
-        for mate in rescue_mate_with_workspace(
+impl MateRescue<'_> {
+    /// The best placement of `read` beside any placement of its mate.
+    fn beside_any(&mut self, read: &Record, mates: &[Mapping]) -> Vec<Mapping> {
+        rescue_mate_with_workspace(
             &read.id,
             &read.seq,
-            index,
-            std::slice::from_ref(anchor),
-            config.params,
-            config.min_insert,
-            config.max_insert,
-            local,
-            workspace,
-        ) {
-            if mate.matched_bases + anchor.matched_bases >= best {
-                rescued.push(mate);
-            }
-        }
+            self.index,
+            mates,
+            self.config.params,
+            self.config.min_insert,
+            self.config.max_insert,
+            self.profile,
+            self.workspace,
+        )
     }
-    rescued
+
+    /// Placements of `read` that complete a pair, no worse than the best
+    /// seeded one, for taxa that `mates` hold without a proper partner in `own`.
+    fn for_unpaired_taxa(
+        &mut self,
+        read: &Record,
+        mates: &[Mapping],
+        own: &[Mapping],
+    ) -> Vec<Mapping> {
+        rescue_competing_mates_with_workspace(
+            &read.id,
+            &read.seq,
+            self.index,
+            mates,
+            own,
+            self.config.params,
+            self.config.min_insert,
+            self.config.max_insert,
+            self.config.mate_rescue_taxa,
+            self.profile,
+            self.workspace,
+        )
+    }
 }
 
 fn map_paired(
@@ -2820,6 +2786,23 @@ mod tests {
             config.paired_emission,
             PairedEmissionPolicy::ConcordantFirst
         );
+    }
+
+    #[test]
+    fn mate_rescue_taxa_has_a_default_and_can_be_overridden() {
+        let config =
+            MappingConfig::resolve(Sequencer::Illumina, true, ProfileMode::Default, &[]).unwrap();
+        assert_eq!(config.mate_rescue_taxa, DEFAULT_MATE_RESCUE_TAXA);
+
+        let args = vec!["--mate-rescue-taxa".to_string(), "0".to_string()];
+        let config =
+            MappingConfig::resolve(Sequencer::Illumina, true, ProfileMode::Default, &args).unwrap();
+        assert_eq!(config.mate_rescue_taxa, 0);
+
+        let args = vec!["--mate-rescue-taxa=3".to_string()];
+        let config =
+            MappingConfig::resolve(Sequencer::Illumina, true, ProfileMode::Default, &args).unwrap();
+        assert_eq!(config.mate_rescue_taxa, 3);
     }
 
     #[test]

@@ -278,6 +278,8 @@ Note that `--min-identity` appears on both sides of `--` with different meanings
 
 Paired-end emission: `--paired-emission concordant-only` (default) emits only concordant same-reference pairs; `concordant-first` emits concordant pairs when present and otherwise discordant rows; `all` emits every mate mapping. The latter two are mainly useful together with `--save-mapping` for diagnostics.
 
+Mate rescue: a mate that seeding did not place is searched for in the insert window of its partner's placements. `--mate-rescue-taxa N` (default `8`) extends this search to fragments that already have a proper pair: for up to `N` other taxa placed on one mate only, the missing mate is searched for and kept when that pair matches at least as many bases as the best seeded pair (§7.1). `--mate-rescue-taxa 0` restricts mate rescue to fragments without any proper pair, the behaviour up to Metax 2.0.2.
+
 ### 5.7 Saved and reused data
 
 Normal profiling writes the coordinate mappings to a temporary compressed file, releases the mapping index, profiles the records, and removes the file. The following options change that behavior.
@@ -419,7 +421,9 @@ The built-in mapper indexes references with syncmer-based randstrobe seeds and r
 
 Before applying `top-n`, the mapper reserves the strongest accepted mapping for each represented profile endpoint (normally species) and each most-specific endpoint (strain when known), then fills the remaining slots with the next best mappings. Repeated placements from one taxon therefore cannot hide another eligible taxon. A candidate-boundary mask records whether endpoints may have been omitted; the profiler keeps such candidates in abundance EM but does not force-resolve an incomplete candidate set.
 
-Paired-end mapping is pair-aware: mates are scored together within the insert-size window, and only concordant same-reference pairs are emitted by default.
+Paired-end mapping is pair-aware: mates are scored together within the insert-size window, and only concordant same-reference pairs are emitted by default. A mate without a seeded placement, or a fragment without any proper pair, triggers mate rescue: the read is searched for in the insert window around its partner's placements.
+
+A proper pair on one taxon does not end the search. Seeding can place a second taxon on one mate only, for example a close relative for which the other mate has too few seed hits, and concordant-only emission would then drop that taxon although it may explain the fragment equally well or better. For each such taxon (profile endpoint, up to `--mate-rescue-taxa` per mate) the missing mate is searched for beside the taxon's best placement. The recovered pair is kept only if it matches at least as many bases as the best pair that seeding placed on one reference, so rescue can add an equally good or better explanation of the fragment but never a worse one. Kept mates are appended after the `top-n` cut and therefore never take a `top-n` slot from a seeded placement.
 
 ### 7.2 Read-level gates
 
