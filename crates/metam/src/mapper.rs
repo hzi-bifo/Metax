@@ -458,6 +458,8 @@ const FAST_EXTEND_MIN_FLANK_DENOM_FOR_FILTER: usize = 64;
 // decoupled from the core identity, so a noisy flank on a high-identity core is
 // no longer rejected just for being noisier than the core.
 const FAST_EXTEND_MIN_FLANK_IDENTITY: f64 = 0.60;
+/// Largest alignment table computed in full; larger ones are banded.
+const FULL_TABLE_MAX_CELLS: usize = 250_000;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct DpCell {
@@ -465,6 +467,22 @@ struct DpCell {
     matches: usize,
     compared: usize,
     denom: usize,
+}
+
+impl DpCell {
+    /// The identity of the alignment that ends in this cell.
+    fn identity(self) -> Identity {
+        Identity {
+            matches: self.matches,
+            compared: self.compared,
+            denom: self.denom,
+            value: if self.denom == 0 {
+                0.0
+            } else {
+                self.matches as f64 / self.denom as f64
+            },
+        }
+    }
 }
 
 impl CandidateAccumulator {
@@ -2121,6 +2139,51 @@ fn identity(
     }
 }
 
+/// [`identity`] of the whole `query` against each window `ref_start..ref_start + len`,
+/// for `len` in `lens`.
+///
+/// The windows share their start, so where a full alignment table is used
+/// the table of the longest window holds those of the shorter ones.
+fn identities_from(
+    query: &[u8],
+    reference: &ReferenceView<'_>,
+    ref_start: usize,
+    lens: std::ops::RangeInclusive<usize>,
+    params: MapParams,
+    workspace: &mut EditDistanceWorkspace,
+) -> Vec<Identity> {
+    let n = query.len();
+    let longest = *lens.end();
+    let shared_row = (matches!(params.identity_mode, IdentityMode::Gapped)
+        && !params.fast_long_read_identity
+        && n > 0
+        && n.saturating_mul(longest) <= FULL_TABLE_MAX_CELLS)
+        .then(|| {
+            alignment_table_last_row(
+                query,
+                reference,
+                ref_start,
+                ref_start + longest,
+                params.ignore_n,
+            )
+        });
+    lens.map(|len| match &shared_row {
+        // Equal-length and empty windows are not read from a table.
+        Some(row) if len != n && len > 0 => row[len].identity(),
+        _ => identity(
+            query,
+            reference,
+            ref_start,
+            ref_start + len,
+            params.ignore_n,
+            params.identity_mode,
+            params.fast_long_read_identity,
+            workspace,
+        ),
+    })
+    .collect()
+}
+
 fn ungapped_identity(
     query: &[u8],
     reference: &ReferenceView<'_>,
@@ -2175,17 +2238,34 @@ fn gapped_identity(
             value: 0.0,
         };
     }
-    if n.saturating_mul(m) > 250_000 {
+    if n.saturating_mul(m) > FULL_TABLE_MAX_CELLS {
         return banded_gapped_identity(query, reference, ref_start, ref_end, ignore_n);
     }
+    alignment_table_last_row(query, reference, ref_start, ref_end, ignore_n)[m].identity()
+}
+
+/// Last row of the table that aligns the whole `query` with
+/// `reference[ref_start..ref_end]`.
+///
+/// Cell `j` holds the best alignment of the query with the first `j`
+/// reference bases, so one table answers for every window that starts at
+/// `ref_start` and is no longer than this one.
+fn alignment_table_last_row(
+    query: &[u8],
+    reference: &ReferenceView<'_>,
+    ref_start: usize,
+    ref_end: usize,
+    ignore_n: bool,
+) -> Vec<DpCell> {
+    let m = ref_end - ref_start;
     let mut prev = vec![DpCell::default(); m + 1];
     for j in 1..=m {
         let rb = reference.code_at(ref_start + j - 1);
         prev[j] = ref_gap(prev[j - 1], rb, ignore_n);
     }
     let mut curr = vec![DpCell::default(); m + 1];
-    for i in 1..=n {
-        let qb = base_code(query[i - 1]);
+    for &q in query {
+        let qb = base_code(q);
         curr[0] = query_gap(prev[0], qb, ignore_n);
         for j in 1..=m {
             let rb = reference.code_at(ref_start + j - 1);
@@ -2196,19 +2276,7 @@ fn gapped_identity(
         }
         std::mem::swap(&mut prev, &mut curr);
     }
-
-    let best = prev[m];
-
-    Identity {
-        matches: best.matches,
-        compared: best.compared,
-        denom: best.denom,
-        value: if best.denom == 0 {
-            0.0
-        } else {
-            best.matches as f64 / best.denom as f64
-        },
-    }
+    prev
 }
 
 fn banded_gapped_identity(
@@ -2269,16 +2337,7 @@ fn banded_gapped_identity(
     if best.score <= impossible.score {
         return ungapped_identity(query, reference, ref_start, ref_end, ignore_n);
     }
-    Identity {
-        matches: best.matches,
-        compared: best.compared,
-        denom: best.denom,
-        value: if best.denom == 0 {
-            0.0
-        } else {
-            best.matches as f64 / best.denom as f64
-        },
-    }
+    best.identity()
 }
 
 /// Oracle for [`banded_gapped_identity`]: identical except that it clears the
@@ -2338,16 +2397,7 @@ fn banded_gapped_identity_full_row_clear(
     if best.score <= impossible.score {
         return ungapped_identity(query, reference, ref_start, ref_end, ignore_n);
     }
-    Identity {
-        matches: best.matches,
-        compared: best.compared,
-        denom: best.denom,
-        value: if best.denom == 0 {
-            0.0
-        } else {
-            best.matches as f64 / best.denom as f64
-        },
-    }
+    best.identity()
 }
 
 /// Fast exact Levenshtein identity for ordinary DNA symbols.
@@ -3040,6 +3090,18 @@ pub fn rescue_competing_mates_with_workspace(
     rescued
 }
 
+/// Whether aligning a whole read to `ref_len` reference bases must miss the
+/// identity cutoff.
+///
+/// A gapped alignment matches at most one read base per reference base and
+/// counts every read base, so its identity is at most `ref_len / read_len`.
+fn whole_read_identity_is_below_cutoff(read_len: usize, ref_len: usize, params: MapParams) -> bool {
+    !params.no_identity_filter
+        && !params.ignore_n
+        && matches!(params.identity_mode, IdentityMode::Gapped)
+        && (ref_len as f64 / read_len as f64) < params.min_identity
+}
+
 /// Search the insert window around one mate placement for `read`, replacing
 /// `best` when the placement found there scores higher.
 ///
@@ -3102,6 +3164,9 @@ fn rescue_beside_mate(
             continue;
         };
         if re <= window_start || rs >= window_end {
+            continue;
+        }
+        if whole_read_identity_is_below_cutoff(query.len(), re - rs, params) {
             continue;
         }
         let ident = identity(
@@ -3207,24 +3272,26 @@ fn brute_force_rescue(
     edit_distance: &mut EditDistanceWorkspace,
 ) -> Option<Mapping> {
     let mut best = None;
+    let window_len = window_end.saturating_sub(window_start);
     for (query, strand) in [(read, 1i8), (rc, -1i8)] {
         let min_len = query.len().saturating_sub(8).max(1);
         let max_len = query.len().saturating_add(8).min(reference.len());
+        if window_len < min_len || max_len < min_len {
+            continue;
+        }
+        // Identities by start position, then by window length from `min_len`.
+        let identities = (window_start..=window_end - min_len)
+            .map(|pos| {
+                let lens = min_len..=max_len.min(window_end - pos);
+                identities_from(query, reference, pos, lens, params, edit_distance)
+            })
+            .collect::<Vec<_>>();
         for ref_len in min_len..=max_len {
-            if window_end.saturating_sub(window_start) < ref_len {
+            if window_len < ref_len {
                 continue;
             }
             for pos in window_start..=window_end - ref_len {
-                let ident = identity(
-                    query,
-                    reference,
-                    pos,
-                    pos + ref_len,
-                    params.ignore_n,
-                    params.identity_mode,
-                    params.fast_long_read_identity,
-                    edit_distance,
-                );
+                let ident = identities[pos - window_start][ref_len - min_len];
                 profile.identity_comparisons += 1;
                 let mapped_frac = ident.compared as f64 / read.len() as f64;
                 let passes = params.no_identity_filter
@@ -4232,6 +4299,128 @@ mod tests {
     }
 
     /// Index the given references in full; each one is its own taxon.
+    fn identity_fields(identity: Identity) -> (usize, usize, usize, u64) {
+        (
+            identity.matches,
+            identity.compared,
+            identity.denom,
+            identity.value.to_bits(),
+        )
+    }
+
+    fn substituted(base: u8) -> u8 {
+        if base == b'A' {
+            b'C'
+        } else {
+            b'A'
+        }
+    }
+
+    #[test]
+    fn windows_sharing_a_start_get_the_identity_of_separate_alignments() {
+        let mut sequence = deterministic_read(700);
+        sequence[70] = b'N';
+        let owned = owned_reference("windows", &sequence);
+        let reference = ReferenceView::Owned(&owned);
+        // A read with a substitution, a deletion, an insertion and an N, and
+        // one whose table would exceed the full-table limit.
+        let mut short = sequence[20..120].to_vec();
+        short[10] = substituted(short[10]);
+        short.remove(40);
+        short.insert(60, b'T');
+        short[80] = b'N';
+        let mut long = sequence[..600].to_vec();
+        long[300] = substituted(long[300]);
+        let mut workspace = EditDistanceWorkspace::default();
+
+        for query in [&short, &long] {
+            for (ignore_n, identity_mode, fast_long_read_identity) in [
+                (false, IdentityMode::Gapped, false),
+                (true, IdentityMode::Gapped, false),
+                (false, IdentityMode::Gapped, true),
+                (false, IdentityMode::Ungapped, false),
+            ] {
+                let params = MapParams {
+                    ignore_n,
+                    identity_mode,
+                    fast_long_read_identity,
+                    ..short_test_params()
+                };
+                for start in [0, 13, 20, 27, 90] {
+                    let lens = query.len() - 8..=query.len() + 8;
+                    let shared = identities_from(
+                        query,
+                        &reference,
+                        start,
+                        lens.clone(),
+                        params,
+                        &mut workspace,
+                    );
+                    assert_eq!(shared.len(), 17);
+                    for (len, shared) in lens.zip(shared) {
+                        let separate = identity(
+                            query,
+                            &reference,
+                            start,
+                            start + len,
+                            ignore_n,
+                            identity_mode,
+                            fast_long_read_identity,
+                            &mut workspace,
+                        );
+                        assert_eq!(
+                            identity_fields(shared),
+                            identity_fields(separate),
+                            "read of {} bases, start {start}, window {len}",
+                            query.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn interval_too_short_for_the_identity_cutoff_needs_no_alignment() {
+        let params = short_test_params();
+        assert!(whole_read_identity_is_below_cutoff(150, 119, params));
+        assert!(!whole_read_identity_is_below_cutoff(150, 120, params));
+        // The bound does not hold where bases or gaps are left out of the identity.
+        for unbounded in [
+            MapParams {
+                ignore_n: true,
+                ..params
+            },
+            MapParams {
+                identity_mode: IdentityMode::Ungapped,
+                ..params
+            },
+            MapParams {
+                no_identity_filter: true,
+                ..params
+            },
+        ] {
+            assert!(!whole_read_identity_is_below_cutoff(150, 60, unbounded));
+        }
+
+        // The longest interval that is skipped really fails after alignment.
+        let sequence = deterministic_read(150);
+        let owned = owned_reference("bound", &sequence);
+        let reference = ReferenceView::Owned(&owned);
+        let aligned = identity(
+            &sequence,
+            &reference,
+            0,
+            119,
+            params.ignore_n,
+            params.identity_mode,
+            params.fast_long_read_identity,
+            &mut EditDistanceWorkspace::default(),
+        );
+        assert_eq!((aligned.matches, aligned.denom), (119, 150));
+        assert!(aligned.value < params.min_identity);
+    }
+
     fn rescue_runtime_index(references: &[(&str, &[u8])]) -> RuntimeIndex {
         let mut seed_rows = Vec::new();
         for (ref_id, (_, sequence)) in references.iter().enumerate() {
