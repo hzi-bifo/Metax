@@ -599,7 +599,7 @@ pub fn map_read_with_workspace(
             params,
             second_score,
             profile,
-            workspace,
+            &mut workspace.edit_distance,
         ) {
             mappings.push(mapping);
         }
@@ -627,7 +627,7 @@ pub fn map_read_with_workspace(
                 params,
                 second_score,
                 profile,
-                workspace,
+                &mut workspace.edit_distance,
             ) {
                 mappings.push(mapping);
             }
@@ -741,7 +741,7 @@ fn evaluate_candidate(
     params: MapParams,
     second_score: i64,
     profile: &mut MapProfile,
-    workspace: &mut MappingWorkspace,
+    edit_distance: &mut EditDistanceWorkspace,
 ) -> Option<Mapping> {
     let reference = index.reference(candidate.ref_id);
     let query = if candidate.strand == 1 { read } else { rc };
@@ -774,7 +774,7 @@ fn evaluate_candidate(
             interval,
             index,
             profile,
-            workspace,
+            edit_distance,
         )
     })
 }
@@ -791,10 +791,17 @@ fn evaluate_candidate_interval(
     interval: (usize, usize, usize, usize),
     index: &RuntimeIndex,
     profile: &mut MapProfile,
-    workspace: &mut MappingWorkspace,
+    edit_distance: &mut EditDistanceWorkspace,
 ) -> Option<Mapping> {
-    let (mut interval, mut ident, mut mapped_frac, mut passes) =
-        evaluate_interval_identity(read, query, reference, interval, params, profile, workspace);
+    let (mut interval, mut ident, mut mapped_frac, mut passes) = evaluate_interval_identity(
+        read,
+        query,
+        reference,
+        interval,
+        params,
+        profile,
+        edit_distance,
+    );
     if params.long_read_chaining
         && params.long_read_extension == LongReadExtension::Candidate
         && should_attempt_long_read_extension(ident, passes, params)
@@ -803,7 +810,13 @@ fn evaluate_candidate_interval(
         if extended != interval {
             let (extended_interval, extended_ident, extended_mapped_frac, extended_passes) =
                 evaluate_interval_identity(
-                    read, query, reference, extended, params, profile, workspace,
+                    read,
+                    query,
+                    reference,
+                    extended,
+                    params,
+                    profile,
+                    edit_distance,
                 );
             if should_use_extended_interval(
                 ident,
@@ -950,7 +963,7 @@ fn evaluate_interval_identity(
     interval: (usize, usize, usize, usize),
     params: MapParams,
     profile: &mut MapProfile,
-    workspace: &mut MappingWorkspace,
+    edit_distance: &mut EditDistanceWorkspace,
 ) -> ((usize, usize, usize, usize), Identity, f64, bool) {
     let (qs, qe, rs, re) = interval;
     let ident = identity(
@@ -961,7 +974,7 @@ fn evaluate_interval_identity(
         params.ignore_n,
         params.identity_mode,
         params.fast_long_read_identity,
-        &mut workspace.edit_distance,
+        edit_distance,
     );
     profile.identity_comparisons += 1;
     let mapped_frac = ident.compared as f64 / read.len() as f64;
@@ -3090,20 +3103,11 @@ pub fn rescue_competing_mates_with_workspace(
     rescued
 }
 
-/// Whether aligning a whole read to `ref_len` reference bases must miss the
-/// identity cutoff.
-///
-/// A gapped alignment matches at most one read base per reference base and
-/// counts every read base, so its identity is at most `ref_len / read_len`.
-fn whole_read_identity_is_below_cutoff(read_len: usize, ref_len: usize, params: MapParams) -> bool {
-    !params.no_identity_filter
-        && !params.ignore_n
-        && matches!(params.identity_mode, IdentityMode::Gapped)
-        && (ref_len as f64 / read_len as f64) < params.min_identity
-}
-
 /// Search the insert window around one mate placement for `read`, replacing
 /// `best` when the placement found there scores higher.
+///
+/// A candidate is judged exactly as seeding judges one, so a rescued
+/// placement carries the identity and mapped bases of its aligned interval.
 ///
 /// The seed hits of `read` must already be prepared in `workspace`.
 #[allow(clippy::too_many_arguments)]
@@ -3143,95 +3147,26 @@ fn rescue_beside_mate(
     );
     candidates.sort_unstable_by(|a, b| b.score.cmp(&a.score));
     for candidate in candidates.into_iter().take(params.top_n.max(4)) {
-        let query = if candidate.strand == 1 {
-            read
-        } else {
-            workspace.mate_rescue.reverse_complement.as_slice()
-        };
-        let (seed_start, seed_end) = if params.full_read_interval {
-            (0, query.len())
-        } else {
-            (candidate.query_seed_start, candidate.query_seed_end)
-        };
-        let Some((qs, qe, rs, re)) = refine_interval(
-            query,
-            &reference,
-            candidate.diag,
-            seed_start,
-            seed_end,
-            params.extension_max_mismatches,
+        let Some(mut mapping) = evaluate_candidate(
+            read_id,
+            read,
+            &workspace.mate_rescue.reverse_complement,
+            &candidate,
+            index,
+            params,
+            0,
+            profile,
+            &mut workspace.edit_distance,
         ) else {
             continue;
         };
-        if re <= window_start || rs >= window_end {
+        if mapping.ref_end as usize <= window_start || mapping.ref_start as usize >= window_end {
             continue;
         }
-        if whole_read_identity_is_below_cutoff(query.len(), re - rs, params) {
-            continue;
-        }
-        let ident = identity(
-            query,
-            &reference,
-            rs,
-            re,
-            params.ignore_n,
-            params.identity_mode,
-            params.fast_long_read_identity,
-            &mut workspace.edit_distance,
-        );
-        profile.identity_comparisons += 1;
-        let mapped_frac = ident.compared as f64 / read.len() as f64;
-        let passes = params.no_identity_filter
-            || (ident.compared > 0
-                && ident.value >= params.min_identity
-                && mapped_frac >= params.min_mapped_frac);
-        if !passes {
-            continue;
-        }
-        let base_score = candidate.score + (ident.value * 1000.0) as i64;
-        let mut mapping = Mapping {
-            read_id: read_id.to_string(),
-            ref_id: index.reference_id(ref_id).to_string(),
-            ref_start: rs as u32,
-            ref_end: re as u32,
-            identity: ident.value,
-            read_len: read.len(),
-            mapped_bases: ident.compared,
-            mate_ref_status: MateRefStatus::NotApplicable,
-            strand: candidate.strand,
-            seed_count: candidate.seed_count,
-            score: base_score,
-            second_score: 0,
-            rank: 1,
-            num_mappings: 1,
-            matched_bases: ident.matches,
-            query_start: qs,
-            query_end: qe,
-            pair_score: 0,
-            adjusted_score: base_score,
-            template_length: 0,
-            pair_status: PairStatus::Single,
-            mate_number: 0,
-            pair_id: 0,
-            candidate_groups: index.reference_candidate_groups(ref_id),
-            candidate_boundary: CandidateBoundary::COMPLETE,
-        };
-        let pair = pair_compatibility(&mapping, mate, min_insert, max_insert);
-        mapping.pair_score = pair.score.max(0);
-        mapping.template_length = pair.template_length;
-        mapping.pair_status = PairStatus::Rescued(pair.relation);
-        mapping.score = base_score + mapping.pair_score;
-        mapping.adjusted_score = mapping.score;
-        if best
-            .as_ref()
-            .map(|prev| {
-                mapping.score > prev.score
-                    || (mapping.score == prev.score && mapping.identity > prev.identity)
-            })
-            .unwrap_or(true)
-        {
-            *best = Some(mapping);
-        }
+        // A rescue window offers few seeds, so the share of the read that
+        // matches carries most of the score.
+        mapping.score += (mapping.matched_bases as f64 / read.len() as f64 * 1000.0) as i64;
+        keep_better_rescue(best, mapping, mate, min_insert, max_insert);
     }
 
     if best.is_none() && window_end.saturating_sub(window_start) <= 256 {
@@ -3302,7 +3237,7 @@ fn brute_force_rescue(
                     continue;
                 }
                 let base_score = (ident.value * 1000.0) as i64 + ident.compared as i64;
-                let mut mapping = Mapping {
+                let mapping = Mapping {
                     read_id: read_id.to_string(),
                     ref_id: index.reference_id(ref_id).to_string(),
                     ref_start: pos as u32,
@@ -3329,26 +3264,36 @@ fn brute_force_rescue(
                     candidate_groups: index.reference_candidate_groups(ref_id),
                     candidate_boundary: CandidateBoundary::COMPLETE,
                 };
-                let pair = pair_compatibility(&mapping, mate, min_insert, max_insert);
-                mapping.pair_score = pair.score.max(0);
-                mapping.template_length = pair.template_length;
-                mapping.pair_status = PairStatus::Rescued(pair.relation);
-                mapping.score = base_score + mapping.pair_score;
-                mapping.adjusted_score = mapping.score;
-                if best
-                    .as_ref()
-                    .map(|prev: &Mapping| {
-                        mapping.score > prev.score
-                            || (mapping.score == prev.score && mapping.identity > prev.identity)
-                    })
-                    .unwrap_or(true)
-                {
-                    best = Some(mapping);
-                }
+                keep_better_rescue(&mut best, mapping, mate, min_insert, max_insert);
             }
         }
     }
     best
+}
+
+/// Record how a rescued placement pairs with `mate`, and keep it in `best`
+/// when it scores higher than the placement held there.
+fn keep_better_rescue(
+    best: &mut Option<Mapping>,
+    mut mapping: Mapping,
+    mate: &Mapping,
+    min_insert: usize,
+    max_insert: usize,
+) {
+    let pair = pair_compatibility(&mapping, mate, min_insert, max_insert);
+    mapping.pair_score = pair.score.max(0);
+    mapping.template_length = pair.template_length;
+    mapping.pair_status = PairStatus::Rescued(pair.relation);
+    mapping.score += mapping.pair_score;
+    mapping.adjusted_score = mapping.score;
+    mapping.rank = 1;
+    mapping.num_mappings = 1;
+    if best.as_ref().is_none_or(|prev| {
+        mapping.score > prev.score
+            || (mapping.score == prev.score && mapping.identity > prev.identity)
+    }) {
+        *best = Some(mapping);
+    }
 }
 
 fn set_ranks(mappings: &mut [Mapping]) {
@@ -4380,47 +4325,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn interval_too_short_for_the_identity_cutoff_needs_no_alignment() {
-        let params = short_test_params();
-        assert!(whole_read_identity_is_below_cutoff(150, 119, params));
-        assert!(!whole_read_identity_is_below_cutoff(150, 120, params));
-        // The bound does not hold where bases or gaps are left out of the identity.
-        for unbounded in [
-            MapParams {
-                ignore_n: true,
-                ..params
-            },
-            MapParams {
-                identity_mode: IdentityMode::Ungapped,
-                ..params
-            },
-            MapParams {
-                no_identity_filter: true,
-                ..params
-            },
-        ] {
-            assert!(!whole_read_identity_is_below_cutoff(150, 60, unbounded));
-        }
-
-        // The longest interval that is skipped really fails after alignment.
-        let sequence = deterministic_read(150);
-        let owned = owned_reference("bound", &sequence);
-        let reference = ReferenceView::Owned(&owned);
-        let aligned = identity(
-            &sequence,
-            &reference,
-            0,
-            119,
-            params.ignore_n,
-            params.identity_mode,
-            params.fast_long_read_identity,
-            &mut EditDistanceWorkspace::default(),
-        );
-        assert_eq!((aligned.matches, aligned.denom), (119, 150));
-        assert!(aligned.value < params.min_identity);
-    }
-
     fn rescue_runtime_index(references: &[(&str, &[u8])]) -> RuntimeIndex {
         let mut seed_rows = Vec::new();
         for (ref_id, (_, sequence)) in references.iter().enumerate() {
@@ -4605,6 +4509,158 @@ mod tests {
         let rescued = rescue_competing(&read2, &index, &mates, &own, 2, &mut profile);
         assert_eq!(rescued.len(), 1, "{rescued:?}");
         assert_eq!(rescued[0].ref_id, "c");
+    }
+
+    /// The reverse mate of a 300-base fragment, with its last `unaligned` bases
+    /// replaced by bases that cannot match.
+    fn read2_with_unaligned_end(fragment: &[u8], unaligned: usize) -> Vec<u8> {
+        let mut read = revcomp(&fragment[200..]);
+        let aligned = read.len() - unaligned;
+        for base in &mut read[aligned..] {
+            *base = substituted(*base);
+        }
+        read
+    }
+
+    fn rescue_beside(
+        read: &[u8],
+        index: &RuntimeIndex,
+        mate: &Mapping,
+        params: MapParams,
+    ) -> Vec<Mapping> {
+        rescue_mate_with_workspace(
+            "pair",
+            read,
+            index,
+            std::slice::from_ref(mate),
+            params,
+            0,
+            1_000,
+            &mut MapProfile::default(),
+            &mut MappingWorkspace::default(),
+        )
+    }
+
+    /// What a rescued and a seeded placement must agree on.
+    fn placement(mapping: &Mapping) -> (u32, u32, i8, usize, usize, usize, usize, u64) {
+        (
+            mapping.ref_start,
+            mapping.ref_end,
+            mapping.strand,
+            mapping.query_start,
+            mapping.query_end,
+            mapping.mapped_bases,
+            mapping.matched_bases,
+            mapping.identity.to_bits(),
+        )
+    }
+
+    #[test]
+    fn rescued_placement_is_described_like_a_seeded_one() {
+        let fragment = deterministic_read(300);
+        let index = rescue_runtime_index(&[("a", &fragment)]);
+        let read2 = read2_with_unaligned_end(&fragment, 15);
+        let (a1, _) = fragment_placements("a", 0);
+
+        // Without gaps as well: the aligned part of the read is compared, not
+        // its first bases.
+        for identity_mode in [IdentityMode::Gapped, IdentityMode::Ungapped] {
+            let params = MapParams {
+                identity_mode,
+                ..short_test_params()
+            };
+            let rescued = rescue_beside(&read2, &index, &a1, params);
+            assert_eq!(rescued.len(), 1, "{rescued:?}");
+            let rescued = &rescued[0];
+            // The 85 aligned bases match; the unaligned end is not part of the identity.
+            assert_eq!((rescued.ref_start, rescued.ref_end), (215, 300));
+            assert_eq!((rescued.mapped_bases, rescued.matched_bases), (85, 85));
+            assert_eq!(rescued.identity, 1.0);
+
+            let seeded = map_read("pair", &read2, &index, params, &mut MapProfile::default());
+            assert_eq!(seeded.len(), 1, "{seeded:?}");
+            assert_eq!(placement(rescued), placement(&seeded[0]));
+        }
+    }
+
+    #[test]
+    fn rescued_chained_placement_is_described_like_a_seeded_one() {
+        let fragment = deterministic_read(300);
+        let index = rescue_runtime_index(&[("a", &fragment)]);
+        // A deletion in the mate: one diagonal covers only part of it.
+        let mut target = fragment[200..].to_vec();
+        target.remove(50);
+        let read2 = revcomp(&target);
+        let (a1, _) = fragment_placements("a", 0);
+        let params = MapParams {
+            long_read_chaining: true,
+            ..short_test_params()
+        };
+
+        let rescued = rescue_beside(&read2, &index, &a1, params);
+        assert_eq!(rescued.len(), 1, "{rescued:?}");
+        // The placement spans the deletion, as the chain does.
+        assert!(rescued[0].ref_start < 240 && rescued[0].ref_end > 260);
+
+        let seeded = map_read("pair", &read2, &index, params, &mut MapProfile::default());
+        assert_eq!(seeded.len(), 1, "{seeded:?}");
+        assert_eq!(placement(&rescued[0]), placement(&seeded[0]));
+    }
+
+    #[test]
+    fn rescue_accepts_what_seeding_accepts() {
+        let fragment = deterministic_read(300);
+        let index = rescue_runtime_index(&[("a", &fragment)]);
+        let (a1, _) = fragment_placements("a", 0);
+
+        // 70 of 100 bases align: above the mapped-fraction cutoff of 0.5.
+        let rescued = rescue_beside(
+            &read2_with_unaligned_end(&fragment, 30),
+            &index,
+            &a1,
+            short_test_params(),
+        );
+        assert_eq!(rescued.len(), 1, "{rescued:?}");
+        assert_eq!((rescued[0].mapped_bases, rescued[0].identity), (70, 1.0));
+
+        // 45 of 100 bases align: below it, for a seeded placement as well.
+        let read2 = read2_with_unaligned_end(&fragment, 55);
+        assert!(rescue_beside(&read2, &index, &a1, short_test_params()).is_empty());
+        let seeded = map_read(
+            "pair",
+            &read2,
+            &index,
+            short_test_params(),
+            &mut MapProfile::default(),
+        );
+        assert!(seeded.is_empty(), "{seeded:?}");
+    }
+
+    #[test]
+    fn rescue_prefers_the_placement_that_matches_more_of_the_read() {
+        let fragment = deterministic_read(300);
+        let target = &fragment[200..];
+        // The whole mate with five substitutions, and further on a perfect copy
+        // of its first 60 bases only.
+        let mut whole = target.to_vec();
+        for position in [10, 30, 50, 70, 90] {
+            whole[position] = substituted(whole[position]);
+        }
+        let mut partial = target.to_vec();
+        for base in &mut partial[60..] {
+            *base = substituted(*base);
+        }
+        let reference = [&fragment[..200], &whole, &fragment[..50], &partial].concat();
+        let index = rescue_runtime_index(&[("a", &reference)]);
+        let (a1, _) = fragment_placements("a", 0);
+
+        let rescued = rescue_beside(&revcomp(target), &index, &a1, short_test_params());
+        assert_eq!(rescued.len(), 1, "{rescued:?}");
+        assert_eq!((rescued[0].ref_start, rescued[0].ref_end), (200, 300));
+        assert_eq!(
+            (rescued[0].mapped_bases, rescued[0].matched_bases),
+            (100, 95)
+        );
     }
 
     #[test]
