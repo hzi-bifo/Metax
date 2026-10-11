@@ -1878,7 +1878,7 @@ mod tests {
         ] {
             assert!(help.contains(option), "missing {option:?} from mapper help");
         }
-        assert!(help.contains("top-n=50, score-ratio=0.60, min-seeds=1"));
+        assert!(help.contains("top-n=50, score-ratio=0.50, min-seeds=1"));
         assert!(help.contains("mapped-length OR gate=300 bases"));
         assert!(help.contains("options before '--' configure taxonomic"));
     }

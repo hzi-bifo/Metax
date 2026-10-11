@@ -1081,7 +1081,7 @@ impl MappingConfig {
         // applied by the profiler's evidence thresholds.
         if preset == MappingPreset::Illumina && is_paired {
             top_n.get_or_insert(50);
-            score_ratio.get_or_insert(0.60);
+            score_ratio.get_or_insert(0.50);
         }
         if mode == ProfileMode::Recall && preset == MappingPreset::Illumina {
             if score_ratio.is_none() {
@@ -1095,7 +1095,7 @@ impl MappingConfig {
         // competitors from the profiler. Unless explicitly overridden, it
         // therefore retains the same mapper score ratio as Default (0.90 for
         // unpaired Illumina/assembly input, 0.70 for long reads, and the
-        // mode-independent 0.60 paired-end policy above). Illumina recall
+        // mode-independent 0.50 paired-end policy above). Illumina recall
         // alone widens candidate acquisition.
         let pair_aware = overrides.pair_aware || (preset == MappingPreset::Illumina && is_paired);
         let mut min_seeds = overrides.min_seeds;
@@ -1201,6 +1201,8 @@ Candidate discovery and retention:
   --top-n <N>
       Maximum retained mappings per read or mate. Larger values preserve more
       ambiguity but increase identity work, output size, and profiler memory.
+      For paired-end reads, 10 is a faster setting; it can lose recall above
+      species level in communities the database covers poorly.
   --score-ratio <FRACTION>
       Retain candidates scoring at least this fraction of the best seed score.
       Lower values improve recall but can substantially increase runtime.
@@ -1275,7 +1277,7 @@ schema. Set those with profile options before '--', not as mapper overrides.
 
 Example:
   metax profile -d DB -i R1.fq.gz -I R2.fq.gz -o sample -- \
-    --top-n 50 --score-ratio 0.60 --min-seeds 1
+    --top-n 50 --score-ratio 0.50 --min-seeds 1
 "#,
         se_top_n = illumina_se.params.top_n,
         se_score_ratio = illumina_se.params.score_ratio,
@@ -2579,7 +2581,7 @@ mod tests {
         assert_eq!(config.batch_base_limit, None);
         assert_eq!(config.params.min_seeds, 1);
         assert_eq!(config.params.top_n, 50);
-        assert!((config.params.score_ratio - 0.60).abs() < f64::EPSILON);
+        assert!((config.params.score_ratio - 0.50).abs() < f64::EPSILON);
         assert!(config.allow_single_strobe_matches);
         assert_eq!(config.paired_emission, PairedEmissionPolicy::ConcordantOnly);
     }
@@ -2593,7 +2595,7 @@ mod tests {
         ] {
             let config = MappingConfig::resolve(Sequencer::Illumina, true, mode, &[]).unwrap();
             assert_eq!(config.params.top_n, 50);
-            assert!((config.params.score_ratio - 0.60).abs() < f64::EPSILON);
+            assert!((config.params.score_ratio - 0.50).abs() < f64::EPSILON);
         }
     }
 
@@ -2611,7 +2613,7 @@ mod tests {
     fn precision_keeps_default_candidate_score_ratios_for_every_input_type() {
         for (sequencer, paired, expected) in [
             (Sequencer::Illumina, false, 0.90),
-            (Sequencer::Illumina, true, 0.60),
+            (Sequencer::Illumina, true, 0.50),
             (Sequencer::Nanopore, false, 0.70),
             (Sequencer::PacBio, false, 0.70),
             (Sequencer::Assembly, false, 0.90),

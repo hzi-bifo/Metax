@@ -265,13 +265,19 @@ Resolved mapper defaults:
 | Input | top-n | score ratio | min seeds | mapper identity | mapper fraction |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Illumina single-end / assembly | 5 | 0.90 (0.80 in recall mode) | 2 | 0.80 | 0.50 |
-| Illumina paired-end | 50 | 0.60 | 1 | 0.80 | 0.50 |
+| Illumina paired-end | 50 | 0.50 | 1 | 0.80 | 0.50 |
 | Nanopore / PacBio | 10 | 0.70 | 3 | 0.80 | 0.30, or 300 mapped bases |
 
 The paired-end candidate set is deliberately broad so that the profiler can see competing species and keep conserved regions ambiguous; the modes differ in the evidence stage, not in candidate generation. Example overrides:
 
 ```bash
 metax profile ... -- --top-n 20 --score-ratio 0.80
+```
+
+Faster paired-end mapping: `--top-n 10` retains at most ten placements per mate at the default score ratio. It is considerably faster and leaves species and genus profiles practically unchanged where the database covers the community well. Where the database covers a community poorly, as is typical for soil, it loses recall above species level, so keep the default there.
+
+```bash
+metax profile ... -- --top-n 10
 ```
 
 Note that `--min-identity` appears on both sides of `--` with different meanings: before it, the profiler's species/strain threshold; after it, the mapper's emission cutoff.
