@@ -9,7 +9,7 @@
 # the package's info/licenses/ metadata, which is where conda expects them.
 
 context:
-  version: "2.0.2"
+  version: "2.0.3"
 
 package:
   name: metax

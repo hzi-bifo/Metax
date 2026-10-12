@@ -4,7 +4,7 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 DIST=${DIST:-$(cd "$HERE/.." && pwd)}
-VERSION=${VERSION:-2.0.2}
+VERSION=${VERSION:-2.0.3}
 REPO=${REPO:-$(cd "$HERE/../.." && pwd)}
 
 map_linux_64=x86_64-unknown-linux-gnu
