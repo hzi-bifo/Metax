@@ -64,6 +64,15 @@ Metax uses NCBI-style taxonomy dump files (`nodes.dmp`, `names.dmp`, `merged.dmp
 
 Databases built for Metax 0.9 are not compatible with Metax 2 and must be rebuilt.
 
+- **2026 RefSeq database**: A pre-built database for Metax 2 is available [here](https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2_refseq_202607_k16w37.tar.gz) (38 GiB). It is based on the **July 2026 NCBI RefSeq snapshot** and covers bacteria, archaea, viruses, fungi, protozoa and the human reference genome (GRCh38), with up to three genomes per species for bacteria and archaea. Unnamed "sp." isolates are included only where GTDB (release 232) places them in a species of their own. In total, it contains **29,112 genomes**. Unpack it and pass the folder to `-d`:
+
+  ```shell
+  tar -xzf metax2_refseq_202607_k16w37.tar.gz
+  metax profile -d metax2_refseq_202607_k16w37 -i <reads_1.fq.gz> -I <reads_2.fq.gz> -o <prefix> -t 20
+  ```
+
+  The first run writes an index cache of about 50 GiB into the unpacked folder, which must therefore be writable.
+
 To build a custom database:
 
 1. Prepare the reference genomes in FASTA format. Each sequence header must follow
