@@ -120,7 +120,8 @@ Rules:
 
 - If the strain or subspecies is known, include both `t:<strain_taxid>` and `s:<species_taxid>`.
 - If only the species or a higher rank is known, include only that rank.
-- Malformed headers, unsupported prefixes, duplicate contigs within a genome, and inconsistent genome sizes are rejected with an explanatory error.
+- The sequences of one genome do not need to be adjacent in the FASTA, but all of them must carry the same taxonomy and, when given, the same `genome_size`.
+- Malformed headers, unsupported prefixes, duplicate contigs within a genome, and inconsistent taxonomies or genome sizes are rejected with an explanatory error.
 - If a provided `genome_size` is larger than the summed contig lengths, indexing warns that only part of the genome is represented. If it is smaller, indexing fails.
 
 Metax keeps the most specific supported `(rank, taxid)` of every genome as its terminal reporting label. A genome labelled `t:1234;s:9606` is reported as species 9606 in community profiling and as strain 1234 in strain profiling. A genome labelled `g:561` is reported directly at genus 561; it is never relabelled as a species.

@@ -667,6 +667,44 @@ pub struct BuildStats {
     pub max_partition_seed_occurrences: usize,
     pub temp_partitions: usize,
     pub seed_chunk_bases: usize,
+    /// `ReferenceOrderDigest` of the reference IDs in the order they were
+    /// stored, so callers can check the index against their own metadata.
+    pub reference_order_digest: u64,
+}
+
+/// Order-sensitive 64-bit FNV-1a digest of a list of reference IDs.
+///
+/// The index records the digest of the IDs it stores, in reference-ID order.
+/// A caller that keeps its own per-reference table computes the same digest
+/// over its names and compares the two, which detects a missing, extra or
+/// reordered reference without keeping all IDs in memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReferenceOrderDigest(u64);
+
+impl ReferenceOrderDigest {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    pub fn new() -> Self {
+        Self(Self::OFFSET_BASIS)
+    }
+
+    pub fn push(&mut self, id: &str) {
+        for &byte in id.as_bytes().iter().chain(std::iter::once(&b'\n')) {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    pub fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for ReferenceOrderDigest {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -693,6 +731,7 @@ struct PartitionedReferenceStats {
     total_reference_bases: u64,
     reference_storage_bytes: u64,
     raw_seed_occurrences: usize,
+    reference_order: ReferenceOrderDigest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1061,6 +1100,7 @@ where
     let total_reference_bases = partitioned.total_reference_bases;
     let reference_storage_bytes = partitioned.reference_storage_bytes;
     let raw_seed_occurrences = partitioned.raw_seed_occurrences;
+    let reference_order_digest = partitioned.reference_order.finish();
     drop(writers);
     ref_store.flush()?;
     drop(ref_store);
@@ -1136,6 +1176,7 @@ where
         max_partition_seed_occurrences,
         temp_partitions: partition_count,
         seed_chunk_bases,
+        reference_order_digest,
     };
     Ok((
         Index {
@@ -1219,6 +1260,7 @@ where
     let total_reference_bases = partitioned.total_reference_bases;
     let reference_storage_bytes = partitioned.reference_storage_bytes;
     let raw_seed_occurrences = partitioned.raw_seed_occurrences;
+    let reference_order_digest = partitioned.reference_order.finish();
     drop(writers);
     ref_store.flush()?;
     drop(ref_store);
@@ -1327,6 +1369,7 @@ where
             max_partition_seed_occurrences,
             temp_partitions: partition_count,
             seed_chunk_bases,
+            reference_order_digest,
         },
     ))
 }
@@ -1504,6 +1547,7 @@ where
                 let partition = partition_for_hash(key, hash_bits, partition_count);
                 write_raw_seed(&mut writers[partition], raw)?;
             }
+            stats.reference_order.push(&record.reference.id);
             write_reference(ref_store, &record.reference)?;
 
             stats.reference_count += 1;
@@ -4010,6 +4054,19 @@ pub fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_order_digest_depends_on_order_and_boundaries() {
+        let digest = |ids: &[&str]| {
+            let mut digest = ReferenceOrderDigest::new();
+            ids.iter().for_each(|id| digest.push(id));
+            digest.finish()
+        };
+        assert_eq!(digest(&["a", "b"]), digest(&["a", "b"]));
+        assert_ne!(digest(&["a", "b"]), digest(&["b", "a"]));
+        assert_ne!(digest(&["ab", "c"]), digest(&["a", "bc"]));
+        assert_ne!(digest(&["a"]), digest(&["a", ""]));
+    }
 
     fn colliding_randstrobe_hashes() -> (u64, u64) {
         let key = 0x1234_5678u64;

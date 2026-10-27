@@ -15,7 +15,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::progress::{self, ProgressOptions};
 use metam::{
-    index::{build_index_file_with_progress, BuildProgress, DEFAULT_INDEX_SEED_CHUNK_MIB},
+    index::{
+        build_index_file_with_progress, BuildProgress, ReferenceOrderDigest,
+        DEFAULT_INDEX_SEED_CHUNK_MIB,
+    },
     progress::log_message,
     seeds::{SeedMode, StrobeStartDistance},
 };
@@ -154,8 +157,9 @@ pub fn build_database(
         validate_subsample_params(params, threads)?;
     }
 
-    let genomes = read_reference_fasta(fasta_path)?;
-    let selected = select_index_records(&genomes, subsample, threads)?;
+    let input = read_reference_fasta(fasta_path)?;
+    let selected = select_index_records(&input, subsample, threads)?;
+    drop(input);
     if selected.is_empty() {
         bail!("reference FASTA produced no indexable records");
     }
@@ -170,12 +174,12 @@ pub fn build_database(
     // reference names so every mapping row carries both values. This includes
     // explicit fractional subsampling and references whose declared full size
     // is larger than the supplied indexed sequence.
-    let references = if force_sampled_field {
+    let (references, indexed) = if force_sampled_field {
         let reference_path = staging_path.join(MAPPING_REFERENCE_FILE);
         let _cleanup_reference = RemoveFileOnDrop::new(reference_path.clone());
         let references =
             write_metam_reference(&reference_path, fasta_path, selected, force_sampled_field)?;
-        run_metam_index(
+        let indexed = run_metam_index(
             &reference_path,
             &index_path,
             threads.unwrap_or(1).max(1),
@@ -183,17 +187,18 @@ pub fn build_database(
         )?;
         gzip_file(&reference_path)
             .with_context(|| format!("failed to compress {}", reference_path.display()))?;
-        references
+        (references, indexed)
     } else {
         let references = build_direct_reference_metadata(selected)?;
-        run_metam_index(
+        let indexed = run_metam_index(
             fasta_path,
             &index_path,
             threads.unwrap_or(1).max(1),
             options,
         )?;
-        references
+        (references, indexed)
     };
+    verify_index_reference_order(&references, indexed)?;
 
     let metadata = DatabaseMetadata {
         metam_index: PathBuf::from(METAM_INDEX_FILE),
@@ -531,6 +536,30 @@ struct GenomeInput {
     full_genome_size: usize,
 }
 
+/// Position of one reference FASTA record: its genome in
+/// `ReferenceInput::genomes` and its contig within that genome.
+#[derive(Clone, Copy, Debug)]
+struct RecordPosition {
+    genome: u32,
+    contig: u32,
+}
+
+/// Reference FASTA contents: genomes in order of first appearance, and the
+/// position of every record in input order. The records of a genome need not
+/// be adjacent. The index stores references in input order, so the database
+/// metadata follows `record_order` rather than the genome order.
+struct ReferenceInput {
+    genomes: Vec<GenomeInput>,
+    record_order: Vec<RecordPosition>,
+}
+
+/// Reference count and `ReferenceOrderDigest` reported by the index build.
+#[derive(Clone, Copy, Debug)]
+struct IndexedReferences {
+    count: usize,
+    order_digest: u64,
+}
+
 #[derive(Clone)]
 struct Segment {
     contig_index: usize,
@@ -565,10 +594,11 @@ impl SelectedRecord {
     }
 }
 
-fn read_reference_fasta(path: &Path) -> Result<Vec<GenomeInput>> {
+fn read_reference_fasta(path: &Path) -> Result<ReferenceInput> {
     let reader = open_text_reader(path)?;
     let reader = BufReader::new(reader);
     let mut genomes: IndexMap<String, GenomeInput> = IndexMap::new();
+    let mut record_order: Vec<RecordPosition> = Vec::new();
     let mut current_header: Option<String> = None;
     let mut current_len = 0usize;
 
@@ -576,7 +606,7 @@ fn read_reference_fasta(path: &Path) -> Result<Vec<GenomeInput>> {
         let line = line.with_context(|| format!("failed reading FASTA {}", path.display()))?;
         if let Some(rest) = line.strip_prefix('>') {
             if let Some(header) = current_header.take() {
-                store_input_record(&mut genomes, &header, current_len)?;
+                record_order.push(store_input_record(&mut genomes, &header, current_len)?);
                 current_len = 0;
             }
             current_header = Some(rest.trim().to_string());
@@ -597,7 +627,7 @@ fn read_reference_fasta(path: &Path) -> Result<Vec<GenomeInput>> {
         }
     }
     if let Some(header) = current_header.take() {
-        store_input_record(&mut genomes, &header, current_len)?;
+        record_order.push(store_input_record(&mut genomes, &header, current_len)?);
     }
     if genomes.is_empty() {
         bail!("reference FASTA contains no records");
@@ -632,7 +662,10 @@ fn read_reference_fasta(path: &Path) -> Result<Vec<GenomeInput>> {
         };
     }
 
-    Ok(genomes.into_values().collect())
+    Ok(ReferenceInput {
+        genomes: genomes.into_values().collect(),
+        record_order,
+    })
 }
 
 fn open_text_reader(path: &Path) -> Result<Box<dyn Read>> {
@@ -648,7 +681,7 @@ fn store_input_record(
     genomes: &mut IndexMap<String, GenomeInput>,
     header: &str,
     length: usize,
-) -> Result<()> {
+) -> Result<RecordPosition> {
     if header.is_empty() {
         bail!("empty FASTA header");
     }
@@ -661,15 +694,21 @@ fn store_input_record(
         );
     }
 
-    let entry = genomes
-        .entry(parsed.genome.clone())
-        .or_insert_with(|| GenomeInput {
-            genome: parsed.genome.clone(),
-            taxonomy: parsed.taxonomy.clone(),
-            provided_genome_size: parsed.genome_size,
-            contigs: Vec::new(),
-            full_genome_size: 0,
-        });
+    let genome_index = match genomes.entry(parsed.genome.clone()) {
+        indexmap::map::Entry::Occupied(entry) => entry.index(),
+        indexmap::map::Entry::Vacant(entry) => {
+            let index = entry.index();
+            entry.insert(GenomeInput {
+                genome: parsed.genome.clone(),
+                taxonomy: parsed.taxonomy.clone(),
+                provided_genome_size: parsed.genome_size,
+                contigs: Vec::new(),
+                full_genome_size: 0,
+            });
+            index
+        }
+    };
+    let entry = &mut genomes[genome_index];
     if entry.taxonomy != parsed.taxonomy {
         bail!(
             "inconsistent taxonomy for genome {}: '{}' vs '{}'",
@@ -700,7 +739,12 @@ fn store_input_record(
         reference_name: header.to_string(),
         length,
     });
-    Ok(())
+    Ok(RecordPosition {
+        genome: u32::try_from(genome_index)
+            .context("reference FASTA contains more than 2^32 genomes")?,
+        contig: u32::try_from(entry.contigs.len() - 1)
+            .with_context(|| format!("genome {} has more than 2^32 records", entry.genome))?,
+    })
 }
 
 struct ParsedHeader {
@@ -860,31 +904,40 @@ fn validate_subsample_params(params: SubsampleParams, threads: Option<usize>) ->
 }
 
 fn select_index_records(
-    genomes: &[GenomeInput],
+    input: &ReferenceInput,
     subsample: Option<SubsampleParams>,
     threads: Option<usize>,
 ) -> Result<Vec<SelectedRecord>> {
+    let genomes = input.genomes.as_slice();
     if genomes.is_empty() {
         return Ok(Vec::new());
     }
     let params = match subsample {
         Some(params) => params,
         None => {
-            return Ok(genomes
+            // Whole records in input order: the index is built from the input
+            // FASTA as it is, so its references come in this order.
+            let effective: Vec<usize> = genomes
                 .iter()
-                .flat_map(|genome| {
-                    let effective: usize = genome.contigs.iter().map(|c| c.length).sum();
-                    genome.contigs.iter().map(move |contig| SelectedRecord {
+                .map(|genome| genome.contigs.iter().map(|c| c.length).sum())
+                .collect();
+            return Ok(input
+                .record_order
+                .iter()
+                .map(|position| {
+                    let genome = &genomes[position.genome as usize];
+                    let contig = &genome.contigs[position.contig as usize];
+                    SelectedRecord {
                         genome: genome.genome.clone(),
                         contig: contig.contig.clone(),
                         source_contig: contig.contig.clone(),
                         source_name: contig.reference_name.clone(),
                         taxonomy: genome.taxonomy.clone(),
                         full_genome_size: genome.full_genome_size,
-                        effective_indexed_size: effective,
+                        effective_indexed_size: effective[position.genome as usize],
                         source_start: 1,
                         source_end: contig.length,
-                    })
+                    }
                 })
                 .collect());
         }
@@ -1187,29 +1240,29 @@ fn write_metam_reference(
         File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
     );
     let mut seen_names = HashSet::new();
-    let mut references = Vec::with_capacity(records.len());
+    let record_count = records.len();
     let mut selected_by_source: HashMap<(String, String), Vec<PreparedRecord>> = HashMap::new();
     for record in records {
         let name = metax_reference_name(&record, force_sampled_field);
         if !seen_names.insert(name.clone()) {
             bail!("generated duplicate reference name '{}'", name);
         }
-        references.push(ReferenceMetadata {
-            name: name.clone(),
-            length: record.len(),
-            genome: record.genome.clone(),
-            contig: record.contig.clone(),
-            full_genome_size: record.full_genome_size,
-            effective_indexed_size: record.effective_indexed_size,
-            taxonomy_field: record.taxonomy.raw.clone(),
-        });
         selected_by_source
             .entry((record.genome.clone(), record.source_contig.clone()))
             .or_default()
             .push(PreparedRecord { name, record });
     }
+    drop(seen_names);
 
-    stream_selected_reference_records(source_fasta, &mut selected_by_source, &mut writer)?;
+    // Metadata rows are added as the records are written, so they follow the
+    // written FASTA (source order), which is the order the index stores.
+    let mut references = Vec::with_capacity(record_count);
+    stream_selected_reference_records(
+        source_fasta,
+        &mut selected_by_source,
+        &mut writer,
+        &mut references,
+    )?;
     writer.flush()?;
     if !selected_by_source.is_empty() {
         let missing = selected_by_source
@@ -1236,6 +1289,7 @@ fn stream_selected_reference_records(
     source_fasta: &Path,
     selected_by_source: &mut HashMap<(String, String), Vec<PreparedRecord>>,
     writer: &mut dyn Write,
+    references: &mut Vec<ReferenceMetadata>,
 ) -> Result<()> {
     let reader = open_text_reader(source_fasta)?;
     let reader = BufReader::new(reader);
@@ -1251,6 +1305,7 @@ fn stream_selected_reference_records(
             flush_selected_source_record(
                 selected_by_source,
                 writer,
+                references,
                 current_key.take(),
                 current_header.take(),
                 &sequence,
@@ -1269,6 +1324,7 @@ fn stream_selected_reference_records(
     flush_selected_source_record(
         selected_by_source,
         writer,
+        references,
         current_key.take(),
         current_header.take(),
         &sequence,
@@ -1279,6 +1335,7 @@ fn stream_selected_reference_records(
 fn flush_selected_source_record(
     selected_by_source: &mut HashMap<(String, String), Vec<PreparedRecord>>,
     writer: &mut dyn Write,
+    references: &mut Vec<ReferenceMetadata>,
     key: Option<(String, String)>,
     header: Option<String>,
     sequence: &str,
@@ -1316,6 +1373,17 @@ fn flush_selected_source_record(
         let end = prepared.record.source_end;
         writeln!(writer, ">{}", prepared.name)?;
         write_normalized_sequence(writer, &sequence.as_bytes()[start..end])?;
+        let length = prepared.record.len();
+        let record = prepared.record;
+        references.push(ReferenceMetadata {
+            name: prepared.name,
+            length,
+            genome: record.genome,
+            contig: record.contig,
+            full_genome_size: record.full_genome_size,
+            effective_indexed_size: record.effective_indexed_size,
+            taxonomy_field: record.taxonomy.raw,
+        });
     }
     Ok(())
 }
@@ -1363,7 +1431,7 @@ fn run_metam_index(
     index_path: &Path,
     threads: usize,
     options: &MetamIndexOptions,
-) -> Result<()> {
+) -> Result<IndexedReferences> {
     let seed_mode = parse_seed_mode(&options.seed_mode)?;
     let strobe_start_dist =
         StrobeStartDistance::new(options.strobe_start_dist_min, options.strobe_start_dist_max)?;
@@ -1422,6 +1490,30 @@ fn run_metam_index(
                 stats.temp_partitions,
                 stats.seed_chunk_bases / (1024 * 1024)
             ),
+        );
+    }
+    Ok(IndexedReferences {
+        count: header.reference_count,
+        order_digest: stats.reference_order_digest,
+    })
+}
+
+/// `metax profile` addresses references by their position in the index and
+/// requires the database metadata to list them in the same order. Checking it
+/// here makes a mismatch fail the build, before a database is published.
+fn verify_index_reference_order(
+    references: &[ReferenceMetadata],
+    indexed: IndexedReferences,
+) -> Result<()> {
+    let mut digest = ReferenceOrderDigest::new();
+    for reference in references {
+        digest.push(&reference.name);
+    }
+    if references.len() != indexed.count || digest.finish() != indexed.order_digest {
+        bail!(
+            "internal error: the mapping index ({} references) and the database metadata ({} rows) do not list the same references in the same order; the database was not written",
+            indexed.count,
+            references.len()
         );
     }
     Ok(())
@@ -1831,5 +1923,134 @@ mod tests {
         );
         let loaded = DatabaseMetadata::load(&output).unwrap();
         assert_eq!(loaded.references.len(), 1);
+    }
+
+    /// Deterministic pseudo-random DNA, so every record yields seeds.
+    fn test_sequence(seed: u64, len: usize) -> String {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                b"ACGT"[(state % 4) as usize] as char
+            })
+            .collect()
+    }
+
+    /// Genome G1 has two records with a G2 record between them.
+    fn write_interleaved_fasta(path: &Path, g1_size: &str) {
+        let records = [
+            format!("G1|c1|t:11;s:20{g1_size}"),
+            "G2|c1|s:30".to_string(),
+            format!("G1|c2|t:11;s:20{g1_size}"),
+        ];
+        let fasta = records
+            .iter()
+            .enumerate()
+            .map(|(i, header)| format!(">{header}\n{}\n", test_sequence(i as u64 + 1, 600)))
+            .collect::<String>();
+        std::fs::write(path, fasta).unwrap();
+    }
+
+    fn index_reference_ids(database: &Path) -> Vec<String> {
+        let index =
+            metam::index::read_index(database.join(METAM_INDEX_FILE).to_str().unwrap()).unwrap();
+        index.references.into_iter().map(|r| r.id).collect()
+    }
+
+    fn build_interleaved(subsample: Option<SubsampleParams>, g1_size: &str) -> DatabaseMetadata {
+        let directory = tempfile::tempdir().unwrap();
+        let fasta = directory.path().join("reference.fa");
+        let output = directory.path().join("database");
+        write_interleaved_fasta(&fasta, g1_size);
+        build_database(
+            fasta.to_str().unwrap(),
+            output.to_str().unwrap(),
+            subsample,
+            Some(2),
+            false,
+            &test_index_options(None),
+        )
+        .unwrap();
+        let loaded = DatabaseMetadata::load(&output).unwrap();
+        let names: Vec<String> = loaded.references.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(index_reference_ids(&output), names);
+        let genomes: Vec<&str> = loaded
+            .references
+            .iter()
+            .map(|r| r.genome.as_str())
+            .collect();
+        assert_eq!(genomes, ["G1", "G2", "G1"]);
+        loaded
+    }
+
+    #[test]
+    fn interleaved_genome_records_keep_input_order() {
+        let loaded = build_interleaved(None, "");
+        let names: Vec<&str> = loaded.references.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["G1|c1|t:11;s:20", "G2|c1|s:30", "G1|c2|t:11;s:20"]);
+        let g1 = &loaded.references[0];
+        assert_eq!(
+            (g1.full_genome_size, g1.effective_indexed_size),
+            (1200, 1200)
+        );
+        assert_eq!(loaded.references[2].full_genome_size, 1200);
+    }
+
+    #[test]
+    fn interleaved_genome_records_keep_input_order_when_fractional() {
+        let params = SubsampleParams {
+            fraction: 0.5,
+            seed: 42,
+            segment_length: 50_000,
+            min_length: 3_000,
+        };
+        let loaded = build_interleaved(Some(params), "");
+        assert!(loaded.is_fractional);
+        let contigs: Vec<&str> = loaded
+            .references
+            .iter()
+            .map(|r| r.contig.as_str())
+            .collect();
+        assert_eq!(contigs, ["c1:1-600", "c1:1-600", "c2:1-600"]);
+    }
+
+    #[test]
+    fn interleaved_genome_records_keep_input_order_with_declared_size() {
+        // A declared size above the summed length takes the rewritten-reference path.
+        let loaded = build_interleaved(None, "|5000");
+        assert!(loaded.is_fractional);
+        let g1 = &loaded.references[0];
+        assert_eq!(
+            (g1.full_genome_size, g1.effective_indexed_size),
+            (5000, 1200)
+        );
+    }
+
+    #[test]
+    fn index_order_check_rejects_a_different_order() {
+        let reference = |name: &str| ReferenceMetadata {
+            name: name.to_string(),
+            length: 1,
+            genome: "G".into(),
+            contig: name.to_string(),
+            full_genome_size: 1,
+            effective_indexed_size: 1,
+            taxonomy_field: "s:1".into(),
+        };
+        let references = vec![reference("a"), reference("b")];
+        let digest = |names: &[&str]| {
+            let mut digest = ReferenceOrderDigest::new();
+            names.iter().for_each(|name| digest.push(name));
+            digest.finish()
+        };
+        let indexed = |names: &[&str]| IndexedReferences {
+            count: names.len(),
+            order_digest: digest(names),
+        };
+        assert!(verify_index_reference_order(&references, indexed(&["a", "b"])).is_ok());
+        assert!(verify_index_reference_order(&references, indexed(&["b", "a"])).is_err());
+        assert!(verify_index_reference_order(&references, indexed(&["a"])).is_err());
     }
 }

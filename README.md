@@ -81,7 +81,7 @@ To build a custom database:
    >genome_id|sequence_id|taxonomy[|genome_size]
    ```
 
-   where `taxonomy` lists the lowest confidently known rank(s) as `prefix:taxid` pairs separated by `;`, for example `t:1234;s:9606` (strain and species), `s:562` (species only), or `g:561` (genus only). Supported prefixes are `t` (strain/subspecies), `s`, `g`, `f`, `o`, `c`, `p`, and `k`. All contigs of one genome share the same `genome_id`; `genome_size` is optional.
+   where `taxonomy` lists the lowest confidently known rank(s) as `prefix:taxid` pairs separated by `;`, for example `t:1234;s:9606` (strain and species), `s:562` (species only), or `g:561` (genus only). Supported prefixes are `t` (strain/subspecies), `s`, `g`, `f`, `o`, `c`, `p`, and `k`. All contigs of one genome share the same `genome_id` and need not be adjacent in the file; `genome_size` is optional.
 
 2. Build the database:
 
