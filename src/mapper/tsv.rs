@@ -144,6 +144,12 @@ impl MetamMappingRecord<'_> {
         self.pair_id == 0 && self.mate_number != 0 && self.mate_ref == MateRef::BeyondEnd
     }
 
+    /// The rows paired-end community profiling uses: selected pairs, and lone
+    /// mates whose mate may lie beyond the end of their reference.
+    pub fn is_paired_evidence(&self) -> bool {
+        self.is_selected_pair_mate() || self.is_mate_beyond_reference_end()
+    }
+
     pub fn validate(self) -> Result<()> {
         nonempty(self.read_id, "read_id")?;
         nonempty(self.ref_id, "ref_id")?;

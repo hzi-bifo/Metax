@@ -819,7 +819,7 @@ impl CommunityProfiler {
                 num_alignments as u64,
                 load_progress_options.interval(),
             );
-            if self.cfg.is_paired && !mapping.is_selected_pair_mate() {
+            if self.cfg.is_paired && !mapping.is_paired_evidence() {
                 return Ok(());
             }
             match self.entry_from_metam_mapping(mapping, &metam_refs, fixed_flank_len) {
@@ -958,7 +958,7 @@ impl CommunityProfiler {
         metam_refs: &HashMap<String, MetamReferenceEntry>,
         fixed_flank_len: usize,
     ) -> Option<(&'a str, AlignmentEntry)> {
-        if self.cfg.is_paired && !mapping.is_selected_pair_mate() {
+        if self.cfg.is_paired && !mapping.is_paired_evidence() {
             return None;
         }
         let reference = metam_refs.get(mapping.ref_id)?;
@@ -3782,9 +3782,9 @@ fn process_evidence_batch(
         genus_order.clear();
         genus_intervals.clear();
         for aln in &read.alignments {
-            // Paired fallback uses only a validated first mate from a complete
-            // concordant group. Long reads use their sole unpaired row.
-            if !matches!(aln.role, MappingRole::Mate1 | MappingRole::Unpaired) {
+            // One row per fragment: the first mate of a pair, a lone mate whose
+            // mate lies beyond its reference end, or a single-end/long read.
+            if aln.role == MappingRole::Mate2 && aln.pair_id != 0 {
                 continue;
             }
             if !aln.profile_rank.is_species() {

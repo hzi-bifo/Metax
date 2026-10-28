@@ -1149,11 +1149,28 @@ impl CandidateScratch {
             };
             self.insert_placement(placement, policy.mode);
         }
+
+        // Without any pair, the fragment's evidence is a mate whose mate may
+        // lie beyond the end of its reference: the only rows without a pair
+        // that paired-end profiling admits.
+        if self.by_taxon_assembly.is_empty() {
+            self.build_unpaired(rows, policy, |mapping| mapping.pair_id == 0);
+        }
     }
 
     fn build_single(&mut self, rows: &[EvidenceAlignment], policy: EvidencePolicy) {
+        self.build_unpaired(rows, policy, |_| true);
+    }
+
+    /// One placement per qualifying single-read row accepted by `include`.
+    fn build_unpaired(
+        &mut self,
+        rows: &[EvidenceAlignment],
+        policy: EvidencePolicy,
+        include: impl Fn(&EvidenceAlignment) -> bool,
+    ) {
         for (input_order, mapping) in rows.iter().enumerate() {
-            if !single_mapping_qualifies(mapping, policy) {
+            if !include(mapping) || !single_mapping_qualifies(mapping, policy) {
                 continue;
             }
             let placement = CandidatePlacement {
@@ -1497,6 +1514,38 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].best.both_mapped, 200);
         assert_eq!(candidates[1].best.both_mapped, 200);
+    }
+
+    #[test]
+    fn lone_mates_place_a_fragment_only_without_a_pair() {
+        // Mates of one fragment beyond the ends of two genes of species 1, and
+        // a lone mate of species 2 that fails the identity gate.
+        let mut lone = vec![
+            mapping(1, 10, 1, 0.99, 100, 100, MappingRole::Mate1),
+            mapping(1, 11, 1, 0.98, 100, 100, MappingRole::Mate2),
+            mapping(2, 20, 2, 0.80, 100, 100, MappingRole::Mate2),
+        ];
+        for row in &mut lone {
+            row.pair_id = 0;
+        }
+        let mut scratch = CandidateScratch::default();
+        let candidates = scratch.build(&lone, policy(EvidenceMode::Paired));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].taxid, 1);
+        assert_eq!(candidates[0].placements.len(), 1);
+        assert_eq!(candidates[0].best.reference_id, 10);
+        assert_eq!(candidates[0].best.both_mapped, 100);
+
+        let mut rows = vec![
+            mapping(3, 30, 3, 0.99, 100, 100, MappingRole::Mate1),
+            mapping(3, 30, 3, 0.99, 100, 100, MappingRole::Mate2),
+        ];
+        rows[0].pair_id = 7;
+        rows[1].pair_id = 7;
+        rows.extend(lone);
+        let candidates = scratch.build(&rows, policy(EvidenceMode::Paired));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].taxid, 3);
     }
 
     #[test]
