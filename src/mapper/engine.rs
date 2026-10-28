@@ -3027,13 +3027,8 @@ mod tests {
         let mut mate1 = lone();
         mate1.push(test_mapping("read/1", "gene-c", MateRefStatus::Same));
         let mate2 = vec![test_mapping("read/2", "gene-c", MateRefStatus::Same)];
-        let paired = prepare_paired_mappings(
-            mate1,
-            mate2,
-            PairedEmissionPolicy::ConcordantOnly,
-            0,
-            1_000,
-        );
+        let paired =
+            prepare_paired_mappings(mate1, mate2, PairedEmissionPolicy::ConcordantOnly, 0, 1_000);
         assert_eq!(paired.len(), 2);
         assert!(paired.iter().all(|mapping| mapping.pair_id != 0));
     }

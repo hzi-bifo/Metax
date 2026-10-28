@@ -420,6 +420,8 @@ pub(crate) struct EvidenceCoverage {
     pub(crate) coebr: f64,
     pub(crate) breadth_pvalue: Option<f64>,
     pub(crate) chunk_pvalue: Option<f64>,
+    /// Distinct marker genes hit, for a genome represented by marker genes.
+    pub(crate) marker_genes_hit: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -434,6 +436,7 @@ pub(crate) struct EvidenceThresholds {
     pub(crate) min_oebr: Option<f64>,
     pub(crate) min_coebr: Option<f64>,
     pub(crate) strict: bool,
+    pub(crate) min_marker_genes: usize,
 }
 
 /// Independent, explainable reasons why a non-standard species witness may be
@@ -535,6 +538,7 @@ struct WitnessFeatures {
     count: usize,
     depth: f64,
     breadth_ok: bool,
+    marker_genes_ok: bool,
     oebr: f64,
     coebr: f64,
     resolved_best_fraction: f64,
@@ -570,6 +574,9 @@ impl WitnessFeatures {
             count: metrics.count,
             depth: metrics.depth,
             breadth_ok: metrics.breadth >= thresholds.min_breadth,
+            marker_genes_ok: metrics
+                .marker_genes_hit
+                .is_none_or(|hit| hit >= thresholds.min_marker_genes),
             oebr: metrics.oebr,
             coebr: metrics.coebr,
             resolved_best_fraction: fraction(evidence.best_fragments, resolved_denominator),
@@ -693,10 +700,11 @@ pub(crate) fn calculate_coverage(
         coebr,
         breadth_pvalue,
         chunk_pvalue,
+        marker_genes_hit: None,
     }
 }
 
-fn merged_interval_bases<F>(intervals: &mut [PresenceInterval], select: F) -> u64
+pub(crate) fn merged_interval_bases<F>(intervals: &mut [PresenceInterval], select: F) -> u64
 where
     F: Fn(&PresenceInterval) -> (u32, u32) + Copy,
 {
@@ -746,7 +754,7 @@ fn ratio_or_nan(observed: f64, expected: f64) -> f64 {
     }
 }
 
-fn adjusted_deviation_pvalue(
+pub(crate) fn adjusted_deviation_pvalue(
     count: usize,
     depth: Option<f64>,
     observed: f64,
@@ -796,15 +804,16 @@ pub(crate) fn evaluate_ranked_witness(
     // from weakening the ordinary standard-evidence path. Evaluate every
     // rescue independently because multiple reasons can match and the PE
     // low-abundance reason carries its own pre-MAP guard.
-    let rescues = if rank.is_species() && features.breadth_ok && !standard {
-        RescueKinds {
-            platform: ordinary_platform_rescue(&features, thresholds, &ratios),
-            high_specificity_low_amount: high_specificity_low_amount_rescue(&features, &ratios),
-            low_abundance_pe: low_abundance_pe_rescue(&features, thresholds),
-        }
-    } else {
-        RescueKinds::default()
-    };
+    let rescues =
+        if rank.is_species() && features.breadth_ok && features.marker_genes_ok && !standard {
+            RescueKinds {
+                platform: ordinary_platform_rescue(&features, thresholds, &ratios),
+                high_specificity_low_amount: high_specificity_low_amount_rescue(&features, &ratios),
+                low_abundance_pe: low_abundance_pe_rescue(&features, thresholds),
+            }
+        } else {
+            RescueKinds::default()
+        };
     let required_premap_guard = required_premap_guard(thresholds.mode, rank, standard, rescues);
     WitnessDecision {
         metrics,
@@ -831,6 +840,7 @@ fn ratio_thresholds(rank: ProfileRank, thresholds: EvidenceThresholds) -> RatioT
 #[inline]
 fn standard_tier(features: &WitnessFeatures, ratios: &RatioThresholds) -> bool {
     features.breadth_ok
+        && features.marker_genes_ok
         && features.amount.passes_standard()
         && finite_between(
             features.oebr,
@@ -1463,6 +1473,7 @@ mod tests {
             min_oebr: None,
             min_coebr: None,
             strict: false,
+            min_marker_genes: 3,
         }
     }
 
@@ -1479,6 +1490,7 @@ mod tests {
             coebr,
             breadth_pvalue: Some(1.0),
             chunk_pvalue: Some(1.0),
+            marker_genes_hit: None,
         }
     }
 

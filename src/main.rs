@@ -384,6 +384,15 @@ struct ProfileArgs {
     min_coebr: Option<f64>,
 
     #[arg(
+        long = "min-marker-genes",
+        value_name = "N",
+        default_value_t = 3,
+        help_heading = "Coverage evidence and filters",
+        help = "Minimum number of distinct marker genes with assigned reads for a species represented by marker genes."
+    )]
+    min_marker_genes: usize,
+
+    #[arg(
         long = "strict",
         action = ArgAction::SetTrue,
         help_heading = "Coverage evidence and filters",
@@ -1014,6 +1023,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             min_reads: args.min_reads,
             min_oebr: args.min_oebr,
             min_coebr: args.min_coebr,
+            min_marker_genes: args.min_marker_genes,
             fraction: args.fraction,
             lowbiomass: args.lowbiomass,
             keep_raw: args.keep_raw,

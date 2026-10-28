@@ -52,6 +52,7 @@ use crate::taxonomy::Taxonomy;
 mod alignment;
 pub(crate) mod community;
 pub(crate) mod evidence;
+mod markers;
 mod output;
 mod pathogen;
 mod statistics;
@@ -773,6 +774,10 @@ pub struct ProfilerConfig {
     /// Minimum observed/expected chunk breadth ratio.
     pub min_coebr: Option<f64>,
 
+    /// Minimum number of distinct marker genes with assigned reads for a
+    /// species represented by marker genes.
+    pub min_marker_genes: usize,
+
     /// Minimum fraction of read that must map (0.0-1.0)
     pub fraction: f64,
 
@@ -984,6 +989,7 @@ pub(crate) fn log_resolved_profiler_parameters(
          \tmin_reads                    {}\n\
          \tmin_oebr                     {}\n\
          \tmin_coebr                    {}\n\
+         \tmin_marker_genes             {}\n\
          \tby_mapped                    {}\n\
          \tgenus_fallback               {}\n\
          \tgenus_identity               {:.3}\n\
@@ -1020,6 +1026,7 @@ pub(crate) fn log_resolved_profiler_parameters(
         display_option(cfg.min_reads),
         display_option(cfg.min_oebr),
         display_option(cfg.min_coebr),
+        cfg.min_marker_genes,
         cfg.by_aligned,
         cfg.genus_fallback,
         cfg.genus_identity,
@@ -1397,6 +1404,7 @@ mod chunk_basis_tests {
             min_reads: None,
             min_oebr: None,
             min_coebr: None,
+            min_marker_genes: 3,
             fraction: 0.7,
             lowbiomass: false,
             keep_raw: false,

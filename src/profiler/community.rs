@@ -61,7 +61,7 @@ use xz2::read::XzDecoder;
 use crate::taxonomy::Taxonomy;
 use csv::WriterBuilder;
 
-use crate::db::DatabaseMetadata;
+use crate::db::{DatabaseMetadata, ReferenceType};
 use crate::mapper::tsv::{
     for_each_metam_mapping_record, for_each_structured_mapping_record, load_shared_metam_profile,
     open_metam_mapping_reader, total_input_units, MetamMappingReceiver, MetamMappingRecord,
@@ -80,6 +80,7 @@ use super::evidence::{
 };
 #[cfg(test)]
 use super::evidence::{PremapChunkGuard, RescueKinds};
+use super::markers::{FragmentGeometry, FragmentLayout, LengthHistogram, MarkerModel};
 use super::output::{
     ClassificationSource, ProfileAnnotations, ProfileRow, ResolvedClassifications,
 };
@@ -809,6 +810,9 @@ impl CommunityProfiler {
         let mut read_map: StableReadMap<AlignmentEntry> = StableReadMap::default();
         let mut num_skipped_reference = 0usize;
         let mut num_alignments = 0usize;
+        let has_marker_genomes = db.uniform_reference_type() != Some(ReferenceType::Genome);
+        let mut read_lengths = LengthHistogram::default();
+        let mut lone_mates = false;
         let load_progress_options = self.cfg.mapping_load_progress_options();
         let load_progress = progress::counter(load_progress_options, "Loading mapping records");
         let parse_result = feed(&mut |mapping| {
@@ -821,6 +825,10 @@ impl CommunityProfiler {
             );
             if self.cfg.is_paired && !mapping.is_paired_evidence() {
                 return Ok(());
+            }
+            if has_marker_genomes {
+                read_lengths.add(mapping.read_len);
+                lone_mates |= mapping.is_mate_beyond_reference_end();
             }
             match self.entry_from_metam_mapping(mapping, &metam_refs, fixed_flank_len) {
                 Some((read_id, entry)) => {
@@ -859,6 +867,14 @@ impl CommunityProfiler {
             })
             .collect::<Vec<_>>();
         let evidence_policy = EvidencePolicy::from_config(&self.cfg);
+        let marker_model = if has_marker_genomes {
+            let geometry =
+                sample_fragment_geometry(&self.cfg, &read_alignments, &read_lengths, lone_mates);
+            log::info!(target: "PROFILER", "Marker genes: {geometry}.");
+            MarkerModel::from_database(db, |genome| assembly_ids[genome], geometry).map(Arc::new)
+        } else {
+            None
+        };
 
         let mapping_rate = if total_reads == 0 {
             0.0
@@ -949,6 +965,7 @@ impl CommunityProfiler {
             terminal_ranks: Arc::new(terminal_ranks),
             skipped_reference_at_load: num_skipped_reference,
             evidence_policy,
+            marker_model,
         })
     }
 
@@ -1726,6 +1743,7 @@ impl CommunityProfiler {
             terminal_ranks: Arc::new(HashMap::new()),
             skipped_reference_at_load: num_skipped_reference,
             evidence_policy: None,
+            marker_model: None,
         })
     }
 
@@ -1991,6 +2009,7 @@ impl CommunityProfiler {
             has_scaled_genomes,
             evidence_policy,
             terminal_ranks,
+            marker_model,
             ..
         } = sam_data;
         let verbose_logging = self.cfg.verbose || self.cfg.very_verbose;
@@ -2044,6 +2063,7 @@ impl CommunityProfiler {
                 min_breadth,
                 min_chunk_breadth,
                 safeguard_min_chunk_breadth,
+                marker_model.as_deref(),
             )?;
             evidence_decisions = resolved.decisions;
             evidence_selected_taxa = resolved.selected_taxa;
@@ -3361,6 +3381,7 @@ fn resolve_coordinate_evidence(
     min_breadth: f64,
     standard_min_chunk_breadth: f64,
     safeguard_min_chunk_breadth: f64,
+    marker_model: Option<&MarkerModel>,
 ) -> Result<CoordinateEvidenceResult> {
     let thresholds = EvidenceThresholds {
         mode: policy.mode,
@@ -3371,6 +3392,7 @@ fn resolve_coordinate_evidence(
         min_oebr: cfg.min_oebr,
         min_coebr: cfg.min_coebr,
         strict: cfg.strict,
+        min_marker_genes: cfg.min_marker_genes,
     };
     let mut presence = std::mem::take(&mut assignment.presence)
         .into_iter()
@@ -3384,6 +3406,11 @@ fn resolve_coordinate_evidence(
     // Both the baseline and post-MAP passes use this same family so the two
     // remain directly comparable.
     let multiple_testing_taxa = baseline_witness_count.max(1);
+    let coverage = |key: &PresenceKey, assembly: &mut PresenceAssembly| {
+        marker_model
+            .and_then(|model| model.coverage(key.assembly_id, assembly, multiple_testing_taxa))
+            .unwrap_or_else(|| calculate_coverage(assembly, multiple_testing_taxa))
+    };
     if cfg.verbose || cfg.very_verbose {
         log::info!(
             target: "PROFILER",
@@ -3399,7 +3426,7 @@ fn resolve_coordinate_evidence(
         presence
             .par_iter_mut()
             .map(|(key, assembly)| {
-                let metrics = calculate_coverage(assembly, multiple_testing_taxa);
+                let metrics = coverage(key, assembly);
                 let evidence = assignment
                     .taxon_evidence
                     .get(&key.taxid)
@@ -3550,7 +3577,7 @@ fn resolve_coordinate_evidence(
                 // the reused value is exactly what recomputing would produce.
                 let metrics = match coverage_dirty.get(index) {
                     Some(false) => baseline_evaluations[index].1.metrics,
-                    _ => calculate_coverage(assembly, multiple_testing_taxa),
+                    _ => coverage(key, assembly),
                 };
                 // The decision itself must always be re-derived: guarded MAP
                 // updates evidence denominators for every candidate of a
@@ -3639,6 +3666,42 @@ fn resolve_coordinate_evidence(
         decisions: post_decisions,
         selected_taxa,
     })
+}
+
+/// Read length, template length and read layout of this sample, measured
+/// on the mappings, for the coverage expected on marker genes.
+fn sample_fragment_geometry(
+    cfg: &ProfilerConfig,
+    bundles: &[ReadBundle],
+    read_lengths: &LengthHistogram,
+    lone_mates: bool,
+) -> FragmentGeometry {
+    let read_len = read_lengths.median().unwrap_or(1);
+    let mut templates = LengthHistogram::default();
+    if cfg.is_paired {
+        for rows in bundles.iter().map(|bundle| &bundle.alignments) {
+            for mate1 in rows
+                .iter()
+                .filter(|row| row.role == MappingRole::Mate1 && row.pair_id != 0)
+            {
+                if let Some(mate2) = rows
+                    .iter()
+                    .find(|row| row.role == MappingRole::Mate2 && row.pair_id == mate1.pair_id)
+                {
+                    let start = mate1.span.0.min(mate2.span.0);
+                    let end = mate1.span.1.max(mate2.span.1);
+                    templates.add(end.saturating_sub(start) as usize);
+                }
+            }
+        }
+    }
+    let layout = match (cfg.is_paired, lone_mates) {
+        (false, _) => FragmentLayout::Reads,
+        (true, false) => FragmentLayout::Pairs,
+        (true, true) => FragmentLayout::PairsAndLoneMates,
+    };
+    let template_len = templates.median().unwrap_or(read_len);
+    FragmentGeometry::new(layout, read_len, template_len, cfg.mapped_len, cfg.fraction)
 }
 
 /// Native short-/long-read assignment policy.
@@ -5354,6 +5417,9 @@ struct SamData {
     /// Native coordinate-evidence policy. `None` disables it and preserves
     /// the legacy behavior.
     evidence_policy: Option<EvidencePolicy>,
+
+    /// Marker genes and fragment geometry when the database has marker genomes.
+    marker_model: Option<Arc<MarkerModel>>,
 }
 
 /// Convert a BAM record to SAM format string.
@@ -5559,6 +5625,7 @@ mod tests {
             min_reads: None,
             min_oebr: None,
             min_coebr: None,
+            min_marker_genes: 3,
             fraction: 0.6,
             lowbiomass: false,
             keep_raw: false,
@@ -5705,6 +5772,7 @@ mod tests {
             terminal_ranks: Arc::new(HashMap::new()),
             skipped_reference_at_load: 0,
             evidence_policy: None,
+            marker_model: None,
         };
         (sam_data, assignment)
     }
@@ -6023,6 +6091,7 @@ mod tests {
             terminal_ranks: Arc::new(HashMap::from([(101, ProfileRank::Species)])),
             skipped_reference_at_load: 0,
             evidence_policy: Some(policy),
+            marker_model: None,
         };
         let assignment = AssignmentResult {
             read_assignments: vec![ReadAssignment {
@@ -6076,6 +6145,7 @@ mod tests {
             terminal_ranks: Arc::new(HashMap::from([(101, ProfileRank::Species)])),
             skipped_reference_at_load: 0,
             evidence_policy: Some(policy),
+            marker_model: None,
         };
         let assignment = AssignmentResult {
             read_assignments: vec![ReadAssignment {
