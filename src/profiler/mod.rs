@@ -654,8 +654,7 @@ pub struct ProfilerConfig {
     pub min_marker_genes: usize,
 
     /// Drop a species when a same-family species with more depth has a mean
-    /// read identity at least this much higher. `None`: only genome-type
-    /// species next to marker-type species in a mixed database, with 0.01.
+    /// read identity at least this much higher. Off when `None`.
     pub relative_identity_gap: Option<f64>,
 
     /// Minimum fraction of read that must map (0.0-1.0)

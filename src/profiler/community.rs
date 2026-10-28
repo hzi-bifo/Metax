@@ -52,7 +52,7 @@ use rayon::ThreadPoolBuilder;
 use crate::taxonomy::Taxonomy;
 use csv::WriterBuilder;
 
-use crate::db::{genome_species_next_to_markers, DatabaseMetadata, ReferenceType};
+use crate::db::{DatabaseMetadata, ReferenceType};
 use crate::mapper::tsv::{
     for_each_metam_mapping_record, for_each_structured_mapping_record, load_shared_metam_profile,
     open_metam_mapping_reader, total_input_units, MetamMappingReceiver, MetamMappingRecord,
@@ -568,26 +568,6 @@ impl CommunityProfiler {
         let (species_normalize_raw, mut species_to_genus_raw) =
             self.build_taxonomy_lookups(&profile_taxids);
         let normalize = |taxid: u32| species_normalize_raw.get(&taxid).copied().unwrap_or(taxid);
-        let species_next_to_markers: HashSet<u32> = if db.uniform_reference_type().is_none() {
-            let genera = genome_species_next_to_markers(
-                db.references
-                    .iter()
-                    .zip(&reference_taxonomies)
-                    .map(|(reference, taxonomy)| {
-                        (reference.reference_type, normalize(taxonomy.profile_taxid))
-                    }),
-                |species| species_to_genus_raw.get(&species).copied(),
-            );
-            let species: HashSet<u32> = genera.into_values().flatten().collect();
-            log::info!(
-                target: "PROFILER",
-                "Mixed database: {} genome-type species share a genus with marker-type species.",
-                species.len()
-            );
-            species
-        } else {
-            HashSet::new()
-        };
         if has_marker_genomes {
             // Genus fallback places reads that no species explains at the genus
             // of their best hit. A marker gene holds too little of a genome for
@@ -720,10 +700,7 @@ impl CommunityProfiler {
                 alignments,
             })
             .collect::<Vec<_>>();
-        let evidence_policy = EvidencePolicy::from_config(&self.cfg).map(|policy| EvidencePolicy {
-            collect_identities: policy.collect_identities || !species_next_to_markers.is_empty(),
-            ..policy
-        });
+        let evidence_policy = EvidencePolicy::from_config(&self.cfg);
         let marker_model = if has_marker_genomes {
             let geometry =
                 sample_fragment_geometry(&self.cfg, &read_alignments, &read_lengths, lone_mates);
@@ -827,7 +804,6 @@ impl CommunityProfiler {
             skipped_reference_at_load: num_skipped_reference,
             evidence_policy,
             marker_model,
-            species_next_to_markers,
         })
     }
 
@@ -1214,7 +1190,6 @@ impl CommunityProfiler {
             evidence_policy,
             terminal_ranks,
             marker_model,
-            species_next_to_markers,
             ..
         } = mapping_data;
         let verbose_logging = self.cfg.verbose || self.cfg.very_verbose;
@@ -1877,14 +1852,12 @@ impl CommunityProfiler {
                 )
             })
             .collect();
-        let identity_gap = self.cfg.relative_identity_gap;
-        if identity_gap.is_some() || !species_next_to_markers.is_empty() {
+        if let Some(gap) = self.cfg.relative_identity_gap {
             let removed = remove_species_explained_by_relatives(
                 &mut normalized,
                 &self.taxonomy,
                 &assignment.taxon_evidence,
-                identity_gap.unwrap_or(BOUNDARY_IDENTITY_GAP),
-                |taxid| identity_gap.is_some() || species_next_to_markers.contains(&taxid),
+                gap,
             );
             log::info!(
                 target: "PROFILER",
@@ -4265,23 +4238,19 @@ fn community_profile_row_passes(
         && pvalue_filter_passes(&row.rank, row.breadth_pvalue, row.chunk_pvalue, cfg.strict)
 }
 
-/// Identity gap of the guard for genome-type species next to marker-type
-/// species in a mixed database.
-const BOUNDARY_IDENTITY_GAP: f64 = 0.01;
-
 /// Remove reported species whose reads a stronger relative explains better:
 /// a reported species of the same family with more depth whose candidate reads
 /// are at least `gap` more identical. Reads from genome regions missing from
 /// the index land on relatives at lower identity, so such a species mostly
-/// consists of the relative's reads. Only species for which `guarded` holds can
-/// be removed. Returns the removed species, each with the relative that
-/// explains it.
+/// consists of the relative's reads. A species truly present next to a much
+/// more abundant relative can be removed as well, because the relative's reads
+/// also land on it and lower its mean identity. Returns the removed species,
+/// each with the relative that explains it.
 fn remove_species_explained_by_relatives(
     rows: &mut Vec<ProfileRow>,
     taxonomy: &Taxonomy,
     evidence: &HashMap<u32, TaxonEvidence>,
     gap: f64,
-    guarded: impl Fn(u32) -> bool,
 ) -> Vec<(u32, u32)> {
     // (taxid, depth, mean identity) of the reported species of each family.
     let mut families: HashMap<u32, Vec<(u32, f64, f64)>> = HashMap::new();
@@ -4303,7 +4272,7 @@ fn remove_species_explained_by_relatives(
     }
     let mut removed = Vec::new();
     for species in families.values() {
-        for &(taxid, depth, identity) in species.iter().filter(|(taxid, ..)| guarded(*taxid)) {
+        for &(taxid, depth, identity) in species {
             let explaining = species.iter().find(|&&(_, other_depth, other_identity)| {
                 other_depth > depth && other_identity - identity >= gap
             });
@@ -4519,9 +4488,6 @@ struct MappingData {
 
     /// Marker genes and fragment geometry when the database has marker genomes.
     marker_model: Option<Arc<MarkerModel>>,
-
-    /// Genome-type species that share a genus with marker-type species.
-    species_next_to_markers: HashSet<u32>,
 }
 
 #[cfg(test)]
@@ -4683,7 +4649,6 @@ mod tests {
             skipped_reference_at_load: 0,
             evidence_policy: None,
             marker_model: None,
-            species_next_to_markers: HashSet::new(),
         };
         (mapping_data, assignment)
     }
@@ -5006,21 +4971,15 @@ mod tests {
         // Species 1002 and 1004 (another genus of the family) are explained by
         // 1001; 1003 is within the gap and 1005 is in another family.
         let mut all = rows();
-        let removed =
-            remove_species_explained_by_relatives(&mut all, &taxonomy, &evidence, 0.01, |_| true);
+        let removed = remove_species_explained_by_relatives(&mut all, &taxonomy, &evidence, 0.01);
         assert_eq!(removed, [(1002, 1001), (1004, 1001)]);
         let kept: Vec<u32> = all.iter().map(|row| row.taxid).collect();
         assert_eq!(kept, [1001, 1003, 1005]);
 
-        let mut guarded_only = rows();
-        let removed = remove_species_explained_by_relatives(
-            &mut guarded_only,
-            &taxonomy,
-            &evidence,
-            0.01,
-            |taxid| taxid == 1004,
-        );
-        assert_eq!(removed, [(1004, 1001)]);
+        // With a gap of 0.045 only 1002 (0.048 below 1001) goes; 1004 (0.038) stays.
+        let mut wide = rows();
+        let removed = remove_species_explained_by_relatives(&mut wide, &taxonomy, &evidence, 0.045);
+        assert_eq!(removed, [(1002, 1001)]);
     }
 
     #[test]
@@ -5087,7 +5046,6 @@ mod tests {
             skipped_reference_at_load: 0,
             evidence_policy: Some(policy),
             marker_model: None,
-            species_next_to_markers: HashSet::new(),
         };
         let assignment = AssignmentResult {
             read_assignments: vec![ReadAssignment {
@@ -5142,7 +5100,6 @@ mod tests {
             skipped_reference_at_load: 0,
             evidence_policy: Some(policy),
             marker_model: None,
-            species_next_to_markers: HashSet::new(),
         };
         let assignment = AssignmentResult {
             read_assignments: vec![ReadAssignment {

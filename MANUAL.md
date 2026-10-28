@@ -201,7 +201,7 @@ Marker genomes:
 
 A read counts on a marker gene only when enough of it lies inside the gene, so marker databases are meant for short reads.
 
-In a mixed database, reads from the part of a marker-only genome that is not indexed can map to the genomes of related species of type `genome`. With `--dmp-dir`, `metax index` lists the genera that hold species of both types; give the species of one genus the same type where possible. `metax profile` applies the relative identity guard (§7.10) to the genome-type species of these genera.
+In a mixed database, reads from the part of a marker-only genome that is not indexed can map to the genomes of related species of type `genome`. With `--dmp-dir`, `metax index` lists the genera that hold species of both types; give the species of one genus the same type where possible.
 
 Databases with marker genomes write metadata version 3, which adds a `reference_type` column and a `#reference_type genome|markers|mixed` line; earlier Metax releases cannot read it. Databases of genomes keep metadata version 2.
 
@@ -592,7 +592,9 @@ A fallback mapping must have identity of at least `--genus-identity` (default `0
 
 ### 7.10 Relative identity guard
 
-When part of a genome is missing from the index, as in fractional indexes and for marker genomes, reads from the missing part land on related genomes at lower identity. Such a relative can pass every coverage test, because these reads spread over its sequence like its own reads. `--relative-identity-gap F` drops a reported species when a reported species of the same family has more depth and a mean mapping identity at least `F` higher; the mean identity of a taxon is taken over every fragment mapped to it, using the fragment's best mapping, before the read-level identity gate. The guard is off by default. In a database that mixes genomes and marker genes it is applied with `F = 0.01` to the genome-type species that share a genus with marker-type species (§4.3). The number of removed species is logged; `--verbose` lists each with the relative that explains it.
+When part of a genome is missing from the index, as in fractional indexes and for marker genomes, reads from the missing part land on related genomes at lower identity. Such a relative can pass every coverage test, because these reads spread over its sequence like its own reads. `--relative-identity-gap F` drops a reported species when a reported species of the same family has more depth and a mean mapping identity at least `F` higher; the mean identity of a taxon is taken over every fragment mapped to it, using the fragment's best mapping, before the read-level identity gate. The number of removed species is logged; `--verbose` lists each with the relative that explains it.
+
+The guard is off by default, because it cannot tell such a relative from a species that is truly present but much less abundant than a close relative: the relative's reads land on that species too and lower its mean identity, so it is removed as well. Use the guard when close relatives are not expected in the same sample.
 
 ### 7.11 Abundance estimation
 
@@ -651,6 +653,8 @@ metax profile -d db_markers -i R1.fastq.gz -I R2.fastq.gz -o sample_markers -t 3
 ```
 
 ### 8.8 Fractional index with the relative identity guard
+
+For samples in which close relatives are not expected together (§7.10):
 
 ```bash
 metax profile -d db_frac_10 -i R1.fastq.gz -I R2.fastq.gz -o sample_frac -t 32 \

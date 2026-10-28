@@ -972,7 +972,7 @@ pub fn report_genera_with_both_types(database: &Path, dmp_dir: Option<&Path>) ->
         .collect();
     names.sort_unstable();
     eprintln!(
-        "[index] warning: {} genera hold both genome-type and marker-type species ({}{}). Reads from the unindexed part of a marker-only genome can map to the genomes of its relatives; metax profile applies --relative-identity-gap 0.01 to those genomes.",
+        "[index] warning: {} genera hold both genome-type and marker-type species ({}{}). Reads from the unindexed part of a marker-only genome can map to the genomes of its relatives there; give the species of one genus the same reference type where possible.",
         names.len(),
         names.iter().take(10).copied().collect::<Vec<_>>().join(", "),
         if names.len() > 10 { ", ..." } else { "" }

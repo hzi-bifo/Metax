@@ -90,8 +90,8 @@ pub(crate) struct EvidencePolicy {
     pub(crate) mapped_len: usize,
     pub(crate) fraction: f64,
     pub(crate) collect_exact_ties: bool,
-    /// Record the mean mapping identity of each taxon, for the relative
-    /// identity guard.
+    /// Record the mean mapping identity of each taxon, for
+    /// `--relative-identity-gap`.
     pub(crate) collect_identities: bool,
 }
 
