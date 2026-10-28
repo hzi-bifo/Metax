@@ -341,9 +341,9 @@ struct ProfileArgs {
         long = "chunk-breadth-scale",
         value_name = "FACTOR",
         value_parser = parse_positive_float,
-        conflicts_with_all = ["chunk_breadth", "min_reads", "lowbiomass"],
+        conflicts_with_all = ["chunk_breadth", "lowbiomass"],
         help_heading = "Coverage evidence and filters",
-        help = "Multiply the automatically estimated minimum chunk breadth by FACTOR (default 1.0). Values below 1 relax the filter; values above 1 make it stricter. The final cutoff is capped at 1. Conflicts with --min-chunk-breadth, --min-reads, and --low-biomass."
+        help = "Multiply the automatically estimated minimum chunk breadth by FACTOR (default 1.0). Values below 1 relax the filter; values above 1 make it stricter. The final cutoff is capped at 1. Conflicts with --min-chunk-breadth and --low-biomass."
     )]
     chunk_breadth_scale: Option<f64>,
 
@@ -361,7 +361,7 @@ struct ProfileArgs {
         long = "min-reads",
         value_name = "N",
         help_heading = "Coverage evidence and filters",
-        help = "Minimum full-index-equivalent assigned reads for a taxon. Disables the automatic chunk-breadth cutoff unless set explicitly."
+        help = "Minimum full-index-equivalent assigned reads for a taxon, in addition to the coverage evidence and chunk-breadth cutoff."
     )]
     min_reads: Option<usize>,
 
@@ -962,9 +962,8 @@ impl TryFrom<ProfileArgs> for AppConfig {
             .mode
             .unwrap_or_else(|| recorded_mode.unwrap_or(ProfileMode::Default));
         let requested_exact_ties = args.exact_ties;
-        let chunk_guard_available = !args.lowbiomass
-            && !args.chunk_breadth.is_some_and(|value| value <= 0.0)
-            && !(args.min_reads.is_some() && args.chunk_breadth.is_none());
+        let chunk_guard_available =
+            !args.lowbiomass && !args.chunk_breadth.is_some_and(|value| value <= 0.0);
         if requested_exact_ties == Some(ExactTiePolicy::GuardedMap) {
             if !sequencer.is_illumina() {
                 bail!("--exact-ties guarded-map requires Illumina short-read input");
@@ -982,9 +981,6 @@ impl TryFrom<ProfileArgs> for AppConfig {
                 bail!(
                     "--exact-ties guarded-map requires --min-chunk-breadth to be greater than zero"
                 );
-            }
-            if args.min_reads.is_some() && args.chunk_breadth.is_none() {
-                bail!("--exact-ties guarded-map requires an automatic or explicit chunk-breadth cutoff; when --min-reads is set, also provide --min-chunk-breadth");
             }
         }
         let exact_ties = requested_exact_ties.unwrap_or_else(|| {
@@ -1499,11 +1495,7 @@ mod tests {
             .is_err());
         }
 
-        for conflicting in [
-            ["--min-chunk-breadth", "0.1"],
-            ["--min-reads", "3"],
-            ["--low-biomass", ""],
-        ] {
+        for conflicting in [["--min-chunk-breadth", "0.1"], ["--low-biomass", ""]] {
             let mut argv = vec![
                 "metax",
                 "profile",
@@ -1611,7 +1603,7 @@ mod tests {
         for extra in [
             vec!["--sequencer", "Nanopore"],
             vec!["--low-biomass"],
-            vec!["--min-reads", "5"],
+            vec!["--min-chunk-breadth", "0"],
         ] {
             let mut argv = vec!["metax", "profile", "-i", "reads.fq.gz", "-o", "sample"];
             argv.extend(extra);
@@ -1688,28 +1680,21 @@ mod tests {
 
     #[test]
     fn guarded_map_requires_an_independent_chunk_breadth_guard() {
-        let cli = Cli::try_parse_from([
-            "metax",
-            "profile",
-            "-i",
-            "r1.fq.gz",
-            "-I",
-            "r2.fq.gz",
-            "-o",
-            "sample",
-            "--min-reads",
-            "5",
-            "--exact-ties",
-            "guarded-map",
-        ])
-        .unwrap();
-        let Commands::Profile(args) = cli.command else {
-            panic!("expected profile command");
+        let parse = |extra: [&str; 2]| {
+            let mut argv = vec!["metax", "profile", "-i", "r1.fq.gz", "-I", "r2.fq.gz"];
+            argv.extend(["-o", "sample", "--exact-ties", "guarded-map"]);
+            argv.extend(extra);
+            let Commands::Profile(args) = Cli::try_parse_from(argv).unwrap().command else {
+                panic!("expected profile command");
+            };
+            AppConfig::try_from(args)
         };
-        assert!(AppConfig::try_from(args)
+        assert!(parse(["--min-chunk-breadth", "0"])
             .unwrap_err()
             .to_string()
-            .contains("also provide --min-chunk-breadth"));
+            .contains("greater than zero"));
+        // A read minimum keeps the automatic chunk-breadth cutoff as the guard.
+        assert!(parse(["--min-reads", "5"]).is_ok());
     }
 
     #[test]

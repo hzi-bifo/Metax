@@ -1231,11 +1231,7 @@ fn strain_profile_row_passes(
         coebr > min_coebr
     };
     let min_reads_ok = equivalent_read_count_passes_minimum(row.equivalent_mapcount, cfg.min_reads);
-    let fixed_chunk_ok = if cfg.min_reads.is_some() && cfg.chunk_breadth.is_none() {
-        true
-    } else {
-        row.fixed_chunk > min_chunk_breadth
-    };
+    let fixed_chunk_ok = row.fixed_chunk > min_chunk_breadth;
     expected_ok
         && oebr.is_finite()
         && coebr.is_finite()
@@ -1431,13 +1427,6 @@ fn resolve_strain_chunk_breadth(
             value,
             automatic: None,
             source: "user-supplied --min-chunk-breadth",
-        };
-    }
-    if cfg.min_reads.is_some() {
-        return StrainChunkBreadthThreshold {
-            value: 0.0,
-            automatic: None,
-            source: "disabled by --min-reads",
         };
     }
     if cfg.lowbiomass {
@@ -2002,8 +1991,6 @@ impl StrainProfiler {
             num_reads
         };
         let min_breadth = self.cfg.breadth.unwrap_or(0.0);
-        let skip_auto_chunk_filter =
-            self.cfg.min_reads.is_some() && self.cfg.chunk_breadth.is_none();
         let chunk_threshold =
             resolve_strain_chunk_breadth(&self.cfg, chunk_basis, by_aligned_effective);
         let min_chunk_breadth_value = chunk_threshold.value;
@@ -2076,12 +2063,7 @@ impl StrainProfiler {
             "Number of mapping records retained after parsing: {}",
             total_retained_alignments
         );
-        if skip_auto_chunk_filter {
-            log::info!(
-                target: "PROFILER",
-                "Automatic minimum chunk breadth filter disabled because --min-reads is set."
-            );
-        } else if self.cfg.lowbiomass && self.cfg.chunk_breadth.is_none() {
+        if self.cfg.lowbiomass && self.cfg.chunk_breadth.is_none() {
             log::info!(
                 target: "PROFILER",
                 "Automatic minimum chunk breadth filter disabled by --low-biomass."
@@ -2302,8 +2284,6 @@ impl StrainProfiler {
             num_reads
         };
         let min_breadth = self.cfg.breadth.unwrap_or(0.0);
-        let skip_auto_chunk_filter =
-            self.cfg.min_reads.is_some() && self.cfg.chunk_breadth.is_none();
         let chunk_threshold =
             resolve_strain_chunk_breadth(&self.cfg, chunk_basis, by_aligned_effective);
         let min_chunk_breadth_value = chunk_threshold.value;
@@ -2339,12 +2319,7 @@ impl StrainProfiler {
         );
         log::info!(target: "PROFILER", "Metam reported mapped read records: {}", profile.mapped_reads);
         log::info!(target: "PROFILER", "Metam emitted mapping records: {}", profile.emitted_records);
-        if skip_auto_chunk_filter {
-            log::info!(
-                target: "PROFILER",
-                "Automatic minimum chunk breadth filter disabled because --min-reads is set."
-            );
-        } else if self.cfg.lowbiomass && self.cfg.chunk_breadth.is_none() {
+        if self.cfg.lowbiomass && self.cfg.chunk_breadth.is_none() {
             log::info!(
                 target: "PROFILER",
                 "Automatic minimum chunk breadth filter disabled by --low-biomass."

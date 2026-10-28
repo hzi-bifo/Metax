@@ -432,7 +432,6 @@ pub(crate) struct EvidenceThresholds {
     pub(crate) standard_min_chunk_breadth: f64,
     /// Original, unscaled cutoff retained by rescue and guarded-MAP policy.
     pub(crate) safeguard_min_chunk_breadth: f64,
-    pub(crate) chunk_filter_enabled: bool,
     pub(crate) min_oebr: Option<f64>,
     pub(crate) min_coebr: Option<f64>,
     pub(crate) strict: bool,
@@ -506,13 +505,12 @@ struct ChunkAmount {
     observed: f64,
     standard_cutoff: f64,
     safeguard_cutoff: f64,
-    filter_enabled: bool,
 }
 
 impl ChunkAmount {
     #[inline]
     fn passes_standard(&self) -> bool {
-        !self.filter_enabled || self.observed > self.standard_cutoff
+        self.observed > self.standard_cutoff
     }
 
     #[inline]
@@ -520,12 +518,12 @@ impl ChunkAmount {
         // Keep the established multiplication form rather than dividing to an
         // explicit ratio. Besides avoiding work in the hot path, this preserves
         // exact floating-point behavior at strict policy boundaries.
-        self.filter_enabled && self.observed > self.safeguard_cutoff * fraction
+        self.observed > self.safeguard_cutoff * fraction
     }
 
     #[inline]
     fn has_positive_safeguard(&self) -> bool {
-        self.filter_enabled && self.safeguard_cutoff > 0.0
+        self.safeguard_cutoff > 0.0
     }
 }
 
@@ -569,7 +567,6 @@ impl WitnessFeatures {
                 observed: metrics.fixed_chunk,
                 standard_cutoff: thresholds.standard_min_chunk_breadth,
                 safeguard_cutoff: thresholds.safeguard_min_chunk_breadth,
-                filter_enabled: thresholds.chunk_filter_enabled,
             },
             count: metrics.count,
             depth: metrics.depth,
@@ -1469,7 +1466,6 @@ mod tests {
             min_breadth: 0.0,
             standard_min_chunk_breadth: 0.60,
             safeguard_min_chunk_breadth: 0.60,
-            chunk_filter_enabled: true,
             min_oebr: None,
             min_coebr: None,
             strict: false,

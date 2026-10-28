@@ -919,8 +919,6 @@ impl CommunityProfiler {
             gate_active,
         );
         let min_breadth = self.cfg.breadth.unwrap_or(0.0);
-        let skip_auto_chunk_filter =
-            self.cfg.min_reads.is_some() && self.cfg.chunk_breadth.is_none();
         let chunk_thresholds =
             resolve_community_chunk_breadth(&self.cfg, chunk_plan.estimate_reads);
         let min_chunk_breadth_value = chunk_thresholds.standard;
@@ -937,12 +935,7 @@ impl CommunityProfiler {
         );
         log::info!(target: "PROFILER", "Metam reported mapped read records: {}", profile.mapped_reads);
         log::info!(target: "PROFILER", "Metam emitted mapping records: {}", profile.emitted_records);
-        if skip_auto_chunk_filter {
-            log::info!(
-                target: "PROFILER",
-                "Automatic minimum chunk breadth filter disabled because --min-reads is set."
-            );
-        } else if self.cfg.lowbiomass && self.cfg.chunk_breadth.is_none() {
+        if self.cfg.lowbiomass && self.cfg.chunk_breadth.is_none() {
             log::info!(
                 target: "PROFILER",
                 "Automatic minimum chunk breadth filter disabled by --low-biomass."
@@ -1591,8 +1584,6 @@ impl CommunityProfiler {
             gate_active,
         );
         let min_breadth = self.cfg.breadth.unwrap_or(0.0);
-        let skip_auto_chunk_filter =
-            self.cfg.min_reads.is_some() && self.cfg.chunk_breadth.is_none();
         let chunk_thresholds =
             resolve_community_chunk_breadth(&self.cfg, chunk_plan.estimate_reads);
         let min_chunk_breadth_value = chunk_thresholds.standard;
@@ -1645,11 +1636,6 @@ impl CommunityProfiler {
                 log::info!(
                     target: "PROFILER",
                     "Minimum chunk breadth supplied by user; read-count basis not used for estimation."
-                );
-            } else if skip_auto_chunk_filter {
-                log::info!(
-                    target: "PROFILER",
-                    "Automatic minimum chunk breadth filter disabled because --min-reads is set."
                 );
             } else if self.cfg.lowbiomass {
                 log::info!(
@@ -3415,7 +3401,6 @@ fn resolve_coordinate_evidence(
         min_breadth,
         standard_min_chunk_breadth,
         safeguard_min_chunk_breadth,
-        chunk_filter_enabled: cfg.min_reads.is_none() || cfg.chunk_breadth.is_some(),
         min_oebr: cfg.min_oebr,
         min_coebr: cfg.min_coebr,
         strict: cfg.strict,
@@ -3500,10 +3485,7 @@ fn resolve_coordinate_evidence(
 
     // This is also checked by the CLI, but library callers receive a safe
     // baseline rather than an unguarded MAP pass if the amount guard is absent.
-    if !policy.mode.supports_guarded_map()
-        || !thresholds.chunk_filter_enabled
-        || safeguard_min_chunk_breadth <= 0.0
-    {
+    if !policy.mode.supports_guarded_map() || safeguard_min_chunk_breadth <= 0.0 {
         log::warn!(
             target: "PROFILER",
             "Guarded short-read MAP requires native Illumina evidence and a positive active chunk-breadth cutoff; exact ties remain ambiguous."
@@ -4643,9 +4625,9 @@ fn resolve_community_chunk_breadth(
         };
     }
 
-    // Preserve the established --min-reads and low-biomass behavior: no
-    // automatic chunk-breadth filtering, and therefore nothing to scale.
-    if cfg.min_reads.is_some() || cfg.lowbiomass {
+    // Low-biomass mode has no automatic chunk-breadth filtering, and
+    // therefore nothing to scale.
+    if cfg.lowbiomass {
         return CommunityChunkBreadthThresholds {
             automatic: 0.0,
             standard: 0.0,
@@ -4682,7 +4664,6 @@ fn automatic_recall_chunk_breadth_scale(cfg: &ProfilerConfig, basis_reads: usize
         || cfg.strain
         || cfg.lowbiomass
         || cfg.chunk_breadth.is_some()
-        || cfg.min_reads.is_some()
         || basis_reads <= RECALL_CHUNK_SCALE_MIN_BASIS
     {
         return 1.0;
@@ -4706,8 +4687,6 @@ fn community_chunk_breadth_source(
 ) -> &'static str {
     if cfg.chunk_breadth.is_some() {
         "user-supplied --min-chunk-breadth"
-    } else if cfg.min_reads.is_some() {
-        "disabled by --min-reads"
     } else if cfg.lowbiomass {
         "disabled by --low-biomass"
     } else {
@@ -5250,13 +5229,11 @@ fn community_profile_row_passes(
 ) -> bool {
     let min_reads_ok = equivalent_read_count_passes_minimum(row.equivalent_mapcount, cfg.min_reads);
     if evidence_selected_taxa.contains(&row.taxid) {
-        return min_reads_ok;
+        // The evidence tiers chose this taxon; cutoffs the user set explicitly
+        // still apply to it, including to rescued taxa.
+        return min_reads_ok && explicit_cutoffs_pass(row, cfg);
     }
-    let fixed_chunk_ok = if cfg.min_reads.is_some() && cfg.chunk_breadth.is_none() {
-        true
-    } else {
-        row.fixed_chunk > min_chunk_breadth
-    };
+    let fixed_chunk_ok = row.fixed_chunk > min_chunk_breadth;
     let ratio_ok = if let Some(default_lowers) = lca_ratio_lower_bounds.get(&row.taxid).copied() {
         ratio_filter_passes_with_defaults(
             row.breadth,
@@ -5282,6 +5259,17 @@ fn community_profile_row_passes(
         && fixed_chunk_ok
         && ratio_ok
         && pvalue_filter_passes(&row.rank, row.breadth_pvalue, row.chunk_pvalue, cfg.strict)
+}
+
+/// Breadth, chunk breadth and ratio cutoffs given on the command line.
+fn explicit_cutoffs_pass(row: &ProfileRow, cfg: &ProfilerConfig) -> bool {
+    let at_least = |cutoff: Option<f64>, value: f64| cutoff.is_none_or(|cutoff| value >= cutoff);
+    at_least(cfg.breadth, row.breadth)
+        && cfg
+            .chunk_breadth
+            .is_none_or(|cutoff| row.fixed_chunk > cutoff)
+        && at_least(cfg.min_oebr, row.breadth / row.expected_breadth)
+        && at_least(cfg.min_coebr, row.flex_chunk / row.expected_flex_chunk)
 }
 
 fn write_community_classifications(
@@ -7434,12 +7422,14 @@ mod tests {
         approx_equal(low_biomass.safeguard, 0.0);
         approx_equal(low_biomass.recall_scale, 1.0);
 
+        // A read minimum adds to the automatic cutoff and leaves it unchanged.
         cfg.lowbiomass = false;
+        let without_min_reads = resolve_community_chunk_breadth(&cfg, 20_000_000);
         cfg.min_reads = Some(3);
-        let min_reads = resolve_community_chunk_breadth(&cfg, 20_000_000);
-        approx_equal(min_reads.standard, 0.0);
-        approx_equal(min_reads.safeguard, 0.0);
-        approx_equal(min_reads.recall_scale, 1.0);
+        assert_eq!(
+            resolve_community_chunk_breadth(&cfg, 20_000_000),
+            without_min_reads
+        );
 
         cfg.min_reads = None;
         cfg.mode = ProfileMode::Default;

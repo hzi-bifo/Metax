@@ -258,11 +258,6 @@ impl MetaxApp {
                     "chunk-breadth scale cannot be combined with an explicit minimum chunk breadth"
                 ));
             }
-            if self.config.min_reads.is_some() {
-                return Err(anyhow!(
-                    "chunk-breadth scale cannot be combined with a minimum-read cutoff, which disables automatic chunk-breadth estimation"
-                ));
-            }
             if self.config.lowbiomass {
                 return Err(anyhow!(
                     "chunk-breadth scale cannot be combined with low-biomass mode, which disables automatic chunk-breadth estimation"
@@ -1059,7 +1054,7 @@ mod tests {
         min_reads.min_reads = Some(3);
         assert!(MetaxApp { config: min_reads }
             .validate_chunk_breadth_configuration()
-            .is_err());
+            .is_ok());
 
         let mut low_biomass = test_app_config();
         low_biomass.chunk_breadth_scale = 0.5;
