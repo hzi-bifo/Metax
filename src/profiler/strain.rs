@@ -3145,6 +3145,7 @@ mod tests {
             min_oebr: None,
             min_coebr: None,
             min_marker_genes: 3,
+            relative_identity_gap: None,
             fraction: 0.8,
             lowbiomass: false,
             keep_raw: false,

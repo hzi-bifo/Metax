@@ -778,6 +778,11 @@ pub struct ProfilerConfig {
     /// species represented by marker genes.
     pub min_marker_genes: usize,
 
+    /// Drop a species when a same-family species with more depth has a mean
+    /// read identity at least this much higher. `None`: only genome-type
+    /// species next to marker-type species in a mixed database, with 0.01.
+    pub relative_identity_gap: Option<f64>,
+
     /// Minimum fraction of read that must map (0.0-1.0)
     pub fraction: f64,
 
@@ -990,6 +995,7 @@ pub(crate) fn log_resolved_profiler_parameters(
          \tmin_oebr                     {}\n\
          \tmin_coebr                    {}\n\
          \tmin_marker_genes             {}\n\
+         \trelative_identity_gap        {}\n\
          \tby_mapped                    {}\n\
          \tgenus_fallback               {}\n\
          \tgenus_identity               {:.3}\n\
@@ -1027,6 +1033,7 @@ pub(crate) fn log_resolved_profiler_parameters(
         display_option(cfg.min_oebr),
         display_option(cfg.min_coebr),
         cfg.min_marker_genes,
+        display_option(cfg.relative_identity_gap),
         cfg.by_aligned,
         cfg.genus_fallback,
         cfg.genus_identity,
@@ -1405,6 +1412,7 @@ mod chunk_basis_tests {
             min_oebr: None,
             min_coebr: None,
             min_marker_genes: 3,
+            relative_identity_gap: None,
             fraction: 0.7,
             lowbiomass: false,
             keep_raw: false,

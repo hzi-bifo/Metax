@@ -393,6 +393,15 @@ struct ProfileArgs {
     min_marker_genes: usize,
 
     #[arg(
+        long = "relative-identity-gap",
+        value_name = "FRACTION",
+        value_parser = parse_probability,
+        help_heading = "Coverage evidence and filters",
+        help = "Drop a species when a species of the same family with more depth has a mean read identity at least FRACTION higher, so that its reads are better explained as reads of that relative. Off by default, except for genome-type species that share a genus with marker-type species in a mixed database, which use 0.01."
+    )]
+    relative_identity_gap: Option<f64>,
+
+    #[arg(
         long = "strict",
         action = ArgAction::SetTrue,
         help_heading = "Coverage evidence and filters",
@@ -644,6 +653,14 @@ struct IndexArgs {
         help = "Rows of genome_id<TAB>genome|markers that set the reference type of single genomes, for databases that mix genomes and marker genes."
     )]
     reference_type_table: Option<String>,
+
+    #[arg(
+        long = "dmp-dir",
+        value_name = "DIR",
+        help_heading = "Input and output",
+        help = "Directory with NCBI taxonomy dump files, used to report the genera of a mixed database that hold both genome-type and marker-type species."
+    )]
+    dmp_dir: Option<String>,
 
     #[arg(
         short = 't',
@@ -1020,6 +1037,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             min_oebr: args.min_oebr,
             min_coebr: args.min_coebr,
             min_marker_genes: args.min_marker_genes,
+            relative_identity_gap: args.relative_identity_gap,
             fraction: args.fraction,
             lowbiomass: args.lowbiomass,
             keep_raw: args.keep_raw,
@@ -1095,6 +1113,7 @@ fn main() -> Result<()> {
                     args.reference_type.parse()?,
                     args.reference_type_table.as_deref().map(Path::new),
                 )?,
+                args.dmp_dir.as_deref().map(Path::new),
                 MetamIndexOptions {
                     k: args.k,
                     w: args.w,

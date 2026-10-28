@@ -92,6 +92,11 @@ impl ReferenceTypes {
         Ok(Self { default, by_genome })
     }
 
+    /// Whether a table sets the type of single genomes.
+    pub fn has_table(&self) -> bool {
+        !self.by_genome.is_empty()
+    }
+
     fn of(&self, genome: &str) -> ReferenceType {
         self.by_genome.get(genome).copied().unwrap_or(self.default)
     }
@@ -210,6 +215,40 @@ pub struct ReferenceMetadata {
     pub effective_indexed_size: usize,
     pub taxonomy_field: String,
     pub reference_type: ReferenceType,
+}
+
+impl ReferenceMetadata {
+    /// Taxid of the profile endpoint the reference supports.
+    pub fn profile_taxid(&self) -> Result<u32> {
+        Ok(parse_taxonomy_field(&self.taxonomy_field)?.profile_taxid)
+    }
+}
+
+/// Genome-type species of every genus that also holds marker-type species,
+/// keyed by genus. Reads from the part of a marker-only genome that is not
+/// indexed can land on these genomes of its relatives.
+pub fn genome_species_next_to_markers(
+    species: impl IntoIterator<Item = (ReferenceType, u32)>,
+    genus_of: impl Fn(u32) -> Option<u32>,
+) -> HashMap<u32, HashSet<u32>> {
+    let mut genera: HashMap<u32, (bool, HashSet<u32>)> = HashMap::new();
+    for (kind, species) in species {
+        let Some(genus) = genus_of(species) else {
+            continue;
+        };
+        let (has_markers, genomes) = genera.entry(genus).or_default();
+        match kind {
+            ReferenceType::Markers => *has_markers = true,
+            ReferenceType::Genome => {
+                genomes.insert(species);
+            }
+        }
+    }
+    genera
+        .into_iter()
+        .filter(|(_, (has_markers, genomes))| *has_markers && !genomes.is_empty())
+        .map(|(genus, (_, genomes))| (genus, genomes))
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -2386,6 +2425,23 @@ mod tests {
         assert!(records
             .iter()
             .all(|r| r.len() == 1_000 && r.effective_indexed_size == 600_000));
+    }
+
+    #[test]
+    fn genome_species_next_to_markers_are_found_per_genus() {
+        let genus_of = |species: u32| (species < 100).then_some(species / 10);
+        let species = [
+            (ReferenceType::Genome, 11),
+            (ReferenceType::Markers, 12),
+            (ReferenceType::Genome, 21),
+            (ReferenceType::Genome, 22),
+            (ReferenceType::Markers, 31),
+            (ReferenceType::Markers, 500),
+            (ReferenceType::Genome, 600),
+        ];
+        let genera = genome_species_next_to_markers(species, genus_of);
+        assert_eq!(genera.len(), 1);
+        assert_eq!(genera[&1], HashSet::from([11]));
     }
 
     #[test]

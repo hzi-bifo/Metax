@@ -61,7 +61,7 @@ use xz2::read::XzDecoder;
 use crate::taxonomy::Taxonomy;
 use csv::WriterBuilder;
 
-use crate::db::{DatabaseMetadata, ReferenceType};
+use crate::db::{genome_species_next_to_markers, DatabaseMetadata, ReferenceType};
 use crate::mapper::tsv::{
     for_each_metam_mapping_record, for_each_structured_mapping_record, load_shared_metam_profile,
     open_metam_mapping_reader, total_input_units, MetamMappingReceiver, MetamMappingRecord,
@@ -750,6 +750,27 @@ impl CommunityProfiler {
             .collect();
         let (species_normalize_raw, mut species_to_genus_raw) =
             self.build_taxonomy_lookups(&profile_taxids);
+        let normalize = |taxid: u32| species_normalize_raw.get(&taxid).copied().unwrap_or(taxid);
+        let species_next_to_markers: HashSet<u32> = if db.uniform_reference_type().is_none() {
+            let genera = genome_species_next_to_markers(
+                db.references
+                    .iter()
+                    .zip(&reference_taxonomies)
+                    .map(|(reference, taxonomy)| {
+                        (reference.reference_type, normalize(taxonomy.profile_taxid))
+                    }),
+                |species| species_to_genus_raw.get(&species).copied(),
+            );
+            let species: HashSet<u32> = genera.into_values().flatten().collect();
+            log::info!(
+                target: "PROFILER",
+                "Mixed database: {} genome-type species share a genus with marker-type species.",
+                species.len()
+            );
+            species
+        } else {
+            HashSet::new()
+        };
         if has_marker_genomes {
             // Genus fallback places reads that no species explains at the genus
             // of their best hit. A marker gene holds too little of a genome for
@@ -758,7 +779,7 @@ impl CommunityProfiler {
             // references take part.
             let species_with_genomes: HashSet<u32> = taxids_with_genomes
                 .iter()
-                .map(|taxid| species_normalize_raw.get(taxid).copied().unwrap_or(*taxid))
+                .map(|&taxid| normalize(taxid))
                 .collect();
             species_to_genus_raw.retain(|species, _| species_with_genomes.contains(species));
         }
@@ -882,7 +903,10 @@ impl CommunityProfiler {
                 alignments,
             })
             .collect::<Vec<_>>();
-        let evidence_policy = EvidencePolicy::from_config(&self.cfg);
+        let evidence_policy = EvidencePolicy::from_config(&self.cfg).map(|policy| EvidencePolicy {
+            collect_identities: policy.collect_identities || !species_next_to_markers.is_empty(),
+            ..policy
+        });
         let marker_model = if has_marker_genomes {
             let geometry =
                 sample_fragment_geometry(&self.cfg, &read_alignments, &read_lengths, lone_mates);
@@ -986,6 +1010,7 @@ impl CommunityProfiler {
             skipped_reference_at_load: num_skipped_reference,
             evidence_policy,
             marker_model,
+            species_next_to_markers,
         })
     }
 
@@ -1757,6 +1782,7 @@ impl CommunityProfiler {
             skipped_reference_at_load: num_skipped_reference,
             evidence_policy: None,
             marker_model: None,
+            species_next_to_markers: HashSet::new(),
         })
     }
 
@@ -1971,6 +1997,10 @@ impl CommunityProfiler {
                 target.clear_best_fragments = target
                     .clear_best_fragments
                     .saturating_add(evidence.clear_best_fragments);
+                target.mapped_fragments = target
+                    .mapped_fragments
+                    .saturating_add(evidence.mapped_fragments);
+                target.identity_sum += evidence.identity_sum;
             }
             final_result.exact_ties.append(result.exact_ties);
             final_result
@@ -2023,6 +2053,7 @@ impl CommunityProfiler {
             evidence_policy,
             terminal_ranks,
             marker_model,
+            species_next_to_markers,
             ..
         } = sam_data;
         let verbose_logging = self.cfg.verbose || self.cfg.very_verbose;
@@ -2685,6 +2716,29 @@ impl CommunityProfiler {
                 )
             })
             .collect();
+        let identity_gap = self.cfg.relative_identity_gap;
+        if identity_gap.is_some() || !species_next_to_markers.is_empty() {
+            let removed = remove_species_explained_by_relatives(
+                &mut normalized,
+                &self.taxonomy,
+                &assignment.taxon_evidence,
+                identity_gap.unwrap_or(BOUNDARY_IDENTITY_GAP),
+                |taxid| identity_gap.is_some() || species_next_to_markers.contains(&taxid),
+            );
+            log::info!(
+                target: "PROFILER",
+                "Relative identity guard removed {} species.",
+                removed.len()
+            );
+            if verbose_logging {
+                for (taxid, relative) in removed {
+                    log::info!(
+                        target: "PROFILER",
+                        "  {taxid} is explained by {relative}, which has more depth and more identical reads."
+                    );
+                }
+            }
+        }
         let total_abundance = normalized.iter().map(|row| row.abundance).sum::<f64>();
         for row in &mut normalized {
             row.normalize_abundance(total_abundance);
@@ -3759,6 +3813,7 @@ fn process_evidence_batch(
     let mut result = AssignmentResult::default();
     let mut scratch = CandidateScratch::default();
     let mut indexed_candidates: Vec<usize> = Vec::new();
+    let mut best_identities: Vec<(u32, f32)> = Vec::new();
 
     // Genus fallback remains a separate, lower-rank path and runs only when
     // no terminal candidate survives the native policy.
@@ -3768,6 +3823,25 @@ fn process_evidence_batch(
     let mut genus_intervals: IntervalMap = HashMap::new();
 
     for read in chunk {
+        if policy.collect_identities {
+            // Best mapping identity of the fragment to each taxon, before any gate.
+            best_identities.clear();
+            for row in &read.alignments {
+                match best_identities
+                    .iter_mut()
+                    .find(|(taxid, _)| *taxid == row.profile_taxid)
+                {
+                    Some((_, best)) => *best = best.max(row.identity),
+                    None => best_identities.push((row.profile_taxid, row.identity)),
+                }
+            }
+            for &(taxid, identity) in &best_identities {
+                let evidence = result.taxon_evidence.entry(taxid).or_default();
+                evidence.mapped_fragments = evidence.mapped_fragments.saturating_add(1);
+                evidence.identity_sum += f64::from(identity);
+            }
+        }
+
         let candidates = scratch.build(&read.alignments, policy);
         result.filter_stats.evaluated = result
             .filter_stats
@@ -5261,6 +5335,59 @@ fn community_profile_row_passes(
         && pvalue_filter_passes(&row.rank, row.breadth_pvalue, row.chunk_pvalue, cfg.strict)
 }
 
+/// Identity gap of the guard for genome-type species next to marker-type
+/// species in a mixed database.
+const BOUNDARY_IDENTITY_GAP: f64 = 0.01;
+
+/// Remove reported species whose reads a stronger relative explains better:
+/// a reported species of the same family with more depth whose candidate reads
+/// are at least `gap` more identical. Reads from genome regions missing from
+/// the index land on relatives at lower identity, so such a species mostly
+/// consists of the relative's reads. Only species for which `guarded` holds can
+/// be removed. Returns the removed species, each with the relative that
+/// explains it.
+fn remove_species_explained_by_relatives(
+    rows: &mut Vec<ProfileRow>,
+    taxonomy: &Taxonomy,
+    evidence: &HashMap<u32, TaxonEvidence>,
+    gap: f64,
+    guarded: impl Fn(u32) -> bool,
+) -> Vec<(u32, u32)> {
+    // (taxid, depth, mean identity) of the reported species of each family.
+    let mut families: HashMap<u32, Vec<(u32, f64, f64)>> = HashMap::new();
+    for row in rows.iter().filter(|row| row.rank == "species") {
+        let family = taxonomy
+            .get_parents(row.taxid)
+            .into_iter()
+            .find(|(_, _, rank)| rank == "family")
+            .map(|(family, _, _)| family);
+        let identity = evidence
+            .get(&row.taxid)
+            .and_then(TaxonEvidence::mean_identity);
+        if let (Some(family), Some(identity)) = (family, identity) {
+            families
+                .entry(family)
+                .or_default()
+                .push((row.taxid, row.depth, identity));
+        }
+    }
+    let mut removed = Vec::new();
+    for species in families.values() {
+        for &(taxid, depth, identity) in species.iter().filter(|(taxid, ..)| guarded(*taxid)) {
+            let explaining = species.iter().find(|&&(_, other_depth, other_identity)| {
+                other_depth > depth && other_identity - identity >= gap
+            });
+            if let Some(&(relative, ..)) = explaining {
+                removed.push((taxid, relative));
+            }
+        }
+    }
+    let explained: HashSet<u32> = removed.iter().map(|&(taxid, _)| taxid).collect();
+    rows.retain(|row| !explained.contains(&row.taxid));
+    removed.sort_unstable();
+    removed
+}
+
 /// Breadth, chunk breadth and ratio cutoffs given on the command line.
 fn explicit_cutoffs_pass(row: &ProfileRow, cfg: &ProfilerConfig) -> bool {
     let at_least = |cutoff: Option<f64>, value: f64| cutoff.is_none_or(|cutoff| value >= cutoff);
@@ -5462,6 +5589,9 @@ struct SamData {
 
     /// Marker genes and fragment geometry when the database has marker genomes.
     marker_model: Option<Arc<MarkerModel>>,
+
+    /// Genome-type species that share a genus with marker-type species.
+    species_next_to_markers: HashSet<u32>,
 }
 
 /// Convert a BAM record to SAM format string.
@@ -5668,6 +5798,7 @@ mod tests {
             min_oebr: None,
             min_coebr: None,
             min_marker_genes: 3,
+            relative_identity_gap: None,
             fraction: 0.6,
             lowbiomass: false,
             keep_raw: false,
@@ -5815,6 +5946,7 @@ mod tests {
             skipped_reference_at_load: 0,
             evidence_policy: None,
             marker_model: None,
+            species_next_to_markers: HashSet::new(),
         };
         (sam_data, assignment)
     }
@@ -6071,6 +6203,90 @@ mod tests {
     }
 
     #[test]
+    fn species_explained_by_a_more_identical_relative_are_removed() {
+        // Family 100 holds genera 10 (species 1, 2, 3) and 11 (species 4);
+        // species 5 is in family 101.
+        let nodes = [
+            (1u32, (1u32, "no rank")),
+            (100, (1, "family")),
+            (101, (1, "family")),
+            (10, (100, "genus")),
+            (11, (100, "genus")),
+            (12, (101, "genus")),
+            (1001, (10, "species")),
+            (1002, (10, "species")),
+            (1003, (10, "species")),
+            (1004, (11, "species")),
+            (1005, (12, "species")),
+        ]
+        .into_iter()
+        .map(|(id, (parent, rank))| (id, (parent, rank.to_string())))
+        .collect();
+        let taxonomy = Taxonomy::from_parts(nodes, HashMap::new(), HashMap::new(), HashSet::new());
+        let row = |taxid: u32, depth: f64| ProfileRow {
+            taxname: taxid.to_string(),
+            taxid,
+            rank: "species".to_string(),
+            equivalent_mapcount: 10.0,
+            depth,
+            abundance: depth,
+            breadth: 0.1,
+            expected_breadth: 0.1,
+            breadth_pvalue: Some(1.0),
+            fixed_chunk: 0.1,
+            flex_chunk: 0.1,
+            expected_flex_chunk: 0.1,
+            chunk_pvalue: Some(1.0),
+            annotations: None,
+        };
+        let evidence: HashMap<u32, TaxonEvidence> = [
+            (1001, 0.998),
+            (1002, 0.95),
+            (1003, 0.993),
+            (1004, 0.96),
+            (1005, 0.90),
+        ]
+        .into_iter()
+        .map(|(taxid, identity)| {
+            let evidence = TaxonEvidence {
+                mapped_fragments: 10,
+                identity_sum: 10.0 * identity,
+                ..TaxonEvidence::default()
+            };
+            (taxid, evidence)
+        })
+        .collect();
+        let rows = || {
+            vec![
+                row(1001, 1.0),
+                row(1002, 0.3),
+                row(1003, 0.2),
+                row(1004, 0.1),
+                row(1005, 0.05),
+            ]
+        };
+
+        // Species 1002 and 1004 (another genus of the family) are explained by
+        // 1001; 1003 is within the gap and 1005 is in another family.
+        let mut all = rows();
+        let removed =
+            remove_species_explained_by_relatives(&mut all, &taxonomy, &evidence, 0.01, |_| true);
+        assert_eq!(removed, [(1002, 1001), (1004, 1001)]);
+        let kept: Vec<u32> = all.iter().map(|row| row.taxid).collect();
+        assert_eq!(kept, [1001, 1003, 1005]);
+
+        let mut guarded_only = rows();
+        let removed = remove_species_explained_by_relatives(
+            &mut guarded_only,
+            &taxonomy,
+            &evidence,
+            0.01,
+            |taxid| taxid == 1004,
+        );
+        assert_eq!(removed, [(1004, 1001)]);
+    }
+
+    #[test]
     fn community_filter_uses_unrounded_chunk_breadth() {
         let cfg = make_cfg(Sequencer::Illumina, None);
         let row = |fixed_chunk| ProfileRow {
@@ -6134,6 +6350,7 @@ mod tests {
             skipped_reference_at_load: 0,
             evidence_policy: Some(policy),
             marker_model: None,
+            species_next_to_markers: HashSet::new(),
         };
         let assignment = AssignmentResult {
             read_assignments: vec![ReadAssignment {
@@ -6188,6 +6405,7 @@ mod tests {
             skipped_reference_at_load: 0,
             evidence_policy: Some(policy),
             marker_model: None,
+            species_next_to_markers: HashSet::new(),
         };
         let assignment = AssignmentResult {
             read_assignments: vec![ReadAssignment {

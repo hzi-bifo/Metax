@@ -18,7 +18,10 @@ use mapper::{
 use profiler::{ExactTiePolicy, Profiler, ProfilerConfig};
 use taxonomy::Taxonomy;
 
-use crate::db::{build_database, DatabaseMetadata, MetamIndexOptions, ReferenceTypes};
+use crate::db::{
+    build_database, genome_species_next_to_markers, DatabaseMetadata, MetamIndexOptions,
+    ReferenceTypes,
+};
 use crate::logging::init_logging;
 use crate::mapper::staging::{human_bytes, is_storage_exhausted, plan_staging_directory};
 use crate::mapper::tsv::{
@@ -102,6 +105,7 @@ pub struct AppConfig {
     pub min_oebr: Option<f64>,
     pub min_coebr: Option<f64>,
     pub min_marker_genes: usize,
+    pub relative_identity_gap: Option<f64>,
     pub fraction: Option<f64>,
     pub lowbiomass: bool,
     pub keep_raw: bool,
@@ -579,6 +583,7 @@ impl MetaxApp {
                 "    --min-oebr {} \\\n",
                 "    --min-coebr {} \\\n",
                 "    --min-marker-genes {} \\\n",
+                "    --relative-identity-gap {} \\\n",
                 "    -f {} \\\n",
                 "    --pathogen-table {} \\\n",
                 "    --host {} \\\n",
@@ -607,6 +612,7 @@ impl MetaxApp {
             fmt_option(&self.config.min_oebr),
             fmt_option(&self.config.min_coebr),
             self.config.min_marker_genes,
+            fmt_option(&self.config.relative_identity_gap),
             fmt_option(&self.config.fraction),
             fmt_option(&self.config.pathogen_host),
             fmt_option(&self.config.host),
@@ -899,6 +905,7 @@ impl MetaxApp {
             min_oebr: self.config.min_oebr,
             min_coebr: self.config.min_coebr,
             min_marker_genes: self.config.min_marker_genes,
+            relative_identity_gap: self.config.relative_identity_gap,
             fraction,
             lowbiomass: self.config.lowbiomass,
             keep_raw: self.config.keep_raw,
@@ -941,6 +948,7 @@ pub fn build_index(
     min_length: usize,
     compress_subsampled: bool,
     reference_types: ReferenceTypes,
+    dmp_dir: Option<&Path>,
     metam_options: MetamIndexOptions,
 ) -> Result<()> {
     let params = subsample.map(|fraction| crate::db::SubsampleParams {
@@ -958,6 +966,53 @@ pub fn build_index(
         &reference_types,
         &metam_options,
     )?;
+    if reference_types.has_table() {
+        report_genera_with_both_types(Path::new(outdir), dmp_dir)?;
+    }
+    Ok(())
+}
+
+/// In a mixed database, list the genera that hold both genome-type and
+/// marker-type species: reads from the unindexed part of a marker-only genome
+/// can land on the genomes of its relatives there.
+fn report_genera_with_both_types(database: &Path, dmp_dir: Option<&Path>) -> Result<()> {
+    let metadata = DatabaseMetadata::load(database)?;
+    if metadata.uniform_reference_type().is_some() {
+        return Ok(());
+    }
+    let Some(dmp_dir) = dmp_dir else {
+        eprintln!(
+            "[index] note: the database mixes genomes and marker genes; pass --dmp-dir to list the genera that hold both"
+        );
+        return Ok(());
+    };
+    let taxonomy = crate::taxonomy::Taxonomy::from_dir(dmp_dir)?;
+    let species = metadata
+        .references
+        .iter()
+        .map(|reference| Ok((reference.reference_type, reference.profile_taxid()?)))
+        .collect::<Result<Vec<_>>>()?;
+    let genera = genome_species_next_to_markers(species, |taxid| {
+        taxonomy
+            .get_parents(taxid)
+            .into_iter()
+            .find(|(_, _, rank)| rank == "genus")
+            .map(|(genus, _, _)| genus)
+    });
+    if genera.is_empty() {
+        return Ok(());
+    }
+    let mut names: Vec<&str> = genera
+        .keys()
+        .map(|&genus| taxonomy.get_name(genus).unwrap_or("unnamed"))
+        .collect();
+    names.sort_unstable();
+    eprintln!(
+        "[index] warning: {} genera hold both genome-type and marker-type species ({}{}). Reads from the unindexed part of a marker-only genome can map to the genomes of its relatives; metax profile applies --relative-identity-gap 0.01 to those genomes.",
+        names.len(),
+        names.iter().take(10).copied().collect::<Vec<_>>().join(", "),
+        if names.len() > 10 { ", ..." } else { "" }
+    );
     Ok(())
 }
 
@@ -1000,6 +1055,7 @@ mod tests {
             min_oebr: None,
             min_coebr: None,
             min_marker_genes: 3,
+            relative_identity_gap: None,
             fraction: None,
             lowbiomass: false,
             keep_raw: false,

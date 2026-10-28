@@ -90,6 +90,9 @@ pub(crate) struct EvidencePolicy {
     pub(crate) mapped_len: usize,
     pub(crate) fraction: f64,
     pub(crate) collect_exact_ties: bool,
+    /// Record the mean mapping identity of each taxon, for the relative
+    /// identity guard.
+    pub(crate) collect_identities: bool,
 }
 
 impl EvidencePolicy {
@@ -115,6 +118,7 @@ impl EvidencePolicy {
             fraction: cfg.fraction,
             collect_exact_ties: mode.supports_guarded_map()
                 && cfg.exact_ties == ExactTiePolicy::GuardedMap,
+            collect_identities: cfg.relative_identity_gap.is_some(),
         })
     }
 }
@@ -405,6 +409,19 @@ pub(crate) struct TaxonEvidence {
     /// rescue uses this (not `best_fragments`) so a conserved region's
     /// ambiguous ties cannot masquerade as own-species support.
     pub(crate) clear_best_fragments: u64,
+    /// Fragments with any mapping to this taxon, before the read-level gates.
+    pub(crate) mapped_fragments: u64,
+    /// Sum over those fragments of their best mapping identity to this taxon.
+    pub(crate) identity_sum: f64,
+}
+
+impl TaxonEvidence {
+    /// Mean best identity of the fragments mapped to this taxon. The read-level
+    /// identity gate is not applied, so reads of relatives that map at lower
+    /// identity count too.
+    pub(crate) fn mean_identity(&self) -> Option<f64> {
+        (self.mapped_fragments > 0).then(|| self.identity_sum / self.mapped_fragments as f64)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1457,6 +1474,7 @@ mod tests {
             mapped_len: 50,
             fraction: 0.70,
             collect_exact_ties: false,
+            collect_identities: true,
         }
     }
 
@@ -1501,6 +1519,8 @@ mod tests {
             resolved_candidate_fragments: resolved_candidates,
             best_fragments: best,
             clear_best_fragments: clear_best,
+            mapped_fragments: 0,
+            identity_sum: 0.0,
         }
     }
 
