@@ -32,5 +32,4 @@ SOFTWARE.
 All other dependencies are obtained from crates.io at build time under their
 own licences (MIT, Apache-2.0, BSD, ISC, Zlib, Unicode-3.0, and MPL-2.0 for
 `option-ext`). Their exact versions are recorded in `Cargo.lock`, and each
-crate's licence text is included in its published source. The bundled htslib
-sources compiled by `rust-htslib` are distributed under the MIT licence.
+crate's licence text is included in its published source.

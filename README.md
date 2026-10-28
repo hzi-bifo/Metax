@@ -17,7 +17,8 @@ By unifying coverage-informed presence probability estimation with EM-based abun
 ## What's new in Metax 2
 
 - **Built-in read mapper.** Metax no longer depends on the external MA aligner (`maCMD`). Indexing, mapping, and profiling run inside a single `metax` executable.
-- **Native short- and long-read evidence.** Single-end and paired-end Illumina, Nanopore, and PacBio reads are profiled with platform-specific coordinate-evidence rules; SAM/BAM parsing is retained only for reusing external alignments.
+- **Native short- and long-read evidence.** Single-end and paired-end Illumina, Nanopore, and PacBio reads are profiled with platform-specific coordinate-evidence rules applied to Metax's own coordinate mappings. SAM/BAM files from other mappers are no longer read.
+- **Marker-gene and mixed databases.** Genomes can be represented by their assembled sequences or by a set of marker genes, also mixed within one database (`--reference-type`, `--reference-type-table`). Marker genomes are evaluated by the genes their reads hit.
 - **Rank-aware reference labels.** References may be labelled at strain, species, genus, or any higher rank, and Metax reports each genome at the lowest rank its label supports.
 - **Lower peak memory.** Mapping and profiling run as separate stages, so the mapping index is released before the profiler starts.
 - **Reusable mapping output.** Save compressed coordinate mappings once and re-profile them with different thresholds without remapping.
@@ -39,7 +40,7 @@ Packages are available for `linux-64`, `linux-aarch64`, and `osx-arm64`. The pac
 
 ### Compile from source
 
-Metax requires Rust 1.89 or newer and a C compiler (used for the bundled htslib).
+Metax requires Rust 1.89 or newer and a C compiler (used for the bundled zstd library).
 
 ```bash
 cargo build --release
@@ -91,6 +92,8 @@ To build a custom database:
 
    Gzip-compressed input is accepted. For machines with limited RAM, `-f <fraction>` builds a **fractional index** from an evenly distributed fraction of each large genome; see the [manual](MANUAL.md#42-fractional-index).
 
+   For marker genes (one FASTA record per gene) add `--reference-type markers`, or list single genomes in `--reference-type-table` to mix genomes and marker genes; see the [manual](MANUAL.md#43-marker-gene-and-mixed-databases). The read counts of marker genomes are the reads mapped to their marker genes, because the size of the full genome is not used; depth and relative abundance remain comparable with genome taxa.
+
 ## How to run profiling
 
 ```shell
@@ -134,7 +137,7 @@ Add `--dmp-dir <dump_dir>` to use a specific taxonomy directory. The first run a
   column 1:  Taxon name
   column 2:  Taxon ID
   column 3:  Taxon rank
-  column 4:  Number of reads (full-index equivalents)
+  column 4:  Number of reads (full-index equivalents; reads on the marker genes for marker genomes)
   column 5:  Depth of coverage
   column 6:  Relative abundance (%)
   column 7:  Breadth of coverage
@@ -145,6 +148,8 @@ Add `--dmp-dir <dump_dir>` to use a specific taxonomy directory. The first run a
   column 12: Expected flex chunk breadth of coverage
   column 13: P-value of the flex chunk breadth deviation
   ```
+
+  For species represented by marker genes, columns 10 and 11 hold the fraction of marker genes hit, column 12 the expected fraction, and column 13 the p-value of the genes hit.
 
   When `--host` is used, three columns are appended:
 
@@ -178,7 +183,7 @@ For detailed installation, indexing, profiling, output, and method descriptions,
    The first run creates a memory-mapped cache (`metax_db.mxi.metamcache`) beside the index. Later runs open the completed cache directly.
 
 4. **Can I reuse alignments produced by another tool?**
-   Yes, with `--reuse-sam`. The SAM/BAM file must use extended CIGAR operators (`=`/`X`) so that identity can be computed. For repeated analyses, prefer `--save-mapping` and `--reuse-mapping`, which avoid remapping.
+   No. Metax profiles its own coordinate mappings. To profile one run several ways, save its mappings with `--save-mapping` and profile them again with `--reuse-mapping`, which avoids remapping.
 
 5. **A species appears in `rprofile.txt` but not in `profile.txt`. Why?**
    `rprofile.txt` is written before the coverage-evidence and support filters. The columns of that row show which criterion the taxon failed.

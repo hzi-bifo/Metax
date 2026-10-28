@@ -7,18 +7,16 @@
 //! # Algorithm Overview
 //!
 //! 1. **Load mappings**: Read Metam coordinate mappings, either streamed from
-//!    the mapper or replayed from a saved mapping file. SAM/BAM input remains
-//!    supported through `--reuse-sam` for compatibility, as text (optionally
-//!    gzip/xz compressed) or binary.
+//!    the mapper or replayed from a saved mapping file.
 //!
-//! 2. **Reference Metadata**: Extract assembly information from reference
-//!    names, which carry
-//!    `genome_or_assembly_accession|contig_or_sequence_id|taxonomy_field|genome_size`
-//!    with the trailing size optional. MANUAL.md describes the format.
+//! 2. **Reference Metadata**: Take genome, taxonomy, size, and reference type
+//!    of every reference from the database metadata. MANUAL.md describes the
+//!    reference format.
 //!
 //! 3. **Coverage Calculation**: Compute coverage metrics:
 //!    - Breadth: Fraction of genome covered by at least one read
-//!    - Fixed and flex chunk: Coverage of genome chunks by at least one read
+//!    - Fixed and flex chunk: Coverage of genome chunks by at least one read;
+//!      for marker genomes the genes are the chunks
 //!
 //! 4. **Taxonomy Assignment**: Assign reads to taxa based on alignment
 //!    quality, filtering by identity, mapped length, and fraction thresholds.
