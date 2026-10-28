@@ -63,6 +63,10 @@ impl MarkerModel {
         (!genes.is_empty()).then_some(Self { genes, geometry })
     }
 
+    pub(crate) fn is_marker_genome(&self, assembly_id: u32) -> bool {
+        self.genes.contains_key(&assembly_id)
+    }
+
     /// Coverage of a marker genome, or `None` for a genome of another type or
     /// when no gene can hold a read of this length.
     pub(crate) fn coverage(

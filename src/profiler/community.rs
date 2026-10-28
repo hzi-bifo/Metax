@@ -702,6 +702,8 @@ impl CommunityProfiler {
         let mut reference_taxonomies = Vec::with_capacity(db.references.len());
         let mut taxonomy_adjustments = ReferenceTaxonomyAdjustments::new();
         let mut taxonomy_resolver = ReferenceTaxonomyResolver::new(&self.taxonomy);
+        let has_marker_genomes = db.uniform_reference_type() != Some(ReferenceType::Genome);
+        let mut taxids_with_genomes: HashSet<u32> = HashSet::new();
         for reference in &db.references {
             let declared_taxonomy = parse_reference_taxonomy(&reference.taxonomy_field)
                 .with_context(|| {
@@ -719,6 +721,9 @@ impl CommunityProfiler {
             let asm = reference.genome.clone();
             *asm_lengths_raw.entry(asm).or_insert(0.0) += reference.length as f64;
             profile_taxids.insert(taxonomy.profile_taxid);
+            if reference.reference_type == ReferenceType::Genome {
+                taxids_with_genomes.insert(taxonomy.profile_taxid);
+            }
             record_terminal_rank(
                 &mut terminal_ranks,
                 taxonomy.profile_taxid,
@@ -743,8 +748,20 @@ impl CommunityProfiler {
                 (asm.clone(), flex.max(1))
             })
             .collect();
-        let (species_normalize_raw, species_to_genus_raw) =
+        let (species_normalize_raw, mut species_to_genus_raw) =
             self.build_taxonomy_lookups(&profile_taxids);
+        if has_marker_genomes {
+            // Genus fallback places reads that no species explains at the genus
+            // of their best hit. A marker gene holds too little of a genome for
+            // that: reads failing every species there come mostly from the
+            // homologous genes of relatives. Only species with genome-type
+            // references take part.
+            let species_with_genomes: HashSet<u32> = taxids_with_genomes
+                .iter()
+                .map(|taxid| species_normalize_raw.get(taxid).copied().unwrap_or(*taxid))
+                .collect();
+            species_to_genus_raw.retain(|species, _| species_with_genomes.contains(species));
+        }
         let db_is_subsampled = db.is_fractional;
         let species_normalize = Arc::new(species_normalize_raw);
         let species_to_genus = Arc::new(if db_is_subsampled && !self.cfg.genus_fallback {
@@ -810,7 +827,6 @@ impl CommunityProfiler {
         let mut read_map: StableReadMap<AlignmentEntry> = StableReadMap::default();
         let mut num_skipped_reference = 0usize;
         let mut num_alignments = 0usize;
-        let has_marker_genomes = db.uniform_reference_type() != Some(ReferenceType::Genome);
         let mut read_lengths = LengthHistogram::default();
         let mut lone_mates = false;
         let load_progress_options = self.cfg.mapping_load_progress_options();
@@ -881,11 +897,22 @@ impl CommunityProfiler {
         } else {
             aligned_reads as f64 / total_reads as f64
         };
-        let gate_active = fallback_gate_active(&self.cfg, mapping_rate);
+        // The low-map gate asks how much of the sample the reference explains, so
+        // fragments count as the genome share they represent.
+        let gate_rate =
+            genome_equivalent_mapping_rate(&read_alignments, total_reads, marker_model.as_deref());
+        if gate_rate != mapping_rate {
+            log::info!(
+                target: "PROFILER",
+                "Genome-equivalent mapping rate for the low-map gate: {:.5}.",
+                gate_rate
+            );
+        }
+        let gate_active = fallback_gate_active(&self.cfg, gate_rate);
         let fallback_mode = genus_fallback_mode_active(&self.cfg, gate_active, db_is_subsampled);
         let chunk_plan = plan_chunk_breadth(
             &self.cfg,
-            mapping_rate,
+            gate_rate,
             total_reads,
             aligned_reads,
             db_is_subsampled,
@@ -3668,6 +3695,33 @@ fn resolve_coordinate_evidence(
     })
 }
 
+/// Mapped fragments as a share of the input fragments, each counting as the
+/// share of a genome it represents: the sampling scale of the genome of its
+/// best placement, so that an index of sampled genomes is not mistaken for a
+/// sample of unknown or host DNA. Fragments placed only on marker genes, whose
+/// genome size is unknown, are left out. Equals the plain mapping rate for a
+/// database of whole genomes.
+fn genome_equivalent_mapping_rate(
+    bundles: &[ReadBundle],
+    total_reads: usize,
+    markers: Option<&MarkerModel>,
+) -> f64 {
+    if total_reads == 0 {
+        return 0.0;
+    }
+    let mapped: f64 = bundles
+        .iter()
+        .filter_map(|bundle| {
+            bundle
+                .alignments
+                .iter()
+                .find(|row| markers.is_none_or(|model| !model.is_marker_genome(row.assembly_id)))
+                .map(|row| f64::from(row.sampling_scale))
+        })
+        .fold(0.0, |total, scale| total + scale);
+    (mapped / total_reads as f64).min(1.0)
+}
+
 /// Read length, template length and read layout of this sample, measured
 /// on the mappings, for the coverage expected on marker genes.
 fn sample_fragment_geometry(
@@ -6214,6 +6268,31 @@ mod tests {
         assert!(message.contains("conflicting terminal ranks for taxid 111"));
         assert!(message.contains("genus"));
         assert!(message.contains("species"));
+    }
+
+    #[test]
+    fn equivalent_mapping_rate_counts_the_genome_share_of_fragments() {
+        let bundle = |scale: f32| {
+            let mut row = native_mapping(1, 10, 1, 0.99, 100, 100, MappingRole::Unpaired);
+            row.sampling_scale = scale;
+            ReadBundle {
+                read_name: Arc::from("read"),
+                alignments: vec![row],
+            }
+        };
+        assert_eq!(
+            genome_equivalent_mapping_rate(&[bundle(1.0), bundle(1.0)], 4, None),
+            0.5
+        );
+        assert_eq!(
+            genome_equivalent_mapping_rate(&[bundle(10.0)], 20, None),
+            0.5
+        );
+        assert_eq!(
+            genome_equivalent_mapping_rate(&[bundle(10.0)], 4, None),
+            1.0
+        );
+        assert_eq!(genome_equivalent_mapping_rate(&[], 0, None), 0.0);
     }
 
     fn native_mapping(
