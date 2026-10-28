@@ -2832,12 +2832,21 @@ pub enum MateRefStatus {
     Unmapped,
     /// The mate mapped to a different reference, named here.
     Other(Arc<str>),
+    /// The mate has no placement on this reference, and the insert window on
+    /// the side where it must lie runs past the end of this reference: the
+    /// mate may come from sequence the reference does not contain.
+    BeyondEnd,
 }
 
 impl MateRefStatus {
     #[inline]
     pub fn is_same(&self) -> bool {
         matches!(self, Self::Same)
+    }
+
+    #[inline]
+    pub fn is_beyond_end(&self) -> bool {
+        matches!(self, Self::BeyondEnd)
     }
 }
 
@@ -2848,6 +2857,7 @@ impl fmt::Display for MateRefStatus {
             Self::Same => formatter.write_str("="),
             Self::Unmapped => formatter.write_str("*"),
             Self::Other(name) => formatter.write_str(name),
+            Self::BeyondEnd => formatter.write_str(">"),
         }
     }
 }
@@ -2978,6 +2988,34 @@ pub fn set_mate_status(r1: &mut [Mapping], r2: &mut [Mapping]) {
     let best_r2: Option<Arc<str>> = r2.first().map(|m| Arc::from(m.ref_id.as_str()));
     assign_mate_status(r1, r2, best_r2.as_ref());
     assign_mate_status(r2, r1, best_r1.as_ref());
+}
+
+/// Mark the placements without a mate on their reference whose mate may lie
+/// beyond the reference end: the insert window on the mate's side (after a
+/// forward read, before a reverse one) runs past the end, so mate rescue could
+/// search only part of it. Marker genes and short contigs end within a
+/// fragment length of most placements.
+pub fn mark_mates_beyond_reference_end(
+    reads: &mut [Mapping],
+    index: &RuntimeIndex,
+    max_insert: usize,
+) {
+    for read in reads
+        .iter_mut()
+        .filter(|read| !read.mate_ref_status.is_same())
+    {
+        let Some(ref_id) = index.reference_index_by_id(&read.ref_id) else {
+            continue;
+        };
+        let window_runs_past_end = if read.strand == 1 {
+            read.ref_end as usize + max_insert > index.reference(ref_id).len()
+        } else {
+            (read.ref_start as usize) < max_insert
+        };
+        if window_runs_past_end {
+            read.mate_ref_status = MateRefStatus::BeyondEnd;
+        }
+    }
 }
 
 fn assign_mate_status(reads: &mut [Mapping], mates: &[Mapping], fallback: Option<&Arc<str>>) {
@@ -4553,6 +4591,32 @@ mod tests {
             mapping.matched_bases,
             mapping.identity.to_bits(),
         )
+    }
+
+    #[test]
+    fn lone_mates_near_a_reference_end_are_marked() {
+        let gene = deterministic_read(2_000);
+        let index = rescue_runtime_index(&[("gene", &gene)]);
+        let place = |start: u32, strand: i8, status: MateRefStatus| {
+            let mut mapping = test_mapping("pair", "gene", start, start + 100, 100, 1.0, 100);
+            mapping.strand = strand;
+            mapping.mate_ref_status = status;
+            mapping
+        };
+        // A forward read's mate lies downstream, a reverse read's upstream.
+        let mut reads = vec![
+            place(1_400, 1, MateRefStatus::Unmapped),
+            place(500, 1, MateRefStatus::Unmapped),
+            place(500, -1, MateRefStatus::Other(Arc::from("other"))),
+            place(1_400, -1, MateRefStatus::Unmapped),
+            place(1_900, 1, MateRefStatus::Same),
+        ];
+        mark_mates_beyond_reference_end(&mut reads, &index, 600);
+        let beyond: Vec<bool> = reads
+            .iter()
+            .map(|read| read.mate_ref_status.is_beyond_end())
+            .collect();
+        assert_eq!(beyond, [true, false, true, false, false]);
     }
 
     #[test]

@@ -13,6 +13,39 @@ use metam::mapper::{CandidateBoundary, MapProfile, Mapping};
 use crate::db::DatabaseMetadata;
 use crate::sequencer::Sequencer;
 
+/// Where the mate of a mapping is, as recorded in the `mate_ref_status` field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MateRef {
+    /// The mate is placed on the same reference (`=`).
+    Same,
+    /// The mate may lie beyond the end of this reference (`>`).
+    BeyondEnd,
+    /// No mate, an unmapped mate, or a mate on another reference.
+    Elsewhere,
+}
+
+impl MateRef {
+    fn parse(field: &str) -> Self {
+        match field {
+            "=" => Self::Same,
+            ">" => Self::BeyondEnd,
+            _ => Self::Elsewhere,
+        }
+    }
+}
+
+impl From<&metam::mapper::MateRefStatus> for MateRef {
+    fn from(status: &metam::mapper::MateRefStatus) -> Self {
+        if status.is_same() {
+            Self::Same
+        } else if status.is_beyond_end() {
+            Self::BeyondEnd
+        } else {
+            Self::Elsewhere
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MetamMapping {
     pub read_id: String,
@@ -24,7 +57,7 @@ pub struct MetamMapping {
     pub identity: f64,
     pub read_len: usize,
     pub mapped_bases: usize,
-    pub mate_ref_status_same_ref: bool,
+    pub mate_ref: MateRef,
     /// Mate number: 0 for an unpaired record, 1 for R1, or 2 for R2.
     pub mate_number: u8,
     /// Read-local identifier shared only by an explicitly selected R1/R2 pair.
@@ -51,7 +84,7 @@ pub struct MetamMappingRecord<'a> {
     pub identity: f64,
     pub read_len: usize,
     pub mapped_bases: usize,
-    pub mate_ref_status_same_ref: bool,
+    pub mate_ref: MateRef,
     pub mate_number: u8,
     pub pair_id: u32,
     pub candidate_boundary: CandidateBoundary,
@@ -70,7 +103,7 @@ impl From<Mapping> for MetamMapping {
             identity: canonical_mapping_identity(mapping.identity),
             read_len: mapping.read_len,
             mapped_bases: mapping.mapped_bases,
-            mate_ref_status_same_ref: mapping.mate_ref_status.is_same(),
+            mate_ref: MateRef::from(&mapping.mate_ref_status),
             mate_number: mapping.mate_number,
             pair_id: mapping.pair_id,
             candidate_boundary: mapping.candidate_boundary,
@@ -88,7 +121,7 @@ impl MetamMapping {
             identity: self.identity,
             read_len: self.read_len,
             mapped_bases: self.mapped_bases,
-            mate_ref_status_same_ref: self.mate_ref_status_same_ref,
+            mate_ref: self.mate_ref,
             mate_number: self.mate_number,
             pair_id: self.pair_id,
             candidate_boundary: self.candidate_boundary,
@@ -101,6 +134,16 @@ impl MetamMapping {
 }
 
 impl MetamMappingRecord<'_> {
+    /// A mate of a pair the mapper selected.
+    pub fn is_selected_pair_mate(&self) -> bool {
+        self.pair_id != 0 && self.mate_ref == MateRef::Same
+    }
+
+    /// A mate without a pair whose mate may lie beyond the end of its reference.
+    pub fn is_mate_beyond_reference_end(&self) -> bool {
+        self.pair_id == 0 && self.mate_number != 0 && self.mate_ref == MateRef::BeyondEnd
+    }
+
     pub fn validate(self) -> Result<()> {
         nonempty(self.read_id, "read_id")?;
         nonempty(self.ref_id, "ref_id")?;
@@ -136,11 +179,14 @@ impl MetamMappingRecord<'_> {
         if self.mate_number == 0 && self.pair_id != 0 {
             bail!("unpaired mapping has nonzero pair_id {}", self.pair_id);
         }
-        if self.pair_id != 0 && !self.mate_ref_status_same_ref {
+        if self.pair_id != 0 && self.mate_ref != MateRef::Same {
             bail!(
                 "mapping in pair {} does not have same-reference mate status",
                 self.pair_id
             );
+        }
+        if self.mate_ref == MateRef::BeyondEnd && (self.pair_id != 0 || self.mate_number == 0) {
+            bail!("only an unpaired mate can have its mate beyond the reference end");
         }
         Ok(())
     }
@@ -155,7 +201,7 @@ impl MetamMappingRecord<'_> {
             identity: self.identity,
             read_len: self.read_len,
             mapped_bases: self.mapped_bases,
-            mate_ref_status_same_ref: self.mate_ref_status_same_ref,
+            mate_ref: self.mate_ref,
             mate_number: self.mate_number,
             pair_id: self.pair_id,
             candidate_boundary: self.candidate_boundary,
@@ -786,7 +832,7 @@ fn parse_mapping_record(line: &str) -> Result<MetamMappingRecord<'_>> {
         next_field(&mut fields, "mate_ref_status")?,
         "mate_ref_status",
     )?;
-    let mate_ref_status_same_ref = mate_ref_status == "=";
+    let mate_ref = MateRef::parse(mate_ref_status);
     let mate_number = u8::try_from(parse_nonnegative(next_field(&mut fields, "mate")?, "mate")?)
         .context("mate does not fit in u8")?;
     let pair_id = u32::try_from(parse_nonnegative(
@@ -808,7 +854,7 @@ fn parse_mapping_record(line: &str) -> Result<MetamMappingRecord<'_>> {
         identity,
         read_len,
         mapped_bases,
-        mate_ref_status_same_ref,
+        mate_ref,
         mate_number,
         pair_id,
         candidate_boundary,
@@ -939,12 +985,16 @@ mod tests {
         assert_eq!(m.start_1based, 1);
         assert_eq!(m.end_1based_exclusive, 101);
         assert_eq!(m.mapped_bases, 100);
-        assert!(!m.mate_ref_status_same_ref);
+        assert_eq!(m.mate_ref, MateRef::Elsewhere);
         assert_eq!(m.mate_number, 0);
         assert_eq!(m.pair_id, 0);
         assert!(m.candidate_boundary.is_complete());
         let paired = parse_mapping_line("r1/1\tref\t0\t100\t0.9700\t150\t100\t=\t1\t7\t3").unwrap();
-        assert!(paired.mate_ref_status_same_ref);
+        assert_eq!(paired.mate_ref, MateRef::Same);
+        let lone = parse_mapping_line("r1/2\tref\t0\t100\t0.9700\t150\t100\t>\t2\t0\t0").unwrap();
+        assert!(lone.as_record().is_mate_beyond_reference_end());
+        assert!(!lone.as_record().is_selected_pair_mate());
+        assert!(parse_mapping_line("r1/2\tref\t0\t100\t0.9700\t150\t100\t>\t2\t3\t0").is_err());
         assert_eq!(paired.mate_number, 1);
         assert_eq!(paired.pair_id, 7);
         assert!(paired.candidate_boundary.profile_incomplete());
@@ -1232,7 +1282,7 @@ mod tests {
                 identity: 0.99,
                 read_len: 90,
                 mapped_bases: 100,
-                mate_ref_status_same_ref: false,
+                mate_ref: MateRef::Elsewhere,
                 mate_number: 0,
                 pair_id: 0,
                 candidate_boundary: CandidateBoundary::COMPLETE,

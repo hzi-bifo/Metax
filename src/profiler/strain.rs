@@ -1081,7 +1081,7 @@ fn strain_record_from_metam<'a>(
     ref_metadata: &HashMap<String, ReferenceMetadata>,
     is_paired: bool,
 ) -> Option<ParsedMetamRecord<'a>> {
-    if is_paired && (!mapping.mate_ref_status_same_ref || mapping.pair_id == 0) {
+    if is_paired && !mapping.is_selected_pair_mate() {
         return None;
     }
     let metadata = ref_metadata.get(mapping.ref_id)?;
@@ -2260,7 +2260,7 @@ impl StrainProfiler {
                 num_alignment as u64,
                 load_progress_options.interval(),
             );
-            if self.cfg.is_paired && (!mapping.mate_ref_status_same_ref || mapping.pair_id == 0) {
+            if self.cfg.is_paired && !mapping.is_selected_pair_mate() {
                 return Ok(());
             }
             if let Some(parsed) =

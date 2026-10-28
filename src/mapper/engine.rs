@@ -20,10 +20,10 @@ use metam::index::{read_index_with_cache_progress, IndexCacheBuildProgress, Load
 use metam::io::{Record, SequenceReader};
 use metam::mapper::{
     apply_pair_awareness, has_proper_pair, limit_mappings_with_workspace, map_read_with_workspace,
-    pair_compatibility, rescue_competing_mates_with_workspace, rescue_mate_with_workspace,
-    set_mate_status, CandidateBoundary, IdentityMode, LongReadExtension, MapParams, MapProfile,
-    Mapping, MappingWorkspace, PairStatus, ReferenceCandidateGroups, RuntimeIndex,
-    RuntimeIndexOptions,
+    mark_mates_beyond_reference_end, pair_compatibility, rescue_competing_mates_with_workspace,
+    rescue_mate_with_workspace, set_mate_status, CandidateBoundary, IdentityMode,
+    LongReadExtension, MapParams, MapProfile, Mapping, MappingWorkspace, PairStatus,
+    ReferenceCandidateGroups, RuntimeIndex, RuntimeIndexOptions,
 };
 
 use crate::db::DatabaseMetadata;
@@ -1788,6 +1788,10 @@ fn map_record_pair(
     m1.append(&mut competing1);
     m2.append(&mut competing2);
     set_mate_status(&mut m1, &mut m2);
+    if config.pair_aware {
+        mark_mates_beyond_reference_end(&mut m1, index, config.max_insert);
+        mark_mates_beyond_reference_end(&mut m2, index, config.max_insert);
+    }
 
     let mappings = prepare_paired_mappings(
         m1,
@@ -2060,6 +2064,15 @@ fn prepare_paired_mappings(
         return paired;
     }
     if paired.is_empty() && policy == PairedEmissionPolicy::ConcordantOnly {
+        // Without any pair, a mate whose mate may lie beyond the end of its
+        // reference is still evidence for that reference.
+        paired.extend(
+            mate1
+                .into_iter()
+                .chain(mate2)
+                .flatten()
+                .filter(|mapping| mapping.mate_ref_status.is_beyond_end()),
+        );
         return paired;
     }
 
@@ -2987,6 +3000,42 @@ mod tests {
         assert_eq!(ordered[1].pair_id, 1);
         assert_eq!(ordered[2].pair_id, 0);
         assert_eq!(ordered[3].pair_id, 0);
+    }
+
+    #[test]
+    fn concordant_only_keeps_mates_beyond_the_reference_end_without_a_pair() {
+        let lone = || {
+            vec![
+                test_mapping("read/1", "gene-a", MateRefStatus::BeyondEnd),
+                test_mapping("read/1", "gene-b", MateRefStatus::Unmapped),
+            ]
+        };
+        let kept = prepare_paired_mappings(
+            lone(),
+            Vec::new(),
+            PairedEmissionPolicy::ConcordantOnly,
+            0,
+            1_000,
+        );
+        assert_eq!(
+            read_ref_order(&kept),
+            vec![("read/1".to_string(), "gene-a".to_string())]
+        );
+        assert_eq!((kept[0].mate_number, kept[0].pair_id), (1, 0));
+
+        // A pair anywhere in the fragment takes precedence.
+        let mut mate1 = lone();
+        mate1.push(test_mapping("read/1", "gene-c", MateRefStatus::Same));
+        let mate2 = vec![test_mapping("read/2", "gene-c", MateRefStatus::Same)];
+        let paired = prepare_paired_mappings(
+            mate1,
+            mate2,
+            PairedEmissionPolicy::ConcordantOnly,
+            0,
+            1_000,
+        );
+        assert_eq!(paired.len(), 2);
+        assert!(paired.iter().all(|mapping| mapping.pair_id != 0));
     }
 
     #[test]

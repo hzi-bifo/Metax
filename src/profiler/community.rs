@@ -819,7 +819,7 @@ impl CommunityProfiler {
                 num_alignments as u64,
                 load_progress_options.interval(),
             );
-            if self.cfg.is_paired && (!mapping.mate_ref_status_same_ref || mapping.pair_id == 0) {
+            if self.cfg.is_paired && !mapping.is_selected_pair_mate() {
                 return Ok(());
             }
             match self.entry_from_metam_mapping(mapping, &metam_refs, fixed_flank_len) {
@@ -958,7 +958,7 @@ impl CommunityProfiler {
         metam_refs: &HashMap<String, MetamReferenceEntry>,
         fixed_flank_len: usize,
     ) -> Option<(&'a str, AlignmentEntry)> {
-        if self.cfg.is_paired && (!mapping.mate_ref_status_same_ref || mapping.pair_id == 0) {
+        if self.cfg.is_paired && !mapping.is_selected_pair_mate() {
             return None;
         }
         let reference = metam_refs.get(mapping.ref_id)?;
