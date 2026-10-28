@@ -42,21 +42,14 @@
 use std::cmp::Ordering;
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::Path;
-use std::rc::Rc;
 use std::str;
 use std::sync::Arc;
-use std::thread;
 
 use anyhow::{anyhow, bail, Context, Result};
-use crossbeam_channel::{bounded, unbounded};
-use flate2::read::MultiGzDecoder;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
-use rust_htslib::bam::record::Record;
-use rust_htslib::bam::{self, Read as BamRead};
-use xz2::read::XzDecoder;
 
 use crate::taxonomy::Taxonomy;
 use csv::WriterBuilder;
@@ -69,7 +62,6 @@ use crate::mapper::tsv::{
 };
 use crate::progress;
 
-use super::alignment::cigar_to_identity;
 use super::evidence::{
     calculate_coverage, evaluate_ranked_witness, guarded_map_winner, resolved_candidate_index,
     standard_ratio_lower_bounds, witness_is_better, CandidateScratch, EvidenceAlignment,
@@ -88,13 +80,11 @@ use super::pathogen::{load_pathogen_table, PathogenEntry};
 use super::statistics::{coverage_deviation_pvalue, round5};
 use super::{
     coverage_passes, equivalent_read_count_passes_minimum, log_reference_taxonomy_adjustments,
-    join_alignment_worker, log_resolved_profiler_parameters, parse_reference_taxonomy,
-    parse_sam_sequence_record, push_string_keyed_value, record_genome_sampling_scale,
-    record_reference_taxonomy_adjustment, require_alignment_reference_dictionary,
-    sampling_scale_from_name_parts,
-    sampling_scale_from_sizes, scale_automatic_chunk_breadth, strip_pair_suffix, ProfileMode,
-    ProfileRank, ProfilerConfig, ReadSupport, ReferenceTaxonomyAdjustments,
-    ReferenceTaxonomyResolver, ResolvedProfilerParameters, StableReadMap,
+    log_resolved_profiler_parameters, parse_reference_taxonomy, push_string_keyed_value,
+    record_genome_sampling_scale, record_reference_taxonomy_adjustment, sampling_scale_from_sizes,
+    scale_automatic_chunk_breadth, strip_pair_suffix, ProfileMode, ProfileRank, ProfilerConfig,
+    ReadSupport, ReferenceTaxonomyAdjustments, ReferenceTaxonomyResolver,
+    ResolvedProfilerParameters, StableReadMap,
 };
 
 /// Fixed coordinate radius used by the native single-end, paired-end, and
@@ -135,98 +125,6 @@ fn record_terminal_rank(
     }
 }
 
-/// Detected alignment file format.
-enum AlignmentFormat {
-    /// Text-based SAM format (may be compressed with gzip or xz)
-    Sam,
-    /// Binary BAM format
-    Bam,
-}
-
-/// Iterator over lines in a text-based SAM file.
-///
-/// Wraps a buffered reader and yields non-empty, trimmed lines.
-/// Skips empty lines and properly handles line endings.
-struct SamLineIter<R: BufRead> {
-    reader: R,
-    /// Reusable line buffer, kept on the struct so one allocation is
-    /// amortised across every line rather than one per `next()`.
-    buffer: String,
-}
-
-impl<R: BufRead> SamLineIter<R> {
-    /// Create a new SAM line iterator from a buffered reader.
-    fn new(reader: R) -> Self {
-        Self {
-            reader,
-            buffer: String::with_capacity(4096),
-        }
-    }
-}
-
-impl<R: BufRead> Iterator for SamLineIter<R> {
-    type Item = Result<String>;
-
-    /// Read the next non-empty line from the SAM file.
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            self.buffer.clear();
-            match self.reader.read_line(&mut self.buffer) {
-                Ok(0) => return None, // EOF reached
-                Ok(_) => {
-                    let trimmed = self.buffer.trim_end();
-                    if trimmed.is_empty() {
-                        continue; // Skip empty lines
-                    }
-                    return Some(Ok(trimmed.to_string()));
-                }
-                Err(err) => return Some(Err(anyhow!(err))),
-            }
-        }
-    }
-}
-
-/// Iterator over records in a BAM file, converting to SAM format.
-///
-/// Uses rust-htslib to read BAM records and converts them to SAM-format
-/// strings for uniform processing with the text SAM parser.
-struct BamRecordIter {
-    /// BAM file reader
-    reader: bam::Reader,
-    /// Reusable record buffer to avoid allocations
-    record: Record,
-    /// BAM header containing reference sequence information
-    header: Rc<bam::HeaderView>,
-}
-
-impl BamRecordIter {
-    /// Create a new BAM record iterator.
-    ///
-    /// # Arguments
-    /// * `reader` - Opened BAM file reader
-    /// * `header` - BAM header view (shared for memory efficiency)
-    fn new(reader: bam::Reader, header: Rc<bam::HeaderView>) -> Self {
-        Self {
-            reader,
-            record: Record::new(),
-            header,
-        }
-    }
-}
-
-impl Iterator for BamRecordIter {
-    type Item = Result<String>;
-
-    /// Read the next BAM record and convert to SAM format string.
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.reader.read(&mut self.record) {
-            Some(Ok(())) => Some(bam_record_to_sam_line(&self.record, &self.header)),
-            Some(Err(err)) => Some(Err(anyhow!(err))),
-            None => None,
-        }
-    }
-}
-
 /// Information about a single alignment of a read to a reference.
 ///
 /// Derived fields are computed once where the alignment enters the profiler --
@@ -264,82 +162,6 @@ struct ReadBundle {
 
     /// All alignments for this read, ordered by quality
     alignments: Vec<AlignmentEntry>,
-}
-
-/// Result from a worker thread processing a batch of alignments.
-///
-/// Workers parse alignment lines in parallel and return structured data
-/// for the main thread to aggregate.
-struct WorkerResult {
-    /// Parsed alignments as (read_name, entry) pairs
-    alignments: Vec<(String, AlignmentEntry)>,
-
-    /// All read names seen (including unmapped)
-    reads_seen: Vec<String>,
-
-    /// Count of valid alignments processed (for progress tracking)
-    alignments_seen: usize,
-
-    /// Alignments rejected in the worker because the reference name
-    /// didn't carry a parsable species taxid, or because the assembly
-    /// total length was unknown / zero. Historically counted inside
-    /// `process_batch`; we now detect these in the worker to avoid
-    /// re-parsing, and propagate the count so the aggregated
-    /// [`FilterStats`] keeps the same meaning.
-    skipped_reference: usize,
-}
-
-/// Shared context for worker threads during alignment parsing.
-///
-/// Contains reference metadata needed to compute coverage coordinates.
-/// Wrapped in Arc for thread-safe sharing.
-struct WorkerContext {
-    /// Reference sequence lengths: ref_name -> length
-    ref_lengths: Arc<HashMap<String, usize>>,
-
-    /// Per-assembly total length: asm_id -> sum(LN) over all @SQ
-    /// sharing this `asm`. Used to pre-compute the per-alignment
-    /// assembly length so the hot loop never has to re-lookup it.
-    asm_lengths: Arc<HashMap<String, f64>>,
-
-    /// Per-assembly full-index-equivalent support multiplier.
-    asm_sampling_scales: Arc<HashMap<String, f64>>,
-
-    /// Sparse sub-species → species normalization map. Raw taxids that
-    /// are below species rank map to their species ancestor; raw
-    /// taxids already at (or above) species rank are absent and the
-    /// worker falls back to the raw value.
-    species_normalize: Arc<HashMap<u32, u32>>,
-
-    /// Flexible chunk flank lengths per assembly: asm_id -> √(asm_length)
-    asm_flex_lengths: Arc<HashMap<String, usize>>,
-
-    /// Fixed flank length for chunk coverage (1000 for paired, 2000 for single)
-    fixed_flank_len: usize,
-
-    /// Whether input is paired-end (affects read name parsing)
-    is_paired: bool,
-}
-
-/// Intermediate result from parsing a single alignment line.
-///
-/// Separates the alignment entry (if valid) from metadata about whether
-/// to count this alignment in statistics.
-struct ParsedAlignment {
-    /// Read name (pair suffix stripped if paired-end)
-    read_name: String,
-
-    /// Parsed alignment entry, or None if unmapped/filtered
-    entry: Option<AlignmentEntry>,
-
-    /// Whether to count this toward alignment statistics
-    /// False for unmapped, secondary alignments, or mate-2 of pairs
-    count_alignment: bool,
-
-    /// `true` when the alignment was discarded because the reference name did
-    /// not parse into the expected `asm|_|species|acc|...` layout, or because
-    /// the assembly total length was unknown or zero.
-    skipped_reference: bool,
 }
 
 /// Coverage metrics aggregated at a terminal taxonomy endpoint.
@@ -602,26 +424,18 @@ impl CommunityProfiler {
     pub fn run(&self) -> Result<()> {
         log::info!(target: "PROFILER", "Initializing the profiler!");
 
-        // Load and parse alignment data. Normal Metax runs consume
-        // Metam's coordinate TSV directly; SAM/BAM remains supported for
-        // --reuse-sam compatibility.
-        let sam_data = if let Some(mappings) = self.cfg.mapper_mappings.as_deref() {
-            let db = self
-                .cfg
-                .db_metadata
-                .as_deref()
-                .ok_or_else(|| anyhow!("missing reference metadata for native mappings"))?;
-            self.load_metam(Path::new(mappings), db)?
-        } else {
-            let sam_path = Path::new(&self.cfg.sam);
-            if !sam_path.exists() {
-                bail!("SAM file {} does not exist", sam_path.display());
-            }
-            self.load_sam(sam_path)?
-        };
-
-        // Run profiling pipeline
-        self.profile(sam_data)
+        let mappings = self
+            .cfg
+            .mapper_mappings
+            .as_deref()
+            .ok_or_else(|| anyhow!("missing Metax mapping file"))?;
+        let db = self
+            .cfg
+            .db_metadata
+            .as_deref()
+            .ok_or_else(|| anyhow!("missing reference metadata for native mappings"))?;
+        let mapping_data = self.load_metam(Path::new(mappings), db)?;
+        self.profile(mapping_data)
     }
 
     pub fn run_with_metam_mappings(
@@ -635,8 +449,8 @@ impl CommunityProfiler {
             .db_metadata
             .as_deref()
             .ok_or_else(|| anyhow!("missing Metax database metadata for streamed mappings"))?;
-        let sam_data = self.load_metam_mappings(receiver, source, db)?;
-        self.profile(sam_data)
+        let mapping_data = self.load_metam_mappings(receiver, source, db)?;
+        self.profile(mapping_data)
     }
 
     fn load_metam_profile(&self, embedded: Option<MetamProfile>) -> Result<MetamProfile> {
@@ -649,7 +463,7 @@ impl CommunityProfiler {
         bail!("mapping file is missing embedded profile counters; rerun mapping with this Metax version")
     }
 
-    fn load_metam(&self, mappings_path: &Path, db: &DatabaseMetadata) -> Result<SamData> {
+    fn load_metam(&self, mappings_path: &Path, db: &DatabaseMetadata) -> Result<MappingData> {
         if !mappings_path.exists() {
             bail!(
                 "Metam mapping file {} does not exist",
@@ -665,7 +479,7 @@ impl CommunityProfiler {
         reader: R,
         source: &str,
         db: &DatabaseMetadata,
-    ) -> Result<SamData> {
+    ) -> Result<MappingData> {
         self.load_metam_records(source, db, |on_mapping| {
             for_each_metam_mapping_record(
                 reader,
@@ -681,13 +495,18 @@ impl CommunityProfiler {
         receiver: MetamMappingReceiver,
         source: &str,
         db: &DatabaseMetadata,
-    ) -> Result<SamData> {
+    ) -> Result<MappingData> {
         self.load_metam_records(source, db, |on_mapping| {
             for_each_structured_mapping_record(receiver, source, on_mapping)
         })
     }
 
-    fn load_metam_records<F>(&self, source: &str, db: &DatabaseMetadata, feed: F) -> Result<SamData>
+    fn load_metam_records<F>(
+        &self,
+        source: &str,
+        db: &DatabaseMetadata,
+        feed: F,
+    ) -> Result<MappingData>
     where
         F: FnOnce(
             &mut dyn for<'a> FnMut(MetamMappingRecord<'a>) -> Result<()>,
@@ -994,7 +813,7 @@ impl CommunityProfiler {
             },
         );
 
-        Ok(SamData {
+        Ok(MappingData {
             read_alignments,
             asm_lengths: Arc::new(asm_lengths_raw),
             min_breadth,
@@ -1077,252 +896,6 @@ impl CommunityProfiler {
         ))
     }
 
-    /// Load alignments from a SAM or BAM file.
-    ///
-    /// Automatically detects the file format (SAM/BAM) and handles
-    /// compression (gzip/xz for SAM files).
-    fn load_sam(&self, sam_path: &Path) -> Result<SamData> {
-        log::info!(target: "PROFILER", "Loading alignments ...");
-        match detect_alignment_format(sam_path)? {
-            AlignmentFormat::Sam => self.load_text_alignments(sam_path),
-            AlignmentFormat::Bam => self.load_bam_alignments(sam_path),
-        }
-    }
-
-    /// Load alignments from a text-based SAM file.
-    ///
-    /// Handles plain text SAM and compressed formats (gzip, xz).
-    /// Parses headers to extract reference sequence metadata.
-    ///
-    /// # SAM Header Processing
-    ///
-    /// @SQ lines are parsed to extract:
-    /// - SN: Reference sequence name (contains taxonomy info)
-    /// - LN: Reference sequence length
-    ///
-    /// Reference names are expected in format:
-    /// `asm_id|taxid|species_taxid|accession|genome_size[|sampled_size]`
-    fn load_text_alignments(&self, sam_path: &Path) -> Result<SamData> {
-        let reader = open_text_alignment_reader(sam_path)?;
-        let mut reader = BufReader::new(reader);
-
-        // Maps to store reference metadata from SAM header.
-        let mut ref_lengths: HashMap<String, usize> = HashMap::new();
-        let mut asm_lengths: HashMap<String, f64> = HashMap::new();
-        let mut asm_sampling_scales: HashMap<String, f64> = HashMap::new();
-        let mut species_taxids: HashSet<u32> = HashSet::new();
-        // Whether the first @SQ line's SN looks like a subsampled-DB entry
-        // (6 `|`-separated fields). Used later to suppress automatic
-        // low-map fallback and to choose the chunk-breadth basis for
-        // explicit `--genus-fallback`.
-        let mut db_is_subsampled: Option<bool> = None;
-
-        // Fixed flank length: shorter for paired-end (reads cover more area together)
-        let fixed_flank_len = if self.cfg.is_paired { 1000 } else { 2000 };
-        let mut first_alignment: Option<String> = None;
-        let mut line = String::new();
-
-        // Parse SAM header lines (start with @)
-        loop {
-            line.clear();
-            let bytes = reader.read_line(&mut line)?;
-            if bytes == 0 {
-                break;
-            }
-            let trimmed = line.trim_end();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if trimmed.starts_with('@') {
-                // Parse @SQ (sequence dictionary) lines for reference info
-                if trimmed.starts_with("@SQ") {
-                    let (sn, len) = parse_sam_sequence_record(trimmed)?;
-                    // Inspect ONLY the first @SQ line to decide whether
-                    // the run is against a subsampled reference DB.
-                    if db_is_subsampled.is_none() {
-                        db_is_subsampled = Some(ref_name_is_subsampled(&sn));
-                    }
-                    if ref_lengths.insert(sn.clone(), len).is_some() {
-                        bail!("SAM header contains duplicate reference name '{}'", sn);
-                    }
-
-                    // Parse reference name to extract assembly ID
-                    let parts: Vec<&str> = sn.split('|').collect();
-                    let asm = parts.first().copied().unwrap_or(&sn).to_string();
-                    record_genome_sampling_scale(
-                        &mut asm_sampling_scales,
-                        &asm,
-                        sampling_scale_from_name_parts(&parts),
-                    )?;
-
-                    // Accumulate total assembly length
-                    *asm_lengths.entry(asm).or_insert(0.0) += len as f64;
-
-                    // Collect species taxid (third field) for genus lookup.
-                    if let Some(species_taxid) =
-                        parts.get(2).and_then(|s| s.parse::<u32>().ok())
-                    {
-                        species_taxids.insert(species_taxid);
-                    }
-                }
-                continue;
-            } else {
-                // First alignment line found - save and exit header parsing
-                first_alignment = Some(trimmed.to_string());
-                break;
-            }
-        }
-        require_alignment_reference_dictionary(sam_path, ref_lengths.len())?;
-
-        // Calculate flexible chunk lengths as √(assembly_length)
-        // This scales coverage checking with genome size
-        let asm_flex_lengths: HashMap<String, usize> = asm_lengths
-            .iter()
-            .map(|(asm, len)| {
-                let flex = len.sqrt().round() as usize;
-                (asm.clone(), flex.max(1))
-            })
-            .collect();
-
-        // Precompute taxonomy lookups from the lineage. The species
-        // normalization map is ALWAYS built (it applies regardless of
-        // fallback mode -- sub-species still need to be merged into
-        // species). The species->genus map is needed for normal databases
-        // and for explicit `--genus-fallback` on subsampled databases.
-        // Built BEFORE `WorkerContext` so the worker can pre-normalize
-        // species taxids during parse and skip an extra HashMap lookup
-        // per alignment in the hot loop.
-        let db_is_subsampled = db_is_subsampled.unwrap_or(false);
-        let (species_normalize, species_to_genus) = self.build_taxonomy_lookups(&species_taxids);
-        let species_normalize = Arc::new(species_normalize);
-        let species_to_genus = Arc::new(if db_is_subsampled && !self.cfg.genus_fallback {
-            HashMap::new()
-        } else {
-            species_to_genus
-        });
-        let asm_lengths = Arc::new(asm_lengths);
-        let has_scaled_genomes = asm_sampling_scales.values().any(|scale| *scale > 1.0);
-
-        // Create shared context for worker threads (now carries the
-        // pre-built taxonomy and assembly-length lookups).
-        let worker_context = Arc::new(WorkerContext {
-            ref_lengths: Arc::new(ref_lengths),
-            asm_lengths: Arc::clone(&asm_lengths),
-            asm_sampling_scales: Arc::new(asm_sampling_scales),
-            species_normalize: Arc::clone(&species_normalize),
-            asm_flex_lengths: Arc::new(asm_flex_lengths),
-            fixed_flank_len,
-            is_paired: self.cfg.is_paired,
-        });
-
-        // Process alignment records through the parallel pipeline
-        let iter = SamLineIter::new(reader);
-        self.consume_alignment_stream(
-            first_alignment,
-            iter,
-            worker_context,
-            asm_lengths,
-            species_to_genus,
-            db_is_subsampled,
-            has_scaled_genomes,
-        )
-    }
-
-    /// Load alignments from a binary BAM file.
-    ///
-    /// Uses rust-htslib for BAM parsing with optional multi-threaded
-    /// decompression. Converts BAM records to SAM format strings for
-    /// uniform processing.
-    fn load_bam_alignments(&self, sam_path: &Path) -> Result<SamData> {
-        let mut reader = bam::Reader::from_path(sam_path)
-            .with_context(|| format!("failed to open {}", sam_path.display()))?;
-        if self.cfg.threads > 1 {
-            if let Err(err) = reader.set_threads(self.cfg.threads) {
-                log::debug!(
-                    target: "PROFILER",
-                    "Unable to enable multi-threaded decoding: {}",
-                    err
-                );
-            }
-        }
-        let header_view = Rc::new(reader.header().clone());
-
-        let mut ref_lengths: HashMap<String, usize> = HashMap::new();
-        let mut asm_lengths: HashMap<String, f64> = HashMap::new();
-        let mut asm_sampling_scales: HashMap<String, f64> = HashMap::new();
-        let mut species_taxids: HashSet<u32> = HashSet::new();
-        // Decide whether the DB is subsampled from the very first target
-        // name (parallels the @SQ-first-line check used for text SAM).
-        let mut db_is_subsampled: Option<bool> = None;
-        for (idx, name_bytes) in header_view.target_names().iter().enumerate() {
-            let name = str::from_utf8(name_bytes)
-                .with_context(|| format!("invalid reference name at index {}", idx))?
-                .to_string();
-            if db_is_subsampled.is_none() {
-                db_is_subsampled = Some(ref_name_is_subsampled(&name));
-            }
-            let len = header_view.target_len(idx as u32).unwrap_or(0) as usize;
-            ref_lengths.insert(name.clone(), len);
-            let parts: Vec<&str> = name.split('|').collect();
-            let asm = parts.first().copied().unwrap_or(&name).to_string();
-            record_genome_sampling_scale(
-                &mut asm_sampling_scales,
-                &asm,
-                sampling_scale_from_name_parts(&parts),
-            )?;
-            *asm_lengths.entry(asm).or_insert(0.0) += len as f64;
-            if let Some(species_taxid) = parts.get(2).and_then(|s| s.parse::<u32>().ok()) {
-                species_taxids.insert(species_taxid);
-            }
-        }
-        require_alignment_reference_dictionary(sam_path, ref_lengths.len())?;
-
-        let asm_flex_lengths: HashMap<String, usize> = asm_lengths
-            .iter()
-            .map(|(asm, len)| {
-                let flex = len.sqrt().round() as usize;
-                (asm.clone(), flex.max(1))
-            })
-            .collect();
-
-        // Precompute both the species-normalization map (always needed)
-        // and the species->genus lookup. For subsampled DBs the automatic
-        // low-map fallback remains disabled, but explicit `--genus-fallback`
-        // is allowed and therefore still needs the genus map. Built BEFORE
-        // `WorkerContext` so the worker can pre-normalize.
-        let db_is_subsampled = db_is_subsampled.unwrap_or(false);
-        let (species_normalize, species_to_genus) = self.build_taxonomy_lookups(&species_taxids);
-        let species_normalize = Arc::new(species_normalize);
-        let species_to_genus = Arc::new(if db_is_subsampled && !self.cfg.genus_fallback {
-            HashMap::new()
-        } else {
-            species_to_genus
-        });
-        let asm_lengths = Arc::new(asm_lengths);
-        let has_scaled_genomes = asm_sampling_scales.values().any(|scale| *scale > 1.0);
-
-        let worker_context = Arc::new(WorkerContext {
-            ref_lengths: Arc::new(ref_lengths),
-            asm_lengths: Arc::clone(&asm_lengths),
-            asm_sampling_scales: Arc::new(asm_sampling_scales),
-            species_normalize: Arc::clone(&species_normalize),
-            asm_flex_lengths: Arc::new(asm_flex_lengths),
-            fixed_flank_len: if self.cfg.is_paired { 1000 } else { 2000 },
-            is_paired: self.cfg.is_paired,
-        });
-
-        let iter = BamRecordIter::new(reader, header_view);
-        self.consume_alignment_stream(
-            None,
-            iter,
-            worker_context,
-            asm_lengths,
-            species_to_genus,
-            db_is_subsampled,
-            has_scaled_genomes,
-        )
-    }
-
     /// Precompute taxonomy lookups used during per-read assignment.
     ///
     /// Given the set of raw taxids observed in the SAM/BAM @SQ headers
@@ -1372,420 +945,6 @@ impl CommunityProfiler {
         (species_normalize, species_to_genus)
     }
 
-    /// Process alignment records through a parallel worker pipeline.
-    ///
-    /// This is the main alignment processing function that:
-    /// 1. Spawns worker threads to parse alignment lines in parallel
-    /// 2. Dispatches batches of lines to workers via channels
-    /// 3. Collects results and aggregates read alignments
-    /// 4. Computes coverage statistics and filtering thresholds
-    ///
-    /// # Architecture
-    ///
-    /// ```text
-    /// Main Thread              Worker Threads
-    ///     |                         |
-    ///     |--[batch]--------------->| parse_alignment_line()
-    ///     |<--[WorkerResult]--------|
-    ///     |                         |
-    ///     v                         v
-    /// Aggregation              Next batch
-    /// ```
-    ///
-    /// # Arguments
-    /// * `first_record` - First alignment line (already read during header parsing)
-    /// * `iter` - Iterator over remaining alignment lines
-    /// * `worker_context` - Shared reference metadata for workers
-    /// * `asm_lengths` - Total assembly lengths (for coverage normalization)
-    fn consume_alignment_stream<I>(
-        &self,
-        first_record: Option<String>,
-        iter: I,
-        worker_context: Arc<WorkerContext>,
-        asm_lengths: Arc<HashMap<String, f64>>,
-        species_to_genus: Arc<HashMap<u32, u32>>,
-        db_is_subsampled: bool,
-        has_scaled_genomes: bool,
-    ) -> Result<SamData>
-    where
-        I: Iterator<Item = Result<String>>,
-    {
-        let worker_count = self.cfg.threads.max(1);
-        let batch_size = self.cfg.batch_size.max(1);
-
-        // Create channels for work distribution and result collection
-        // bounded channel with 2x workers prevents memory bloat
-        let (line_tx, line_rx) = bounded::<Vec<String>>(worker_count * 2);
-        let (result_tx, result_rx) = unbounded::<WorkerResult>();
-
-        // Spawn worker threads
-        let mut handles = Vec::new();
-        for _ in 0..worker_count {
-            let rx = line_rx.clone();
-            let tx = result_tx.clone();
-            let ctx = Arc::clone(&worker_context);
-
-            handles.push(thread::spawn(move || {
-                // Process batches until channel closes
-                for chunk in rx.iter() {
-                    let chunk_len = chunk.len();
-                    let mut reads_seen: Vec<String> = Vec::with_capacity(chunk_len);
-                    let mut alignments: Vec<(String, AlignmentEntry)> =
-                        Vec::with_capacity(chunk_len);
-                    let mut alignments_seen = 0usize;
-                    let mut skipped_reference = 0usize;
-
-                    // Parse each alignment line in the batch
-                    for line in chunk {
-                        if let Some(parsed) = parse_alignment_line(&line, &ctx) {
-                            let ParsedAlignment {
-                                read_name,
-                                entry,
-                                count_alignment,
-                                skipped_reference: was_skipped_ref,
-                            } = parsed;
-
-                            if count_alignment {
-                                alignments_seen += 1;
-                            }
-                            if was_skipped_ref {
-                                skipped_reference += 1;
-                            }
-                            // For rows that produced a kept alignment,
-                            // the `read_name` is already carried as the
-                            // key of the alignment tuple — it will
-                            // therefore surface in `read_map.keys()` on
-                            // the main thread, so we skip pushing it
-                            // into `reads_seen` to avoid one `String`
-                            // clone per kept alignment. Unmapped /
-                            // discarded rows still push into
-                            // `reads_seen` (consuming the `String`, no
-                            // clone) so the main thread can count them
-                            // toward the total-read denominator.
-                            match entry {
-                                Some(aln) => {
-                                    alignments.push((read_name, aln));
-                                }
-                                None => {
-                                    reads_seen.push(read_name);
-                                }
-                            }
-                        }
-                    }
-
-                    // Send results back to main thread
-                    if (!reads_seen.is_empty() || alignments_seen > 0 || skipped_reference > 0)
-                        && tx
-                            .send(WorkerResult {
-                                alignments,
-                                reads_seen,
-                                alignments_seen,
-                                skipped_reference,
-                            })
-                            .is_err()
-                    {
-                        break;
-                    }
-                }
-            }));
-        }
-        // Drop our copy of result_tx so channel closes when workers finish
-        drop(result_tx);
-        // Only worker-held receivers may keep the work channel connected. If
-        // every worker panics, the next send now fails instead of blocking on
-        // this unused receiver forever.
-        drop(line_rx);
-
-        // Main-thread aggregation: one `.entry()` per alignment on
-        // `read_map`, one `.insert()` per unmapped/discarded row on
-        // `all_reads` (aligned rows carry `read_name` only via
-        // `read_map`; see end-of-stream read-count reconciliation).
-        let mut read_map: StableReadMap<AlignmentEntry> = StableReadMap::default();
-        let mut all_reads: HashSet<String> = HashSet::new();
-        let mut num_alignments: usize = 0;
-        let mut num_skipped_reference: usize = 0;
-        let mut next_progress: usize = 1_000_000;
-
-        let mut chunk: Vec<String> = Vec::with_capacity(batch_size);
-        if let Some(first) = first_record {
-            if !first.is_empty() {
-                chunk.push(first);
-            }
-        }
-
-        for line in iter {
-            let record = line?;
-            if record.is_empty() {
-                continue;
-            }
-            chunk.push(record);
-            if chunk.len() >= batch_size {
-                line_tx
-                    .send(chunk)
-                    .map_err(|e| anyhow!("failed to dispatch SAM chunk: {}", e))?;
-                chunk = Vec::with_capacity(batch_size);
-            }
-            while let Ok(result) = result_rx.try_recv() {
-                absorb_worker_result(
-                    result,
-                    &mut read_map,
-                    &mut all_reads,
-                    &mut num_alignments,
-                    &mut num_skipped_reference,
-                    &mut next_progress,
-                );
-            }
-        }
-
-        if !chunk.is_empty() {
-            line_tx
-                .send(chunk)
-                .map_err(|e| anyhow!("failed to dispatch final SAM chunk: {}", e))?;
-        }
-        drop(line_tx);
-
-        for result in result_rx.iter() {
-            absorb_worker_result(
-                result,
-                &mut read_map,
-                &mut all_reads,
-                &mut num_alignments,
-                &mut num_skipped_reference,
-                &mut next_progress,
-            );
-        }
-
-        for handle in handles {
-            join_alignment_worker(handle, "community SAM parsing worker")?;
-        }
-        if num_skipped_reference > 0 {
-            bail!(
-                "SAM contains {} mapped record(s) with a reference absent from @SQ or incompatible reference metadata",
-                num_skipped_reference
-            );
-        }
-
-        // Total distinct reads = (unmapped/discarded rows tracked in
-        // `all_reads`) ∪ (rows with at least one kept alignment, which
-        // live in `read_map` as the sole copy of their `read_name`).
-        // Workers skip pushing aligned names into `reads_seen` to save
-        // one `String` clone per alignment, so we count the aligned
-        // reads that are **not already** in `all_reads` here. A read
-        // with both mapped and unmapped rows is correctly counted
-        // once because it's present in `all_reads`.
-        let aligned_unique_not_in_all_reads = read_map
-            .keys()
-            .filter(|k| !all_reads.contains(k.as_str()))
-            .count();
-        let num_reads = all_reads.len() + aligned_unique_not_in_all_reads;
-        let aligned_reads = read_map.len();
-        let mapped_unit = if self.cfg.is_paired {
-            "fragments"
-        } else {
-            "reads"
-        };
-        let read_alignments = read_map
-            .into_iter()
-            .map(|(read_name, alignments)| ReadBundle {
-                read_name: Arc::<str>::from(read_name),
-                alignments,
-            })
-            .collect::<Vec<_>>();
-        // Mapping rate must be computed before the chunk-breadth basis can
-        // be auto-selected, since the auto-rule consults it.
-        let mapping_rate = if num_reads == 0 {
-            0.0
-        } else {
-            aligned_reads as f64 / num_reads as f64
-        };
-        let gate_active = fallback_gate_active(&self.cfg, mapping_rate);
-        let fallback_mode = genus_fallback_mode_active(&self.cfg, gate_active, db_is_subsampled);
-        let chunk_plan = plan_chunk_breadth(
-            &self.cfg,
-            mapping_rate,
-            num_reads,
-            aligned_reads,
-            db_is_subsampled,
-            gate_active,
-        );
-        let min_breadth = self.cfg.breadth.unwrap_or(0.0);
-        let chunk_thresholds =
-            resolve_community_chunk_breadth(&self.cfg, chunk_plan.estimate_reads);
-        let min_chunk_breadth_value = chunk_thresholds.standard;
-        let chunk_breadth_source =
-            community_chunk_breadth_source(&self.cfg, chunk_plan, chunk_thresholds);
-
-        if self.cfg.verbose || self.cfg.very_verbose {
-            const INDENT: &str = "                                                ";
-            log::info!(
-                target: "PROFILER",
-                "Profiler parameters:\n{}min_breadth        {}\n{}min_chunk_breadth  {}\n{}min_reads          {}\n{}min_oebr           {}\n{}min_coebr          {}\n{}identity           {}\n{}mapped_len   {}\n{}fraction           {}\n{}batch_size         {}\n",
-                INDENT,
-                min_breadth,
-                INDENT,
-                min_chunk_breadth_value,
-                INDENT,
-                self.cfg
-                    .min_reads
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "None".to_string()),
-                INDENT,
-                self.cfg
-                    .min_oebr
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "None".to_string()),
-                INDENT,
-                self.cfg
-                    .min_coebr
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "None".to_string()),
-                INDENT,
-                self.cfg.identity,
-                INDENT,
-                self.cfg.mapped_len,
-                INDENT,
-                self.cfg.fraction,
-                INDENT,
-                self.cfg.batch_size,
-            );
-
-            log::info!(target: "PROFILER", "Total number of reads: {}", num_reads);
-            log::info!(target: "PROFILER", "Number of mapping records: {}", num_alignments);
-            log::info!(
-                target: "PROFILER",
-                "Number of mapped {}: {}",
-                mapped_unit,
-                aligned_reads
-            );
-            if self.cfg.chunk_breadth.is_some() {
-                log::info!(
-                    target: "PROFILER",
-                    "Minimum chunk breadth supplied by user; read-count basis not used for estimation."
-                );
-            } else if self.cfg.lowbiomass {
-                log::info!(
-                    target: "PROFILER",
-                    "Automatic minimum chunk breadth filter disabled by --low-biomass."
-                );
-            } else {
-                // Log the unscaled basis selected for the chunk-breadth curve.
-                // Any optional 1.5x boost is logged separately below.
-                if !chunk_plan.use_aligned_basis {
-                    log::info!(
-                        target: "PROFILER",
-                        "Minimum chunk breadth estimated from total reads ({}).",
-                        num_reads
-                    );
-                    if chunk_plan.force_total_for_subsampled_fallback {
-                        log::info!(
-                            target: "PROFILER",
-                            "--genus-fallback with a subsampled reference DB: chunk-breadth estimate uses total read count."
-                        );
-                    }
-                } else if chunk_plan.by_aligned_auto {
-                    log::info!(
-                        target: "PROFILER",
-                        "Minimum chunk breadth estimated from mapped {} ({}) [auto-forced: low-map Illumina run, mapping_rate {:.5} < {:.5}].",
-                        mapped_unit,
-                        aligned_reads,
-                        mapping_rate,
-                        self.cfg.low_map_rate_threshold
-                    );
-                } else {
-                    log::info!(
-                        target: "PROFILER",
-                        "Minimum chunk breadth estimated from mapped {} ({}).",
-                        mapped_unit,
-                        aligned_reads
-                    );
-                }
-                if chunk_plan.scaled {
-                    log::info!(
-                        target: "PROFILER",
-                        "Low-map genus fallback active and --min-chunk-breadth not set: mapped-read chunk basis scaled by {:.2}x ({} -> {}) before applying the chunk-breadth equation.",
-                        FALLBACK_CHUNK_BASIS_SCALE,
-                        chunk_plan.basis_reads,
-                        chunk_plan.estimate_reads,
-                    );
-                }
-            }
-        }
-        log_chunk_breadth_scaling(chunk_thresholds);
-
-        if self.cfg.verbose || self.cfg.very_verbose {
-            log::info!(
-                target: "PROFILER",
-                "Mapping rate: {:.5} (mapped {} / total {})",
-                mapping_rate,
-                aligned_reads,
-                num_reads
-            );
-            if fallback_mode {
-                if gate_active && !db_is_subsampled {
-                    log::info!(
-                        target: "PROFILER",
-                        "Genus-level fallback mode ENABLED (low-map Illumina, host=None, mapping_rate {:.5} < {:.5}; genus_identity={:.3}).",
-                        mapping_rate,
-                        self.cfg.low_map_rate_threshold,
-                        self.cfg.genus_identity,
-                    );
-                } else if self.cfg.genus_fallback && db_is_subsampled {
-                    log::info!(
-                        target: "PROFILER",
-                        "Genus-level fallback mode ENABLED (--genus-fallback on subsampled reference DB; genus_identity={:.3}).",
-                        self.cfg.genus_identity,
-                    );
-                } else {
-                    log::info!(
-                        target: "PROFILER",
-                        "Genus-level fallback mode ENABLED (--genus-fallback; genus_identity={:.3}).",
-                        self.cfg.genus_identity,
-                    );
-                }
-            } else if gate_active && db_is_subsampled {
-                // The automatic low-map assignment path would have been on,
-                // but a subsampled reference database suppresses the
-                // automatic fallback. An explicit --genus-fallback still
-                // enables the assignment path.
-                log::info!(
-                    target: "PROFILER",
-                    "Automatic low-map genus fallback mode DISABLED: reference database appears to be subsampled (first @SQ name has 6 `|`-separated fields)."
-                );
-            }
-        }
-        log_resolved_profiler_parameters(
-            &self.cfg,
-            ResolvedProfilerParameters {
-                min_breadth,
-                min_chunk_breadth: min_chunk_breadth_value,
-                chunk_breadth_source,
-                chunk_breadth_basis_reads: chunk_plan.estimate_reads,
-                total_reads: num_reads,
-                mapped_reads: aligned_reads,
-                mapping_rate,
-            },
-        );
-
-        Ok(SamData {
-            read_alignments,
-            asm_lengths,
-            min_breadth,
-            min_chunk_breadth: min_chunk_breadth_value,
-            safeguard_min_chunk_breadth: chunk_thresholds.safeguard,
-            has_scaled_genomes,
-            total_reads: num_reads,
-            aligned_reads,
-            mapping_rate,
-            fallback_mode,
-            species_to_genus,
-            terminal_ranks: Arc::new(HashMap::new()),
-            skipped_reference_at_load: num_skipped_reference,
-            evidence_policy: None,
-            marker_model: None,
-            species_next_to_markers: HashSet::new(),
-        })
-    }
-
     /// Run the main profiling algorithm on loaded alignment data.
     ///
     /// Steps:
@@ -1794,8 +953,8 @@ impl CommunityProfiler {
     /// 3. Resolve ambiguous multi-mapping reads with EM
     /// 4. Filter taxa based on coverage statistics
     /// 5. Write output files
-    fn profile(&self, mut sam_data: SamData) -> Result<()> {
-        let SamData {
+    fn profile(&self, mut mapping_data: MappingData) -> Result<()> {
+        let MappingData {
             read_alignments,
             fallback_mode,
             species_to_genus,
@@ -1805,7 +964,7 @@ impl CommunityProfiler {
             skipped_reference_at_load,
             evidence_policy,
             ..
-        } = &sam_data;
+        } = &mapping_data;
         let verbose_logging = self.cfg.verbose || self.cfg.very_verbose;
         if verbose_logging {
             log::info!(
@@ -1855,7 +1014,7 @@ impl CommunityProfiler {
         // Release the dominant all-mappings buffer before coverage reduction
         // and output construction so mapper/profiler peak RSS does not carry
         // both representations at once.
-        drop(std::mem::take(&mut sam_data.read_alignments));
+        drop(std::mem::take(&mut mapping_data.read_alignments));
         if verbose_logging {
             log::info!(
                 target: "PROFILER",
@@ -1868,7 +1027,7 @@ impl CommunityProfiler {
                 "Profiling taxonomy abundance ..."
             );
         }
-        let final_classified = self.write_outputs(sam_data, assignment)?;
+        let final_classified = self.write_outputs(mapping_data, assignment)?;
         log::info!(
             target: "PROFILER",
             "Number of {} assigned to retained taxa: {}",
@@ -2043,8 +1202,12 @@ impl CommunityProfiler {
     /// # Returns
     ///
     /// Number of taxonomically classified reads
-    fn write_outputs(&self, sam_data: SamData, mut assignment: AssignmentResult) -> Result<usize> {
-        let SamData {
+    fn write_outputs(
+        &self,
+        mapping_data: MappingData,
+        mut assignment: AssignmentResult,
+    ) -> Result<usize> {
+        let MappingData {
             asm_lengths,
             min_breadth,
             min_chunk_breadth,
@@ -2055,7 +1218,7 @@ impl CommunityProfiler {
             marker_model,
             species_next_to_markers,
             ..
-        } = sam_data;
+        } = mapping_data;
         let verbose_logging = self.cfg.verbose || self.cfg.very_verbose;
         // Majority-LCA rows are evaluated later than native coordinate
         // witnesses. Resolve the same platform mode here so their default
@@ -4279,232 +3442,6 @@ fn commit_assignment(
     });
 }
 
-/// Absorb results from a worker thread into the main aggregation structures.
-///
-/// Called by the main thread to integrate worker results:
-/// - Adds alignments to the read_map (keyed by read name)
-/// - Records all seen reads in all_reads set
-/// - Updates alignment count and logs progress
-///
-/// # Arguments
-/// * `result` - Worker result to absorb
-/// * `read_map` - Main map of read_name -> alignments
-/// * `all_reads` - Set of all read names seen
-/// * `num_alignments` - Running count of alignments
-/// * `num_skipped_reference` - Running count of alignments discarded at
-///   parse time because their reference name did not carry a parsable
-///   species taxid or assembly length
-/// * `next_progress` - Next milestone for progress logging
-fn absorb_worker_result(
-    result: WorkerResult,
-    read_map: &mut StableReadMap<AlignmentEntry>,
-    all_reads: &mut HashSet<String>,
-    num_alignments: &mut usize,
-    num_skipped_reference: &mut usize,
-    next_progress: &mut usize,
-) {
-    all_reads.extend(result.reads_seen);
-    for (read, entry) in result.alignments {
-        read_map.entry(read).or_default().push(entry);
-    }
-    *num_skipped_reference += result.skipped_reference;
-    if result.alignments_seen > 0 {
-        *num_alignments += result.alignments_seen;
-        while *num_alignments >= *next_progress {
-            log::info!(
-                target: "PROFILER",
-                "{} alignments processed",
-                *num_alignments
-            );
-            *next_progress += 1_000_000;
-        }
-    }
-}
-
-/// Parse a single SAM alignment line into structured data.
-///
-/// Extracts key fields from the tab-delimited SAM format:
-/// - Read name (with optional pair suffix stripping)
-/// - Reference name (contains taxonomy info)
-/// - Position and CIGAR string
-/// - Alignment coordinates and chunk intervals
-///
-/// # SAM Fields Used
-/// 1. QNAME - Read name
-/// 2. FLAG - Bitwise flags (paired, unmapped, etc.)
-/// 3. RNAME - Reference name
-/// 4. POS - 1-based leftmost position
-/// 6. CIGAR - Alignment operations
-/// 7. RNEXT - Mate reference ("=" if same)
-/// 8. PNEXT - Mate position
-/// 10. SEQ - Read sequence
-///
-/// # Returns
-///
-/// ParsedAlignment with read name and optional AlignmentEntry
-/// Returns None if the line is malformed
-fn parse_alignment_line(line: &str, ctx: &WorkerContext) -> Option<ParsedAlignment> {
-    let mut iter = line.split('\t');
-    let read_name_raw = iter.next()?.trim();
-    let flag = iter
-        .next()
-        .and_then(|field| field.parse::<u16>().ok())
-        .unwrap_or(0);
-    if (flag & 0x200) != 0 {
-        return None;
-    }
-    let ref_name = iter.next()?.trim();
-    let start_pos = iter
-        .next()
-        .and_then(|field| field.parse::<isize>().ok())
-        .unwrap_or(1)
-        .max(1) as usize;
-    let _mapq = iter.next();
-    let cigar = iter.next()?.trim();
-    let rnext = iter.next().unwrap_or("*").trim();
-    let pnext = iter
-        .next()
-        .and_then(|field| field.parse::<isize>().ok())
-        .unwrap_or(0)
-        .max(1) as usize;
-    let _tlen = iter.next();
-    let read_seq = iter.next().unwrap_or("");
-    let _qual = iter.next();
-
-    let read_name = if ctx.is_paired {
-        read_name_raw
-            .rsplit_once('/')
-            .map(|(base, _)| base.to_string())
-            .unwrap_or_else(|| read_name_raw.to_string())
-    } else {
-        read_name_raw.to_string()
-    };
-
-    // Helper to short-circuit with "record seen but not kept".
-    let discard = |reason_skipped: bool, count_alignment: bool| ParsedAlignment {
-        read_name: read_name.clone(),
-        entry: None,
-        count_alignment,
-        skipped_reference: reason_skipped,
-    };
-
-    if ref_name == "*" || cigar == "*" {
-        return Some(discard(false, false));
-    }
-    if ctx.is_paired && rnext != "=" {
-        return Some(discard(false, false));
-    }
-
-    let ref_len = match ctx.ref_lengths.get(ref_name) {
-        Some(len) => *len,
-        None => return Some(discard(true, false)),
-    };
-    if ref_len == 0 {
-        return Some(discard(true, false));
-    }
-
-    let mapped_len = read_seq.len();
-    if mapped_len == 0 {
-        return Some(discard(false, false));
-    }
-
-    // Parse the reference-name taxonomy fields once up front. Parse failures
-    // are reported through `ParsedAlignment::skipped_reference`.
-    let mut ref_parts = ref_name.split('|');
-    let asm_str = match ref_parts.next() {
-        Some(v) if !v.is_empty() => v,
-        _ => return Some(discard(true, false)),
-    };
-    let _asm_taxid = ref_parts.next();
-    let raw_species_taxid = match ref_parts.next().and_then(|s| s.parse::<u32>().ok()) {
-        Some(v) => v,
-        None => return Some(discard(true, false)),
-    };
-    let species_taxid = ctx
-        .species_normalize
-        .get(&raw_species_taxid)
-        .copied()
-        .unwrap_or(raw_species_taxid);
-    let acc_str = ref_parts.next().unwrap_or("");
-
-    let asm_len = match ctx.asm_lengths.get(asm_str) {
-        Some(len) if *len > 0.0 => *len,
-        _ => return Some(discard(true, false)),
-    };
-    let sampling_scale = ctx.asm_sampling_scales.get(asm_str).copied().unwrap_or(1.0) as f32;
-
-    // Pre-compute identity / fraction once per alignment — `process_batch`
-    // just reads these as f64s instead of re-scanning the CIGAR string.
-    let (identity, _matched_len, fraction) = cigar_to_identity(cigar);
-
-    let flex_len = ctx
-        .asm_flex_lengths
-        .get(asm_str)
-        .copied()
-        .unwrap_or(ctx.fixed_flank_len);
-
-    let pair_start = if ctx.is_paired {
-        start_pos.min(pnext)
-    } else {
-        start_pos
-    };
-    let mut start = pair_start.min(ref_len.max(1));
-    if start == 0 {
-        start = 1;
-    }
-    let ref_end = ref_len.saturating_add(1);
-    let mut end = start.saturating_add(mapped_len);
-    if end > ref_end {
-        end = ref_end;
-    }
-    let midpoint = start + ((end.saturating_sub(start)) / 2);
-    let fixed_chunk_start = start.saturating_sub(ctx.fixed_flank_len).max(1);
-    let fixed_chunk_end = end.saturating_add(ctx.fixed_flank_len).min(ref_end);
-    let flex_chunk_start = midpoint.saturating_sub(flex_len).max(1);
-    let flex_chunk_end = midpoint.saturating_add(flex_len).min(ref_end);
-
-    let entry = AlignmentEntry {
-        asm: Arc::<str>::from(asm_str),
-        acc: Arc::<str>::from(acc_str),
-        profile_taxid: species_taxid,
-        profile_rank: ProfileRank::Species,
-        reference_id: u32::MAX,
-        assembly_id: u32::MAX,
-        role: MappingRole::Unpaired,
-        pair_id: 0,
-        candidate_boundary: metam::mapper::CandidateBoundary::COMPLETE,
-        sampling_scale,
-        asm_len,
-        identity: identity as f32,
-        fraction: fraction as f32,
-        mapped_len: clamp_u32(mapped_len),
-        span: (clamp_u32(start), clamp_u32(end)),
-        fixed_chunk: (clamp_u32(fixed_chunk_start), clamp_u32(fixed_chunk_end)),
-        flex_chunk: (clamp_u32(flex_chunk_start), clamp_u32(flex_chunk_end)),
-    };
-    let mut count_alignment = true;
-    if ctx.is_paired {
-        if (flag & 0x4) != 0 {
-            count_alignment = false;
-        }
-        if (flag & 0x40) == 0 {
-            return Some(ParsedAlignment {
-                read_name,
-                entry: None,
-                count_alignment,
-                skipped_reference: false,
-            });
-        }
-    }
-
-    Some(ParsedAlignment {
-        read_name,
-        entry: Some(entry),
-        count_alignment,
-        skipped_reference: false,
-    })
-}
-
 /// Merge overlapping genomic intervals.
 ///
 /// Takes a list of (start, end) coordinate pairs and returns a list
@@ -4816,11 +3753,6 @@ fn fallback_scale_chunk_basis(chunk_basis_reads: usize, scale: bool) -> usize {
     } else {
         chunk_basis_reads
     }
-}
-
-/// Return `true` when a reference name has the subsampled-DB header layout.
-fn ref_name_is_subsampled(sn: &str) -> bool {
-    sn.split('|').count() == 6
 }
 
 /// Derive the genus taxid for a species taxid using the NCBI taxonomy
@@ -5527,7 +4459,7 @@ fn write_community_classifications(
 /// Aggregated data from SAM file loading.
 ///
 /// Contains all information needed for the profiling phase.
-struct SamData {
+struct MappingData {
     /// Per-read alignment bundles
     read_alignments: Vec<ReadBundle>,
 
@@ -5594,157 +4526,6 @@ struct SamData {
     species_next_to_markers: HashSet<u32>,
 }
 
-/// Convert a BAM record to SAM format string.
-///
-/// Reconstructs the SAM line format from BAM binary representation.
-/// Preserves CIGAR operations including '=' and 'X' that are needed
-/// for identity calculation.
-fn bam_record_to_sam_line(record: &Record, header: &bam::HeaderView) -> Result<String> {
-    let qname =
-        str::from_utf8(record.qname()).with_context(|| "invalid read name in BAM record")?;
-    let flag = record.flags();
-
-    let rname = if record.tid() >= 0 {
-        let name_bytes = header.tid2name(record.tid() as u32);
-        str::from_utf8(name_bytes)
-            .with_context(|| format!("invalid reference name for tid {}", record.tid()))?
-            .to_string()
-    } else {
-        "*".to_string()
-    };
-
-    let pos = if record.pos() >= 0 {
-        record.pos() + 1
-    } else {
-        0
-    };
-    let mapq = record.mapq();
-    let cigar = if record.cigar().is_empty() {
-        "*".to_string()
-    } else {
-        // rust-htslib preserves '=' and 'X' operators when stringifying BAM CIGARs,
-        // ensuring we retain the match/mismatch split expected by the profiler.
-        record.cigar().to_string()
-    };
-
-    let rnext = if record.mtid() < 0 {
-        "*".to_string()
-    } else if record.mtid() == record.tid() {
-        "=".to_string()
-    } else {
-        let mate_bytes = header.tid2name(record.mtid() as u32);
-        str::from_utf8(mate_bytes)
-            .with_context(|| format!("invalid mate reference name for tid {}", record.mtid()))?
-            .to_string()
-    };
-
-    let pnext = if record.mpos() >= 0 {
-        record.mpos() + 1
-    } else {
-        0
-    };
-    let tlen = record.insert_size();
-
-    let seq = String::from_utf8(record.seq().as_bytes())
-        .with_context(|| format!("invalid sequence for read {}", qname))?;
-    let qual = if record.qual().is_empty() {
-        "*".to_string()
-    } else {
-        record
-            .qual()
-            .iter()
-            .map(|&q| (q + 33) as char)
-            .collect::<String>()
-    };
-
-    Ok(format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        qname, flag, rname, pos, mapq, cigar, rnext, pnext, tlen, seq, qual
-    ))
-}
-
-/// Report that CRAM format is unsupported and return error.
-///
-/// CRAM files normalize CIGAR strings, collapsing '=' and 'X' operations
-/// into 'M', which prevents accurate identity calculation.
-fn unsupported_cram(path: &Path) -> Result<AlignmentFormat> {
-    log::warn!(
-        target: "PROFILER",
-        "CRAM input {} is unsupported because CRAM CIGAR records collapse '=' and 'X' operations, preventing faithful coverage accounting.",
-        path.display()
-    );
-    bail!("CRAM inputs cannot preserve match/mismatch operations");
-}
-
-/// Detect alignment file format from filename and magic bytes.
-///
-/// Checks:
-/// 1. File extension (.sam, .bam, .cram, .sam.gz, .sam.xz)
-/// 2. Magic bytes at file start (BAM\x01, CRAM)
-///
-/// CRAM files are rejected as they don't preserve match/mismatch info.
-fn detect_alignment_format(path: &Path) -> Result<AlignmentFormat> {
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        let lower = name.to_ascii_lowercase();
-        if lower.ends_with(".sam") || lower.ends_with(".sam.gz") || lower.ends_with(".sam.xz") {
-            return Ok(AlignmentFormat::Sam);
-        }
-        if lower.ends_with(".bam") {
-            return Ok(AlignmentFormat::Bam);
-        }
-        if lower.ends_with(".cram") {
-            return unsupported_cram(path);
-        }
-    }
-
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        match ext.to_ascii_lowercase().as_str() {
-            "sam" => return Ok(AlignmentFormat::Sam),
-            "bam" => return Ok(AlignmentFormat::Bam),
-            "cram" => {
-                return unsupported_cram(path);
-            }
-            _ => {}
-        }
-    }
-
-    let mut file = File::open(path)
-        .with_context(|| format!("failed to open {} for format detection", path.display()))?;
-    let mut magic = [0u8; 4];
-    let read = file.read(&mut magic)?;
-    if read == 4 {
-        if &magic == b"BAM\x01" {
-            return Ok(AlignmentFormat::Bam);
-        }
-        if &magic == b"CRAM" {
-            return unsupported_cram(path);
-        }
-    }
-
-    Ok(AlignmentFormat::Sam)
-}
-
-/// Open a text-based alignment file, handling compression.
-///
-/// Detects and handles:
-/// - Plain text SAM
-/// - Gzip-compressed SAM (.sam.gz, magic bytes 1f 8b)
-/// - XZ-compressed SAM (.sam.xz, magic bytes fd 37 7a 58 5a 00)
-fn open_text_alignment_reader(path: &Path) -> Result<Box<dyn Read>> {
-    let mut file =
-        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut magic = [0u8; 6];
-    let read = file.read(&mut magic)?;
-    file.seek(SeekFrom::Start(0))?;
-    if read >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
-        return Ok(Box::new(MultiGzDecoder::new(file)));
-    }
-    if read >= 6 && magic.starts_with(&[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) {
-        return Ok(Box::new(XzDecoder::new(file)));
-    }
-    Ok(Box::new(file))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5779,7 +4560,6 @@ mod tests {
     /// fields relevant to the scenario under test.
     fn make_cfg(sequencer: Sequencer, host: Option<&str>) -> ProfilerConfig {
         ProfilerConfig {
-            sam: String::new(),
             mapper_mappings: None,
             mapping_profile_memory: None,
             db_metadata: None,
@@ -5840,48 +4620,7 @@ mod tests {
         Arc::new(Taxonomy::from_files(&nodes, &names, &merged, None).unwrap())
     }
 
-    #[test]
-    fn headerless_sam_is_rejected_before_alignment_workers_start() {
-        let directory = tempfile::tempdir().unwrap();
-        let taxonomy = test_taxonomy(directory.path());
-        let sam = directory.path().join("headerless.sam");
-        std::fs::write(
-            &sam,
-            "read-1\t0\tref-a\t1\t60\t4=\t*\t0\t0\tACGT\tIIII\n",
-        )
-        .unwrap();
-        let profiler = CommunityProfiler::new(make_cfg(Sequencer::Illumina, None), taxonomy)
-            .expect("test profiler should construct");
-        let error = match profiler.load_text_alignments(&sam) {
-            Ok(_) => panic!("headerless SAM input must fail"),
-            Err(error) => error,
-        };
-        assert!(format!("{error:#}").contains("no usable reference sequence dictionary"));
-    }
-
-    #[test]
-    fn sam_mapping_to_undeclared_reference_is_rejected() {
-        let directory = tempfile::tempdir().unwrap();
-        let taxonomy = test_taxonomy(directory.path());
-        let sam = directory.path().join("unknown-reference.sam");
-        std::fs::write(
-            &sam,
-            "@SQ\tSN:asm-a|0|101|contig-a|1000\tLN:1000\n\
-             read-1\t0\tasm-b|0|101|contig-b|1000\t1\t60\t4=\t*\t0\t0\tACGT\tIIII\n",
-        )
-        .unwrap();
-        let profiler = CommunityProfiler::new(make_cfg(Sequencer::Illumina, None), taxonomy)
-            .expect("test profiler should construct");
-        let error = match profiler.load_text_alignments(&sam) {
-            Ok(_) => panic!("mapped RNAME absent from @SQ must fail"),
-            Err(error) => error,
-        };
-        let message = format!("{error:#}");
-        assert!(message.contains("1 mapped record(s)"));
-        assert!(message.contains("absent from @SQ"));
-    }
-
-    fn raw_output_fixture() -> (SamData, AssignmentResult) {
+    fn raw_output_fixture() -> (MappingData, AssignmentResult) {
         let good_key = AccKey {
             taxid: 101,
             asm: Arc::<str>::from("asm101"),
@@ -5927,7 +4666,7 @@ mod tests {
             ]),
             ..AssignmentResult::default()
         };
-        let sam_data = SamData {
+        let mapping_data = MappingData {
             read_alignments: Vec::new(),
             asm_lengths: Arc::new(HashMap::from([
                 ("asm101".to_string(), 1_000.0),
@@ -5948,7 +4687,7 @@ mod tests {
             marker_model: None,
             species_next_to_markers: HashSet::new(),
         };
-        (sam_data, assignment)
+        (mapping_data, assignment)
     }
 
     #[test]
@@ -6139,8 +4878,8 @@ mod tests {
         baseline_cfg.breadth = Some(0.05);
         baseline_cfg.chunk_breadth = Some(0.05);
         let baseline = CommunityProfiler::new(baseline_cfg, Arc::clone(&taxonomy)).unwrap();
-        let (sam_data, assignment) = raw_output_fixture();
-        assert_eq!(baseline.write_outputs(sam_data, assignment).unwrap(), 1);
+        let (mapping_data, assignment) = raw_output_fixture();
+        assert_eq!(baseline.write_outputs(mapping_data, assignment).unwrap(), 1);
 
         let mut raw_cfg = make_cfg(Sequencer::Illumina, None);
         raw_cfg.outprefix = raw_prefix.to_string_lossy().into_owned();
@@ -6149,8 +4888,8 @@ mod tests {
         raw_cfg.breadth = Some(0.05);
         raw_cfg.chunk_breadth = Some(0.05);
         let with_raw = CommunityProfiler::new(raw_cfg, taxonomy).unwrap();
-        let (sam_data, assignment) = raw_output_fixture();
-        assert_eq!(with_raw.write_outputs(sam_data, assignment).unwrap(), 1);
+        let (mapping_data, assignment) = raw_output_fixture();
+        assert_eq!(with_raw.write_outputs(mapping_data, assignment).unwrap(), 1);
 
         let baseline_profile =
             std::fs::read(format!("{}.profile.txt", baseline_prefix.to_string_lossy())).unwrap();
@@ -6187,9 +4926,9 @@ mod tests {
         cfg.save_classifications = true;
         cfg.min_reads = Some(2);
         let profiler = CommunityProfiler::new(cfg, taxonomy).unwrap();
-        let (sam_data, assignment) = raw_output_fixture();
+        let (mapping_data, assignment) = raw_output_fixture();
 
-        assert_eq!(profiler.write_outputs(sam_data, assignment).unwrap(), 0);
+        assert_eq!(profiler.write_outputs(mapping_data, assignment).unwrap(), 0);
         assert!(
             std::fs::read(format!("{}.profile.txt", output.to_string_lossy()))
                 .unwrap()
@@ -6334,7 +5073,7 @@ mod tests {
         cfg.chunk_breadth = Some(0.0);
         let policy = EvidencePolicy::from_config(&cfg).unwrap();
         let profiler = CommunityProfiler::new(cfg, taxonomy).unwrap();
-        let sam_data = SamData {
+        let mapping_data = MappingData {
             read_alignments: Vec::new(),
             asm_lengths: Arc::new(HashMap::from([("asm101".to_string(), 1_000.0)])),
             min_breadth: 0.0,
@@ -6365,7 +5104,7 @@ mod tests {
             ..AssignmentResult::default()
         };
 
-        assert_eq!(profiler.write_outputs(sam_data, assignment).unwrap(), 0);
+        assert_eq!(profiler.write_outputs(mapping_data, assignment).unwrap(), 0);
         assert!(
             std::fs::read(format!("{}.profile.txt", output.to_string_lossy()))
                 .unwrap()
@@ -6389,7 +5128,7 @@ mod tests {
             asm: Arc::<str>::from("asm101"),
             acc: Arc::<str>::from("ref101"),
         };
-        let sam_data = SamData {
+        let mapping_data = MappingData {
             read_alignments: Vec::new(),
             asm_lengths: Arc::new(HashMap::from([("asm101".to_string(), 1_000.0)])),
             min_breadth: 0.0,
@@ -6423,7 +5162,7 @@ mod tests {
             ..AssignmentResult::default()
         };
 
-        assert_eq!(profiler.write_outputs(sam_data, assignment).unwrap(), 1);
+        assert_eq!(profiler.write_outputs(mapping_data, assignment).unwrap(), 1);
         let profile =
             std::fs::read_to_string(format!("{}.profile.txt", output.to_string_lossy())).unwrap();
         assert_eq!(profile.lines().count(), 1);
@@ -7181,14 +5920,13 @@ mod tests {
     /// Intermediate synthetic alignment used inside tests.
     ///
     /// `AlignmentEntry` stores the pre-parsed
-    /// `asm`/`acc`/`species_taxid`/`identity`/`fraction` rather than the raw
-    /// `ref_name`/`cigar`. Tests describe alignments as "this ref name, this
-    /// CIGAR" for readability and let [`run_single_with_normalize`] perform the
-    /// exact same pre-parsing the worker would do.
+    /// `asm`/`acc`/`species_taxid` rather than the raw `ref_name`. Tests
+    /// describe alignments by reference name and (identity, mapped fraction),
+    /// and let [`run_single_with_normalize`] derive the rest.
     #[derive(Clone, Debug)]
     struct RawAln {
         ref_name: String,
-        cigar: String,
+        quality: (f64, f64),
         mapped_len: usize,
         span: (usize, usize),
     }
@@ -7198,10 +5936,15 @@ mod tests {
     ///
     /// `ref_name` must match the expected `asm|taxid|species_taxid|acc|...`
     /// layout so the profiler can extract the species taxid.
-    fn aln_entry(ref_name: &str, cigar: &str, mapped_len: usize, span: (usize, usize)) -> RawAln {
+    fn aln_entry(
+        ref_name: &str,
+        quality: (f64, f64),
+        mapped_len: usize,
+        span: (usize, usize),
+    ) -> RawAln {
         RawAln {
             ref_name: ref_name.to_string(),
-            cigar: cigar.to_string(),
+            quality,
             mapped_len,
             span,
         }
@@ -7234,7 +5977,7 @@ mod tests {
         if asm_len <= 0.0 {
             return None;
         }
-        let (identity, _, fraction) = cigar_to_identity(&raw.cigar);
+        let (identity, fraction) = raw.quality;
         Some(AlignmentEntry {
             asm: Arc::<str>::from(asm),
             acc: Arc::<str>::from(acc),
@@ -7299,25 +6042,6 @@ mod tests {
         // Assembly input is not a read platform -> never auto-triggers.
         let cfg = make_cfg(Sequencer::Assembly, None);
         assert!(!fallback_gate_active(&cfg, 0.0));
-    }
-
-    #[test]
-    fn ref_name_is_subsampled_checks_six_field_layout() {
-        // 6 fields (subsampled DB) => true
-        assert!(ref_name_is_subsampled(
-            "GCF_000172695.2|2020311|2020311|NZ_CP021128.1|6817255|600000"
-        ));
-        // 5 fields (full DB) => false
-        assert!(!ref_name_is_subsampled(
-            "GCF_000172695.2|2020311|2020311|NZ_CP021128.1|6817255"
-        ));
-        // Other counts => false
-        assert!(!ref_name_is_subsampled("asmA"));
-        assert!(!ref_name_is_subsampled("asmA|1"));
-        assert!(!ref_name_is_subsampled("asmA|1|2|3"));
-        assert!(!ref_name_is_subsampled("asmA|1|2|3|4|5|6|7"));
-        // Empty fields still count as separators.
-        assert!(ref_name_is_subsampled("|||||"));
     }
 
     #[test]
@@ -8073,12 +6797,12 @@ mod tests {
         m
     }
 
-    /// CIGAR that yields identity = 1.0 (all '='): used for species-qualified hits.
-    const PERFECT_CIGAR: &str = "100=";
-    /// CIGAR that yields identity = 0.92, fraction = 1.0: used for genus fallback.
-    const NEAR_MISS_CIGAR: &str = "92=8X";
-    // identity = 50/50 = 1.0, fraction = 50/(50+50) = 0.5 (below GENUS_FALLBACK_MIN_FRACTION).
-    const LOW_FRACTION_CIGAR: &str = "50=50S";
+    /// (identity, mapped fraction) of a species-qualified hit.
+    const PERFECT: (f64, f64) = (1.0, 1.0);
+    /// (identity, mapped fraction) of a hit for genus fallback.
+    const NEAR_MISS: (f64, f64) = (0.92, 1.0);
+    /// Mapped fraction 0.5, below GENUS_FALLBACK_MIN_FRACTION.
+    const LOW_FRACTION: (f64, f64) = (1.0, 0.5);
 
     // ------------------------------------------------------------------
     // Sub-species -> species normalization
@@ -8096,7 +6820,7 @@ mod tests {
         norm.insert(9001u32, 101u32);
         let alns = vec![aln_entry(
             "asmA|9001|9001|accA|1000",
-            PERFECT_CIGAR,
+            PERFECT,
             100,
             (1, 100),
         )];
@@ -8134,8 +6858,8 @@ mod tests {
         norm.insert(9001u32, 101u32);
         norm.insert(9002u32, 101u32);
         let alns = vec![
-            aln_entry("asmA|9001|9001|accA|1000", PERFECT_CIGAR, 100, (1, 100)),
-            aln_entry("asmB|9002|9002|accB|1000", PERFECT_CIGAR, 100, (1, 100)),
+            aln_entry("asmA|9001|9001|accA|1000", PERFECT, 100, (1, 100)),
+            aln_entry("asmB|9002|9002|accB|1000", PERFECT, 100, (1, 100)),
         ];
         let assignment = run_single_with_normalize(&cfg, &asm, &norm, &s2g, false, "r1", alns)
             .expect("species assignment");
@@ -8154,12 +6878,7 @@ mod tests {
         let asm = mk_asm_map();
         let s2g = mk_genus_map();
         let norm: HashMap<u32, u32> = HashMap::new();
-        let alns = vec![aln_entry(
-            "asmA|1|101|accA|1000",
-            PERFECT_CIGAR,
-            100,
-            (1, 100),
-        )];
+        let alns = vec![aln_entry("asmA|1|101|accA|1000", PERFECT, 100, (1, 100))];
         let assignment = run_single_with_normalize(&cfg, &asm, &norm, &s2g, false, "r1", alns)
             .expect("species assignment");
         assert_eq!(assignment.rank, AssignRank::Species);
@@ -8180,7 +6899,7 @@ mod tests {
         norm.insert(9001u32, 101u32);
         let alns = vec![aln_entry(
             "asmA|9001|9001|accA|1000",
-            NEAR_MISS_CIGAR,
+            NEAR_MISS,
             100,
             (1, 100),
         )];
@@ -8198,8 +6917,8 @@ mod tests {
         // Two alignments: first qualifies as species (perfect), second only
         // as genus fallback. Species must win even with fallback_mode=true.
         let alns = vec![
-            aln_entry("asmA|1|101|accA|1000", PERFECT_CIGAR, 100, (1, 100)),
-            aln_entry("asmB|1|103|accB|1000", NEAR_MISS_CIGAR, 100, (1, 100)),
+            aln_entry("asmA|1|101|accA|1000", PERFECT, 100, (1, 100)),
+            aln_entry("asmB|1|103|accB|1000", NEAR_MISS, 100, (1, 100)),
         ];
         let assignment =
             run_single(&cfg, &asm, &s2g, /*fallback*/ true, "r1", alns).expect("assignment");
@@ -8213,12 +6932,7 @@ mod tests {
         let asm = mk_asm_map();
         let s2g = mk_genus_map();
         // Only a near-miss alignment: passes genus thresholds, not species.
-        let alns = vec![aln_entry(
-            "asmA|1|101|accA|1000",
-            NEAR_MISS_CIGAR,
-            100,
-            (1, 100),
-        )];
+        let alns = vec![aln_entry("asmA|1|101|accA|1000", NEAR_MISS, 100, (1, 100))];
         let assignment = run_single(&cfg, &asm, &s2g, true, "r1", alns).expect("assignment");
         assert_eq!(assignment.rank, AssignRank::Genus);
         assert_eq!(assignment.taxids, vec![5001]);
@@ -8230,12 +6944,7 @@ mod tests {
         let asm = mk_asm_map();
         let s2g = mk_genus_map();
         // Same near-miss alignment; fallback_mode = false => no assignment.
-        let alns = vec![aln_entry(
-            "asmA|1|101|accA|1000",
-            NEAR_MISS_CIGAR,
-            100,
-            (1, 100),
-        )];
+        let alns = vec![aln_entry("asmA|1|101|accA|1000", NEAR_MISS, 100, (1, 100))];
         let assignment = run_single(&cfg, &asm, &s2g, /*fallback*/ false, "r1", alns);
         assert!(
             assignment.is_none(),
@@ -8256,12 +6965,7 @@ mod tests {
         // Identity 0.92, fraction 1.0, mapped_len 60 => species disqualified
         // (mapped_len < cfg.mapped_len), but genus-qualified (mapped_len >= 50,
         // fraction >= 0.6, identity >= cfg.genus_identity).
-        let alns = vec![aln_entry(
-            "asmA|1|101|accA|1000",
-            NEAR_MISS_CIGAR,
-            60,
-            (1, 60),
-        )];
+        let alns = vec![aln_entry("asmA|1|101|accA|1000", NEAR_MISS, 60, (1, 60))];
         let assignment = run_single(&cfg, &asm, &s2g, true, "r1", alns).expect("assignment");
         assert_eq!(assignment.rank, AssignRank::Genus);
         assert_eq!(assignment.taxids, vec![5001]);
@@ -8278,7 +6982,7 @@ mod tests {
         // the species fraction cutoff while still passing the genus fallback
         // fraction cutoff. High identity must not be rejected by an upper-bound
         // species-identity check in the fallback path.
-        let alns = vec![aln_entry("asmA|1|101|accA|1000", "70=30S", 70, (1, 70))];
+        let alns = vec![aln_entry("asmA|1|101|accA|1000", (1.0, 0.7), 70, (1, 70))];
         let assignment = run_single(&cfg, &asm, &s2g, true, "r1", alns)
             .expect("high-identity partial alignment should fall back to genus");
         assert_eq!(assignment.rank, AssignRank::Genus);
@@ -8291,12 +6995,7 @@ mod tests {
         let asm = mk_asm_map();
         let s2g = mk_genus_map();
         // mapped_len = 49 violates the fixed 50 floor for genus fallback.
-        let alns = vec![aln_entry(
-            "asmA|1|101|accA|1000",
-            NEAR_MISS_CIGAR,
-            49,
-            (1, 49),
-        )];
+        let alns = vec![aln_entry("asmA|1|101|accA|1000", NEAR_MISS, 49, (1, 49))];
         let assignment = run_single(&cfg, &asm, &s2g, true, "r1", alns);
         assert!(
             assignment.is_none(),
@@ -8320,12 +7019,7 @@ mod tests {
 
         // mapped_len 80 < 100 (length fails) but NEAR_MISS fraction = 1.0:
         // accepted via fraction.
-        let via_fraction = vec![aln_entry(
-            "asmA|1|101|accA|1000",
-            NEAR_MISS_CIGAR,
-            80,
-            (1, 80),
-        )];
+        let via_fraction = vec![aln_entry("asmA|1|101|accA|1000", NEAR_MISS, 80, (1, 80))];
         assert_eq!(
             run_single(&cfg, &asm, &s2g, true, "r1", via_fraction)
                 .expect("accepted on fraction")
@@ -8334,12 +7028,7 @@ mod tests {
         );
 
         // mapped_len 100 >= 100: accepted via length.
-        let via_length = vec![aln_entry(
-            "asmA|1|101|accA|1000",
-            NEAR_MISS_CIGAR,
-            100,
-            (1, 100),
-        )];
+        let via_length = vec![aln_entry("asmA|1|101|accA|1000", NEAR_MISS, 100, (1, 100))];
         assert_eq!(
             run_single(&cfg, &asm, &s2g, true, "r1", via_length)
                 .expect("accepted on length")
@@ -8349,12 +7038,7 @@ mod tests {
 
         // mapped_len 80 < 100 AND LOW_FRACTION fraction 0.5 < 0.60: both fail ->
         // rejected.
-        let neither = vec![aln_entry(
-            "asmA|1|101|accA|1000",
-            LOW_FRACTION_CIGAR,
-            80,
-            (1, 80),
-        )];
+        let neither = vec![aln_entry("asmA|1|101|accA|1000", LOW_FRACTION, 80, (1, 80))];
         assert!(
             run_single(&cfg, &asm, &s2g, true, "r1", neither).is_none(),
             "long reads: genus fallback rejects an alignment failing both length and fraction"
@@ -8371,7 +7055,7 @@ mod tests {
         // for species (identity >= cfg.identity=0.95, mapped_len >= 50) *except*
         // fraction < cfg.fraction => species disqualified. Then fallback:
         // fraction < 0.60 => also disqualified.
-        let alns = vec![aln_entry("asmA|1|101|accA|1000", "50=50S", 50, (1, 50))];
+        let alns = vec![aln_entry("asmA|1|101|accA|1000", (1.0, 0.5), 50, (1, 50))];
         let assignment = run_single(&cfg, &asm, &s2g, true, "r1", alns);
         assert!(
             assignment.is_none(),
@@ -8381,19 +7065,14 @@ mod tests {
 
     #[test]
     fn genus_fallback_identity_cutoff_is_cfg_genus_identity() {
-        // identity of a NEAR_MISS_CIGAR = 92/100 = 0.92.
+        // identity of a NEAR_MISS = 92/100 = 0.92.
         let asm = mk_asm_map();
         let s2g = mk_genus_map();
 
         // With the default genus_identity=0.80, a 0.92 near-miss qualifies.
         let cfg_default = make_cfg(Sequencer::Illumina, None);
         assert!((cfg_default.genus_identity - 0.80).abs() < 1e-12);
-        let alns = vec![aln_entry(
-            "asmA|1|101|accA|1000",
-            NEAR_MISS_CIGAR,
-            100,
-            (1, 100),
-        )];
+        let alns = vec![aln_entry("asmA|1|101|accA|1000", NEAR_MISS, 100, (1, 100))];
         let assignment = run_single(&cfg_default, &asm, &s2g, true, "r1", alns.clone())
             .expect("default genus_identity should accept 0.92 near-miss");
         assert_eq!(assignment.rank, AssignRank::Genus);
@@ -8412,7 +7091,7 @@ mod tests {
         // boundary around the old (0.85) and new (0.80) defaults.
         let boundary = vec![aln_entry(
             "asmA|1|101|accA|1000",
-            "82=18X", // identity = 0.82, fraction = 1.0
+            (0.82, 1.0),
             100,
             (1, 100),
         )];
@@ -8433,7 +7112,7 @@ mod tests {
         let cfg_default = make_cfg(Sequencer::Illumina, None);
         let below_default = vec![aln_entry(
             "asmA|1|101|accA|1000",
-            "78=22X", // identity = 0.78, fraction = 1.0
+            (0.78, 1.0),
             100,
             (1, 100),
         )];
@@ -8450,12 +7129,7 @@ mod tests {
         let asm = mk_asm_map();
         // species 999 is missing from the s2g map (no genus resolvable).
         let s2g: HashMap<u32, u32> = HashMap::new();
-        let alns = vec![aln_entry(
-            "asmA|1|999|accA|1000",
-            NEAR_MISS_CIGAR,
-            100,
-            (1, 100),
-        )];
+        let alns = vec![aln_entry("asmA|1|999|accA|1000", NEAR_MISS, 100, (1, 100))];
         let assignment = run_single(&cfg, &asm, &s2g, true, "r1", alns);
         assert!(
             assignment.is_none(),

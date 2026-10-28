@@ -27,26 +27,21 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicUsize, Ordering as AtomicOrdering},
     Arc,
 };
-use std::thread;
 
 use anyhow::{anyhow, bail, Context, Result};
-use crossbeam_channel::{bounded, unbounded};
 use csv::WriterBuilder;
-use flate2::read::MultiGzDecoder;
 use indexmap::IndexMap;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
-use xz2::read::XzDecoder;
 
 use metam::mapper::CandidateBoundary;
 
-use super::alignment::cigar_to_identity;
 use super::evidence::{
     EvidenceMode, LONG_RELATIVE_SCORE_MARGIN, PAIRED_ERROR_MARGIN, SINGLE_ERROR_MARGIN,
 };
@@ -56,14 +51,12 @@ use super::output::{
 use super::pathogen::load_pathogen_table;
 use super::statistics::{coverage_deviation_pvalue, round5};
 use super::{
-    coverage_passes, equivalent_read_count_passes_minimum, join_alignment_worker,
-    log_reference_taxonomy_adjustments, log_resolved_profiler_parameters,
-    parse_reference_taxonomy, parse_sam_sequence_record, push_string_keyed_value,
-    record_genome_sampling_scale, record_reference_taxonomy_adjustment,
-    require_alignment_reference_dictionary, sampling_scale_from_name_parts,
-    sampling_scale_from_sizes, scale_automatic_chunk_breadth, strip_pair_suffix, ProfilerConfig,
-    ReadSupport, ReferenceTaxonomyAdjustments, ReferenceTaxonomyResolver,
-    ResolvedProfilerParameters, StableReadMap,
+    coverage_passes, equivalent_read_count_passes_minimum, log_reference_taxonomy_adjustments,
+    log_resolved_profiler_parameters, parse_reference_taxonomy, push_string_keyed_value,
+    record_genome_sampling_scale, record_reference_taxonomy_adjustment, sampling_scale_from_sizes,
+    scale_automatic_chunk_breadth, strip_pair_suffix, ProfilerConfig, ReadSupport,
+    ReferenceTaxonomyAdjustments, ReferenceTaxonomyResolver, ResolvedProfilerParameters,
+    StableReadMap,
 };
 use crate::db::DatabaseMetadata;
 use crate::mapper::tsv::{
@@ -148,102 +141,10 @@ struct ReferenceMetadata {
     fallback_taxid: Option<u32>,
 }
 
-/// Shared context for worker threads during alignment parsing.
-struct WorkerContext {
-    /// Reference metadata: ref_name -> metadata
-    ref_metadata: Arc<HashMap<String, ReferenceMetadata>>,
-
-    /// Whether input is paired-end data
-    is_paired: bool,
-}
-
-/// Result from a worker thread processing alignment lines.
-struct WorkerResult {
-    /// Parsed alignments: (read_name, record)
-    alignments: Vec<(String, AlignmentRecord)>,
-
-    /// All read names encountered
-    reads_seen: Vec<String>,
-
-    /// Count of alignments processed
-    alignments_processed: usize,
-
-    /// Mapped records whose reference was missing or unusable.
-    skipped_reference: usize,
-}
-
-/// Intermediate result from parsing a single SAM line.
-struct ParsedAlignment {
-    /// Read name (pair suffix stripped if paired-end)
-    read_name: String,
-
-    /// Whether to count this in alignment statistics
-    count_alignment: bool,
-
-    /// Parsed alignment record (None if unmapped/filtered)
-    record: Option<ParsedAlignmentRecord>,
-
-    /// The mapped reference was absent from the sequence dictionary or had
-    /// unusable metadata.
-    skipped_reference: bool,
-}
-
-/// Full parsed data from a valid alignment.
-struct ParsedAlignmentRecord {
-    /// Alignment span coordinates (start, end)
-    span: (usize, usize),
-
-    /// Number of aligned bases
-    mapped_len: usize,
-
-    /// CIGAR string
-    cigar: String,
-
-    /// Stable reference and assembly identifiers.
-    reference_id: u32,
-    assembly_id: u32,
-
-    /// Primary taxonomy ID
-    taxid: Option<u32>,
-
-    /// Fallback (species) taxonomy ID
-    fallback_taxid: Option<u32>,
-}
-
-/// Absorb worker results into main aggregation structures.
-///
-/// Integrates results from a single worker batch into the main thread's
-/// data structures. Called repeatedly as workers complete batches.
-fn absorb_worker_result(
-    result: WorkerResult,
-    read_alignments_map: &mut StableReadMap<AlignmentRecord>,
-    all_reads: &mut HashSet<String>,
-    num_processed: &mut usize,
-    skipped_reference: &mut usize,
-    next_progress: &mut usize,
-) {
-    for (read, aln) in result.alignments {
-        read_alignments_map.entry(read).or_default().push(aln);
-    }
-    for read in result.reads_seen {
-        all_reads.insert(read);
-    }
-    *num_processed += result.alignments_processed;
-    *skipped_reference += result.skipped_reference;
-    while *num_processed >= *next_progress {
-        log::info!(
-            target: "PROFILER",
-            "{} alignments processed",
-            *num_processed
-        );
-        *next_progress += 1_000_000;
-    }
-}
-
-/// Aggregated results from SAM loading phase.
+/// Aggregated results from loading the mappings.
 ///
 /// Contains all data needed for the profiling algorithm.
-struct SamLoadResult {
+struct LoadedMappings {
     /// Per-read alignment collections
     read_alignments: Vec<ReadAlignment>,
 
@@ -951,126 +852,6 @@ struct AssignTaxaResult {
     alignments_passing: usize,
 }
 
-/// Parse a single SAM alignment line.
-///
-/// Similar to community profiler's parsing but preserves strain-level
-/// taxonomy information from reference names.
-///
-/// # Returns
-///
-/// ParsedAlignment with strain/species taxids and alignment coordinates
-fn parse_alignment_line(line: &str, ctx: &WorkerContext) -> Option<ParsedAlignment> {
-    let mut iter = line.split('\t');
-    let read_name_raw = iter.next()?.trim();
-    let flag = iter
-        .next()
-        .and_then(|field| field.parse::<u16>().ok())
-        .unwrap_or(0);
-    if (flag & 0x200) != 0 {
-        return None;
-    }
-    let ref_name = iter.next()?.trim();
-    let start_pos = iter
-        .next()
-        .and_then(|field| field.parse::<isize>().ok())
-        .unwrap_or(1)
-        .max(1) as usize;
-    let _mapq = iter.next();
-    let cigar = iter.next()?.trim();
-    let rnext = iter.next().unwrap_or("*").trim();
-    let mate_pos = iter
-        .next()
-        .and_then(|field| field.parse::<isize>().ok())
-        .unwrap_or(0)
-        .max(1) as usize;
-    let _tlen = iter.next();
-    let read_seq = iter.next().unwrap_or("");
-    let _qual = iter.next();
-
-    let read_name = if ctx.is_paired {
-        read_name_raw
-            .rsplit_once('/')
-            .map(|(base, _)| base.to_string())
-            .unwrap_or_else(|| read_name_raw.to_string())
-    } else {
-        read_name_raw.to_string()
-    };
-
-    let discard = |skipped_reference: bool| ParsedAlignment {
-        read_name: read_name.clone(),
-        count_alignment: false,
-        record: None,
-        skipped_reference,
-    };
-
-    if ref_name == "*" || cigar == "*" {
-        return Some(discard(false));
-    }
-
-    if ctx.is_paired && rnext != "=" {
-        return Some(discard(false));
-    }
-
-    let metadata = match ctx.ref_metadata.get(ref_name) {
-        Some(meta) => meta,
-        None => return Some(discard(true)),
-    };
-    if metadata.length == 0 {
-        return Some(discard(true));
-    }
-
-    let mapped_len = read_seq.len();
-    if mapped_len == 0 {
-        return Some(discard(false));
-    }
-
-    let pair_start = if ctx.is_paired {
-        start_pos.min(mate_pos)
-    } else {
-        start_pos
-    };
-    let mut start = pair_start.min(metadata.length.max(1));
-    if start == 0 {
-        start = 1;
-    }
-    let ref_end = metadata.length.saturating_add(1);
-    let mut end = start.saturating_add(mapped_len);
-    if end > ref_end {
-        end = ref_end;
-    }
-    let span = (start, end);
-
-    let mut count_alignment = true;
-    if ctx.is_paired {
-        if (flag & 0x4) != 0 {
-            count_alignment = false;
-        }
-        if (flag & 0x40) == 0 {
-            return Some(ParsedAlignment {
-                read_name,
-                count_alignment,
-                record: None,
-                skipped_reference: false,
-            });
-        }
-    }
-
-    Some(ParsedAlignment {
-        read_name,
-        count_alignment,
-        skipped_reference: false,
-        record: Some(ParsedAlignmentRecord {
-            span,
-            mapped_len,
-            cigar: cigar.to_string(),
-            reference_id: metadata.reference_id,
-            assembly_id: metadata.assembly_id,
-            taxid: metadata.taxid,
-            fallback_taxid: metadata.fallback_taxid,
-        }),
-    })
-}
-
 struct ParsedMetamRecord<'a> {
     read_name: &'a str,
     record: AlignmentRecord,
@@ -1135,34 +916,6 @@ fn merge_intervals(mut intervals: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
         }
     }
     merged
-}
-
-/// Parse reference name parts to extract taxonomy information.
-///
-/// Reference format: `asm|strain_taxid|species_taxid|acc|...`
-///
-/// # Returns
-///
-/// Tuple of (assembly_id, primary_taxid, fallback_taxid)
-/// - primary_taxid: strain-level if available, else species-level
-/// - fallback_taxid: always species-level
-fn parse_reference_header(parts: &[&str]) -> (String, Option<u32>, Option<u32>) {
-    let asm = parts.first().copied().unwrap_or("").to_string();
-    let strain_taxid = parts
-        .get(1)
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value > 0);
-    let species_taxid = parts
-        .get(2)
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value > 0);
-    if let Some(strain) = strain_taxid {
-        (asm, Some(strain), species_taxid)
-    } else if let Some(species) = species_taxid {
-        (asm, Some(species), Some(species))
-    } else {
-        (asm, None, None)
-    }
 }
 
 const STRAIN_PROB_CUTOFF: f64 = 1e-10;
@@ -1499,24 +1252,6 @@ fn normalize_fraction_map(map: &mut TaxonFractions) {
     }
 }
 
-/// Open alignment file with automatic compression detection.
-///
-/// Supports plain text, gzip (.gz), and xz (.xz) compression.
-fn open_alignment_reader(path: &Path) -> Result<Box<dyn Read>> {
-    let mut file =
-        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut magic = [0u8; 6];
-    let read = file.read(&mut magic)?;
-    file.seek(SeekFrom::Start(0))?;
-    if read >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
-        return Ok(Box::new(MultiGzDecoder::new(file)));
-    }
-    if read >= 6 && magic.starts_with(&[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) {
-        return Ok(Box::new(XzDecoder::new(file)));
-    }
-    Ok(Box::new(file))
-}
-
 /// Check if a taxonomy ID is in the lineage of any given host taxids.
 ///
 /// Used for pathogen filtering - checks if the candidate host is
@@ -1608,22 +1343,19 @@ impl StrainProfiler {
     /// Run the strain-level profiling pipeline.
     pub(super) fn run(&self) -> Result<()> {
         log::info!(target: "PROFILER", "Loading alignments ...");
-        let loaded = if let Some(mappings) = self.cfg.mapper_mappings.as_deref() {
-            let db = self
-                .cfg
-                .db_metadata
-                .as_deref()
-                .ok_or_else(|| anyhow!("missing reference metadata for native mappings"))?;
-            self.load_metam(Path::new(mappings), db)
-                .context("failed to parse Metam coordinate mappings")?
-        } else {
-            let sam_path = Path::new(&self.cfg.sam);
-            if !sam_path.exists() {
-                bail!("SAM file {} does not exist", sam_path.display());
-            }
-            self.load_sam(sam_path)
-                .context("failed to parse SAM file")?
-        };
+        let mappings = self
+            .cfg
+            .mapper_mappings
+            .as_deref()
+            .ok_or_else(|| anyhow!("missing Metax mapping file"))?;
+        let db = self
+            .cfg
+            .db_metadata
+            .as_deref()
+            .ok_or_else(|| anyhow!("missing reference metadata for native mappings"))?;
+        let loaded = self
+            .load_metam(Path::new(mappings), db)
+            .context("failed to parse Metam coordinate mappings")?;
         self.profile_loaded(loaded)
     }
 
@@ -1654,9 +1386,9 @@ impl StrainProfiler {
         bail!("mapping file is missing embedded profile counters; rerun mapping with this Metax version")
     }
 
-    fn profile_loaded(&self, loaded: SamLoadResult) -> Result<()> {
+    fn profile_loaded(&self, loaded: LoadedMappings) -> Result<()> {
         let verbose_logging = self.cfg.verbose || self.cfg.very_verbose;
-        let SamLoadResult {
+        let LoadedMappings {
             read_alignments,
             assembly_stats,
             taxid_coverage,
@@ -1744,379 +1476,7 @@ impl StrainProfiler {
         Ok(())
     }
 
-    /// Load and parse SAM file, computing coverage metrics.
-    ///
-    /// Unlike community profiler, this tracks coverage per assembly
-    /// for strain-level resolution.
-    fn load_sam(&self, sam_path: &Path) -> Result<SamLoadResult> {
-        let reader = open_alignment_reader(sam_path)?;
-        let mut reader = BufReader::new(reader);
-        let mut assembly_stats: Vec<AssemblyStats> = Vec::new();
-        let mut ref_metadata: HashMap<String, ReferenceMetadata> = HashMap::new();
-        let mut references: Vec<ReferenceMetadata> = Vec::new();
-        let mut assembly_ids: HashMap<String, u32> = HashMap::new();
-        let mut genome_sampling_scales: HashMap<String, f64> = HashMap::new();
-        let mut has_scaled_genomes = false;
-        let mut first_alignment: Option<String> = None;
-
-        let mut line = String::new();
-        loop {
-            line.clear();
-            if reader.read_line(&mut line)? == 0 {
-                break;
-            }
-            let trimmed = line.trim_end();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if trimmed.starts_with('@') {
-                if trimmed.starts_with("@SQ") {
-                    let (sn, len) = parse_sam_sequence_record(trimmed)?;
-                    let parts: Vec<&str> = sn.split('|').collect();
-                    let (asm_name, taxid, fallback_taxid) = parse_reference_header(&parts);
-                    let assembly_id = intern_assembly(
-                        &asm_name,
-                        &mut assembly_ids,
-                        &mut assembly_stats,
-                        "SAM",
-                    )?;
-                    let reference_id = u32::try_from(references.len())
-                        .context("SAM contains more than 2^32 reference sequences")?;
-                    let sampling_scale = sampling_scale_from_name_parts(&parts);
-                    record_genome_sampling_scale(
-                        &mut genome_sampling_scales,
-                        &asm_name,
-                        sampling_scale,
-                    )?;
-                    has_scaled_genomes |= sampling_scale > 1.0;
-                    let metadata = ReferenceMetadata {
-                        reference_id,
-                        assembly_id,
-                        length: len,
-                        taxid,
-                        fallback_taxid,
-                    };
-                    if ref_metadata.insert(sn.clone(), metadata.clone()).is_some() {
-                        bail!("SAM header contains duplicate reference name '{}'", sn);
-                    }
-                    references.push(metadata);
-                    let stats = &mut assembly_stats[assembly_id as usize];
-                    stats.length += len;
-                    stats.sampling_scale = sampling_scale;
-                }
-                continue;
-            }
-            first_alignment = Some(trimmed.to_string());
-            break;
-        }
-        require_alignment_reference_dictionary(sam_path, ref_metadata.len())?;
-
-        let worker_context = Arc::new(WorkerContext {
-            ref_metadata: Arc::new(ref_metadata.clone()),
-            is_paired: self.cfg.is_paired,
-        });
-
-        let worker_count = self.cfg.threads.max(1);
-        let batch_size = self.cfg.batch_size.max(1);
-        let (line_tx, line_rx) = bounded::<Vec<String>>(worker_count * 2);
-        let (result_tx, result_rx) = unbounded::<WorkerResult>();
-
-        let mut handles = Vec::new();
-        for _ in 0..worker_count {
-            let rx = line_rx.clone();
-            let tx = result_tx.clone();
-            let ctx = Arc::clone(&worker_context);
-            handles.push(thread::spawn(move || {
-                for chunk in rx.iter() {
-                    let chunk_len = chunk.len();
-                    let mut reads_seen: Vec<String> = Vec::with_capacity(chunk_len);
-                    let mut alignments: Vec<(String, AlignmentRecord)> =
-                        Vec::with_capacity(chunk_len);
-                    let mut alignments_processed = 0usize;
-                    let mut skipped_reference = 0usize;
-                    for line in chunk {
-                        if let Some(parsed) = parse_alignment_line(&line, &ctx) {
-                            let ParsedAlignment {
-                                read_name,
-                                count_alignment,
-                                record,
-                                skipped_reference: was_skipped_reference,
-                            } = parsed;
-                            if was_skipped_reference {
-                                skipped_reference += 1;
-                            }
-                            reads_seen.push(read_name.clone());
-                            if count_alignment {
-                                alignments_processed += 1;
-                            }
-                            if let Some(record) = record {
-                                let (identity, _, fraction) = cigar_to_identity(&record.cigar);
-                                let alignment = AlignmentRecord {
-                                    mapped_len: record.mapped_len,
-                                    identity,
-                                    fraction,
-                                    reference_id: record.reference_id,
-                                    assembly_id: record.assembly_id,
-                                    span: record.span,
-                                    mate_number: if ctx.is_paired { 1 } else { 0 },
-                                    pair_id: 0,
-                                    candidate_boundary: CandidateBoundary::COMPLETE,
-                                    taxid: record.taxid,
-                                    fallback_taxid: record.fallback_taxid,
-                                };
-                                alignments.push((read_name, alignment));
-                            }
-                        }
-                    }
-                    if (!reads_seen.is_empty()
-                        || !alignments.is_empty()
-                        || alignments_processed > 0
-                        || skipped_reference > 0)
-                        && tx
-                            .send(WorkerResult {
-                                alignments,
-                                reads_seen,
-                                alignments_processed,
-                                skipped_reference,
-                            })
-                            .is_err()
-                    {
-                        break;
-                    }
-                }
-            }));
-        }
-        drop(result_tx);
-        drop(line_rx);
-
-        let mut read_alignments_map: StableReadMap<AlignmentRecord> = StableReadMap::default();
-        let mut all_reads: HashSet<String> = HashSet::new();
-        let mut num_alignment = 0usize;
-        let mut skipped_reference = 0usize;
-        let mut next_progress: usize = 1_000_000;
-
-        let mut pending: Vec<String> = Vec::with_capacity(batch_size);
-        if let Some(first) = first_alignment.take() {
-            pending.push(first);
-        }
-        loop {
-            line.clear();
-            let read = reader.read_line(&mut line)?;
-            if read == 0 {
-                break;
-            }
-            let trimmed = line.trim_end();
-            if trimmed.is_empty() || trimmed.starts_with('@') {
-                continue;
-            }
-            pending.push(trimmed.to_string());
-            if pending.len() >= batch_size {
-                line_tx.send(pending)?;
-                pending = Vec::with_capacity(batch_size);
-                while let Ok(result) = result_rx.try_recv() {
-                    absorb_worker_result(
-                        result,
-                        &mut read_alignments_map,
-                        &mut all_reads,
-                        &mut num_alignment,
-                        &mut skipped_reference,
-                        &mut next_progress,
-                    );
-                }
-            }
-        }
-        if !pending.is_empty() {
-            line_tx.send(pending)?;
-        }
-        drop(line_tx);
-
-        while let Ok(result) = result_rx.try_recv() {
-            absorb_worker_result(
-                result,
-                &mut read_alignments_map,
-                &mut all_reads,
-                &mut num_alignment,
-                &mut skipped_reference,
-                &mut next_progress,
-            );
-        }
-
-        for result in result_rx.iter() {
-            absorb_worker_result(
-                result,
-                &mut read_alignments_map,
-                &mut all_reads,
-                &mut num_alignment,
-                &mut skipped_reference,
-                &mut next_progress,
-            );
-        }
-
-        for handle in handles {
-            join_alignment_worker(handle, "strain SAM parsing worker")?;
-        }
-        if skipped_reference > 0 {
-            bail!(
-                "SAM contains {} mapped record(s) with a reference absent from @SQ or incompatible reference metadata",
-                skipped_reference
-            );
-        }
-
-        log::info!(
-            target: "PROFILER",
-            "{} alignments processed",
-            num_alignment
-        );
-
-        let num_reads = all_reads.len();
-        let aligned_reads = read_alignments_map.len();
-        let mapped_unit = if self.cfg.is_paired {
-            "fragments"
-        } else {
-            "reads"
-        };
-        let mapping_rate = if num_reads == 0 {
-            0.0
-        } else {
-            aligned_reads as f64 / num_reads as f64
-        };
-        // Honour explicit --by-mapped; otherwise auto-force mapped-read
-        // basis for low-map Illumina non-pathogen runs. Identical chunk-
-        // breadth equation; only the numerator basis changes.
-        let by_aligned_effective = self.cfg.resolve_by_aligned(mapping_rate);
-        let by_aligned_auto = !self.cfg.by_aligned && by_aligned_effective;
-        let chunk_basis = if by_aligned_effective {
-            aligned_reads
-        } else {
-            num_reads
-        };
-        let min_breadth = self.cfg.breadth.unwrap_or(0.0);
-        let chunk_threshold =
-            resolve_strain_chunk_breadth(&self.cfg, chunk_basis, by_aligned_effective);
-        let min_chunk_breadth_value = chunk_threshold.value;
-        let chunk_breadth_source = chunk_threshold.source;
-        log_strain_chunk_breadth_scaling(&self.cfg, chunk_threshold);
-        let min_chunk_display = format!("{:.6}", min_chunk_breadth_value);
-        const INDENT: &str = "                                                ";
-        if self.cfg.verbose || self.cfg.very_verbose {
-            log::info!(
-                target: "PROFILER",
-                "Profiler parameters:\n{}min_breadth        {}\n{}min_chunk_breadth  {}\n{}min_reads          {}\n{}min_oebr           {}\n{}min_coebr          {}\n{}identity           {}\n{}mapped_len   {}\n{}fraction           {}\n{}batch_size         {}\n",
-                INDENT,
-                min_breadth,
-                INDENT,
-                min_chunk_display,
-                INDENT,
-                self.cfg
-                    .min_reads
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "None".to_string()),
-                INDENT,
-                self.cfg
-                    .min_oebr
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "None".to_string()),
-                INDENT,
-                self.cfg
-                    .min_coebr
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "None".to_string()),
-                INDENT,
-                self.cfg.identity,
-                INDENT,
-                self.cfg.mapped_len,
-                INDENT,
-                self.cfg.fraction,
-                INDENT,
-                self.cfg.batch_size,
-            );
-        }
-
-        let read_alignments: Vec<ReadAlignment> = read_alignments_map
-            .into_iter()
-            .map(|(read_name, alignments)| ReadAlignment {
-                read_name: Arc::<str>::from(read_name),
-                alignments,
-            })
-            .collect();
-        let total_retained_alignments: usize = read_alignments
-            .iter()
-            .map(|read| read.alignments.len())
-            .sum();
-        let taxid_coverage =
-            self.resolved_strain_coverage(&read_alignments, &references, &assembly_stats)?;
-
-        log::info!(target: "PROFILER", "Total number of reads: {}", num_reads);
-        log::info!(
-            target: "PROFILER",
-            "Number of mapped {}: {}",
-            mapped_unit,
-            read_alignments.len()
-        );
-        log::info!(
-            target: "PROFILER",
-            "Number of mapping records: {}",
-            num_alignment
-        );
-        log::info!(
-            target: "PROFILER",
-            "Number of mapping records retained after parsing: {}",
-            total_retained_alignments
-        );
-        if self.cfg.lowbiomass && self.cfg.chunk_breadth.is_none() {
-            log::info!(
-                target: "PROFILER",
-                "Automatic minimum chunk breadth filter disabled by --low-biomass."
-            );
-        } else if by_aligned_effective {
-            if by_aligned_auto {
-                log::info!(
-                    target: "PROFILER",
-                    "Minimum chunk breadth estimated from mapped {} ({}) [auto-forced: low-map Illumina run, mapping_rate {:.5} < {:.5}].",
-                    mapped_unit,
-                    aligned_reads,
-                    mapping_rate,
-                    self.cfg.low_map_rate_threshold
-                );
-            } else {
-                log::info!(
-                    target: "PROFILER",
-                    "Minimum chunk breadth estimated from mapped {} ({}).",
-                    mapped_unit,
-                    aligned_reads
-                );
-            }
-        } else {
-            log::info!(
-                target: "PROFILER",
-                "Minimum chunk breadth estimated from total reads ({}).",
-                num_reads
-            );
-        }
-        log_resolved_profiler_parameters(
-            &self.cfg,
-            ResolvedProfilerParameters {
-                min_breadth,
-                min_chunk_breadth: min_chunk_breadth_value,
-                chunk_breadth_source,
-                chunk_breadth_basis_reads: chunk_basis,
-                total_reads: num_reads,
-                mapped_reads: aligned_reads,
-                mapping_rate,
-            },
-        );
-
-        Ok(SamLoadResult {
-            read_alignments,
-            assembly_stats,
-            taxid_coverage,
-            min_breadth,
-            min_chunk_breadth: min_chunk_breadth_value,
-            has_scaled_genomes,
-        })
-    }
-
-    fn load_metam(&self, mappings_path: &Path, db: &DatabaseMetadata) -> Result<SamLoadResult> {
+    fn load_metam(&self, mappings_path: &Path, db: &DatabaseMetadata) -> Result<LoadedMappings> {
         if !mappings_path.exists() {
             bail!(
                 "Metam mapping file {} does not exist",
@@ -2132,7 +1492,7 @@ impl StrainProfiler {
         reader: R,
         source: &str,
         db: &DatabaseMetadata,
-    ) -> Result<SamLoadResult> {
+    ) -> Result<LoadedMappings> {
         self.load_metam_records(source, db, |on_mapping| {
             for_each_metam_mapping_record(
                 reader,
@@ -2148,7 +1508,7 @@ impl StrainProfiler {
         receiver: MetamMappingReceiver,
         source: &str,
         db: &DatabaseMetadata,
-    ) -> Result<SamLoadResult> {
+    ) -> Result<LoadedMappings> {
         self.load_metam_records(source, db, |on_mapping| {
             for_each_structured_mapping_record(receiver, source, on_mapping)
         })
@@ -2159,7 +1519,7 @@ impl StrainProfiler {
         source: &str,
         db: &DatabaseMetadata,
         feed: F,
-    ) -> Result<SamLoadResult>
+    ) -> Result<LoadedMappings>
     where
         F: FnOnce(
             &mut dyn for<'a> FnMut(MetamMappingRecord<'a>) -> Result<()>,
@@ -2362,7 +1722,7 @@ impl StrainProfiler {
             },
         );
 
-        Ok(SamLoadResult {
+        Ok(LoadedMappings {
             read_alignments,
             assembly_stats,
             taxid_coverage,
@@ -3090,10 +2450,9 @@ mod tests {
     use super::{
         finalize_resolved_strain_coverage, scaled_strain_chunk_breadth_cutoff,
         strain_chunk_breadth_cutoff, strain_probability_endpoint, strain_profile_row_passes,
-        strain_pvalue_filter_passes, parse_alignment_line, AlignmentRecord, AssemblyStats,
-        AssignmentQualityThresholds, CandidateBoundary, EvidenceMode, ProfileRow, ReadAlignment,
-        ReferenceMetadata, ResolvedStrainIntervals, StrainCandidatePlacement,
-        StrainCandidateScratch, Taxonomy, WorkerContext,
+        strain_pvalue_filter_passes, AlignmentRecord, AssemblyStats, AssignmentQualityThresholds,
+        CandidateBoundary, EvidenceMode, ProfileRow, ReadAlignment, ReferenceMetadata,
+        ResolvedStrainIntervals, StrainCandidatePlacement, StrainCandidateScratch, Taxonomy,
     };
     use crate::profiler::{ExactTiePolicy, ProfileMode, ProfilerConfig};
     use crate::sequencer::Sequencer;
@@ -3126,7 +2485,6 @@ mod tests {
 
     fn output_test_config() -> ProfilerConfig {
         ProfilerConfig {
-            sam: String::new(),
             mapper_mappings: None,
             mapping_profile_memory: None,
             db_metadata: None,
@@ -3167,21 +2525,6 @@ mod tests {
             dmp_dir: None,
             strain: true,
         }
-    }
-
-    #[test]
-    fn strain_sam_parser_marks_undeclared_references() {
-        let context = WorkerContext {
-            ref_metadata: std::sync::Arc::new(HashMap::new()),
-            is_paired: false,
-        };
-        let parsed = parse_alignment_line(
-            "read-1\t0\tmissing-ref\t1\t60\t4=\t*\t0\t0\tACGT\tIIII",
-            &context,
-        )
-        .expect("well-formed SAM row should produce a discard record");
-        assert!(parsed.skipped_reference);
-        assert!(parsed.record.is_none());
     }
 
     #[test]

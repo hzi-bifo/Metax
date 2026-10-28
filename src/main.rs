@@ -77,7 +77,7 @@ use metax::mapper::mapper_options_help;
 use metax::mapper::tsv::load_mapping_run_metadata;
 use metax::profiler::{ExactTiePolicy, ProfileMode};
 use metax::sequencer::Sequencer;
-use metax::{build_index, info::run_info, AppConfig, MetaxApp};
+use metax::{build_index, info::run_info, report_genera_with_both_types, AppConfig, MetaxApp};
 
 /// Main command-line interface structure parsed by clap.
 /// Uses derive macros for automatic argument parsing and help generation.
@@ -446,7 +446,6 @@ struct ProfileArgs {
             "sequencer",
             "is_paired",
             "resume",
-            "reuse_sam",
             "keep_mapping_output",
             "stream_mappings",
             "temp_dir"
@@ -456,12 +455,8 @@ struct ProfileArgs {
     )]
     reuse_mappings: Option<String>,
 
-    #[arg(
-        long = "reuse-sam",
-        value_name = "SAM_OR_BAM",
-        help_heading = "Saved and reused data",
-        help = "Profile an existing SAM/BAM instead of running the built-in mapper (legacy compatibility path)."
-    )]
+    /// Removed SAM/BAM input; kept only to explain the removal.
+    #[arg(long = "reuse-sam", value_name = "SAM_OR_BAM", hide = true)]
     reuse_sam: Option<String>,
 
     #[arg(
@@ -947,6 +942,9 @@ impl TryFrom<ProfileArgs> for AppConfig {
         if args.mapper_help {
             bail!("--mapper-help displays mapper options and cannot start profiling");
         }
+        if args.reuse_sam.is_some() {
+            bail!("SAM/BAM input is no longer supported. Save the Metax mappings of a run with --save-mapping and profile them again with --reuse-mapping.");
+        }
         let outprefix = args
             .outprefix
             .context("--output is required for profiling")?;
@@ -988,9 +986,6 @@ impl TryFrom<ProfileArgs> for AppConfig {
             if args.strain {
                 bail!("--exact-ties guarded-map is supported only by community profiling, not --strain");
             }
-            if args.reuse_sam.is_some() {
-                bail!("--exact-ties guarded-map requires native Metax coordinate mappings and cannot be used with --reuse-sam");
-            }
             if args.lowbiomass {
                 bail!("--exact-ties guarded-map requires an active positive chunk-breadth safeguard and cannot be used with --low-biomass");
             }
@@ -1001,11 +996,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             }
         }
         let exact_ties = requested_exact_ties.unwrap_or_else(|| {
-            if sequencer.is_illumina()
-                && !args.strain
-                && args.reuse_sam.is_none()
-                && chunk_guard_available
-            {
+            if sequencer.is_illumina() && !args.strain && chunk_guard_available {
                 ExactTiePolicy::GuardedMap
             } else {
                 ExactTiePolicy::Ambiguous
@@ -1018,7 +1009,6 @@ impl TryFrom<ProfileArgs> for AppConfig {
             outprefix,
             threads: args.threads,
             resume: args.resume,
-            reuse_sam: args.reuse_sam,
             reuse_mappings: args.reuse_mappings,
             sequencer,
             is_paired,
@@ -1099,6 +1089,11 @@ fn main() -> Result<()> {
                 args.match_both_strobes,
                 args.first_strobe_only,
             )?;
+            let reference_types = ReferenceTypes::new(
+                args.reference_type.parse()?,
+                args.reference_type_table.as_deref().map(Path::new),
+            )?;
+            let mixed_types_possible = reference_types.has_table();
             // Build mapping index from reference FASTA
             build_index(
                 &args.fasta,
@@ -1109,11 +1104,7 @@ fn main() -> Result<()> {
                 args.segment_length,
                 args.min_length,
                 args.compress_subsampled,
-                ReferenceTypes::new(
-                    args.reference_type.parse()?,
-                    args.reference_type_table.as_deref().map(Path::new),
-                )?,
-                args.dmp_dir.as_deref().map(Path::new),
+                reference_types,
                 MetamIndexOptions {
                     k: args.k,
                     w: args.w,
@@ -1130,7 +1121,14 @@ fn main() -> Result<()> {
                     no_progress: args.no_progress,
                     progress_interval: args.progress_interval,
                 },
-            )
+            )?;
+            if mixed_types_possible {
+                report_genera_with_both_types(
+                    Path::new(&args.outdir),
+                    args.dmp_dir.as_deref().map(Path::new),
+                )?;
+            }
+            Ok(())
         }
         Commands::Info(args) => run_info(args.db.as_deref(), args.index.as_deref()),
     }

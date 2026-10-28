@@ -34,11 +34,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::BuildHasher;
-use std::path::Path;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::ValueEnum;
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
 
@@ -49,7 +47,6 @@ use crate::sequencer::Sequencer;
 use crate::taxonomy::Taxonomy;
 
 // Sub-modules for different profiling strategies
-mod alignment;
 pub(crate) mod community;
 pub(crate) mod evidence;
 mod markers;
@@ -65,107 +62,6 @@ pub(crate) mod strain;
 /// floating-point reduction order. XXH3 is already a project dependency and
 /// is faster than the standard keyed hasher for short sequencing identifiers.
 pub(crate) type StableReadMap<T> = HashMap<String, Vec<T>, Xxh3DefaultBuilder>;
-
-/// Parse one SAM `@SQ` dictionary record and require the fields needed for
-/// coordinate normalization. The compatibility profiler cannot safely infer a
-/// missing reference name or length from alignment rows.
-fn parse_sam_sequence_record(line: &str) -> Result<(String, usize)> {
-    let mut name = None;
-    let mut length = None;
-    for field in line.split('\t').skip(1) {
-        if let Some(value) = field.strip_prefix("SN:") {
-            name = Some(value);
-        } else if let Some(value) = field.strip_prefix("LN:") {
-            length = Some(value);
-        }
-    }
-    let name = name
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("SAM @SQ record is missing a non-empty SN field: {line}"))?;
-    let raw_length = length
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("SAM @SQ record is missing an LN field: {line}"))?;
-    let length = raw_length
-        .parse::<usize>()
-        .with_context(|| format!("invalid SAM @SQ length '{raw_length}' for reference '{name}'"))?;
-    if length == 0 {
-        bail!("SAM @SQ reference '{}' has zero length", name);
-    }
-    Ok((name.to_string(), length))
-}
-
-/// Require a usable sequence dictionary before parsing SAM/BAM mappings.
-/// Metax needs reference lengths for every coverage statistic, so accepting a
-/// headerless alignment file would silently discard all mapped records.
-fn require_alignment_reference_dictionary(path: &Path, references: usize) -> Result<()> {
-    if references == 0 {
-        bail!(
-            "alignment file '{}' has no usable reference sequence dictionary; include @SQ records with SN and positive LN fields",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-/// Join a SAM parsing worker without discarding its panic. Worker panics are
-/// exceptional, so extracting the payload has no cost on successful runs.
-fn join_alignment_worker(handle: JoinHandle<()>, label: &str) -> Result<()> {
-    handle.join().map_err(|payload| {
-        let message = if let Some(message) = payload.downcast_ref::<&str>() {
-            (*message).to_string()
-        } else if let Some(message) = payload.downcast_ref::<String>() {
-            message.clone()
-        } else {
-            "unknown panic payload".to_string()
-        };
-        anyhow::anyhow!("{label} panicked: {message}")
-    })
-}
-
-#[cfg(test)]
-mod sam_header_tests {
-    use std::path::Path;
-
-    use super::{
-        join_alignment_worker, parse_sam_sequence_record, require_alignment_reference_dictionary,
-    };
-
-    #[test]
-    fn sam_sequence_record_requires_name_and_positive_length() {
-        assert_eq!(
-            parse_sam_sequence_record("@SQ\tSN:ref-a\tLN:123").unwrap(),
-            ("ref-a".to_string(), 123)
-        );
-        for line in [
-            "@SQ\tLN:123",
-            "@SQ\tSN:ref-a",
-            "@SQ\tSN:ref-a\tLN:0",
-            "@SQ\tSN:ref-a\tLN:not-a-number",
-        ] {
-            assert!(parse_sam_sequence_record(line).is_err(), "line={line}");
-        }
-    }
-
-    #[test]
-    fn alignment_input_requires_a_reference_dictionary() {
-        let error = require_alignment_reference_dictionary(Path::new("headerless.sam"), 0)
-            .expect_err("a missing sequence dictionary must fail");
-        let message = format!("{error:#}");
-        assert!(message.contains("headerless.sam"));
-        assert!(message.contains("no usable reference sequence dictionary"));
-        require_alignment_reference_dictionary(Path::new("valid.sam"), 1).unwrap();
-    }
-
-    #[test]
-    fn alignment_worker_panic_is_reported() {
-        let handle = std::thread::spawn(|| panic!("synthetic worker failure"));
-        let error = join_alignment_worker(handle, "SAM parsing worker")
-            .expect_err("worker panic must be propagated");
-        let message = format!("{error:#}");
-        assert!(message.contains("SAM parsing worker panicked"));
-        assert!(message.contains("synthetic worker failure"));
-    }
-}
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -543,24 +439,6 @@ pub(crate) fn sampling_scale_from_sizes(
     }
 }
 
-/// Read a genome-specific sampling scale from the internal SAM reference-name
-/// layout `...|full_genome_size|effective_indexed_size`. Missing or invalid
-/// size fields are treated as an unscaled, fully indexed reference.
-pub(crate) fn sampling_scale_from_name_parts(parts: &[&str]) -> f64 {
-    if parts.len() < 6 {
-        return 1.0;
-    }
-    let full = match parts[4].parse::<usize>() {
-        Ok(value) if value > 0 => value,
-        _ => return 1.0,
-    };
-    let effective = match parts[5].parse::<usize>() {
-        Ok(value) if value > 0 => value,
-        _ => return 1.0,
-    };
-    sampling_scale_from_sizes(full, effective)
-}
-
 /// Record one scale per genome and reject internally inconsistent metadata.
 pub(crate) fn record_genome_sampling_scale(
     scales: &mut HashMap<String, f64>,
@@ -709,11 +587,8 @@ impl std::fmt::Display for ExactTiePolicy {
 /// - `min_coebr`: Minimum observed/expected chunk breadth ratio
 #[derive(Debug, Clone)]
 pub struct ProfilerConfig {
-    /// Path to the input SAM/BAM mapping file
-    pub sam: String,
-
-    /// Path to Metam coordinate TSV output for native Metam-backed profiling.
-    /// When set, the profiler reads coordinates directly instead of parsing SAM.
+    /// Path to a Metax mapping TSV. Unset when mappings are streamed from the
+    /// mapper.
     pub mapper_mappings: Option<String>,
 
     /// In-memory mapping counters for the default streamed mapper path.
@@ -1300,8 +1175,7 @@ mod reference_taxonomy_tests {
 mod subsample_scaling_tests {
     use super::{
         equivalent_read_count_passes_minimum, push_string_keyed_value,
-        record_genome_sampling_scale, sampling_scale_from_name_parts, sampling_scale_from_sizes,
-        strip_pair_suffix, ReadSupport,
+        record_genome_sampling_scale, sampling_scale_from_sizes, strip_pair_suffix, ReadSupport,
     };
     use std::collections::HashMap;
 
@@ -1321,12 +1195,6 @@ mod subsample_scaling_tests {
     fn scaling_from_sizes_ignores_full_indexes() {
         assert_close(sampling_scale_from_sizes(1_000, 1_000), 1.0);
         assert_close(sampling_scale_from_sizes(250, 1_000), 1.0);
-    }
-
-    #[test]
-    fn scaling_from_name_parts_preserves_legacy_sam_layout() {
-        let parts = ["asm", "101", "100", "contig", "1000", "250"];
-        assert_close(sampling_scale_from_name_parts(&parts), 4.0);
     }
 
     #[test]
@@ -1393,7 +1261,6 @@ mod chunk_basis_tests {
 
     fn minimal_cfg() -> ProfilerConfig {
         ProfilerConfig {
-            sam: String::new(),
             mapper_mappings: None,
             mapping_profile_memory: None,
             db_metadata: None,

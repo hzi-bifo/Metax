@@ -37,9 +37,6 @@ pub struct MetaxApp {
 }
 
 enum PreparedMapping {
-    Sam {
-        path: String,
-    },
     Metam {
         output: MappingOutput,
         db: String,
@@ -83,7 +80,6 @@ pub struct AppConfig {
     pub outprefix: String,
     pub threads: usize,
     pub resume: bool,
-    pub reuse_sam: Option<String>,
     pub reuse_mappings: Option<String>,
     pub sequencer: Sequencer,
     pub is_paired: bool,
@@ -220,10 +216,6 @@ impl MetaxApp {
             } => {
                 self.run_structured_mapping(profiler, mapper, profile)?;
             }
-            PreparedMapping::Sam { .. } => {
-                profiler.run()?;
-                drop(profiler);
-            }
             PreparedMapping::Metam { output, .. } => {
                 let profile_result = profiler.run();
                 drop(profiler);
@@ -330,20 +322,6 @@ impl MetaxApp {
 
     fn prepare_mapping(&self, profiler: MappingProfilerMetadata) -> Result<PreparedMapping> {
         // Respect explicit reuse and resume-before-aligning behavior.
-        if let Some(ref reuse) = self.config.reuse_sam {
-            log::info!(
-                target: "MAIN",
-                "Taxonomy profiling based on specified mapping file."
-            );
-            log::info!(
-                target: "MAIN",
-                "Reusing existing SAM file at {} for profiling.",
-                reuse
-            );
-            return Ok(PreparedMapping::Sam {
-                path: reuse.clone(),
-            });
-        }
         if let Some(ref reuse) = self.config.reuse_mappings {
             let db =
                 self.config.db.as_ref().ok_or_else(|| {
@@ -566,7 +544,6 @@ impl MetaxApp {
                 "    -i {} \\\n",
                 "    -o {} \\\n",
                 "    -t {} \\\n",
-                "    --reuse-sam {} \\\n",
                 "    --reuse-mapping {} \\\n",
                 "    --temp-dir {} \\\n",
                 "    --sequencer {} \\\n",
@@ -595,7 +572,6 @@ impl MetaxApp {
             fmt_option(&self.config.input_sequences),
             self.config.outprefix,
             self.config.threads,
-            fmt_option(&self.config.reuse_sam),
             fmt_option(&self.config.reuse_mappings),
             fmt_option(&self.config.temp_dir),
             self.config.sequencer,
@@ -845,8 +821,7 @@ impl MetaxApp {
         // so any library caller bypassing the CLI is trusted to supply
         // values in [0.0, 1.0].
         let suppress_mapping_load_progress = matches!(mapping, PreparedMapping::MetamStream { .. });
-        let (sam, mapper_mappings, mapping_profile_memory, db_metadata) = match mapping {
-            PreparedMapping::Sam { path, .. } => (path.clone(), None, None, None),
+        let (mapper_mappings, mapping_profile_memory, db_metadata) = match mapping {
             PreparedMapping::Metam { output, db } => {
                 let mapping_path = Path::new(&output.mappings_tsv);
                 let database = Arc::new(DatabaseMetadata::load(Path::new(db))?);
@@ -871,22 +846,15 @@ impl MetaxApp {
                         metadata.mapper_mode
                     );
                 }
-                (
-                    String::new(),
-                    Some(output.mappings_tsv.clone()),
-                    None,
-                    Some(database),
-                )
+                (Some(output.mappings_tsv.clone()), None, Some(database))
             }
             PreparedMapping::MetamStream { profile, db, .. } => (
-                String::new(),
                 None,
                 Some(profile.clone()),
                 Some(Arc::new(DatabaseMetadata::load(Path::new(db))?)),
             ),
         };
         Ok(ProfilerConfig {
-            sam,
             mapper_mappings,
             mapping_profile_memory,
             db_metadata,
@@ -948,7 +916,6 @@ pub fn build_index(
     min_length: usize,
     compress_subsampled: bool,
     reference_types: ReferenceTypes,
-    dmp_dir: Option<&Path>,
     metam_options: MetamIndexOptions,
 ) -> Result<()> {
     let params = subsample.map(|fraction| crate::db::SubsampleParams {
@@ -966,16 +933,13 @@ pub fn build_index(
         &reference_types,
         &metam_options,
     )?;
-    if reference_types.has_table() {
-        report_genera_with_both_types(Path::new(outdir), dmp_dir)?;
-    }
     Ok(())
 }
 
 /// In a mixed database, list the genera that hold both genome-type and
 /// marker-type species: reads from the unindexed part of a marker-only genome
 /// can land on the genomes of its relatives there.
-fn report_genera_with_both_types(database: &Path, dmp_dir: Option<&Path>) -> Result<()> {
+pub fn report_genera_with_both_types(database: &Path, dmp_dir: Option<&Path>) -> Result<()> {
     let metadata = DatabaseMetadata::load(database)?;
     if metadata.uniform_reference_type().is_some() {
         return Ok(());
@@ -1036,7 +1000,6 @@ mod tests {
             outprefix: "test".to_string(),
             threads: 1,
             resume: false,
-            reuse_sam: None,
             reuse_mappings: None,
             sequencer: Sequencer::Illumina,
             is_paired: false,
