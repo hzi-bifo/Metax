@@ -22,7 +22,7 @@
 
 use std::{
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{bail, Context, Result};
@@ -72,7 +72,7 @@ fn parse_positive_float(s: &str) -> Result<f64, String> {
     Ok(value)
 }
 
-use metax::db::{MetamIndexOptions, DEFAULT_SEED_CHUNK_MIB};
+use metax::db::{MetamIndexOptions, ReferenceTypes, DEFAULT_SEED_CHUNK_MIB};
 use metax::mapper::mapper_options_help;
 use metax::mapper::tsv::load_mapping_run_metadata;
 use metax::profiler::{ExactTiePolicy, ProfileMode};
@@ -618,6 +618,25 @@ struct IndexArgs {
     outdir: String,
 
     #[arg(
+        long = "reference-type",
+        value_name = "TYPE",
+        default_value = "genome",
+        value_parser = ["genome", "markers"],
+        ignore_case = true,
+        help_heading = "Input and output",
+        help = "What each genome's sequences represent: genome (assembled sequences) or markers (one sequence per marker gene). Applies to genomes not listed in --reference-type-table."
+    )]
+    reference_type: String,
+
+    #[arg(
+        long = "reference-type-table",
+        value_name = "TSV",
+        help_heading = "Input and output",
+        help = "Rows of genome_id<TAB>genome|markers that set the reference type of single genomes, for databases that mix genomes and marker genes."
+    )]
+    reference_type_table: Option<String>,
+
+    #[arg(
         short = 't',
         long = "threads",
         value_name = "N",
@@ -1066,6 +1085,10 @@ fn main() -> Result<()> {
                 args.segment_length,
                 args.min_length,
                 args.compress_subsampled,
+                ReferenceTypes::new(
+                    args.reference_type.parse()?,
+                    args.reference_type_table.as_deref().map(Path::new),
+                )?,
                 MetamIndexOptions {
                     k: args.k,
                     w: args.w,
@@ -1116,6 +1139,7 @@ mod tests {
                 full_genome_size: 100,
                 effective_indexed_size: 100,
                 taxonomy_field: "s:8".to_string(),
+                reference_type: Default::default(),
             }],
             is_fractional: false,
         };

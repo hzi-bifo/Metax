@@ -26,8 +26,113 @@ use metam::{
 pub const DB_TSV_FILE: &str = "metax_db.tsv.gz";
 const METAM_INDEX_FILE: &str = "metax_db.mxi";
 const MAPPING_REFERENCE_FILE: &str = "metax_reference.fasta";
-const DB_VERSION: &str = "2";
+/// Metadata layout for databases whose references are all genomes. It is
+/// still written for such databases so that earlier Metax 2 releases can read
+/// them.
+const DB_VERSION_GENOMES: &str = "2";
+/// Metadata layout with a per-reference `reference_type` column, written when
+/// at least one genome is not of type `genome`.
+const DB_VERSION_TYPED: &str = "3";
+const COLUMNS_GENOMES: &str =
+    "reference_name\treference_length\tfull_genome_size\teffective_indexed_size\tgenome\tcontig\ttaxonomy";
 pub const DEFAULT_SEED_CHUNK_MIB: usize = DEFAULT_INDEX_SEED_CHUNK_MIB;
+
+/// What the reference sequences of one genome represent.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum ReferenceType {
+    /// Assembled genome sequences: chromosomes, plasmids, scaffolds or contigs.
+    #[default]
+    Genome,
+    /// A set of marker genes, one reference sequence per gene. The genome size
+    /// is the summed marker length, so read counts are reported as mapped.
+    Markers,
+}
+
+impl ReferenceType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Genome => "genome",
+            Self::Markers => "markers",
+        }
+    }
+}
+
+impl std::str::FromStr for ReferenceType {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "genome" => Ok(Self::Genome),
+            "markers" => Ok(Self::Markers),
+            _ => bail!("unsupported reference type '{value}'; expected genome or markers"),
+        }
+    }
+}
+
+impl std::fmt::Display for ReferenceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Reference type of every genome in an index build: a default and the
+/// genomes listed in a `genome_id<TAB>type` table.
+#[derive(Clone, Debug, Default)]
+pub struct ReferenceTypes {
+    default: ReferenceType,
+    by_genome: HashMap<String, ReferenceType>,
+}
+
+impl ReferenceTypes {
+    pub fn new(default: ReferenceType, table: Option<&Path>) -> Result<Self> {
+        let by_genome = match table {
+            Some(path) => read_reference_type_table(path)?,
+            None => HashMap::new(),
+        };
+        Ok(Self { default, by_genome })
+    }
+
+    fn of(&self, genome: &str) -> ReferenceType {
+        self.by_genome.get(genome).copied().unwrap_or(self.default)
+    }
+}
+
+fn read_reference_type_table(path: &Path) -> Result<HashMap<String, ReferenceType>> {
+    let reader = BufReader::new(open_text_reader(path)?);
+    let mut types = HashMap::new();
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("failed reading {}", path.display()))?;
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (genome, kind) = line
+            .split_once('\t')
+            .filter(|(_, kind)| !kind.contains('\t'))
+            .ok_or_else(|| {
+                anyhow!(
+                    "line {} of {} must be genome_id<TAB>reference_type",
+                    line_no + 1,
+                    path.display()
+                )
+            })?;
+        let kind: ReferenceType = kind
+            .trim()
+            .parse()
+            .with_context(|| format!("line {} of {}", line_no + 1, path.display()))?;
+        if types
+            .insert(genome.trim().to_string(), kind)
+            .is_some_and(|old| old != kind)
+        {
+            bail!(
+                "genome {} has two reference types in {}",
+                genome.trim(),
+                path.display()
+            );
+        }
+    }
+    Ok(types)
+}
 
 #[derive(Clone, Debug)]
 pub struct DatabaseMetadata {
@@ -37,12 +142,29 @@ pub struct DatabaseMetadata {
 }
 
 impl DatabaseMetadata {
+    /// `Some(type)` when every reference has that type, `None` when mixed.
+    pub fn uniform_reference_type(&self) -> Option<ReferenceType> {
+        let first = self.references.first()?.reference_type;
+        self.references
+            .iter()
+            .all(|reference| reference.reference_type == first)
+            .then_some(first)
+    }
+
+    /// `genome`, `markers`, or `mixed`.
+    pub fn reference_type_label(&self) -> &'static str {
+        self.uniform_reference_type()
+            .map_or("mixed", ReferenceType::as_str)
+    }
+
     /// Stable content fingerprint of the reference table. Reused mappings
     /// (`--reuse-mapping` / `--resume`) record this so profiling can verify
     /// they were produced against this exact database. It hashes the parsed
     /// reference identities in load order — not the compressed file bytes — so
     /// recompressing `metax_db.tsv.gz` never changes it, while any real
-    /// reference, length, or taxonomy difference does.
+    /// reference, length, taxonomy, or reference-type difference does. Genome
+    /// rows hash as before reference types existed, so databases of genomes
+    /// keep their fingerprint.
     pub fn fingerprint(&self) -> u128 {
         use std::fmt::Write as _;
         use xxhash_rust::xxh3::Xxh3;
@@ -57,7 +179,7 @@ impl DatabaseMetadata {
         for reference in &self.references {
             row.clear();
             // Tab-delimited canonical identity, mirroring metax_db.tsv.gz columns.
-            let _ = writeln!(
+            let _ = write!(
                 row,
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 reference.name,
@@ -68,6 +190,10 @@ impl DatabaseMetadata {
                 reference.contig,
                 reference.taxonomy_field,
             );
+            if reference.reference_type != ReferenceType::Genome {
+                let _ = write!(row, "\t{}", reference.reference_type);
+            }
+            row.push('\n');
             hasher.update(row.as_bytes());
         }
         hasher.digest128()
@@ -83,6 +209,7 @@ pub struct ReferenceMetadata {
     pub full_genome_size: usize,
     pub effective_indexed_size: usize,
     pub taxonomy_field: String,
+    pub reference_type: ReferenceType,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +257,7 @@ pub fn build_database(
     subsample: Option<SubsampleParams>,
     threads: Option<usize>,
     _compress_reference: bool,
+    types: &ReferenceTypes,
     options: &MetamIndexOptions,
 ) -> Result<PathBuf> {
     let outdir_path = Path::new(outdir);
@@ -157,7 +285,7 @@ pub fn build_database(
         validate_subsample_params(params, threads)?;
     }
 
-    let input = read_reference_fasta(fasta_path)?;
+    let input = read_reference_fasta(fasta_path, types)?;
     let selected = select_index_records(&input, subsample, threads)?;
     drop(input);
     if selected.is_empty() {
@@ -359,7 +487,9 @@ fn resolve_db_path(path: &Path) -> Result<PathBuf> {
 fn load_db_tsv(path: &Path) -> Result<DatabaseMetadata> {
     let reader = open_metadata_reader(path)?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut version_ok = false;
+    // The typed layout (version 3) adds a trailing reference_type column.
+    let mut typed: Option<bool> = None;
+    let mut declared_type: Option<String> = None;
     let mut metam_index: Option<PathBuf> = None;
     let mut is_fractional = false;
     let mut references = Vec::new();
@@ -372,14 +502,15 @@ fn load_db_tsv(path: &Path) -> Result<DatabaseMetadata> {
         let fields: Vec<&str> = line.split('\t').collect();
         match fields.as_slice() {
             ["#metax_db_version", version] => {
-                if *version != DB_VERSION {
-                    bail!(
+                typed = Some(match *version {
+                    DB_VERSION_GENOMES => false,
+                    DB_VERSION_TYPED => true,
+                    _ => bail!(
                         "unsupported Metax DB version {} in {}",
                         version,
                         path.display()
-                    );
-                }
-                version_ok = true;
+                    ),
+                });
             }
             ["#mapping_index", value] => {
                 metam_index = Some(resolve_relative_path(base, value));
@@ -388,15 +519,33 @@ fn load_db_tsv(path: &Path) -> Result<DatabaseMetadata> {
                 is_fractional = parse_bool(value)
                     .with_context(|| format!("invalid fractional flag on line {}", line_no + 1))?;
             }
-            ["#columns", "reference_name", "reference_length", "full_genome_size", "effective_indexed_size", "genome", "contig", "taxonomy"] =>
-                {}
-            ["#columns", ..] => bail!(
-                "unsupported database metadata columns on line {} in {}: {}",
-                line_no + 1,
-                path.display(),
-                line
-            ),
-            [name, length, full, effective, genome, contig, taxonomy] => {
+            ["#reference_type", value] if typed == Some(true) => {
+                declared_type = Some((*value).to_string());
+            }
+            ["#columns", columns @ ..] => {
+                let expected = if typed == Some(true) {
+                    format!("{COLUMNS_GENOMES}\treference_type")
+                } else {
+                    COLUMNS_GENOMES.to_string()
+                };
+                if columns.join("\t") != expected {
+                    bail!(
+                        "unsupported database metadata columns on line {} in {}: {}",
+                        line_no + 1,
+                        path.display(),
+                        line
+                    );
+                }
+            }
+            [name, length, full, effective, genome, contig, taxonomy, rest @ ..]
+                if rest.len() == usize::from(typed == Some(true)) =>
+            {
+                let reference_type = match rest.first() {
+                    Some(value) => value.parse().with_context(|| {
+                        format!("invalid reference type on line {}", line_no + 1)
+                    })?,
+                    None => ReferenceType::Genome,
+                };
                 references.push(ReferenceMetadata {
                     name: (*name).to_string(),
                     length: parse_positive_usize(length, "reference length").with_context(
@@ -415,6 +564,7 @@ fn load_db_tsv(path: &Path) -> Result<DatabaseMetadata> {
                         format!("invalid effective indexed size on line {}", line_no + 1)
                     })?,
                     taxonomy_field: (*taxonomy).to_string(),
+                    reference_type,
                 });
             }
             _ => bail!(
@@ -426,7 +576,7 @@ fn load_db_tsv(path: &Path) -> Result<DatabaseMetadata> {
         }
     }
 
-    if !version_ok {
+    if typed.is_none() {
         bail!("{} is not a Metax database metadata file", path.display());
     }
     let metam_index =
@@ -434,12 +584,22 @@ fn load_db_tsv(path: &Path) -> Result<DatabaseMetadata> {
     if references.is_empty() {
         bail!("{} contains no reference metadata", path.display());
     }
-
-    Ok(DatabaseMetadata {
+    let metadata = DatabaseMetadata {
         metam_index,
         references,
         is_fractional,
-    })
+    };
+    if let Some(declared) = declared_type {
+        if declared != metadata.reference_type_label() {
+            bail!(
+                "{} declares reference_type {} but its rows are {}",
+                path.display(),
+                declared,
+                metadata.reference_type_label()
+            );
+        }
+    }
+    Ok(metadata)
 }
 
 fn open_metadata_reader(path: &Path) -> Result<Box<dyn BufRead>> {
@@ -481,23 +641,35 @@ fn write_db_tsv(path: &Path, metadata: &DatabaseMetadata) -> Result<()> {
 }
 
 fn write_db_tsv_body(writer: &mut dyn Write, metadata: &DatabaseMetadata) -> Result<()> {
-    writeln!(writer, "#metax_db_version\t{DB_VERSION}")?;
+    let typed = metadata.uniform_reference_type() != Some(ReferenceType::Genome);
+    let version = if typed {
+        DB_VERSION_TYPED
+    } else {
+        DB_VERSION_GENOMES
+    };
+    writeln!(writer, "#metax_db_version\t{version}")?;
     writeln!(
         writer,
         "#mapping_index\t{}",
         metadata.metam_index.to_string_lossy()
     )?;
     writeln!(writer, "#fractional\t{}", metadata.is_fractional)?;
-    writeln!(
-        writer,
-        "#columns\treference_name\treference_length\tfull_genome_size\teffective_indexed_size\tgenome\tcontig\ttaxonomy"
-    )?;
+    if typed {
+        writeln!(
+            writer,
+            "#reference_type\t{}",
+            metadata.reference_type_label()
+        )?;
+        writeln!(writer, "#columns\t{COLUMNS_GENOMES}\treference_type")?;
+    } else {
+        writeln!(writer, "#columns\t{COLUMNS_GENOMES}")?;
+    }
     for r in &metadata.references {
         ensure_tsv_safe(&r.name, "reference name")?;
         ensure_tsv_safe(&r.genome, "genome accession")?;
         ensure_tsv_safe(&r.contig, "contig id")?;
         ensure_tsv_safe(&r.taxonomy_field, "taxonomy field")?;
-        writeln!(
+        write!(
             writer,
             "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             r.name,
@@ -508,6 +680,10 @@ fn write_db_tsv_body(writer: &mut dyn Write, metadata: &DatabaseMetadata) -> Res
             r.contig,
             r.taxonomy_field
         )?;
+        if typed {
+            write!(writer, "\t{}", r.reference_type)?;
+        }
+        writeln!(writer)?;
     }
     writer.flush()?;
     Ok(())
@@ -534,6 +710,7 @@ struct GenomeInput {
     provided_genome_size: Option<usize>,
     contigs: Vec<InputContig>,
     full_genome_size: usize,
+    reference_type: ReferenceType,
 }
 
 /// Position of one reference FASTA record: its genome in
@@ -580,6 +757,7 @@ struct SelectedRecord {
     source_contig: String,
     source_name: String,
     taxonomy: TaxonomySpec,
+    reference_type: ReferenceType,
     full_genome_size: usize,
     effective_indexed_size: usize,
     source_start: usize,
@@ -594,7 +772,7 @@ impl SelectedRecord {
     }
 }
 
-fn read_reference_fasta(path: &Path) -> Result<ReferenceInput> {
+fn read_reference_fasta(path: &Path, types: &ReferenceTypes) -> Result<ReferenceInput> {
     let reader = open_text_reader(path)?;
     let reader = BufReader::new(reader);
     let mut genomes: IndexMap<String, GenomeInput> = IndexMap::new();
@@ -633,21 +811,29 @@ fn read_reference_fasta(path: &Path) -> Result<ReferenceInput> {
         bail!("reference FASTA contains no records");
     }
 
+    let mut ignored_marker_sizes = 0usize;
     for genome in genomes.values_mut() {
+        genome.reference_type = types.of(&genome.genome);
         let sequence_sum: usize = genome.contigs.iter().map(|c| c.length).sum();
         if sequence_sum == 0 {
             bail!("genome {} has no sequence bases", genome.genome);
         }
         genome.full_genome_size = match genome.provided_genome_size {
+            Some(size) if size < sequence_sum => bail!(
+                "provided genome size {} for {} is smaller than summed contig length {}",
+                size,
+                genome.genome,
+                sequence_sum
+            ),
+            // Marker read counts are reported as mapped, so a marker genome's
+            // size is its summed marker length.
+            Some(size)
+                if size > sequence_sum && genome.reference_type == ReferenceType::Markers =>
+            {
+                ignored_marker_sizes += 1;
+                sequence_sum
+            }
             Some(size) => {
-                if size < sequence_sum {
-                    bail!(
-                        "provided genome size {} for {} is smaller than summed contig length {}",
-                        size,
-                        genome.genome,
-                        sequence_sum
-                    );
-                }
                 if size > sequence_sum {
                     eprintln!(
                         "[index] warning: provided genome size {} for {} exceeds summed contig length {}; profiling will treat this as a partially indexed genome",
@@ -660,6 +846,21 @@ fn read_reference_fasta(path: &Path) -> Result<ReferenceInput> {
             }
             None => sequence_sum,
         };
+    }
+    if ignored_marker_sizes > 0 {
+        eprintln!(
+            "[index] note: {ignored_marker_sizes} marker genomes declare a genome size larger than their marker genes; marker genomes use their summed marker length"
+        );
+    }
+    let unlisted = types
+        .by_genome
+        .keys()
+        .filter(|genome| !genomes.contains_key(genome.as_str()))
+        .count();
+    if unlisted > 0 {
+        eprintln!(
+            "[index] note: {unlisted} genomes of the reference type table are not in the reference FASTA"
+        );
     }
 
     Ok(ReferenceInput {
@@ -704,6 +905,7 @@ fn store_input_record(
                 provided_genome_size: parsed.genome_size,
                 contigs: Vec::new(),
                 full_genome_size: 0,
+                reference_type: ReferenceType::Genome,
             });
             index
         }
@@ -933,6 +1135,7 @@ fn select_index_records(
                         source_contig: contig.contig.clone(),
                         source_name: contig.reference_name.clone(),
                         taxonomy: genome.taxonomy.clone(),
+                        reference_type: genome.reference_type,
                         full_genome_size: genome.full_genome_size,
                         effective_indexed_size: effective[position.genome as usize],
                         source_start: 1,
@@ -992,7 +1195,10 @@ fn subsample_genome<R: rand::Rng + ?Sized>(
     const SHORT_GENOME_THRESHOLD: usize = 500_000;
 
     let mut segments = Vec::new();
-    if genome.full_genome_size < SHORT_GENOME_THRESHOLD {
+    // Short genomes, and marker genes of any size, are indexed whole.
+    if genome.reference_type == ReferenceType::Markers
+        || genome.full_genome_size < SHORT_GENOME_THRESHOLD
+    {
         for (idx, contig) in genome.contigs.iter().enumerate() {
             let len = contig.length;
             if len > 0 {
@@ -1132,6 +1338,7 @@ fn subsample_genome<R: rand::Rng + ?Sized>(
             source_contig: contig.contig.clone(),
             source_name: contig.reference_name.clone(),
             taxonomy: genome.taxonomy.clone(),
+            reference_type: genome.reference_type,
             full_genome_size: genome.full_genome_size,
             effective_indexed_size,
             source_start: start,
@@ -1225,6 +1432,7 @@ fn build_direct_reference_metadata(records: Vec<SelectedRecord>) -> Result<Vec<R
             full_genome_size: record.full_genome_size,
             effective_indexed_size: record.effective_indexed_size,
             taxonomy_field: record.taxonomy.raw,
+            reference_type: record.reference_type,
         });
     }
     Ok(references)
@@ -1383,6 +1591,7 @@ fn flush_selected_source_record(
             full_genome_size: record.full_genome_size,
             effective_indexed_size: record.effective_indexed_size,
             taxonomy_field: record.taxonomy.raw,
+            reference_type: record.reference_type,
         });
     }
     Ok(())
@@ -1700,6 +1909,7 @@ mod tests {
                 primary_taxid: Some(7),
                 profile_taxid: 8,
             },
+            reference_type: ReferenceType::Genome,
             full_genome_size: 100,
             effective_indexed_size: 10,
             source_start: 1,
@@ -1720,6 +1930,7 @@ mod tests {
                 primary_taxid: None,
                 profile_taxid: 8,
             },
+            reference_type: ReferenceType::Genome,
             full_genome_size: 100,
             effective_indexed_size: 60,
             source_start: 1,
@@ -1752,6 +1963,7 @@ mod tests {
                 full_genome_size: 1000,
                 effective_indexed_size: 1000,
                 taxonomy_field: "s:20".into(),
+                reference_type: ReferenceType::Genome,
             }],
         };
         let mut out = Vec::new();
@@ -1841,6 +2053,7 @@ mod tests {
             None,
             Some(2),
             false,
+            &ReferenceTypes::default(),
             &options,
         )
         .unwrap_err();
@@ -1873,6 +2086,7 @@ mod tests {
             None,
             Some(1),
             false,
+            &ReferenceTypes::default(),
             &options,
         )
         .unwrap_err();
@@ -1902,6 +2116,7 @@ mod tests {
             None,
             Some(2),
             false,
+            &ReferenceTypes::default(),
             &options,
         )
         .unwrap();
@@ -1970,6 +2185,7 @@ mod tests {
             subsample,
             Some(2),
             false,
+            &ReferenceTypes::default(),
             &test_index_options(None),
         )
         .unwrap();
@@ -2038,6 +2254,7 @@ mod tests {
             full_genome_size: 1,
             effective_indexed_size: 1,
             taxonomy_field: "s:1".into(),
+            reference_type: ReferenceType::Genome,
         };
         let references = vec![reference("a"), reference("b")];
         let digest = |names: &[&str]| {
@@ -2052,5 +2269,184 @@ mod tests {
         assert!(verify_index_reference_order(&references, indexed(&["a", "b"])).is_ok());
         assert!(verify_index_reference_order(&references, indexed(&["b", "a"])).is_err());
         assert!(verify_index_reference_order(&references, indexed(&["a"])).is_err());
+    }
+
+    fn build_typed(
+        types: &str,
+        subsample: Option<SubsampleParams>,
+        g1_size: &str,
+    ) -> (DatabaseMetadata, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let fasta = directory.path().join("reference.fa");
+        let table = directory.path().join("types.tsv");
+        let output = directory.path().join("database");
+        write_interleaved_fasta(&fasta, g1_size);
+        std::fs::write(&table, types).unwrap();
+        let built = build_database(
+            fasta.to_str().unwrap(),
+            output.to_str().unwrap(),
+            subsample,
+            Some(2),
+            false,
+            &ReferenceTypes::new(ReferenceType::Genome, Some(&table)).unwrap(),
+            &test_index_options(None),
+        )
+        .unwrap();
+        let mut text = String::new();
+        MultiGzDecoder::new(File::open(built).unwrap())
+            .read_to_string(&mut text)
+            .unwrap();
+        (DatabaseMetadata::load(&output).unwrap(), text)
+    }
+
+    #[test]
+    fn genome_databases_keep_the_version_2_layout_and_fingerprint() {
+        let (loaded, text) = build_typed("# no overrides\n", None, "");
+        assert!(text.starts_with("#metax_db_version\t2\n"));
+        assert!(!text.contains("reference_type"));
+        assert_eq!(loaded.reference_type_label(), "genome");
+
+        use std::fmt::Write as _;
+        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+        hasher.update(b"absolute\n");
+        for r in &loaded.references {
+            let mut row = String::new();
+            writeln!(
+                row,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                r.name,
+                r.length,
+                r.full_genome_size,
+                r.effective_indexed_size,
+                r.genome,
+                r.contig,
+                r.taxonomy_field
+            )
+            .unwrap();
+            hasher.update(row.as_bytes());
+        }
+        assert_eq!(loaded.fingerprint(), hasher.digest128());
+    }
+
+    #[test]
+    fn mixed_databases_record_reference_types() {
+        // G1 declares a genome size, which a marker genome does not use.
+        let params = SubsampleParams {
+            fraction: 0.5,
+            seed: 7,
+            segment_length: 100,
+            min_length: 50,
+        };
+        let (loaded, text) = build_typed("G1\tMarkers\n", Some(params), "|5000");
+        assert!(text.starts_with("#metax_db_version\t3\n"));
+        assert!(text.contains("\n#reference_type\tmixed\n"));
+        assert_eq!(loaded.reference_type_label(), "mixed");
+        for r in &loaded.references {
+            let expected = if r.genome == "G1" {
+                ReferenceType::Markers
+            } else {
+                ReferenceType::Genome
+            };
+            assert_eq!(r.reference_type, expected);
+            if r.genome == "G1" {
+                assert_eq!((r.full_genome_size, r.effective_indexed_size), (1200, 1200));
+            }
+        }
+        let mut genomes_only = loaded.clone();
+        for r in &mut genomes_only.references {
+            r.reference_type = ReferenceType::Genome;
+        }
+        assert_ne!(loaded.fingerprint(), genomes_only.fingerprint());
+    }
+
+    #[test]
+    fn marker_genomes_are_never_subsampled() {
+        let genome = GenomeInput {
+            genome: "M".into(),
+            taxonomy: parse_taxonomy_field("s:5").unwrap(),
+            provided_genome_size: None,
+            contigs: (0..600)
+                .map(|i| InputContig {
+                    contig: format!("gene{i}"),
+                    reference_name: format!("M|gene{i}|s:5"),
+                    length: 1_000,
+                })
+                .collect(),
+            full_genome_size: 600_000,
+            reference_type: ReferenceType::Markers,
+        };
+        let params = SubsampleParams {
+            fraction: 0.1,
+            seed: 1,
+            segment_length: 50_000,
+            min_length: 3_000,
+        };
+        let records = subsample_genome(&genome, params, &mut StdRng::seed_from_u64(1)).unwrap();
+        assert_eq!(records.len(), 600);
+        assert!(records
+            .iter()
+            .all(|r| r.len() == 1_000 && r.effective_indexed_size == 600_000));
+    }
+
+    #[test]
+    fn reference_type_tables_are_validated() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("types.tsv");
+        std::fs::write(
+            &path,
+            "# genome\ttype\nA\tmarkers\nB\tGENOME\n\nA\tmarkers\n",
+        )
+        .unwrap();
+        let types = ReferenceTypes::new(ReferenceType::Genome, Some(&path)).unwrap();
+        assert_eq!(types.of("A"), ReferenceType::Markers);
+        assert_eq!(types.of("B"), ReferenceType::Genome);
+        assert_eq!(types.of("C"), ReferenceType::Genome);
+
+        for bad in [
+            "A\tmarkers\nA\tgenome\n",
+            "A\tplasmid\n",
+            "A markers\n",
+            "A\tmarkers\textra\n",
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                ReferenceTypes::new(ReferenceType::Genome, Some(&path)).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_layouts_are_checked() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metax_db.tsv");
+        let header = |version: &str, extra: &str, columns: &str| {
+            format!("#metax_db_version\t{version}\n#mapping_index\tmetax_db.mxi\n#fractional\tfalse\n{extra}#columns\t{columns}\n")
+        };
+        let row = "G|c|s:20\t100\t100\t100\tG\tc\ts:20";
+        let typed_columns = format!("{COLUMNS_GENOMES}\treference_type");
+        let cases = [
+            // version 2 with a type column
+            (header("2", "", &typed_columns) + row + "\tmarkers\n", false),
+            // version 3 without one
+            (
+                header("3", "#reference_type\tmarkers\n", COLUMNS_GENOMES) + row + "\n",
+                false,
+            ),
+            // declared type differs from the rows
+            (
+                header("3", "#reference_type\tmixed\n", &typed_columns) + row + "\tmarkers\n",
+                false,
+            ),
+            (
+                header("3", "#reference_type\tmarkers\n", &typed_columns) + row + "\tmarkers\n",
+                true,
+            ),
+            (header("2", "", COLUMNS_GENOMES) + row + "\n", true),
+        ];
+        for (text, ok) in cases {
+            std::fs::write(&path, &text).unwrap();
+            assert_eq!(load_db_tsv(&path).is_ok(), ok, "{text}");
+        }
     }
 }

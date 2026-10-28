@@ -18,7 +18,7 @@ use mapper::{
 use profiler::{ExactTiePolicy, Profiler, ProfilerConfig};
 use taxonomy::Taxonomy;
 
-use crate::db::{build_database, DatabaseMetadata, MetamIndexOptions};
+use crate::db::{build_database, DatabaseMetadata, MetamIndexOptions, ReferenceTypes};
 use crate::logging::init_logging;
 use crate::mapper::staging::{human_bytes, is_storage_exhausted, plan_staging_directory};
 use crate::mapper::tsv::{
@@ -941,6 +941,7 @@ pub fn build_index(
     segment_length: usize,
     min_length: usize,
     compress_subsampled: bool,
+    reference_types: ReferenceTypes,
     metam_options: MetamIndexOptions,
 ) -> Result<()> {
     let params = subsample.map(|fraction| crate::db::SubsampleParams {
@@ -955,6 +956,7 @@ pub fn build_index(
         params,
         threads,
         compress_subsampled,
+        &reference_types,
         &metam_options,
     )?;
     Ok(())

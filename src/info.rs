@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::db::DatabaseMetadata;
+use crate::db::{DatabaseMetadata, ReferenceType};
 
 const INDEX_MAGIC: [u8; 8] = *b"METAMM02";
 const MIN_SUPPORTED_INDEX_VERSION: u32 = 4;
@@ -69,17 +69,23 @@ fn run_index_info(path: &Path) -> Result<()> {
 
 fn print_metadata_summary(metadata: &DatabaseMetadata) {
     let mut genomes = HashSet::new();
+    let mut marker_genomes = 0usize;
     let mut reference_bases = 0u64;
     let mut full_genome_bases = 0u64;
     let mut effective_indexed_bases = 0u64;
     for reference in &metadata.references {
-        genomes.insert(reference.genome.as_str());
         reference_bases += reference.length as u64;
-        full_genome_bases += reference.full_genome_size as u64;
-        effective_indexed_bases += reference.effective_indexed_size as u64;
+        // Genome sizes repeat on every row of a genome; count each genome once.
+        if genomes.insert(reference.genome.as_str()) {
+            full_genome_bases += reference.full_genome_size as u64;
+            effective_indexed_bases += reference.effective_indexed_size as u64;
+            marker_genomes += usize::from(reference.reference_type == ReferenceType::Markers);
+        }
     }
+    print_kv("reference_type", metadata.reference_type_label());
     print_kv("metadata_reference_count", metadata.references.len());
     print_kv("metadata_genome_count", genomes.len());
+    print_kv("metadata_marker_genome_count", marker_genomes);
     print_kv("metadata_reference_bases", reference_bases);
     print_kv("metadata_full_genome_bases", full_genome_bases);
     print_kv("metadata_effective_indexed_bases", effective_indexed_bases);
