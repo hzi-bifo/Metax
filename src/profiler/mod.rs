@@ -653,7 +653,7 @@ pub struct ProfilerConfig {
     /// species represented by marker genes.
     pub min_marker_genes: usize,
 
-    /// Drop a species when a same-family species with more depth has a mean
+    /// Drop a species when a same-genus species with more depth has a mean
     /// read identity at least this much higher. Off when `None`.
     pub relative_identity_gap: Option<f64>,
 

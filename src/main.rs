@@ -397,7 +397,7 @@ struct ProfileArgs {
         value_name = "FRACTION",
         value_parser = parse_probability,
         help_heading = "Coverage evidence and filters",
-        help = "Drop a species when a species of the same family with more depth has a mean read identity at least FRACTION higher, so that its reads are better explained as reads of that relative. Removes relatives that only receive reads from genome parts missing from a fractional or marker index, but also a truly present species that is much less abundant than a close relative; use it when close relatives are not expected together. Off by default."
+        help = "Drop a species when a species of the same genus with more depth has a mean read identity at least FRACTION higher, so that its reads are better explained as reads of that relative. Removes relatives that only receive reads from genome parts missing from a fractional or marker index, but also a truly present species that is much less abundant than a close relative; use it when close relatives are not expected together. Off by default."
     )]
     relative_identity_gap: Option<f64>,
 

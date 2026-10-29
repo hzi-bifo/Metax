@@ -4239,7 +4239,7 @@ fn community_profile_row_passes(
 }
 
 /// Remove reported species whose reads a stronger relative explains better:
-/// a reported species of the same family with more depth whose candidate reads
+/// a reported species of the same genus with more depth whose candidate reads
 /// are at least `gap` more identical. Reads from genome regions missing from
 /// the index land on relatives at lower identity, so such a species mostly
 /// consists of the relative's reads. A species truly present next to a much
@@ -4252,26 +4252,27 @@ fn remove_species_explained_by_relatives(
     evidence: &HashMap<u32, TaxonEvidence>,
     gap: f64,
 ) -> Vec<(u32, u32)> {
-    // (taxid, depth, mean identity) of the reported species of each family.
-    let mut families: HashMap<u32, Vec<(u32, f64, f64)>> = HashMap::new();
+    // (taxid, depth, mean identity) of the reported species of each genus.
+    // Species without a genus in the taxonomy are not checked.
+    let mut genera: HashMap<u32, Vec<(u32, f64, f64)>> = HashMap::new();
     for row in rows.iter().filter(|row| row.rank == "species") {
-        let family = taxonomy
+        let genus = taxonomy
             .get_parents(row.taxid)
             .into_iter()
-            .find(|(_, _, rank)| rank == "family")
-            .map(|(family, _, _)| family);
+            .find(|(_, _, rank)| rank == "genus")
+            .map(|(genus, _, _)| genus);
         let identity = evidence
             .get(&row.taxid)
             .and_then(TaxonEvidence::mean_identity);
-        if let (Some(family), Some(identity)) = (family, identity) {
-            families
-                .entry(family)
+        if let (Some(genus), Some(identity)) = (genus, identity) {
+            genera
+                .entry(genus)
                 .or_default()
                 .push((row.taxid, row.depth, identity));
         }
     }
     let mut removed = Vec::new();
-    for species in families.values() {
+    for species in genera.values() {
         for &(taxid, depth, identity) in species {
             let explaining = species.iter().find(|&&(_, other_depth, other_identity)| {
                 other_depth > depth && other_identity - identity >= gap
@@ -4968,18 +4969,19 @@ mod tests {
             ]
         };
 
-        // Species 1002 and 1004 (another genus of the family) are explained by
-        // 1001; 1003 is within the gap and 1005 is in another family.
+        // Species 1002 is explained by 1001 of the same genus; 1003 is within
+        // the gap, 1004 is in another genus of the family and 1005 is in
+        // another family.
         let mut all = rows();
         let removed = remove_species_explained_by_relatives(&mut all, &taxonomy, &evidence, 0.01);
-        assert_eq!(removed, [(1002, 1001), (1004, 1001)]);
-        let kept: Vec<u32> = all.iter().map(|row| row.taxid).collect();
-        assert_eq!(kept, [1001, 1003, 1005]);
-
-        // With a gap of 0.045 only 1002 (0.048 below 1001) goes; 1004 (0.038) stays.
-        let mut wide = rows();
-        let removed = remove_species_explained_by_relatives(&mut wide, &taxonomy, &evidence, 0.045);
         assert_eq!(removed, [(1002, 1001)]);
+        let kept: Vec<u32> = all.iter().map(|row| row.taxid).collect();
+        assert_eq!(kept, [1001, 1003, 1004, 1005]);
+
+        // With a gap of 0.05, 1002 (0.048 below 1001) stays as well.
+        let mut wide = rows();
+        let removed = remove_species_explained_by_relatives(&mut wide, &taxonomy, &evidence, 0.05);
+        assert!(removed.is_empty());
     }
 
     #[test]
