@@ -49,6 +49,7 @@ use crate::taxonomy::Taxonomy;
 // Sub-modules for different profiling strategies
 pub(crate) mod community;
 pub(crate) mod evidence;
+mod identity;
 mod markers;
 mod output;
 mod pathogen;
@@ -662,6 +663,11 @@ pub struct ProfilerConfig {
     /// their genus, when the species' reads spread over its genome.
     pub removed_to_genus: bool,
 
+    /// Report a species at its genus when the mean identity of its best
+    /// placements lies more than this below the sample's baseline. Off when
+    /// `None`.
+    pub identity_margin: Option<f64>,
+
     /// Minimum fraction of read that must map (0.0-1.0)
     pub fraction: f64,
 
@@ -876,6 +882,7 @@ pub(crate) fn log_resolved_profiler_parameters(
          \tmin_marker_genes             {}\n\
          \trelative_identity_gap        {}\n\
          \tremoved_to_genus             {}\n\
+         \tidentity_margin              {}\n\
          \tby_mapped                    {}\n\
          \tgenus_fallback               {}\n\
          \tgenus_identity               {:.3}\n\
@@ -915,6 +922,7 @@ pub(crate) fn log_resolved_profiler_parameters(
         cfg.min_marker_genes,
         display_option(cfg.relative_identity_gap),
         cfg.removed_to_genus,
+        display_option(cfg.identity_margin),
         cfg.by_aligned,
         cfg.genus_fallback,
         cfg.genus_identity,
@@ -1287,6 +1295,7 @@ mod chunk_basis_tests {
             min_marker_genes: 3,
             relative_identity_gap: None,
             removed_to_genus: false,
+            identity_margin: None,
             fraction: 0.7,
             lowbiomass: false,
             keep_raw: false,

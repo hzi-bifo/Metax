@@ -70,6 +70,9 @@ use super::evidence::{
 };
 #[cfg(test)]
 use super::evidence::{PremapChunkGuard, RescueKinds};
+use super::identity::{
+    identity_baseline, move_rows_to_genus, BestPlacementScratch, BestPlacements,
+};
 use super::markers::{FragmentGeometry, FragmentLayout, LengthHistogram, MarkerModel};
 use super::output::{
     ClassificationSource, ProfileAnnotations, ProfileRow, ResolvedClassifications,
@@ -271,6 +274,10 @@ struct AssignmentResult {
     /// Candidate, resolved-best, and direct-clear fragment counts used by the
     /// evidence-policy rescue tiers.
     taxon_evidence: HashMap<u32, TaxonEvidence>,
+
+    /// Fragments whose best placement lies on each taxon, for
+    /// `--identity-margin`.
+    best_placements: HashMap<u32, BestPlacements>,
 
     /// Compact coordinate payload for exact top-score short-read ties.
     /// Populated only when guarded MAP is active.
@@ -1161,6 +1168,13 @@ impl CommunityProfiler {
                     .saturating_add(evidence.mapped_fragments);
                 target.identity_sum += evidence.identity_sum;
             }
+            for (taxid, placements) in result.best_placements {
+                final_result
+                    .best_placements
+                    .entry(taxid)
+                    .or_default()
+                    .add(placements);
+            }
             final_result.exact_ties.append(result.exact_ties);
             final_result
                 .uniquely_supported_taxa
@@ -1854,35 +1868,9 @@ impl CommunityProfiler {
                     chunkcov_prob,
                 )
             };
-            let annotations = if let Some(host_taxid) = host_taxid {
-                if let Some(map) = pathogen_map.as_ref() {
-                    if let Some(entry) = map.get(&taxid) {
-                        let (report_it, host_names, host_taxids, diseases) =
-                            self.annotate_host_disease(entry, host_taxid);
-                        if !report_it {
-                            continue;
-                        }
-                        Some(ProfileAnnotations {
-                            host_names: host_names.unwrap_or_else(|| "NA".to_string()),
-                            host_taxids: host_taxids.unwrap_or_else(|| "NA".to_string()),
-                            diseases: diseases.unwrap_or_else(|| "NA".to_string()),
-                        })
-                    } else {
-                        Some(ProfileAnnotations {
-                            host_names: "unknown".to_string(),
-                            host_taxids: "unknown".to_string(),
-                            diseases: "unknown".to_string(),
-                        })
-                    }
-                } else {
-                    Some(ProfileAnnotations {
-                        host_names: "unknown".to_string(),
-                        host_taxids: "unknown".to_string(),
-                        diseases: "unknown".to_string(),
-                    })
-                }
-            } else {
-                None
+            let Some(annotations) = self.row_annotations(taxid, host_taxid, pathogen_map.as_ref())
+            else {
+                continue;
             };
             out_taxa_list.push(ProfileRow {
                 taxname: taxname.to_string(),
@@ -1935,6 +1923,17 @@ impl CommunityProfiler {
                     );
                 }
             }
+        }
+        if let Some(margin) = self.cfg.identity_margin {
+            let moved = self.report_low_identity_species_at_genus(
+                &mut normalized,
+                &assignment.best_placements,
+                margin,
+                host_taxid,
+                pathogen_map.as_ref(),
+            );
+            resolved_classifications.relabel(&moved);
+            relabel_ambiguous_fractions(&mut ambiguous_fraction, &moved);
         }
         let total_abundance = normalized.iter().map(|row| row.abundance).sum::<f64>();
         for row in &mut normalized {
@@ -2199,27 +2198,8 @@ impl CommunityProfiler {
                 )
             };
 
-            let annotations = if let Some(host_taxid) = host_taxid {
-                if let Some(entry) = pathogen_map.and_then(|map| map.get(&taxid)) {
-                    let (report_it, host_names, host_taxids, diseases) =
-                        self.annotate_host_disease(entry, host_taxid);
-                    if !report_it {
-                        continue;
-                    }
-                    Some(ProfileAnnotations {
-                        host_names: host_names.unwrap_or_else(|| "NA".to_string()),
-                        host_taxids: host_taxids.unwrap_or_else(|| "NA".to_string()),
-                        diseases: diseases.unwrap_or_else(|| "NA".to_string()),
-                    })
-                } else {
-                    Some(ProfileAnnotations {
-                        host_names: "unknown".to_string(),
-                        host_taxids: "unknown".to_string(),
-                        diseases: "unknown".to_string(),
-                    })
-                }
-            } else {
-                None
+            let Some(annotations) = self.row_annotations(taxid, host_taxid, pathogen_map) else {
+                continue;
             };
             rows.push(ProfileRow {
                 taxname: taxname.to_string(),
@@ -2239,6 +2219,109 @@ impl CommunityProfiler {
             });
         }
         rows
+    }
+
+    /// `--identity-margin`: report at their genus the reported species whose
+    /// best placements are clearly less identical than those of the sample's
+    /// typical species. Returns the species moved, each with its genus.
+    fn report_low_identity_species_at_genus(
+        &self,
+        rows: &mut Vec<ProfileRow>,
+        placements: &HashMap<u32, BestPlacements>,
+        margin: f64,
+        host_taxid: Option<u32>,
+        pathogen_map: Option<&HashMap<u32, PathogenEntry>>,
+    ) -> HashMap<u32, u32> {
+        let species = rows
+            .iter()
+            .filter(|row| row.rank == "species")
+            .map(|row| row.taxid);
+        let Some(judged) = identity_baseline(species, placements) else {
+            log::info!(
+                target: "PROFILER",
+                "Identity margin not applied: fewer than 3 reported species have best placements."
+            );
+            return HashMap::new();
+        };
+        let moves: HashMap<u32, u32> = judged
+            .below(margin)
+            .filter_map(|species| {
+                let genus = resolve_genus_taxid(&self.taxonomy, species.taxid)?;
+                Some((species.taxid, genus))
+            })
+            .collect();
+        let moved = move_rows_to_genus(rows, &moves, |genus| {
+            let name = self.taxonomy.get_name(genus)?.to_string();
+            Some((name, self.row_annotations(genus, host_taxid, pathogen_map)?))
+        });
+        log::info!(
+            target: "PROFILER",
+            "Identity baseline {:.5} over {} species; {} species more than {} below it reported at genus.",
+            judged.baseline,
+            judged.species.len(),
+            moved.len(),
+            margin,
+        );
+        if self.cfg.verbose || self.cfg.very_verbose {
+            // --verbose lists the species below the baseline, --very-verbose
+            // every judged species.
+            let name = |taxid: u32| self.taxonomy.get_name(taxid).unwrap_or("unknown");
+            for species in &judged.species {
+                let below = judged.is_below(species, margin);
+                if !below && !self.cfg.very_verbose {
+                    continue;
+                }
+                let outcome = match moved.get(&species.taxid) {
+                    Some(&genus) => format!("reported at {} ({genus})", name(genus)),
+                    None if below => "kept: no genus to report".to_string(),
+                    None => "kept".to_string(),
+                };
+                log::info!(
+                    target: "PROFILER",
+                    "  {} ({}): identity {:.5} over {} fragments, {}",
+                    name(species.taxid),
+                    species.taxid,
+                    species.identity,
+                    species.fragments,
+                    outcome,
+                );
+            }
+        }
+        moved
+    }
+
+    /// Host and disease columns of a profile row; rows have none without
+    /// `--host`. `None` when the host filter excludes the taxon.
+    fn row_annotations(
+        &self,
+        taxid: u32,
+        host_taxid: Option<u32>,
+        pathogen_map: Option<&HashMap<u32, PathogenEntry>>,
+    ) -> Option<Option<ProfileAnnotations>> {
+        let Some(host_taxid) = host_taxid else {
+            return Some(None);
+        };
+        let annotations = match pathogen_map.and_then(|map| map.get(&taxid)) {
+            Some(entry) => {
+                let (report_it, host_names, host_taxids, diseases) =
+                    self.annotate_host_disease(entry, host_taxid);
+                if !report_it {
+                    return None;
+                }
+                let or_na = |value: Option<String>| value.unwrap_or_else(|| "NA".to_string());
+                ProfileAnnotations {
+                    host_names: or_na(host_names),
+                    host_taxids: or_na(host_taxids),
+                    diseases: or_na(diseases),
+                }
+            }
+            None => ProfileAnnotations {
+                host_names: "unknown".to_string(),
+                host_taxids: "unknown".to_string(),
+                diseases: "unknown".to_string(),
+            },
+        };
+        Some(Some(annotations))
     }
 
     /// Annotate a pathogen with host and disease information.
@@ -3092,6 +3175,7 @@ fn process_evidence_batch(
     let mut scratch = CandidateScratch::default();
     let mut indexed_candidates: Vec<usize> = Vec::new();
     let mut best_identities: Vec<(u32, f32)> = Vec::new();
+    let mut best_placements = BestPlacementScratch::default();
 
     // Genus fallback remains a separate, lower-rank path and runs only when
     // no terminal candidate survives the native policy.
@@ -3118,6 +3202,9 @@ fn process_evidence_batch(
                 evidence.mapped_fragments = evidence.mapped_fragments.saturating_add(1);
                 evidence.identity_sum += f64::from(identity);
             }
+        }
+        if policy.collect_best_placements {
+            best_placements.credit(&read.alignments, &mut result.best_placements);
         }
 
         let candidates = scratch.build(&read.alignments, policy);
@@ -4451,6 +4538,24 @@ fn explicit_cutoffs_pass(row: &ProfileRow, cfg: &ProfilerConfig) -> bool {
         && at_least(cfg.min_coebr, row.flex_chunk / row.expected_flex_chunk)
 }
 
+/// Move the shares of relabelled taxa in ambiguous classifications to their
+/// new taxid.
+fn relabel_ambiguous_fractions(
+    fractions: &mut HashMap<Vec<u32>, HashMap<u32, f64>>,
+    relabel: &HashMap<u32, u32>,
+) {
+    if relabel.is_empty() {
+        return;
+    }
+    for shares in fractions.values_mut() {
+        for (&from, &to) in relabel {
+            if let Some(share) = shares.remove(&from) {
+                *shares.entry(to).or_default() += share;
+            }
+        }
+    }
+}
+
 fn write_community_classifications(
     path: Option<&str>,
     resolved: &ResolvedClassifications,
@@ -4700,6 +4805,7 @@ mod tests {
             min_marker_genes: 3,
             relative_identity_gap: None,
             removed_to_genus: false,
+            identity_margin: None,
             fraction: 0.6,
             lowbiomass: false,
             keep_raw: false,

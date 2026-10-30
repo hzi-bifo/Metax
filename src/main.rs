@@ -306,6 +306,18 @@ struct ProfileArgs {
     removed_to_genus: bool,
 
     #[arg(
+        long = "identity-margin",
+        value_name = "FRACTION",
+        num_args = 0..=1,
+        default_missing_value = "0.025",
+        value_parser = parse_probability,
+        conflicts_with = "strain",
+        help_heading = "Genus fallback and low-map behavior",
+        help = "Report a species at its genus when the reads placed best on it are, on average, more than FRACTION less identical than those of the sample's typical species (the median over the reported species, weighted by their fragments). Such a species is mostly a relative that receives the reads of an organism missing from the database. Needs at least 3 reported species. Without a value: 0.025. Off by default."
+    )]
+    identity_margin: Option<f64>,
+
+    #[arg(
         long = "genus-identity",
         value_name = "FRACTION",
         default_value_t = 0.80,
@@ -1038,6 +1050,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             min_marker_genes: args.min_marker_genes,
             relative_identity_gap: args.relative_identity_gap,
             removed_to_genus: args.removed_to_genus,
+            identity_margin: args.identity_margin,
             fraction: args.fraction,
             lowbiomass: args.lowbiomass,
             keep_raw: args.keep_raw,
@@ -1326,6 +1339,22 @@ mod tests {
         assert_eq!(config.mode, ProfileMode::Recall);
         assert_eq!(config.exact_ties, ExactTiePolicy::GuardedMap);
         assert_eq!(config.reuse_mappings.as_deref(), file.path().to_str());
+    }
+
+    #[test]
+    fn identity_margin_is_off_by_default_and_has_a_default_value() {
+        let margin = |extra: &[&str]| {
+            let argv = ["metax", "profile", "-d", "db", "-i", "r1.fq", "-o", "out"];
+            let cli = Cli::try_parse_from(argv.iter().chain(extra)).unwrap();
+            let Commands::Profile(args) = cli.command else {
+                panic!("expected profile command");
+            };
+            args.identity_margin
+        };
+        assert_eq!(margin(&[]), None);
+        assert_eq!(margin(&["--identity-margin"]), Some(0.025));
+        assert_eq!(margin(&["--identity-margin", "0.04"]), Some(0.04));
+        assert_eq!(margin(&["--identity-margin", "-t", "4"]), Some(0.025));
     }
 
     #[test]

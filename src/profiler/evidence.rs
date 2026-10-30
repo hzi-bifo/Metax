@@ -93,6 +93,9 @@ pub(crate) struct EvidencePolicy {
     /// Record the mean mapping identity of each taxon, for
     /// `--relative-identity-gap`.
     pub(crate) collect_identities: bool,
+    /// Record the fragments whose best placement lies on each taxon, for
+    /// `--identity-margin`.
+    pub(crate) collect_best_placements: bool,
 }
 
 impl EvidencePolicy {
@@ -119,6 +122,7 @@ impl EvidencePolicy {
             collect_exact_ties: mode.supports_guarded_map()
                 && cfg.exact_ties == ExactTiePolicy::GuardedMap,
             collect_identities: cfg.relative_identity_gap.is_some(),
+            collect_best_placements: cfg.identity_margin.is_some(),
         })
     }
 }
@@ -1479,6 +1483,7 @@ mod tests {
             fraction: 0.70,
             collect_exact_ties: false,
             collect_identities: true,
+            collect_best_placements: false,
         }
     }
 

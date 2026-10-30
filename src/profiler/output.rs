@@ -92,6 +92,26 @@ impl ResolvedClassifications {
         groups
     }
 
+    /// Move the groups of the taxa in `relabel` to their new taxid, naming the
+    /// old taxid as their source.
+    pub(crate) fn relabel(&mut self, relabel: &HashMap<u32, u32>) {
+        if relabel.is_empty() {
+            return;
+        }
+        self.indices.clear();
+        for group in std::mem::take(&mut self.groups) {
+            let ResolvedClassificationKey { taxid, source } = group.key;
+            let (taxid, source) = match (relabel.get(&taxid), source) {
+                (Some(&to), ClassificationSource::Direct) => {
+                    (to, ClassificationSource::Candidates(vec![taxid]))
+                }
+                (Some(&to), source) => (to, source),
+                (None, source) => (taxid, source),
+            };
+            self.record(taxid, source, group.count, Some(group.reads));
+        }
+    }
+
     pub(crate) fn record_read(&mut self, taxid: u32, read: &str) {
         let reads = self.retain_read_names.then(|| vec![read.to_string()]);
         self.record(taxid, ClassificationSource::Direct, 1, reads);

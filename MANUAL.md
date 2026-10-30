@@ -607,7 +607,17 @@ When part of a genome is missing from the index, as in fractional indexes and fo
 
 The guard is off by default, because it cannot tell such a relative from a species that is truly present but much less abundant than a close relative: the relative's reads land on that species too and lower its mean identity, so it is removed as well. Use the guard when close relatives are not expected in the same sample.
 
-### 7.12 Abundance estimation
+### 7.12 Identity relative to the sample
+
+The reads of an organism that the database lacks land on its closest relatives, at an identity below that of reads from organisms the database holds, and such a relative can pass every coverage test. Sequencing errors, read length and strain diversity lower the identity of all species in a sample alike, so `--identity-margin [F]` compares each reported species with the sample itself:
+
+- In every fragment, each taxon's placement is scored as mapped bases × (2 × identity − 1): the pair of both mates on one reference when the taxon has one, otherwise the best single placement of each mate. The fragment counts for every taxon that reaches its top score, with the identity of that placement (weighted by mapped bases).
+- For every reported species the mean identity of its fragments is taken. The baseline is the median of these means over the reported species, weighted by their fragments.
+- A species whose mean lies more than `F` below the baseline is reported at its genus: its row joins the genus row, which adds up fragments, depth and abundance and shows the coverage columns of its largest part, and its classified reads follow.
+
+Given without a value, `F` is `0.025`. The rule needs at least 3 reported species with such fragments; a species without a genus in the taxonomy stays. With the relative identity guard (§7.11) it runs after the guard. The log reports the baseline and the number of species moved; `--verbose` lists each with its mean identity. The option is off by default.
+
+### 7.13 Abundance estimation
 
 Reads with several retained candidates are redistributed by an expectation–maximization procedure that iterates until the relative change falls below `1e-5` or `--max-em-iterations` is reached. Abundance is normalized across the taxa that pass the final filters. Read counts are reported in full-index equivalents.
 
@@ -679,4 +689,5 @@ metax profile -d db_frac_10 -i R1.fastq.gz -I R2.fastq.gz -o sample_frac -t 32 \
 - Profiling reads Metax's own coordinate mappings; SAM/BAM files from other mappers are not supported.
 - Strain profiling is experimental (§5.9).
 - `--removed-to-genus` cannot recognise a reference that consists mostly of foreign DNA (§7.10).
+- `--identity-margin` also reports at genus a species present only as a strain that has diverged clearly from every reference of its species (§7.12).
 - Windows is supported only through WSL.
