@@ -590,13 +590,24 @@ Genus fallback assigns a read to a genus when none of its mappings qualifies for
 
 A fallback mapping must have identity of at least `--genus-identity` (default `0.80`), a mapped length of at least 50 bases for Illumina or the configured species `--mapped-len` otherwise, and pass the platform-aware genus coverage gate. The genus taxid is resolved from the species taxid through the taxonomy; species/strain evidence always takes precedence.
 
-### 7.10 Relative identity guard
+### 7.10 Reads of removed species at genus
+
+The coverage evidence removes a species whose reads cover its reference too little or unevenly. These reads often still belong to the species' genus: the sample organism may be a divergent strain that shares only part of its genome with the reference, or a new species of a genus the database holds. With `--removed-to-genus`, a fragment none of whose candidate species was kept is credited to the candidate of its best placement, the donor, and is reported at the genus when all its candidates lie in that genus. A donor takes part only when its own evidence spreads over its genome:
+
+- chunk ratio (COEBR, §7.6) of at least `0.40`, and
+- window spread of at least `0.50`: the genome of the donor's strongest witness is cut into `min(100, n/5)` equal windows for its `n` resolved fragments, and the spread is the share of windows that hold the start of at least one of them. With fewer than 4 windows the donor does not take part.
+
+A genus row needs at least 200 fragments from its donors. It enters abundance estimation with the other taxa, and its coverage columns show the donor with the most fragments, as a majority-LCA row shows its witness. `--min-reads` and explicitly set coverage cutoffs apply to it. Species represented by marker genes do not take part. Host genomes in the database take part like any other: reads of a host whose genome they cover too thinly for a species call are reported at its genus, with an abundance that follows their small depth. The log reports the number of genus rows; `--verbose` lists the donors of each.
+
+Foreign contigs in a reference, a misassembled region, and DNA shared across genera also leave removed species behind, but their reads reach only that part of the genome, which the window spread rejects. A reference that consists mostly of foreign DNA can pass both checks and produce a false genus row. The option is off by default.
+
+### 7.11 Relative identity guard
 
 When part of a genome is missing from the index, as in fractional indexes and for marker genomes, reads from the missing part land on related genomes at lower identity. Such a relative can pass every coverage test, because these reads spread over its sequence like its own reads. `--relative-identity-gap F` drops a reported species when a reported species of the same genus has more depth and a mean mapping identity at least `F` higher; the mean identity of a taxon is taken over every fragment mapped to it, using the fragment's best mapping, before the read-level identity gate. Species without a genus in the taxonomy are not checked. The number of removed species is logged; `--verbose` lists each with the relative that explains it.
 
 The guard is off by default, because it cannot tell such a relative from a species that is truly present but much less abundant than a close relative: the relative's reads land on that species too and lower its mean identity, so it is removed as well. Use the guard when close relatives are not expected in the same sample.
 
-### 7.11 Abundance estimation
+### 7.12 Abundance estimation
 
 Reads with several retained candidates are redistributed by an expectation–maximization procedure that iterates until the relative change falls below `1e-5` or `--max-em-iterations` is reached. Abundance is normalized across the taxa that pass the final filters. Read counts are reported in full-index equivalents.
 
@@ -654,7 +665,7 @@ metax profile -d db_markers -i R1.fastq.gz -I R2.fastq.gz -o sample_markers -t 3
 
 ### 8.8 Fractional index with the relative identity guard
 
-For samples in which close relatives are not expected together (§7.10):
+For samples in which close relatives are not expected together (§7.11):
 
 ```bash
 metax profile -d db_frac_10 -i R1.fastq.gz -I R2.fastq.gz -o sample_frac -t 32 \
@@ -667,4 +678,5 @@ metax profile -d db_frac_10 -i R1.fastq.gz -I R2.fastq.gz -o sample_frac -t 32 \
 - Per-read classification output is unavailable for fractional databases.
 - Profiling reads Metax's own coordinate mappings; SAM/BAM files from other mappers are not supported.
 - Strain profiling is experimental (§5.9).
+- `--removed-to-genus` cannot recognise a reference that consists mostly of foreign DNA (§7.10).
 - Windows is supported only through WSL.

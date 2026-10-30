@@ -439,6 +439,9 @@ pub(crate) struct EvidenceCoverage {
     pub(crate) chunk_pvalue: Option<f64>,
     /// Distinct marker genes hit, for a genome represented by marker genes.
     pub(crate) marker_genes_hit: Option<usize>,
+    /// Share of genome windows that the reads reach; measured only for
+    /// `--removed-to-genus` and when there are enough reads.
+    pub(crate) window_spread: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -715,6 +718,7 @@ pub(crate) fn calculate_coverage(
         breadth_pvalue,
         chunk_pvalue,
         marker_genes_hit: None,
+        window_spread: None,
     }
 }
 
@@ -1505,6 +1509,7 @@ mod tests {
             breadth_pvalue: Some(1.0),
             chunk_pvalue: Some(1.0),
             marker_genes_hit: None,
+            window_spread: None,
         }
     }
 

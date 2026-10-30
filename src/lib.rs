@@ -102,6 +102,7 @@ pub struct AppConfig {
     pub min_coebr: Option<f64>,
     pub min_marker_genes: usize,
     pub relative_identity_gap: Option<f64>,
+    pub removed_to_genus: bool,
     pub fraction: Option<f64>,
     pub lowbiomass: bool,
     pub keep_raw: bool,
@@ -506,6 +507,9 @@ impl MetaxApp {
             if self.config.genus_fallback {
                 flags.push("--genus-fallback".to_string());
             }
+            if self.config.removed_to_genus {
+                flags.push("--removed-to-genus".to_string());
+            }
             if self.config.lenient_mapping_input {
                 flags.push("--lenient-mapping-input".to_string());
             }
@@ -874,6 +878,7 @@ impl MetaxApp {
             min_coebr: self.config.min_coebr,
             min_marker_genes: self.config.min_marker_genes,
             relative_identity_gap: self.config.relative_identity_gap,
+            removed_to_genus: self.config.removed_to_genus,
             fraction,
             lowbiomass: self.config.lowbiomass,
             keep_raw: self.config.keep_raw,
@@ -1019,6 +1024,7 @@ mod tests {
             min_coebr: None,
             min_marker_genes: 3,
             relative_identity_gap: None,
+            removed_to_genus: false,
             fraction: None,
             lowbiomass: false,
             keep_raw: false,

@@ -268,6 +268,7 @@ fn marker_coverage(
         ),
         chunk_pvalue: Some((at_most(&hit_probabilities, genes_hit) * tests).min(1.0)),
         marker_genes_hit: Some(genes_hit),
+        window_spread: None,
     })
 }
 

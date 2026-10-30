@@ -297,6 +297,15 @@ struct ProfileArgs {
     genus_fallback: bool,
 
     #[arg(
+        long = "removed-to-genus",
+        action = ArgAction::SetTrue,
+        conflicts_with = "strain",
+        help_heading = "Genus fallback and low-map behavior",
+        help = "Report the reads of a species that the coverage evidence removes at the species' genus, when its own reads spread over its genome (chunk ratio of at least 0.40 and reads in at least half of the genome's windows) and the genus collects at least 200 fragments. Recovers the reads of divergent strains and of new species of a genus in the database. A reference that consists mostly of foreign DNA can still produce a false genus row. Community profiling; species represented by marker genes do not take part. Off by default."
+    )]
+    removed_to_genus: bool,
+
+    #[arg(
         long = "genus-identity",
         value_name = "FRACTION",
         default_value_t = 0.80,
@@ -1028,6 +1037,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             min_coebr: args.min_coebr,
             min_marker_genes: args.min_marker_genes,
             relative_identity_gap: args.relative_identity_gap,
+            removed_to_genus: args.removed_to_genus,
             fraction: args.fraction,
             lowbiomass: args.lowbiomass,
             keep_raw: args.keep_raw,

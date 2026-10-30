@@ -75,6 +75,7 @@ use super::output::{
     ClassificationSource, ProfileAnnotations, ProfileRow, ResolvedClassifications,
 };
 use super::pathogen::{load_pathogen_table, PathogenEntry};
+use super::rollup::{GenomeLayout, GenusRollup, GenusRow, OrphanedFragments};
 use super::statistics::{coverage_deviation_pvalue, round5};
 use super::{
     coverage_passes, equivalent_read_count_passes_minimum, log_reference_taxonomy_adjustments,
@@ -353,7 +354,16 @@ struct ReadAssignment {
 
     /// Genome-specific multiplier for each representative candidate mapping.
     sampling_scales: Vec<f64>,
+
+    /// Index in `taxids` of the candidate with the best placement. Native
+    /// assignments only; `--removed-to-genus` credits an orphaned fragment to
+    /// that species.
+    best: u32,
 }
+
+// `best` fills alignment padding: the per-fragment record must not grow.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<ReadAssignment>() == 120);
 
 #[derive(Clone, Copy, Debug, Default)]
 struct TaxonTotals {
@@ -580,6 +590,12 @@ impl CommunityProfiler {
                 .collect();
             species_to_genus_raw.retain(|species, _| species_with_genomes.contains(species));
         }
+        // The roll-up needs every genus, also on a fractional database, where
+        // genus fallback is off.
+        let rollup_genus_of = self
+            .cfg
+            .removed_to_genus
+            .then(|| species_to_genus_raw.clone());
         let db_is_subsampled = db.is_fractional;
         let species_normalize = Arc::new(species_normalize_raw);
         let species_to_genus = Arc::new(if db_is_subsampled && !self.cfg.genus_fallback {
@@ -595,6 +611,15 @@ impl CommunityProfiler {
                 assembly_ids.insert(reference.genome.as_str(), next);
             }
         }
+        let genus_rollup = rollup_genus_of.map(|genus_of| {
+            let layout = GenomeLayout::new(db.references.iter().map(|reference| {
+                (
+                    assembly_ids[reference.genome.as_str()],
+                    reference.length as u64,
+                )
+            }));
+            Arc::new(GenusRollup { genus_of, layout })
+        });
         let mut metam_refs: HashMap<String, MetamReferenceEntry> =
             HashMap::with_capacity(db.references.len());
         for (reference_index, (reference, taxonomy)) in
@@ -804,6 +829,7 @@ impl CommunityProfiler {
             skipped_reference_at_load: num_skipped_reference,
             evidence_policy,
             marker_model,
+            genus_rollup,
         })
     }
 
@@ -1190,6 +1216,7 @@ impl CommunityProfiler {
             evidence_policy,
             terminal_ranks,
             marker_model,
+            genus_rollup,
             ..
         } = mapping_data;
         let verbose_logging = self.cfg.verbose || self.cfg.very_verbose;
@@ -1243,7 +1270,10 @@ impl CommunityProfiler {
                 min_breadth,
                 min_chunk_breadth,
                 safeguard_min_chunk_breadth,
-                marker_model.as_deref(),
+                CoverageModel {
+                    markers: marker_model.as_deref(),
+                    layout: genus_rollup.as_deref().map(|rollup| &rollup.layout),
+                },
             )?;
             evidence_decisions = resolved.decisions;
             evidence_selected_taxa = resolved.selected_taxa;
@@ -1283,6 +1313,9 @@ impl CommunityProfiler {
         let mut unambiguous: HashMap<u32, TaxonTotals> = HashMap::new();
         let mut ambiguous_counts: HashMap<Vec<u32>, AmbiguousTotals> = HashMap::new();
         let mut ambiguous_reads: HashMap<Vec<u32>, Vec<String>> = HashMap::new();
+        let mut orphans = genus_rollup
+            .as_deref()
+            .map(|rollup| OrphanedFragments::new(rollup, write_classifications));
 
         for assignment in &assignment.read_assignments {
             let mut final_taxids = Vec::new();
@@ -1309,6 +1342,21 @@ impl CommunityProfiler {
             }
             match final_taxids.len() {
                 0 => {
+                    // The coverage evidence rejected every candidate.
+                    if let Some(orphans) = orphans
+                        .as_mut()
+                        .filter(|_| assignment.requires_terminal_evidence)
+                    {
+                        let best = assignment.best as usize;
+                        orphans.offer(
+                            &assignment.taxids,
+                            best,
+                            assignment.depths[best],
+                            assignment.mapped_lens[best],
+                            assignment.sampling_scales[best],
+                            &assignment.read,
+                        );
+                    }
                     continue;
                 }
                 1 => {
@@ -1522,6 +1570,16 @@ impl CommunityProfiler {
                 .or_insert(values);
         }
 
+        let rollup_metrics = match orphans {
+            Some(orphans) => self.add_genus_rows(
+                orphans.into_genus_rows(&evidence_decisions),
+                &mut unambiguous,
+                &mut resolved_classifications,
+            ),
+            None => HashMap::new(),
+        };
+        let rolled_up_genera: HashSet<u32> = rollup_metrics.keys().copied().collect();
+
         let mut species_count_depth = unambiguous.clone();
         let mut ambiguous_fraction: HashMap<Vec<u32>, HashMap<u32, f64>> = HashMap::new();
         let mut em_groups = ambiguous_counts.iter().collect::<Vec<_>>();
@@ -1726,7 +1784,11 @@ impl CommunityProfiler {
                 // descendant witness instead of dividing pooled observations by
                 // an expectation rebuilt from pooled depth and count. Report
                 // filtering still applies to LCA rows; only the numbers change.
-                lca_metrics.get(&taxid).copied()
+                // A roll-up genus row reports its strongest donor likewise.
+                lca_metrics
+                    .get(&taxid)
+                    .or_else(|| rollup_metrics.get(&taxid))
+                    .copied()
             };
             let (
                 breadth,
@@ -1848,6 +1910,7 @@ impl CommunityProfiler {
                     &self.cfg,
                     min_chunk_breadth,
                     &evidence_selected_taxa,
+                    &rolled_up_genera,
                     &lca_ratio_lower_bounds,
                 )
             })
@@ -1956,6 +2019,59 @@ impl CommunityProfiler {
         }
 
         Ok(final_classified_reads)
+    }
+
+    /// Add the genus rows of `--removed-to-genus` to the unambiguous totals
+    /// that enter the EM, and their fragments to the classifications. Returns
+    /// the coverage that each row reports.
+    fn add_genus_rows(
+        &self,
+        rows: Vec<GenusRow>,
+        unambiguous: &mut HashMap<u32, TaxonTotals>,
+        classifications: &mut ResolvedClassifications,
+    ) -> HashMap<u32, EvidenceCoverage> {
+        let unit = if self.cfg.is_paired {
+            "fragments"
+        } else {
+            "reads"
+        };
+        let name = |taxid: u32| self.taxonomy.get_name(taxid).unwrap_or("unknown");
+        log::info!(
+            target: "PROFILER",
+            "Reads of removed species reported at genus: {} genus rows, {:.0} {} from {} species.",
+            rows.len(),
+            rows.iter().map(|row| row.fragments).sum::<f64>(),
+            unit,
+            rows.iter().map(|row| row.donors.len()).sum::<usize>(),
+        );
+        let mut metrics = HashMap::with_capacity(rows.len());
+        for row in rows {
+            if self.cfg.verbose || self.cfg.very_verbose {
+                let donors = row
+                    .donors
+                    .iter()
+                    .map(|&taxid| name(taxid))
+                    .collect::<Vec<_>>();
+                log::info!(
+                    target: "PROFILER",
+                    "  {} ({}): {:.0} {} of {}",
+                    name(row.genus),
+                    row.genus,
+                    row.fragments,
+                    unit,
+                    donors.join(", "),
+                );
+            }
+            let totals = unambiguous.entry(row.genus).or_default();
+            totals
+                .support
+                .add_weighted(row.fragments, row.equivalent, 1.0);
+            totals.depth += row.depth;
+            totals.mapped_len += row.mapped_len;
+            classifications.record_group(row.genus, row.donors, row.fragments as usize, row.reads);
+            metrics.insert(row.genus, row.witness);
+        }
+        metrics
     }
 
     /// Format the optional raw community profile from its independent EM
@@ -2575,6 +2691,36 @@ fn add_exact_tie_placement(
     Ok(index)
 }
 
+/// How the coverage of an assembly-coherent witness is measured: a marker
+/// genome by the genes its reads hit, any other genome by its intervals, with
+/// the window spread when `--removed-to-genus` needs it.
+#[derive(Clone, Copy)]
+struct CoverageModel<'a> {
+    markers: Option<&'a MarkerModel>,
+    layout: Option<&'a GenomeLayout>,
+}
+
+impl CoverageModel<'_> {
+    fn measure(
+        self,
+        key: &PresenceKey,
+        assembly: &mut PresenceAssembly,
+        multiple_testing_taxa: usize,
+    ) -> EvidenceCoverage {
+        if let Some(markers) = self
+            .markers
+            .and_then(|model| model.coverage(key.assembly_id, assembly, multiple_testing_taxa))
+        {
+            return markers;
+        }
+        let mut metrics = calculate_coverage(assembly, multiple_testing_taxa);
+        metrics.window_spread = self
+            .layout
+            .and_then(|layout| layout.window_spread(key.assembly_id, &assembly.intervals));
+        metrics
+    }
+}
+
 fn resolve_coordinate_evidence(
     cfg: &ProfilerConfig,
     policy: EvidencePolicy,
@@ -2582,7 +2728,7 @@ fn resolve_coordinate_evidence(
     min_breadth: f64,
     standard_min_chunk_breadth: f64,
     safeguard_min_chunk_breadth: f64,
-    marker_model: Option<&MarkerModel>,
+    coverage_model: CoverageModel<'_>,
 ) -> Result<CoordinateEvidenceResult> {
     let thresholds = EvidenceThresholds {
         mode: policy.mode,
@@ -2607,9 +2753,7 @@ fn resolve_coordinate_evidence(
     // remain directly comparable.
     let multiple_testing_taxa = baseline_witness_count.max(1);
     let coverage = |key: &PresenceKey, assembly: &mut PresenceAssembly| {
-        marker_model
-            .and_then(|model| model.coverage(key.assembly_id, assembly, multiple_testing_taxa))
-            .unwrap_or_else(|| calculate_coverage(assembly, multiple_testing_taxa))
+        coverage_model.measure(key, assembly, multiple_testing_taxa)
     };
     if cfg.verbose || cfg.very_verbose {
         log::info!(
@@ -3016,6 +3160,11 @@ fn process_evidence_batch(
             let mut depths = Vec::with_capacity(candidates.len());
             let mut mapped_lens = Vec::with_capacity(candidates.len());
             let mut sampling_scales = Vec::with_capacity(candidates.len());
+            // Candidates arrive best placement first.
+            let best = indexed_candidates
+                .iter()
+                .position(|&index| index == 0)
+                .unwrap_or(0) as u32;
             for &index in &indexed_candidates {
                 let candidate = &candidates[index];
                 let placement = candidate.best;
@@ -3036,6 +3185,7 @@ fn process_evidence_batch(
                 depths,
                 mapped_lens,
                 sampling_scales,
+                best,
             });
 
             if policy.collect_exact_ties
@@ -3410,6 +3560,7 @@ fn commit_assignment(
         depths,
         mapped_lens: maplens,
         sampling_scales,
+        best: 0,
     });
 }
 
@@ -4202,12 +4353,13 @@ fn community_profile_row_passes(
     cfg: &ProfilerConfig,
     min_chunk_breadth: f64,
     evidence_selected_taxa: &HashSet<u32>,
+    rolled_up_genera: &HashSet<u32>,
     lca_ratio_lower_bounds: &HashMap<u32, (f64, f64)>,
 ) -> bool {
     let min_reads_ok = equivalent_read_count_passes_minimum(row.equivalent_mapcount, cfg.min_reads);
-    if evidence_selected_taxa.contains(&row.taxid) {
-        // The evidence tiers chose this taxon; cutoffs the user set explicitly
-        // still apply to it, including to rescued taxa.
+    if evidence_selected_taxa.contains(&row.taxid) || rolled_up_genera.contains(&row.taxid) {
+        // The evidence tiers, or the genus roll-up, chose this taxon; cutoffs
+        // the user set explicitly still apply to it, including to rescued taxa.
         return min_reads_ok && explicit_cutoffs_pass(row, cfg);
     }
     let fixed_chunk_ok = row.fixed_chunk > min_chunk_breadth;
@@ -4489,6 +4641,9 @@ struct MappingData {
 
     /// Marker genes and fragment geometry when the database has marker genomes.
     marker_model: Option<Arc<MarkerModel>>,
+
+    /// Inputs of `--removed-to-genus`; `None` when it is off.
+    genus_rollup: Option<Arc<GenusRollup>>,
 }
 
 #[cfg(test)]
@@ -4544,6 +4699,7 @@ mod tests {
             min_coebr: None,
             min_marker_genes: 3,
             relative_identity_gap: None,
+            removed_to_genus: false,
             fraction: 0.6,
             lowbiomass: false,
             keep_raw: false,
@@ -4606,6 +4762,7 @@ mod tests {
                     depths: vec![0.1],
                     mapped_lens: vec![100.0],
                     sampling_scales: vec![1.0],
+                    best: 0,
                 },
                 ReadAssignment {
                     read: "rejected-read".into(),
@@ -4615,6 +4772,7 @@ mod tests {
                     depths: vec![0.1],
                     mapped_lens: vec![100.0],
                     sampling_scales: vec![1.0],
+                    best: 0,
                 },
             ],
             acc_intervals: HashMap::from([
@@ -4650,6 +4808,7 @@ mod tests {
             skipped_reference_at_load: 0,
             evidence_policy: None,
             marker_model: None,
+            genus_rollup: None,
         };
         (mapping_data, assignment)
     }
@@ -4667,6 +4826,7 @@ mod tests {
                 depths: vec![1.0],
                 mapped_lens: vec![100.0],
                 sampling_scales: vec![1.0],
+                best: 0,
             },
             ReadAssignment {
                 read: "unique-two".into(),
@@ -4676,6 +4836,7 @@ mod tests {
                 depths: vec![3.0],
                 mapped_lens: vec![100.0],
                 sampling_scales: vec![1.0],
+                best: 0,
             },
             ReadAssignment {
                 read: "ambiguous".into(),
@@ -4685,6 +4846,7 @@ mod tests {
                 depths: vec![2.0, 2.0],
                 mapped_lens: vec![100.0, 100.0],
                 sampling_scales: vec![1.0, 1.0],
+                best: 0,
             },
         ];
         let totals = estimate_unfiltered_taxon_totals(
@@ -4714,6 +4876,7 @@ mod tests {
             depths: vec![2.0],
             mapped_lens: vec![100.0],
             sampling_scales: vec![1.0],
+            best: 0,
         }];
         for taxid in [1111, 1112, 1113] {
             assignments.push(ReadAssignment {
@@ -4724,6 +4887,7 @@ mod tests {
                 depths: vec![1.0],
                 mapped_lens: vec![100.0],
                 sampling_scales: vec![1.0],
+                best: 0,
             });
         }
         assignments.push(ReadAssignment {
@@ -4734,6 +4898,7 @@ mod tests {
             depths: vec![1.0; 4],
             mapped_lens: vec![100.0; 4],
             sampling_scales: vec![1.0; 4],
+            best: 0,
         });
 
         let totals = estimate_unfiltered_taxon_totals(
@@ -4763,6 +4928,7 @@ mod tests {
             depths: vec![1.0],
             mapped_lens: vec![100.0, 100.0],
             sampling_scales: vec![1.0, 1.0],
+            best: 0,
         }];
         let error = estimate_unfiltered_taxon_totals(
             &assignments,
@@ -5010,6 +5176,7 @@ mod tests {
             &cfg,
             0.5,
             &selected,
+            &HashSet::new(),
             &lca,
         ));
         assert!(community_profile_row_passes(
@@ -5017,6 +5184,7 @@ mod tests {
             &cfg,
             0.5,
             &selected,
+            &HashSet::new(),
             &lca,
         ));
     }
@@ -5048,6 +5216,7 @@ mod tests {
             skipped_reference_at_load: 0,
             evidence_policy: Some(policy),
             marker_model: None,
+            genus_rollup: None,
         };
         let assignment = AssignmentResult {
             read_assignments: vec![ReadAssignment {
@@ -5058,6 +5227,7 @@ mod tests {
                 depths: vec![0.1],
                 mapped_lens: vec![100.0],
                 sampling_scales: vec![1.0],
+                best: 0,
             }],
             ..AssignmentResult::default()
         };
@@ -5102,6 +5272,7 @@ mod tests {
             skipped_reference_at_load: 0,
             evidence_policy: Some(policy),
             marker_model: None,
+            genus_rollup: None,
         };
         let assignment = AssignmentResult {
             read_assignments: vec![ReadAssignment {
@@ -5112,6 +5283,7 @@ mod tests {
                 depths: vec![0.1],
                 mapped_lens: vec![100.0],
                 sampling_scales: vec![1.0],
+                best: 0,
             }],
             acc_intervals: HashMap::from([(key.clone(), vec![(0, 100)])]),
             acc_fixed_chunk_intervals: HashMap::from([(key.clone(), vec![(0, 100)])]),
@@ -5733,6 +5905,7 @@ mod tests {
                 depths: vec![95.0],
                 mapped_lens: vec![100.0],
                 sampling_scales: vec![1.0],
+                best: 0,
             },
             ReadAssignment {
                 read: "unique-2".into(),
@@ -5742,6 +5915,7 @@ mod tests {
                 depths: vec![5.0],
                 mapped_lens: vec![100.0],
                 sampling_scales: vec![1.0],
+                best: 0,
             },
             ReadAssignment {
                 read: "ambiguous".into(),
@@ -5751,6 +5925,7 @@ mod tests {
                 depths: vec![100.0, 100.0, 100.0],
                 mapped_lens: vec![100.0; 3],
                 sampling_scales: vec![1.0; 3],
+                best: 0,
             },
         ];
         let eligible = HashSet::from([101, 102]);
