@@ -318,7 +318,7 @@ metax profile ... -- --top-n 10
 
 Note that `--min-identity` appears on both sides of `--` with different meanings: before it, the profiler's species/strain threshold; after it, the mapper's emission cutoff.
 
-Paired-end emission: `--paired-emission concordant-only` (default) emits same-reference pairs and, for a fragment without any pair, its mates whose mate may lie beyond the end of their reference (§7.1); `concordant-first` emits concordant pairs when present and otherwise discordant rows; `all` emits every mate mapping. The latter two are mainly useful together with `--save-mapping` for diagnostics.
+Paired-end emission: `--paired-emission concordant-only` (default) emits same-reference pairs and, for a fragment without any pair, its mates whose mate may lie beyond the end of their reference (§7.1); `concordant-first` emits concordant pairs when present and otherwise discordant rows; `all` emits every mate mapping. The latter two are mainly useful together with `--save-mapping` for diagnostics. A pair is written once, also when mate rescue finds again a placement that a mate already has.
 
 Mate rescue: a mate that seeding did not place is searched for in the insert window of its partner's placements. `--mate-rescue-taxa N` (default `8`) extends this search to fragments that already have a proper pair: for up to `N` other taxa per mate placed on that mate only, the missing mate is searched for and kept when that pair matches at least as many bases as the best seeded pair (§7.1). `--mate-rescue-taxa 0` restricts mate rescue to fragments without any proper pair, the cases that Metax 2.0.2 rescued.
 

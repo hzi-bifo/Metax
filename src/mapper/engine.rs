@@ -2066,6 +2066,14 @@ fn prepare_paired_mappings(
         let mut right = mate2[mate2_index]
             .take()
             .expect("selected R2 mapping is present");
+        // Mate rescue can return a placement that a mate already holds; a
+        // pair that repeats one already formed adds nothing.
+        if paired
+            .chunks_exact(2)
+            .any(|pair| same_placement(&pair[0], &left) && same_placement(&pair[1], &right))
+        {
+            continue;
+        }
         for mapping in [&mut left, &mut right] {
             mapping.pair_id = pair_id;
             mapping.pair_score = compatibility.score.max(0);
@@ -2104,6 +2112,17 @@ fn prepare_paired_mappings(
         }
     }
     paired
+}
+
+/// Whether two placements of one mate are the same alignment.
+fn same_placement(a: &Mapping, b: &Mapping) -> bool {
+    a.ref_id == b.ref_id
+        && a.ref_start == b.ref_start
+        && a.ref_end == b.ref_end
+        && a.strand == b.strand
+        && a.identity == b.identity
+        && a.mapped_bases == b.mapped_bases
+        && a.matched_bases == b.matched_bases
 }
 
 fn partner_is_better(
@@ -3040,6 +3059,42 @@ mod tests {
         assert_eq!(mappings[0].ref_id, "ref-a");
         assert_eq!(mappings[1].ref_id, "ref-c");
         assert!(mappings.iter().all(|mapping| mapping.pair_id == 0));
+    }
+
+    #[test]
+    fn a_pair_that_repeats_one_already_formed_is_not_emitted() {
+        let placement = |read_id: &str, start: u32| {
+            let mut mapping = test_mapping(read_id, "ref-a", MateRefStatus::Same);
+            mapping.ref_start = start;
+            mapping.ref_end = start + 100;
+            mapping
+        };
+        let mate1 = vec![
+            placement("read/1", 1),
+            placement("read/1", 1),
+            placement("read/1", 51),
+        ];
+        let mate2 = vec![
+            placement("read/2", 201),
+            placement("read/2", 201),
+            placement("read/2", 251),
+        ];
+
+        for policy in [
+            PairedEmissionPolicy::ConcordantOnly,
+            PairedEmissionPolicy::All,
+        ] {
+            let mappings = prepare_paired_mappings(mate1.clone(), mate2.clone(), policy, 0, 1_000);
+            let pairs: Vec<_> = mappings
+                .iter()
+                .map(|m| (m.mate_number, m.ref_start, m.pair_id))
+                .collect();
+            assert_eq!(
+                pairs,
+                [(1, 1, 1), (2, 201, 1), (1, 51, 2), (2, 251, 2)],
+                "{policy:?}"
+            );
+        }
     }
 
     #[test]
