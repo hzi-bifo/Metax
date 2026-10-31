@@ -2925,6 +2925,12 @@ pub struct PairCompatibility {
     pub relation: PairRelation,
 }
 
+/// Pair score of a proper pair, the highest that `pair_compatibility` gives.
+const PROPER_PAIR_SCORE: i64 = 80;
+
+/// Most a rescued placement gains for the share of the read that matches.
+const RESCUE_MATCH_BONUS: i64 = 1000;
+
 pub fn pair_compatibility(
     a: &Mapping,
     b: &Mapping,
@@ -2944,7 +2950,7 @@ pub fn pair_compatibility(
     let inward_facing = inward_facing_pair(a, b);
     if inward_facing && (min_insert as i64..=max_insert as i64).contains(&template) {
         PairCompatibility {
-            score: 80,
+            score: PROPER_PAIR_SCORE,
             template_length: template,
             relation: PairRelation::ProperPair,
         }
@@ -3072,7 +3078,8 @@ pub fn rescue_mate_with_workspace(
 ///
 /// A taxon whose placement is too weak for that even with a perfectly
 /// matching mate is not searched, and the read is seeded only when a search
-/// takes place.
+/// takes place, unless `hits_prepared` says that `workspace` already holds
+/// the mate-rescue seed hits of `read`.
 #[allow(clippy::too_many_arguments)]
 pub fn rescue_competing_mates_with_workspace(
     read_id: &str,
@@ -3084,6 +3091,7 @@ pub fn rescue_competing_mates_with_workspace(
     min_insert: usize,
     max_insert: usize,
     max_taxa: usize,
+    hits_prepared: bool,
     profile: &mut MapProfile,
     workspace: &mut MappingWorkspace,
 ) -> Vec<Mapping> {
@@ -3092,9 +3100,12 @@ pub fn rescue_competing_mates_with_workspace(
         return rescued;
     }
     let mut considered = 0usize;
-    let mut seeded = false;
+    let mut seeded = hits_prepared;
     let mut seeded_matches = None;
     for (rank, mate) in mate_mappings.iter().enumerate() {
+        if considered == max_taxa {
+            break;
+        }
         let taxon = mate.candidate_groups.profile_taxon;
         let same_taxon = |other: &Mapping| other.candidate_groups.profile_taxon == taxon;
         // Each taxon is considered once, at its best placement.
@@ -3104,9 +3115,6 @@ pub fn rescue_competing_mates_with_workspace(
             })
         {
             continue;
-        }
-        if considered == max_taxa {
-            break;
         }
         considered += 1;
         let seeded_matches =
@@ -3146,6 +3154,9 @@ pub fn rescue_competing_mates_with_workspace(
 ///
 /// A candidate is judged exactly as seeding judges one, so a rescued
 /// placement carries the identity and mapped bases of its aligned interval.
+/// Only when no candidate is found on a reference of at most 256 bases is the
+/// read aligned as a whole at every position of the window
+/// (`brute_force_rescue`).
 ///
 /// The seed hits of `read` must already be prepared in `workspace`.
 #[allow(clippy::too_many_arguments)]
@@ -3185,6 +3196,15 @@ fn rescue_beside_mate(
     );
     candidates.sort_unstable_by(|a, b| b.score.cmp(&a.score));
     for candidate in candidates.into_iter().take(params.top_n.max(4)) {
+        // A short-read placement scores its candidate's score plus the match
+        // and pair bonuses; once that cannot reach `best`, no later candidate can.
+        if !params.long_read_chaining
+            && best.as_ref().is_some_and(|best| {
+                candidate.score + RESCUE_MATCH_BONUS + PROPER_PAIR_SCORE < best.score
+            })
+        {
+            break;
+        }
         let Some(mut mapping) = evaluate_candidate(
             read_id,
             read,
@@ -3203,7 +3223,8 @@ fn rescue_beside_mate(
         }
         // A rescue window offers few seeds, so the share of the read that
         // matches carries most of the score.
-        mapping.score += (mapping.matched_bases as f64 / read.len() as f64 * 1000.0) as i64;
+        mapping.score +=
+            (mapping.matched_bases as f64 / read.len() as f64 * RESCUE_MATCH_BONUS as f64) as i64;
         keep_better_rescue(best, mapping, mate, min_insert, max_insert);
     }
 
@@ -3227,6 +3248,11 @@ fn rescue_beside_mate(
     }
 }
 
+/// Align the whole read (and its reverse complement) at every start in the
+/// window, over reference spans up to 8 bases shorter or longer than the read.
+/// Unlike seeded and rescued candidates, identity and mapped fraction are
+/// taken over the whole read; the window is at most 256 bases, so this is the
+/// fallback for very short references only.
 #[allow(clippy::too_many_arguments)]
 fn brute_force_rescue(
     read_id: &str,
@@ -4281,7 +4307,6 @@ mod tests {
         );
     }
 
-    /// Index the given references in full; each one is its own taxon.
     fn identity_fields(identity: Identity) -> (usize, usize, usize, u64) {
         (
             identity.matches,
@@ -4363,6 +4388,7 @@ mod tests {
         }
     }
 
+    /// Index the given references in full; each one is its own taxon.
     fn rescue_runtime_index(references: &[(&str, &[u8])]) -> RuntimeIndex {
         let mut seed_rows = Vec::new();
         for (ref_id, (_, sequence)) in references.iter().enumerate() {
@@ -4445,6 +4471,7 @@ mod tests {
             0,
             1_000,
             max_taxa,
+            false,
             profile,
             &mut MappingWorkspace::default(),
         )
@@ -4772,6 +4799,154 @@ mod tests {
         assert_eq!(refs(&rescued), ["b", "c"]);
         assert!(one.total_query_seeds > 0);
         assert_eq!(all.total_query_seeds, one.total_query_seeds);
+    }
+
+    /// The window search of `brute_force_rescue`, written out position by
+    /// position and length by length.
+    #[allow(clippy::too_many_arguments)]
+    fn brute_force_by_position(
+        read: &[u8],
+        index: &RuntimeIndex,
+        mate: &Mapping,
+        params: MapParams,
+        min_insert: usize,
+        max_insert: usize,
+        window_start: usize,
+        window_end: usize,
+    ) -> Option<Mapping> {
+        let reference = index.reference(0);
+        let rc = revcomp(read);
+        let mut workspace = EditDistanceWorkspace::default();
+        let mut best = None;
+        for (query, strand) in [(read, 1i8), (rc.as_slice(), -1i8)] {
+            let min_len = query.len().saturating_sub(8).max(1);
+            let max_len = query.len().saturating_add(8).min(reference.len());
+            for ref_len in min_len..=max_len {
+                for pos in window_start..=window_end.saturating_sub(ref_len) {
+                    if pos + ref_len > window_end {
+                        continue;
+                    }
+                    let ident = identity(
+                        query,
+                        &reference,
+                        pos,
+                        pos + ref_len,
+                        params.ignore_n,
+                        params.identity_mode,
+                        params.fast_long_read_identity,
+                        &mut workspace,
+                    );
+                    let mapped_frac = ident.compared as f64 / read.len() as f64;
+                    if ident.compared == 0
+                        || ident.value < params.min_identity
+                        || mapped_frac < params.min_mapped_frac
+                    {
+                        continue;
+                    }
+                    let score = (ident.value * 1000.0) as i64 + ident.compared as i64;
+                    let mut mapping = test_mapping(
+                        "pair",
+                        "tiny",
+                        pos as u32,
+                        (pos + ref_len) as u32,
+                        ident.compared,
+                        ident.value,
+                        score,
+                    );
+                    mapping.strand = strand;
+                    mapping.matched_bases = ident.matches;
+                    mapping.read_len = read.len();
+                    keep_better_rescue(&mut best, mapping, mate, min_insert, max_insert);
+                }
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn small_reference_rescue_aligns_the_whole_read_at_every_position() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        let mut found = 0;
+        for case in 0..60 {
+            let reference = {
+                let len = 120 + next(137);
+                let mut sequence = deterministic_read(len + case);
+                sequence.drain(..case);
+                sequence
+            };
+            let index = rescue_runtime_index(&[("tiny", &reference)]);
+            // A read from the reference with up to 3 substitutions and an
+            // insertion or deletion, on either strand.
+            let start = next(reference.len() - 100);
+            let mut read = reference[start..start + 100].to_vec();
+            for _ in 0..next(4) {
+                let at = next(read.len());
+                read[at] = substituted(read[at]);
+            }
+            match next(3) {
+                0 => {
+                    read.insert(next(100), b'G');
+                }
+                1 => {
+                    read.remove(next(100));
+                }
+                _ => {}
+            }
+            if next(2) == 1 {
+                read = revcomp(&read);
+            }
+            let mut mate = test_mapping("pair", "tiny", 0, 50, 50, 1.0, 50);
+            mate.strand = if next(2) == 1 { 1 } else { -1 };
+            let params = short_test_params();
+            let window_end = reference.len();
+
+            let rc = revcomp(&read);
+            let mut profile = MapProfile::default();
+            let expected =
+                brute_force_by_position(&read, &index, &mate, params, 0, 1_000, 0, window_end);
+            let actual = brute_force_rescue(
+                "pair",
+                &read,
+                &rc,
+                &index.reference(0),
+                0,
+                &mate,
+                params,
+                0,
+                1_000,
+                0,
+                window_end,
+                &index,
+                &mut profile,
+                &mut EditDistanceWorkspace::default(),
+            );
+            let key = |m: &Mapping| {
+                (
+                    m.ref_start,
+                    m.ref_end,
+                    m.strand,
+                    m.identity.to_bits(),
+                    m.mapped_bases,
+                    m.matched_bases,
+                    m.score,
+                    m.pair_status,
+                )
+            };
+            assert_eq!(
+                actual.as_ref().map(key),
+                expected.as_ref().map(key),
+                "case {case}: reference of {} bases, read from {start}",
+                reference.len()
+            );
+            found += usize::from(actual.is_some());
+        }
+        assert!(found > 30, "most reads are placed: {found} of 60");
     }
 
     #[test]

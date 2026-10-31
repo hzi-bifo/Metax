@@ -2001,6 +2001,7 @@ mod tests {
             "--paired-emission",
             "--min-insert",
             "--max-insert",
+            "--mate-rescue-taxa",
             "--identity-mode",
             "--extend",
             "--fast-extend",

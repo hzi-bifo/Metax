@@ -1199,7 +1199,8 @@ recall otherwise differ through profiler evidence thresholds.
 
 Candidate discovery and retention:
   --top-n <N>
-      Maximum retained mappings per read or mate. Larger values preserve more
+      Maximum retained mappings per read or mate; mates recovered by
+      --mate-rescue-taxa are kept in addition. Larger values preserve more
       ambiguity but increase identity work, output size, and profiler memory.
       For paired-end reads, 10 is a faster setting; it can lose recall above
       species level in communities the database covers poorly.
@@ -1243,10 +1244,11 @@ Paired-end mapping:
   --max-insert <BASES>
       Maximum proper-pair template span (default {max_insert}).
   --mate-rescue-taxa <N>
-      When one taxon already forms a proper pair, also search for the missing
-      mate of up to N other taxa placed on one mate only, and keep it if that
-      pair matches at least as many bases. With 0, mate rescue is limited to
-      fragments without any proper pair (default {mate_rescue_taxa}).
+      When one taxon already forms a proper pair, also search, for each mate,
+      for the missing mate of up to N other taxa placed on that mate only, and
+      keep it if that pair matches at least as many bases. With 0, mate rescue
+      is limited to fragments without any proper pair (default
+      {mate_rescue_taxa}).
 
 Long-read mapping:
   --identity-mode <MODE>
@@ -1753,18 +1755,29 @@ fn map_record_pair(
             profile: &mut local,
             workspace: &mut *workspace,
         };
+        // The mate whose rescue seed hits the workspace holds, if any.
+        let mut prepared = None;
         if m1.is_empty() && !m2.is_empty() {
             m1 = rescue.beside_any(r1, &m2);
+            prepared = Some(1);
         }
         if m2.is_empty() && !m1.is_empty() {
             m2 = rescue.beside_any(r2, &m1);
+            prepared = Some(2);
         }
         if !m1.is_empty() && !m2.is_empty() {
             if has_proper_pair(&m1, &m2, config.min_insert, config.max_insert) {
                 // A proper pair on one taxon must not hide a taxon that
                 // explains the fragment as well but was seeded on one mate only.
-                competing1 = rescue.for_unpaired_taxa(r1, &m2, &m1);
-                competing2 = rescue.for_unpaired_taxa(r2, &m1, &m2);
+                // The two searches are independent; the mate just rescued goes
+                // first, so its seed hits are reused.
+                if prepared == Some(2) {
+                    competing2 = rescue.for_unpaired_taxa(r2, &m1, &m2, true);
+                    competing1 = rescue.for_unpaired_taxa(r1, &m2, &m1, false);
+                } else {
+                    competing1 = rescue.for_unpaired_taxa(r1, &m2, &m1, prepared == Some(1));
+                    competing2 = rescue.for_unpaired_taxa(r2, &m1, &m2, false);
+                }
             } else {
                 let mut rescued1 = rescue.beside_any(r1, &m2);
                 let mut rescued2 = rescue.beside_any(r2, &m1);
@@ -1829,11 +1842,13 @@ impl MateRescue<'_> {
 
     /// Placements of `read` that complete a pair, no worse than the best
     /// seeded one, for taxa that `mates` hold without a proper partner in `own`.
+    /// `hits_prepared`: the last search of this pair was for `read`.
     fn for_unpaired_taxa(
         &mut self,
         read: &Record,
         mates: &[Mapping],
         own: &[Mapping],
+        hits_prepared: bool,
     ) -> Vec<Mapping> {
         rescue_competing_mates_with_workspace(
             &read.id,
@@ -1845,6 +1860,7 @@ impl MateRescue<'_> {
             self.config.min_insert,
             self.config.max_insert,
             self.config.mate_rescue_taxa,
+            hits_prepared,
             self.profile,
             self.workspace,
         )
@@ -2818,6 +2834,132 @@ mod tests {
         let config =
             MappingConfig::resolve(Sequencer::Illumina, true, ProfileMode::Default, &args).unwrap();
         assert_eq!(config.mate_rescue_taxa, 3);
+    }
+
+    fn random_bases(len: usize, mut state: u64) -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                b"ACGT"[(state >> 30) as usize & 3]
+            })
+            .collect()
+    }
+
+    /// An index of the given references in full; each one is its own taxon.
+    fn small_index(references: &[(&str, &[u8])]) -> RuntimeIndex {
+        let mut fasta = tempfile::NamedTempFile::new().unwrap();
+        for (id, sequence) in references {
+            writeln!(fasta, ">{id}\n{}", std::str::from_utf8(sequence).unwrap()).unwrap();
+        }
+        fasta.flush().unwrap();
+        let (index, _) = metam::index::build_index_with_progress(
+            fasta.path().to_str().unwrap(),
+            8,
+            4,
+            100,
+            64,
+            metam::seeds::SeedMode::Minimizer,
+            false,
+            None,
+            1,
+            metam::index::DEFAULT_INDEX_SEED_CHUNK_BYTES,
+            |_| {},
+        )
+        .unwrap();
+        RuntimeIndex::new(index)
+    }
+
+    /// Map a pair with the paired-end defaults, or without pair awareness and
+    /// so without mate rescue; returns the emitted records as (reference,
+    /// mate, matched bases, pair id).
+    fn map_pair(
+        index: &RuntimeIndex,
+        r1: &[u8],
+        r2: &[u8],
+        pair_aware: bool,
+    ) -> Vec<(String, u8, usize, u32)> {
+        let mut config =
+            MappingConfig::resolve(Sequencer::Illumina, true, ProfileMode::Default, &[]).unwrap();
+        config.pair_aware = pair_aware;
+        let record = |seq: &[u8]| Record {
+            id: "pair".to_string(),
+            seq: seq.to_vec(),
+        };
+        let (mappings, _) = map_record_pair(
+            &record(r1),
+            &record(r2),
+            index,
+            &config,
+            &mut MappingWorkspace::default(),
+        );
+        let mut records: Vec<_> = mappings
+            .iter()
+            .map(|m| (m.ref_id.clone(), m.mate_number, m.matched_bases, m.pair_id))
+            .collect();
+        records.sort();
+        records
+    }
+
+    #[test]
+    fn a_proper_pair_is_emitted_without_rescue() {
+        let reference = random_bases(800, 0x9e37_79b9_7f4a_7c15);
+        let index = small_index(&[("a", &reference)]);
+        let r1 = &reference[100..200];
+        let r2 = metam::sequence::revcomp(&reference[400..500]);
+
+        let records = map_pair(&index, r1, &r2, true);
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.0.as_str(), r.1, r.2))
+                .collect::<Vec<_>>(),
+            [("a", 1, 100), ("a", 2, 100)]
+        );
+        assert_eq!(records[0].3, records[1].3);
+        assert_eq!(
+            map_pair(&index, r1, &r2, false),
+            records,
+            "no rescue was needed"
+        );
+    }
+
+    #[test]
+    fn mates_seeded_on_different_references_are_rescued_both_ways() {
+        // R1 matches "b" exactly and "a" with a substitution every 12 bases,
+        // which leaves seeding too little to place it there; R2 the reverse.
+        let fragment = random_bases(3_000, 0xd1b5_4a32_d192_ed03);
+        let diverged = |range: std::ops::Range<usize>| {
+            let mut sequence = fragment.clone();
+            for at in range.step_by(12) {
+                sequence[at] = if sequence[at] == b'A' { b'C' } else { b'A' };
+            }
+            sequence
+        };
+        let a = diverged(1_006..1_100);
+        let b = diverged(1_306..1_400);
+        let index = small_index(&[("a", &a), ("b", &b)]);
+        let r1 = &fragment[1_000..1_100];
+        let r2 = metam::sequence::revcomp(&fragment[1_300..1_400]);
+
+        let records = map_pair(&index, r1, &r2, true);
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.0.as_str(), r.1, r.2))
+                .collect::<Vec<_>>(),
+            [("a", 1, 92), ("a", 2, 100), ("b", 1, 100), ("b", 2, 92)],
+            "{records:?}"
+        );
+        assert!(
+            records.iter().all(|r| r.3 != 0),
+            "all records are paired: {records:?}"
+        );
+        // Seeding alone places neither diverged mate.
+        let seeded = map_pair(&index, r1, &r2, false);
+        assert!(seeded.iter().all(|r| r.2 == 100), "{seeded:?}");
     }
 
     #[test]
