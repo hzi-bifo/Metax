@@ -31,6 +31,9 @@ use clap::{ArgAction, Args, Parser, Subcommand};
 /// Parser for a probability-valued CLI option. Rejects non-finite values
 /// and values outside `[0.0, 1.0]` at parse time so misuse is caught
 /// before any I/O work begins.
+/// Identity margin used when `--identity-margin` is on by default or given without a value.
+const DEFAULT_IDENTITY_MARGIN: f64 = 0.025;
+
 fn parse_probability(s: &str) -> Result<f64, String> {
     let value: f64 = s
         .parse()
@@ -313,9 +316,18 @@ struct ProfileArgs {
         value_parser = parse_probability,
         conflicts_with = "strain",
         help_heading = "Genus fallback and low-map behavior",
-        help = "Report a species at its genus when the reads placed best on it are, on average, more than FRACTION less identical than those of the sample's typical species (the median over the reported species, weighted by their fragments). Such a species is mostly a relative that receives the reads of an organism missing from the database. Needs at least 3 reported species. Without a value: 0.025. Off by default."
+        help = "Report a species at its genus when the reads placed best on it are, on average, more than FRACTION less identical than those of the sample's typical species (the median over the reported species, weighted by their fragments). Such a species is mostly a relative that receives the reads of an organism missing from the database. Needs at least 3 reported species. On by default with 0.025 for paired-end Illumina community profiling; other inputs use it only when it is given (without a value: 0.025)."
     )]
     identity_margin: Option<f64>,
+
+    #[arg(
+        long = "no-identity-margin",
+        action = ArgAction::SetTrue,
+        conflicts_with = "identity_margin",
+        help_heading = "Genus fallback and low-map behavior",
+        help = "Do not report species at genus by --identity-margin."
+    )]
+    no_identity_margin: bool,
 
     #[arg(
         long = "genus-identity",
@@ -1023,6 +1035,14 @@ impl TryFrom<ProfileArgs> for AppConfig {
                 ExactTiePolicy::Ambiguous
             }
         });
+        let identity_margin = if args.no_identity_margin {
+            None
+        } else {
+            args.identity_margin.or_else(|| {
+                (sequencer.is_illumina() && is_paired && !args.strain)
+                    .then_some(DEFAULT_IDENTITY_MARGIN)
+            })
+        };
         Ok(AppConfig {
             db: args.db,
             dmp_dir: args.dmp_dir,
@@ -1050,7 +1070,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             min_marker_genes: args.min_marker_genes,
             relative_identity_gap: args.relative_identity_gap,
             removed_to_genus: args.removed_to_genus,
-            identity_margin: args.identity_margin,
+            identity_margin,
             fraction: args.fraction,
             lowbiomass: args.lowbiomass,
             keep_raw: args.keep_raw,
@@ -1170,7 +1190,7 @@ mod tests {
 
     use super::{
         mapper_options_help, resolve_index_match_both_strobes, resolve_profile_inputs, AppConfig,
-        Cli, Commands, ExactTiePolicy, ProfileMode, Sequencer,
+        Cli, Commands, ExactTiePolicy, ProfileMode, Sequencer, DEFAULT_IDENTITY_MARGIN,
     };
 
     fn clean_mapping(sequencer: Sequencer, paired: bool, mode: ProfileMode) -> NamedTempFile {
@@ -1342,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_margin_is_off_by_default_and_has_a_default_value() {
+    fn identity_margin_without_a_value_takes_the_default() {
         let margin = |extra: &[&str]| {
             let argv = ["metax", "profile", "-d", "db", "-i", "r1.fq", "-o", "out"];
             let cli = Cli::try_parse_from(argv.iter().chain(extra)).unwrap();
@@ -1352,9 +1372,48 @@ mod tests {
             args.identity_margin
         };
         assert_eq!(margin(&[]), None);
-        assert_eq!(margin(&["--identity-margin"]), Some(0.025));
+        assert_eq!(
+            margin(&["--identity-margin"]),
+            Some(DEFAULT_IDENTITY_MARGIN)
+        );
         assert_eq!(margin(&["--identity-margin", "0.04"]), Some(0.04));
-        assert_eq!(margin(&["--identity-margin", "-t", "4"]), Some(0.025));
+        assert_eq!(
+            margin(&["--identity-margin", "-t", "4"]),
+            Some(DEFAULT_IDENTITY_MARGIN)
+        );
+    }
+
+    #[test]
+    fn identity_margin_is_on_by_default_for_paired_illumina_community_profiling() {
+        let margin = |extra: &[&str]| {
+            let argv = ["metax", "profile", "-d", "db", "-o", "out"];
+            let cli = Cli::try_parse_from(argv.iter().chain(extra)).unwrap();
+            let Commands::Profile(args) = cli.command else {
+                panic!("expected profile command");
+            };
+            AppConfig::try_from(args).unwrap().identity_margin
+        };
+        let paired = ["-i", "r1.fq", "-I", "r2.fq"];
+        let with = |more: &[&'static str]| [&paired[..], more].concat();
+        assert_eq!(margin(&paired), Some(DEFAULT_IDENTITY_MARGIN));
+        assert_eq!(margin(&with(&["--identity-margin", "0.04"])), Some(0.04));
+        assert_eq!(margin(&with(&["--no-identity-margin"])), None);
+        assert_eq!(margin(&with(&["--strain"])), None);
+        assert_eq!(margin(&with(&["--sequencer", "Nanopore"])), None);
+        assert_eq!(margin(&["-i", "r1.fq"]), None);
+        assert_eq!(
+            margin(&["-i", "r1.fq", "--identity-margin"]),
+            Some(DEFAULT_IDENTITY_MARGIN)
+        );
+        let both = [
+            "metax",
+            "profile",
+            "-o",
+            "out",
+            "--identity-margin",
+            "--no-identity-margin",
+        ];
+        assert!(Cli::try_parse_from(both).is_err());
     }
 
     #[test]
