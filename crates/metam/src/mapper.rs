@@ -19,6 +19,7 @@ pub struct RuntimeIndex {
     ref_lookup: HashMap<String, usize>,
     lookup_mode: SeedLookupMode,
     reference_candidate_groups: Option<Box<[ReferenceCandidateGroups]>>,
+    open_ended_references: Option<Box<[bool]>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -49,6 +50,7 @@ impl RuntimeIndex {
             ref_lookup,
             lookup_mode,
             reference_candidate_groups: None,
+            open_ended_references: None,
         }
     }
 
@@ -68,6 +70,23 @@ impl RuntimeIndex {
             );
         }
         self.reference_candidate_groups = Some(groups.into_boxed_slice());
+        Ok(())
+    }
+
+    /// Install which references are open-ended: cut from a longer sequence
+    /// that continues past their ends, as marker genes and sampled segments
+    /// are, so that a fragment can reach beyond them. Only these get lone
+    /// mates (see [`mark_mates_beyond_reference_end`]). The table is indexed by
+    /// numeric reference ID. Without a table, every reference is open-ended.
+    pub fn set_open_ended_references(&mut self, open_ended: Vec<bool>) -> Result<()> {
+        if open_ended.len() != self.index.reference_count() {
+            bail!(
+                "open-ended reference count {} does not match index reference count {}",
+                open_ended.len(),
+                self.index.reference_count()
+            );
+        }
+        self.open_ended_references = Some(open_ended.into_boxed_slice());
         Ok(())
     }
 
@@ -97,6 +116,12 @@ impl RuntimeIndex {
             .as_deref()
             .map(|groups| groups[ref_id as usize])
             .unwrap_or_else(|| ReferenceCandidateGroups::for_reference(ref_id))
+    }
+
+    fn is_open_ended(&self, ref_id: u32) -> bool {
+        self.open_ended_references
+            .as_deref()
+            .is_none_or(|open_ended| open_ended[ref_id as usize])
     }
 }
 
@@ -2999,8 +3024,10 @@ pub fn set_mate_status(r1: &mut [Mapping], r2: &mut [Mapping]) {
 /// Mark the placements without a mate on their reference whose mate may lie
 /// beyond the reference end: the insert window on the mate's side (after a
 /// forward read, before a reverse one) runs past the end, so mate rescue could
-/// search only part of it. Marker genes and short contigs end within a
-/// fragment length of most placements.
+/// search only part of it. Only open-ended references are marked
+/// ([`RuntimeIndex::set_open_ended_references`]): the end of a marker gene or
+/// a sampled segment cuts the sequence a fragment came from, the end of an
+/// assembled genome sequence mostly does not.
 pub fn mark_mates_beyond_reference_end(
     reads: &mut [Mapping],
     index: &RuntimeIndex,
@@ -3013,6 +3040,9 @@ pub fn mark_mates_beyond_reference_end(
         let Some(ref_id) = index.reference_index_by_id(&read.ref_id) else {
             continue;
         };
+        if !index.is_open_ended(ref_id) {
+            continue;
+        }
         let window_runs_past_end = if read.strand == 1 {
             read.ref_end as usize + max_insert > index.reference(ref_id).len()
         } else {
@@ -4644,6 +4674,27 @@ mod tests {
             .map(|read| read.mate_ref_status.is_beyond_end())
             .collect();
         assert_eq!(beyond, [true, false, true, false, false]);
+    }
+
+    #[test]
+    fn lone_mates_are_marked_only_on_open_ended_references() {
+        let gene = deterministic_read(2_000);
+        let genome = deterministic_read(2_000)
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        let mut index = rescue_runtime_index(&[("gene", &gene), ("genome", &genome)]);
+        assert!(index.set_open_ended_references(vec![true]).is_err());
+        index.set_open_ended_references(vec![true, false]).unwrap();
+        // Both placements end 100 bases before their reference does.
+        let mut reads = ["gene", "genome"].map(|reference| {
+            let mut mapping = test_mapping("pair", reference, 1_800, 1_900, 100, 1.0, 100);
+            mapping.mate_ref_status = MateRefStatus::Unmapped;
+            mapping
+        });
+        mark_mates_beyond_reference_end(&mut reads, &index, 600);
+        assert!(reads[0].mate_ref_status.is_beyond_end());
+        assert!(matches!(reads[1].mate_ref_status, MateRefStatus::Unmapped));
     }
 
     #[test]

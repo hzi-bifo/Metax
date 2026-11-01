@@ -26,7 +26,7 @@ use metam::mapper::{
     ReferenceCandidateGroups, RuntimeIndex, RuntimeIndexOptions,
 };
 
-use crate::db::DatabaseMetadata;
+use crate::db::{DatabaseMetadata, ReferenceType};
 use crate::mapper::tsv::{
     format_sample_metadata_line, store_shared_metam_profile, write_mapping_run_metadata,
     MappingProfilerMetadata, MetamMapping, MetamMappingBatch, MetamMappingReceiver, MetamProfile,
@@ -906,6 +906,7 @@ impl Mapper {
             },
         );
         runtime_index.set_reference_candidate_groups(reference_candidate_groups)?;
+        runtime_index.set_open_ended_references(open_ended_references(&db))?;
         let runtime_index = Arc::new(runtime_index);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads.max(1))
@@ -995,6 +996,21 @@ fn build_reference_candidate_groups(
         ));
     }
     Ok(groups)
+}
+
+/// The references on which a mate can be a lone mate, by numeric reference ID:
+/// marker genes, and every reference of a fractional database, whose sampled
+/// segments end inside the genome. In a mixed database each reference follows
+/// its own type. Database rows are in index order, which
+/// `build_reference_candidate_groups` has checked.
+fn open_ended_references(database: &DatabaseMetadata) -> Vec<bool> {
+    database
+        .references
+        .iter()
+        .map(|reference| {
+            database.is_fractional || reference.reference_type == ReferenceType::Markers
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3313,5 +3329,29 @@ mod tests {
             candidate_groups: ReferenceCandidateGroups::new(1, 1),
             candidate_boundary: CandidateBoundary::COMPLETE,
         }
+    }
+
+    #[test]
+    fn only_marker_genes_and_sampled_segments_are_open_ended() {
+        let reference = |name: &str, reference_type| crate::db::ReferenceMetadata {
+            name: name.to_string(),
+            length: 1_000,
+            genome: name.to_string(),
+            contig: name.to_string(),
+            full_genome_size: 1_000,
+            effective_indexed_size: 1_000,
+            taxonomy_field: "s:8".to_string(),
+            reference_type,
+        };
+        let mixed = |is_fractional| DatabaseMetadata {
+            metam_index: PathBuf::from("metax_db.mxi"),
+            references: vec![
+                reference("genome", ReferenceType::Genome),
+                reference("gene", ReferenceType::Markers),
+            ],
+            is_fractional,
+        };
+        assert_eq!(open_ended_references(&mixed(false)), [false, true]);
+        assert_eq!(open_ended_references(&mixed(true)), [true, true]);
     }
 }
