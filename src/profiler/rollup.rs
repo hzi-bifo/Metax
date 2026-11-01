@@ -10,7 +10,7 @@
 //! species' own evidence keep those out: the chunk ratio (COEBR) and the share
 //! of genome windows that its reads reach.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::evidence::{EvidenceCoverage, PresenceInterval, WitnessDecision};
@@ -85,6 +85,12 @@ pub(crate) struct GenusRollup {
     /// homologous genes of relatives.
     pub(crate) genus_of: HashMap<u32, u32>,
     pub(crate) layout: GenomeLayout,
+    /// A fractional database: a genus with an accepted species gets no row.
+    /// Reads from the unindexed parts of a genome land on the sampled segments
+    /// of relatives and leave them orphaned, while the accepted species'
+    /// abundance is already scaled to its full genome, so a genus row would
+    /// count those reads a second time.
+    pub(crate) fractional: bool,
 }
 
 /// One genus row made from orphaned fragments.
@@ -165,13 +171,27 @@ impl<'a> OrphanedFragments<'a> {
 
     /// Genus rows from the donors whose own evidence spreads over the genome,
     /// in genus order. A donor without evidence, or whose window spread could
-    /// not be measured, does not pass.
+    /// not be measured, does not pass. `accepted` holds the taxa the coverage
+    /// evidence kept; on a fractional database their genera get no row.
     pub(crate) fn into_genus_rows(
         self,
         decisions: &HashMap<u32, WitnessDecision>,
+        accepted: &HashSet<u32>,
     ) -> Vec<GenusRow> {
+        let genus_of = &self.rollup.genus_of;
+        let represented: HashSet<u32> = if self.rollup.fractional {
+            accepted
+                .iter()
+                .filter_map(|taxid| genus_of.get(taxid).copied())
+                .collect()
+        } else {
+            HashSet::new()
+        };
         let mut by_genus: HashMap<u32, Vec<(u32, Donor)>> = HashMap::new();
         for (taxid, donor) in self.donors {
+            if represented.contains(&donor.genus) {
+                continue;
+            }
             let Some(metrics) = decisions.get(&taxid).map(|decision| decision.metrics) else {
                 continue;
             };
@@ -254,6 +274,7 @@ mod tests {
         GenusRollup {
             genus_of: genus_of.iter().copied().collect(),
             layout: GenomeLayout::new([(0, 1_000)]),
+            fractional: false,
         }
     }
 
@@ -301,7 +322,7 @@ mod tests {
         orphans.offer(&[4], 0, 1.0, 1.0, 1.0, &read);
         let decisions =
             HashMap::from([(1, decision(0.9, Some(0.8))), (2, decision(0.6, Some(0.6)))]);
-        let rows = orphans.into_genus_rows(&decisions);
+        let rows = orphans.into_genus_rows(&decisions, &HashSet::new());
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(
@@ -330,7 +351,7 @@ mod tests {
             (3, decision(0.9, None)),       // spread not measured
             (5, decision(0.40, Some(0.50))),
         ]);
-        let rows = orphans.into_genus_rows(&decisions);
+        let rows = orphans.into_genus_rows(&decisions, &HashSet::new());
         assert_eq!(
             rows.iter().map(|row| row.genus).collect::<Vec<_>>(),
             vec![30]
@@ -341,6 +362,34 @@ mod tests {
         for _ in 0..199 {
             few.offer(&[5], 0, 0.01, 150.0, 1.0, &read);
         }
-        assert!(few.into_genus_rows(&decisions).is_empty());
+        assert!(few.into_genus_rows(&decisions, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn a_fractional_database_rolls_up_only_genera_without_an_accepted_species() {
+        // Species 1 and 2 are removed, in genera 10 and 20; species 3 of genus
+        // 10 is accepted.
+        let rows_of = |fractional| {
+            let rollup = GenusRollup {
+                fractional,
+                ..rollup(&[(1, 10), (2, 20), (3, 10)])
+            };
+            let mut orphans = OrphanedFragments::new(&rollup, false);
+            let read: Arc<str> = Arc::from("r");
+            for taxid in [1, 2] {
+                for _ in 0..300 {
+                    orphans.offer(&[taxid], 0, 0.01, 150.0, 10.0, &read);
+                }
+            }
+            let decisions =
+                HashMap::from([(1, decision(0.9, Some(1.0))), (2, decision(0.9, Some(1.0)))]);
+            orphans
+                .into_genus_rows(&decisions, &HashSet::from([3]))
+                .iter()
+                .map(|row| row.genus)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows_of(true), vec![20]);
+        assert_eq!(rows_of(false), vec![10, 20]);
     }
 }

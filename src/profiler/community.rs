@@ -625,7 +625,11 @@ impl CommunityProfiler {
                     reference.length as u64,
                 )
             }));
-            Arc::new(GenusRollup { genus_of, layout })
+            Arc::new(GenusRollup {
+                genus_of,
+                layout,
+                fractional: db_is_subsampled,
+            })
         });
         let mut metam_refs: HashMap<String, MetamReferenceEntry> =
             HashMap::with_capacity(db.references.len());
@@ -1586,7 +1590,7 @@ impl CommunityProfiler {
 
         let rollup_metrics = match orphans {
             Some(orphans) => self.add_genus_rows(
-                orphans.into_genus_rows(&evidence_decisions),
+                orphans.into_genus_rows(&evidence_decisions, &evidence_selected_taxa),
                 &mut unambiguous,
                 &mut resolved_classifications,
             ),
