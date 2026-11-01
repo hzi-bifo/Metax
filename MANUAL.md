@@ -211,7 +211,7 @@ Seed scheme:
 
 - `-k, --seed-length`: length of each syncmer component. Default `15`.
 - `-w, --seed-window`: seed density/window parameter; larger values produce fewer seeds and a smaller index. Default `15`.
-- `--max-occ`: discard seed keys occurring at more than N reference positions. Default `100`.
+- `--max-occ`: discard seed keys occurring at more than N reference positions. Default `500` for an index of marker genes only (`--reference-type markers` without `--reference-type-table` or `--fraction`), where conserved genes share many seeds, and `100` otherwise.
 - `--seed-mode`: `randstrobe` (default) or `minimizer`.
 - `--hash-bits`: high hash bits stored as the lookup key (24–64). Default `32`.
 - `--strobe-start-dist-min` / `--strobe-start-dist-max`: start-to-start distance range between the two strobes. Defaults `30` and `90`.

@@ -75,7 +75,7 @@ fn parse_positive_float(s: &str) -> Result<f64, String> {
     Ok(value)
 }
 
-use metax::db::{MetamIndexOptions, ReferenceTypes, DEFAULT_SEED_CHUNK_MIB};
+use metax::db::{MetamIndexOptions, ReferenceType, ReferenceTypes, DEFAULT_SEED_CHUNK_MIB};
 use metax::mapper::mapper_options_help;
 use metax::mapper::tsv::load_mapping_run_metadata;
 use metax::profiler::{ExactTiePolicy, ProfileMode};
@@ -739,11 +739,10 @@ struct IndexArgs {
     #[arg(
         long = "max-occ",
         value_name = "N",
-        default_value_t = 100,
         help_heading = "Seed index configuration",
-        help = "Discard seed keys occurring at more than N reference positions. Lower values shrink the index but may reduce sensitivity."
+        help = "Discard seed keys occurring at more than N reference positions. Lower values shrink the index but may reduce sensitivity. Default 500 for an index of marker genes only (--reference-type markers without --reference-type-table or --fraction), where conserved genes share many seeds, and 100 otherwise."
     )]
-    max_occ: usize,
+    max_occ: Option<usize>,
 
     #[arg(
         long = "seed-mode",
@@ -945,6 +944,26 @@ fn resolve_profile_inputs(
     Ok((input_sequences, is_paired))
 }
 
+const DEFAULT_MAX_OCC: usize = 100;
+const DEFAULT_MARKER_MAX_OCC: usize = 500;
+
+/// Seed occurrence limit of `metax index`: an explicit value, else a higher
+/// limit for an index of marker genes only.
+fn resolve_index_max_occ(
+    explicit: Option<usize>,
+    reference_type: ReferenceType,
+    has_type_table: bool,
+    fraction: Option<f64>,
+) -> usize {
+    explicit.unwrap_or(
+        if reference_type == ReferenceType::Markers && !has_type_table && fraction.is_none() {
+            DEFAULT_MARKER_MAX_OCC
+        } else {
+            DEFAULT_MAX_OCC
+        },
+    )
+}
+
 fn resolve_index_match_both_strobes(
     seed_mode: &str,
     explicit_match_both: bool,
@@ -1131,11 +1150,18 @@ fn main() -> Result<()> {
                 args.match_both_strobes,
                 args.first_strobe_only,
             )?;
+            let default_reference_type: ReferenceType = args.reference_type.parse()?;
             let reference_types = ReferenceTypes::new(
-                args.reference_type.parse()?,
+                default_reference_type,
                 args.reference_type_table.as_deref().map(Path::new),
             )?;
             let mixed_types_possible = reference_types.has_table();
+            let max_occ = resolve_index_max_occ(
+                args.max_occ,
+                default_reference_type,
+                args.reference_type_table.is_some(),
+                args.fraction,
+            );
             // Build mapping index from reference FASTA
             build_index(
                 &args.fasta,
@@ -1150,7 +1176,7 @@ fn main() -> Result<()> {
                 MetamIndexOptions {
                     k: args.k,
                     w: args.w,
-                    max_occ: args.max_occ,
+                    max_occ,
                     hash_bits: args.hash_bits,
                     seed_mode: args.seed_mode,
                     match_both_strobes,
@@ -1413,6 +1439,19 @@ mod tests {
             "--no-identity-margin",
         ];
         assert!(Cli::try_parse_from(both).is_err());
+    }
+
+    #[test]
+    fn marker_only_indexes_default_to_a_higher_seed_occurrence_limit() {
+        use super::resolve_index_max_occ;
+        use metax::db::ReferenceType::{Genome, Markers};
+        assert_eq!(resolve_index_max_occ(None, Markers, false, None), 500);
+        assert_eq!(resolve_index_max_occ(None, Genome, false, None), 100);
+        assert_eq!(resolve_index_max_occ(None, Markers, true, None), 100);
+        assert_eq!(resolve_index_max_occ(None, Genome, true, None), 100);
+        assert_eq!(resolve_index_max_occ(None, Markers, false, Some(0.1)), 100);
+        assert_eq!(resolve_index_max_occ(Some(100), Markers, false, None), 100);
+        assert_eq!(resolve_index_max_occ(Some(42), Genome, false, None), 42);
     }
 
     #[test]
