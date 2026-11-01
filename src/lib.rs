@@ -508,8 +508,8 @@ impl MetaxApp {
             if self.config.genus_fallback {
                 flags.push("--genus-fallback".to_string());
             }
-            if self.config.removed_to_genus {
-                flags.push("--removed-to-genus".to_string());
+            if !self.config.removed_to_genus && !self.config.strain {
+                flags.push("--strict-coverage".to_string());
             }
             if self.config.lenient_mapping_input {
                 flags.push("--lenient-mapping-input".to_string());

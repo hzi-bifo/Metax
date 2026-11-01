@@ -659,8 +659,10 @@ pub struct ProfilerConfig {
     /// read identity at least this much higher. Off when `None`.
     pub relative_identity_gap: Option<f64>,
 
-    /// Report the fragments of species removed by the coverage evidence at
-    /// their genus, when the species' reads spread over its genome.
+    /// Report species removed by the coverage evidence whose reads cover their
+    /// genome evenly, and the fragments of other removed species at their
+    /// genus when the species' reads spread over its genome. On unless
+    /// `--strict-coverage` or `--strain`.
     pub removed_to_genus: bool,
 
     /// Report a species at its genus when the mean identity of its best

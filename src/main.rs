@@ -300,13 +300,12 @@ struct ProfileArgs {
     genus_fallback: bool,
 
     #[arg(
-        long = "removed-to-genus",
+        long = "strict-coverage",
         action = ArgAction::SetTrue,
-        conflicts_with = "strain",
         help_heading = "Genus fallback and low-map behavior",
-        help = "Report the reads of a species that the coverage evidence removes at the species' genus, when its own reads spread over its genome (chunk ratio of at least 0.40 and reads in at least half of the genome's windows) and the genus collects at least 200 fragments. Recovers the reads of divergent strains and of new species of a genus in the database. A reference that consists mostly of foreign DNA can still produce a false genus row. On a fractional database, genera with a kept species are skipped. A removed species whose reads cover its whole genome evenly (at least 200 fragments, both coverage ratios 0.9-1.1, reads in at least 90 % of its windows) is reported at species instead when no taxon of its genus is kept; not on a fractional database. Community profiling; species represented by marker genes do not take part. Off by default."
+        help = "Report only the species kept by the coverage evidence; the reads of removed species are dropped. By default, a removed species whose reads cover its whole genome evenly (at least 200 fragments, both coverage ratios 0.9-1.1, reads in at least 90 % of its windows) is reported at species when no taxon of its genus is kept, and the reads of other removed species are reported at their genus when they spread over the species' genome (chunk ratio of at least 0.40 and reads in at least half of the genome's windows) and the genus collects at least 200 fragments. These recover large genomes at low depth, divergent strains and new species of a genus in the database; a reference that consists mostly of foreign DNA can still produce a false genus row. Community profiling; species represented by marker genes do not take part, and a fractional database gets no even-coverage species and no genus row for a genus with a kept species."
     )]
-    removed_to_genus: bool,
+    strict_coverage: bool,
 
     #[arg(
         long = "identity-margin",
@@ -1069,7 +1068,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             min_coebr: args.min_coebr,
             min_marker_genes: args.min_marker_genes,
             relative_identity_gap: args.relative_identity_gap,
-            removed_to_genus: args.removed_to_genus,
+            removed_to_genus: !args.strict_coverage && !args.strain,
             identity_margin,
             fraction: args.fraction,
             lowbiomass: args.lowbiomass,
@@ -1414,6 +1413,23 @@ mod tests {
             "--no-identity-margin",
         ];
         assert!(Cli::try_parse_from(both).is_err());
+    }
+
+    #[test]
+    fn removed_species_are_reported_unless_strict_coverage_or_strain() {
+        let rollup = |extra: &[&str]| {
+            let argv = ["metax", "profile", "-d", "db", "-o", "out", "-i", "r1.fq"];
+            let cli = Cli::try_parse_from(argv.iter().chain(extra)).unwrap();
+            let Commands::Profile(args) = cli.command else {
+                panic!("expected profile command");
+            };
+            AppConfig::try_from(args).unwrap().removed_to_genus
+        };
+        assert!(rollup(&[]));
+        assert!(rollup(&["-I", "r2.fq"]));
+        assert!(rollup(&["--sequencer", "Nanopore"]));
+        assert!(!rollup(&["--strict-coverage"]));
+        assert!(!rollup(&["--strain"]));
     }
 
     #[test]

@@ -362,7 +362,7 @@ struct ReadAssignment {
     sampling_scales: Vec<f64>,
 
     /// Index in `taxids` of the candidate with the best placement. Native
-    /// assignments only; `--removed-to-genus` credits an orphaned fragment to
+    /// assignments only; the genus roll-up credits an orphaned fragment to
     /// that species.
     best: u32,
 }
@@ -2064,7 +2064,7 @@ impl CommunityProfiler {
         Ok(final_classified_reads)
     }
 
-    /// Add the genus rows of `--removed-to-genus` to the unambiguous totals
+    /// Add the genus rows of the roll-up to the unambiguous totals
     /// that enter the EM, and their fragments to the classifications. Returns
     /// the coverage that each row reports.
     fn add_genus_rows(
@@ -2820,7 +2820,7 @@ fn add_exact_tie_placement(
 
 /// How the coverage of an assembly-coherent witness is measured: a marker
 /// genome by the genes its reads hit, any other genome by its intervals, with
-/// the window spread when `--removed-to-genus` needs it.
+/// the window spread when the genus roll-up needs it.
 #[derive(Clone, Copy)]
 struct CoverageModel<'a> {
     markers: Option<&'a MarkerModel>,
@@ -4809,7 +4809,7 @@ struct MappingData {
     /// Marker genes and fragment geometry when the database has marker genomes.
     marker_model: Option<Arc<MarkerModel>>,
 
-    /// Inputs of `--removed-to-genus`; `None` when it is off.
+    /// Inputs of the genus roll-up; `None` when it is off (`--strict-coverage`).
     genus_rollup: Option<Arc<GenusRollup>>,
 }
 

@@ -592,7 +592,7 @@ A fallback mapping must have identity of at least `--genus-identity` (default `0
 
 ### 7.10 Reads of removed species at genus
 
-The coverage evidence removes a species whose reads cover its reference too little or unevenly. These reads often still belong to the species' genus: the sample organism may be a divergent strain that shares only part of its genome with the reference, or a new species of a genus the database holds. With `--removed-to-genus`, a fragment none of whose candidate species was kept is credited to the candidate of its best placement, the donor, and is reported at the genus when all its candidates lie in that genus. A donor takes part only when its own evidence spreads over its genome:
+The coverage evidence removes a species whose reads cover its reference too little or unevenly. These reads often still belong to the species' genus: the sample organism may be a divergent strain that shares only part of its genome with the reference, or a new species of a genus the database holds. In community profiling, a fragment none of whose candidate species was kept is credited to the candidate of its best placement, the donor, and is reported at the genus when all its candidates lie in that genus. A donor takes part only when its own evidence spreads over its genome:
 
 - chunk ratio (COEBR, §7.6) of at least `0.40`, and
 - window spread of at least `0.50`: the genome of the donor's strongest witness is cut into `min(100, n/5)` equal windows for its `n` resolved fragments, and the spread is the share of windows that hold the start of at least one of them. With fewer than 4 windows the donor does not take part.
@@ -601,7 +601,7 @@ Before that, a removed species whose reads cover its whole genome evenly is repo
 
 A genus row needs at least 200 fragments from its donors. It enters abundance estimation with the other taxa, and its coverage columns show the donor with the most fragments, as a majority-LCA row shows its witness. `--min-reads` and explicitly set coverage cutoffs apply to it. Species represented by marker genes do not take part. On a fractional database a genus that holds a species kept by the coverage evidence gets no row: reads from the unindexed parts of that species' genome land on the sampled segments of relatives and leave them removed, and the species' abundance already includes them through the scaling to its full genome (§4.2). Host genomes in the database take part like any other: reads of a host whose genome they cover too thinly for a species call are reported at species when they cover it evenly, and otherwise at its genus, with an abundance that follows their small depth. The log reports the number of genus rows; `--verbose` lists the donors of each.
 
-Foreign contigs in a reference, a misassembled region, and DNA shared across genera also leave removed species behind, but their reads reach only that part of the genome, which the window spread rejects. A reference that consists mostly of foreign DNA can pass both checks and produce a false genus row. The option is off by default.
+Foreign contigs in a reference, a misassembled region, and DNA shared across genera also leave removed species behind, but their reads reach only that part of the genome, which the window spread rejects. A reference that consists mostly of foreign DNA can pass both checks and produce a false genus row. Both the even-coverage species and the genus rows are on by default; `--strict-coverage` turns both off, and the reads of removed species are then dropped. Strain profiling does not use them.
 
 ### 7.11 Relative identity guard
 
@@ -692,6 +692,6 @@ metax profile -d db_frac_10 -i R1.fastq.gz -I R2.fastq.gz -o sample_frac -t 32 \
 - Per-read classification output is unavailable for fractional databases.
 - Profiling reads Metax's own coordinate mappings; SAM/BAM files from other mappers are not supported.
 - Strain profiling is experimental (§5.9).
-- `--removed-to-genus` cannot recognise a reference that consists mostly of foreign DNA (§7.10).
+- The genus rows for the reads of removed species cannot recognise a reference that consists mostly of foreign DNA (§7.10).
 - The identity margin also reports at genus a species present only as a strain that has diverged clearly from every reference of its species (§7.12).
 - Windows is supported only through WSL.
