@@ -356,6 +356,7 @@ mod tests {
             identity,
             fraction: 1.0,
             mapped_len: bases,
+            read_len: bases,
             span: (1, 1 + bases),
             fixed_chunk: (1, 1 + bases),
             flex_chunk: (1, 1 + bases),

@@ -195,7 +195,7 @@ metax index genomes_and_markers.fa -o db_mixed --reference-type-table types.tsv 
 Marker genomes:
 
 - are indexed whole, also with `--fraction`;
-- have the summed marker length as genome size. A larger `genome_size` in the FASTA header is ignored, because the size of the full genome is not used: read counts (profile column 4) are the reads mapped to the marker genes, not full-genome equivalents, and depth and coverage refer to the marker genes. Marker genes are largely single-copy, so the depth of a marker genome estimates the depth of the organism, and relative abundances of marker and genome taxa are comparable even though their read counts are not;
+- have the summed marker length as genome size. A larger `genome_size` in the FASTA header is ignored: read counts (profile column 4) are the reads mapped to the marker genes, not full-genome equivalents, and coverage refers to the marker genes. Depth (profile column 5) is that of the whole genome: a fragment on a marker gene adds the length of its read over the placements that the genome's genes offer (§7.13). Marker genes are largely single-copy, so relative abundances of marker and genome taxa are comparable even though their read counts are not;
 - are evaluated by the genes their reads hit rather than by chunk breadth (§7.4);
 - never take part in genus fallback (§7.9).
 
@@ -408,7 +408,7 @@ The profile is tab-separated, has no header row, and contains one row per report
 | 2 | taxid |
 | 3 | rank |
 | 4 | number of reads, in full-index equivalents (scaled for fractional databases; for marker genomes, the reads mapped to the marker genes) |
-| 5 | depth of coverage |
+| 5 | depth of coverage (for marker genomes, of the whole genome; §7.13) |
 | 6 | relative abundance (%), normalized over the reported taxa |
 | 7 | observed breadth of coverage |
 | 8 | expected breadth of coverage |
@@ -619,7 +619,9 @@ The rule is on by default with `F = 0.025` for paired-end Illumina community pro
 
 ### 7.13 Abundance estimation
 
-Reads with several retained candidates are redistributed by an expectation–maximization procedure that iterates until the relative change falls below `1e-5` or `--max-em-iterations` is reached. Abundance is normalized across the taxa that pass the final filters. Read counts are reported in full-index equivalents.
+Each fragment adds depth to its candidates: the mapped bases of its read (mate 1 of a pair) over the genome size, which for a fractional index is the effective indexed size. A fragment on a marker gene adds the length of its read, also when the read is clipped at the end of the gene, over `Σ placements(L_i)` for the genome's genes of lengths `L_i` (§7.4). A genome of `G` bases offers about `G` placements, so this is the depth of the whole genome, comparable with the depth of a genome taxon. When no gene of a marker genome can hold a read of the sample's length, its fragments add mapped bases over the summed gene length.
+
+Reads with several retained candidates are redistributed by an expectation–maximization procedure that weights the candidates by these depths and iterates until the relative change falls below `1e-5` or `--max-em-iterations` is reached. Abundance is depth normalized across the taxa that pass the final filters. Read counts are reported in full-index equivalents.
 
 ## 8. Common Recipes
 

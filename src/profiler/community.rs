@@ -62,11 +62,10 @@ use crate::progress;
 
 use super::evidence::{
     calculate_coverage, evaluate_ranked_witness, guarded_map_winner, resolved_candidate_index,
-    standard_ratio_lower_bounds, witness_is_better, CandidateScratch, EvidenceAlignment,
-    EvidenceCoverage, EvidenceMode, EvidencePolicy, EvidenceThresholds, ExactTiePlacement,
-    ExactTies, MappingRole,
-    PresenceAssembly, PresenceInterval, PresenceKey, TaxonEvidence, WitnessDecision,
-    STANDARD_RATIO_UPPER,
+    standard_ratio_lower_bounds, witness_is_better, CandidatePlacement, CandidateScratch,
+    EvidenceAlignment, EvidenceCoverage, EvidenceMode, EvidencePolicy, EvidenceThresholds,
+    ExactTiePlacement, ExactTies, MappingRole, PresenceAssembly, PresenceInterval, PresenceKey,
+    TaxonEvidence, WitnessDecision, STANDARD_RATIO_UPPER,
 };
 #[cfg(test)]
 use super::evidence::{PremapChunkGuard, RescueKinds};
@@ -900,6 +899,7 @@ impl CommunityProfiler {
                 identity: mapping.identity as f32,
                 fraction: fraction as f32,
                 mapped_len: clamp_u32(mapping.mapped_bases),
+                read_len: clamp_u32(mapping.read_len),
                 span: (clamp_u32(start), clamp_u32(end)),
                 fixed_chunk: (clamp_u32(fixed_chunk_start), clamp_u32(fixed_chunk_end)),
                 flex_chunk: (clamp_u32(flex_chunk_start), clamp_u32(flex_chunk_end)),
@@ -974,6 +974,7 @@ impl CommunityProfiler {
             aligned_reads,
             skipped_reference_at_load,
             evidence_policy,
+            marker_model,
             ..
         } = &mapping_data;
         let verbose_logging = self.cfg.verbose || self.cfg.very_verbose;
@@ -997,6 +998,7 @@ impl CommunityProfiler {
             *fallback_mode,
             Arc::clone(species_to_genus),
             *evidence_policy,
+            marker_model.as_deref(),
         )?;
         // The `skipped_reference` diagnostic now accumulates two
         // streams: parser-time rejections (unparsable species taxid /
@@ -1073,6 +1075,7 @@ impl CommunityProfiler {
         fallback_mode: bool,
         species_to_genus: Arc<HashMap<u32, u32>>,
         evidence_policy: Option<EvidencePolicy>,
+        markers: Option<&MarkerModel>,
     ) -> Result<AssignmentResult> {
         let batch_size = self.cfg.batch_size.max(1);
         let cfg = Arc::new(self.cfg.clone());
@@ -1101,6 +1104,7 @@ impl CommunityProfiler {
                             policy,
                             fallback_mode,
                             species_to_genus.as_ref(),
+                            markers,
                         )
                     } else {
                         process_batch(chunk, &cfg, fallback_mode, species_to_genus.as_ref())
@@ -3159,6 +3163,23 @@ fn sample_fragment_geometry(
     FragmentGeometry::new(layout, read_len, template_len, cfg.mapped_len, cfg.fraction)
 }
 
+/// Depth that one fragment adds to its candidate: its mapped bases over the
+/// genome length. A fragment on a marker gene stands for one fragment of the
+/// whole genome: it adds its whole read length, also when the read is clipped
+/// at a gene end, over the placements that the genome's genes offer, so that
+/// marker and genome taxa have comparable depths. Marker genes that cannot
+/// hold a read keep mapped bases over their summed length.
+fn fragment_depth(
+    placement: CandidatePlacement,
+    mapped: u32,
+    markers: Option<&MarkerModel>,
+) -> f64 {
+    match markers.and_then(|model| model.fragment_placements(placement.assembly_id)) {
+        Some(placements) => f64::from(placement.read_len) / placements,
+        None => f64::from(mapped) / placement.asm_len.max(1.0),
+    }
+}
+
 /// Native short-/long-read assignment policy.
 ///
 /// All valid terminal-taxon candidates are retained through evidence
@@ -3174,6 +3195,7 @@ fn process_evidence_batch(
     policy: EvidencePolicy,
     fallback_mode: bool,
     species_to_genus: &HashMap<u32, u32>,
+    markers: Option<&MarkerModel>,
 ) -> AssignmentResult {
     let mut result = AssignmentResult::default();
     let mut scratch = CandidateScratch::default();
@@ -3264,7 +3286,7 @@ fn process_evidence_batch(
                     EvidenceMode::Long => placement.both_mapped,
                 };
                 taxids.push(candidate.taxid);
-                depths.push(f64::from(mapped) / placement.asm_len.max(1.0));
+                depths.push(fragment_depth(placement, mapped, markers));
                 mapped_lens.push(f64::from(mapped));
                 sampling_scales.push(placement.sampling_scale);
             }
@@ -4771,6 +4793,46 @@ mod tests {
         );
     }
 
+    fn placement(assembly_id: u32, mapped: u32, read_len: u32) -> CandidatePlacement {
+        CandidatePlacement {
+            taxid: 1,
+            profile_rank: ProfileRank::Species,
+            reference_id: 0,
+            assembly_id,
+            sampling_scale: 1.0,
+            asm_len: 2_000.0,
+            r1_mapped: mapped,
+            both_mapped: mapped,
+            read_len,
+            pair_errors: 0.0,
+            long_score: 0.0,
+            span: (1, 1 + mapped),
+            fixed_chunk: (1, 1 + mapped),
+            flex_chunk: (1, 1 + mapped),
+            input_order: 0,
+        }
+    }
+
+    #[test]
+    fn a_fragment_on_a_marker_gene_adds_its_read_over_the_genes_placements() {
+        // 150 bp pairs of 400 bases with lone mates: genes of 1,000 bases
+        // offer 1,191 placements each; a gene of 100 bases holds no read.
+        let geometry = FragmentGeometry::new(FragmentLayout::PairsAndLoneMates, 150, 400, 50, 0.7);
+        let markers =
+            MarkerModel::from_gene_lengths(&[(7, &[1_000, 1_000]), (8, &[100])], geometry);
+        let depth = |assembly, mapped, markers| {
+            fragment_depth(placement(assembly, mapped, 150), mapped, markers)
+        };
+        approx_equal(depth(7, 150, Some(&markers)), 150.0 / 2_382.0);
+        // A read clipped at a gene end stands for its whole read.
+        approx_equal(depth(7, 110, Some(&markers)), 150.0 / 2_382.0);
+        // Genome references and marker genes without placements keep mapped
+        // bases over the summed length.
+        approx_equal(depth(9, 140, Some(&markers)), 140.0 / 2_000.0);
+        approx_equal(depth(8, 90, Some(&markers)), 90.0 / 2_000.0);
+        approx_equal(depth(7, 140, None), 140.0 / 2_000.0);
+    }
+
     #[test]
     fn expected_breadth_is_clamped_for_high_depths() {
         let expected = crate::profiler::evidence::expected_breadth(10.0, 5.0);
@@ -5530,6 +5592,7 @@ mod tests {
             identity,
             fraction: mapped_len as f32 / read_len as f32,
             mapped_len,
+            read_len,
             span: (100, 100 + mapped_len),
             fixed_chunk: (1, 300 + mapped_len),
             flex_chunk: (1, 500 + mapped_len),
@@ -5784,15 +5847,27 @@ mod tests {
         cfg.is_paired = true;
 
         let default_policy = EvidencePolicy::from_config(&cfg).unwrap();
-        let default_result =
-            process_evidence_batch(&[bundle()], &cfg, default_policy, false, &HashMap::new());
+        let default_result = process_evidence_batch(
+            &[bundle()],
+            &cfg,
+            default_policy,
+            false,
+            &HashMap::new(),
+            None,
+        );
         assert_eq!(default_result.exact_ties.fragment_count(), 0);
 
         cfg.exact_ties = ExactTiePolicy::GuardedMap;
         let guarded_policy = EvidencePolicy::from_config(&cfg).unwrap();
         assert!(guarded_policy.collect_exact_ties);
-        let guarded_result =
-            process_evidence_batch(&[bundle()], &cfg, guarded_policy, false, &HashMap::new());
+        let guarded_result = process_evidence_batch(
+            &[bundle()],
+            &cfg,
+            guarded_policy,
+            false,
+            &HashMap::new(),
+            None,
+        );
         assert_eq!(guarded_result.exact_ties.fragment_count(), 1);
         assert!(guarded_result.presence.is_empty());
         for taxid in [101, 102] {
@@ -5823,7 +5898,7 @@ mod tests {
         };
         let policy = EvidencePolicy::from_config(&cfg).unwrap();
         assert_eq!(policy.mode, EvidenceMode::Single);
-        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new());
+        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new(), None);
 
         assert_eq!(result.read_assignments.len(), 1);
         assert_eq!(result.read_assignments[0].taxids, vec![101, 102]);
@@ -5855,7 +5930,7 @@ mod tests {
             alignments: vec![mapping],
         };
         let policy = EvidencePolicy::from_config(&cfg).unwrap();
-        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new());
+        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new(), None);
 
         assert_eq!(result.read_assignments.len(), 1);
         assert_eq!(result.read_assignments[0].taxids, vec![101]);
@@ -5900,7 +5975,7 @@ mod tests {
             ],
         };
         let policy = EvidencePolicy::from_config(&cfg).unwrap();
-        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new());
+        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new(), None);
 
         assert_eq!(result.read_assignments.len(), 1);
         assert_eq!(result.read_assignments[0].rank, AssignRank::Mixed);
@@ -5942,7 +6017,7 @@ mod tests {
         };
         let policy = EvidencePolicy::from_config(&cfg).unwrap();
         assert_eq!(policy.mode, EvidenceMode::Long);
-        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new());
+        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new(), None);
 
         assert_eq!(result.read_assignments.len(), 1);
         assert_eq!(result.read_assignments[0].rank, AssignRank::Mixed);
@@ -5971,7 +6046,7 @@ mod tests {
             )],
         };
         let policy = EvidencePolicy::from_config(&cfg).unwrap();
-        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new());
+        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new(), None);
 
         assert_eq!(result.read_assignments.len(), 1);
         assert_eq!(result.read_assignments[0].rank, AssignRank::Genus);
@@ -5997,7 +6072,7 @@ mod tests {
             ],
         };
         let policy = EvidencePolicy::from_config(&cfg).unwrap();
-        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new());
+        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new(), None);
 
         assert_eq!(result.exact_ties.fragment_count(), 1);
         assert!(result.presence.is_empty());
@@ -6065,7 +6140,7 @@ mod tests {
             alignments: rows,
         };
         let policy = EvidencePolicy::from_config(&cfg).unwrap();
-        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new());
+        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new(), None);
 
         assert_eq!(result.read_assignments.len(), 1);
         assert_eq!(result.read_assignments[0].taxids, vec![101, 102]);
@@ -6100,7 +6175,7 @@ mod tests {
             alignments: rows,
         };
         let policy = EvidencePolicy::from_config(&cfg).unwrap();
-        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new());
+        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new(), None);
 
         assert_eq!(result.read_assignments.len(), 1);
         assert_eq!(result.read_assignments[0].taxids, vec![101, 102]);
@@ -6144,7 +6219,7 @@ mod tests {
             alignments: rows,
         };
         let policy = EvidencePolicy::from_config(&cfg).unwrap();
-        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new());
+        let result = process_evidence_batch(&[bundle], &cfg, policy, false, &HashMap::new(), None);
 
         assert_eq!(result.presence.len(), 2);
         assert!(result.presence.contains_key(&PresenceKey {
@@ -6235,6 +6310,7 @@ mod tests {
             identity: identity as f32,
             fraction: fraction as f32,
             mapped_len: clamp_u32(raw.mapped_len),
+            read_len: clamp_u32(raw.mapped_len),
             span: (clamp_u32(raw.span.0), clamp_u32(raw.span.1)),
             fixed_chunk: (clamp_u32(raw.span.0), clamp_u32(raw.span.1)),
             flex_chunk: (clamp_u32(raw.span.0), clamp_u32(raw.span.1)),
@@ -7396,6 +7472,7 @@ mod tests {
             identity: 0.98,
             fraction: 1.0,
             mapped_len: 100,
+            read_len: 100,
             span: (1, 101),
             fixed_chunk: (1, 101),
             flex_chunk: (1, 101),

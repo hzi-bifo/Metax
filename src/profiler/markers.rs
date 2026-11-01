@@ -31,6 +31,9 @@ use crate::db::{DatabaseMetadata, ReferenceType};
 pub(crate) struct MarkerModel {
     /// Genes of every marker genome by assembly id, in reference order.
     genes: HashMap<u32, Vec<Gene>>,
+    /// Fragment placements summed over the genes of every marker genome
+    /// that can hold a read, by assembly id.
+    placements: HashMap<u32, f64>,
     geometry: FragmentGeometry,
 }
 
@@ -60,11 +63,58 @@ impl MarkerModel {
                     });
             }
         }
-        (!genes.is_empty()).then_some(Self { genes, geometry })
+        (!genes.is_empty()).then(|| Self::new(genes, geometry))
+    }
+
+    fn new(genes: HashMap<u32, Vec<Gene>>, geometry: FragmentGeometry) -> Self {
+        let placements = genes
+            .iter()
+            .filter_map(|(&assembly_id, genes)| {
+                let placements: f64 = genes
+                    .iter()
+                    .map(|gene| geometry.placements(i64::from(gene.len)))
+                    .sum();
+                (placements > 0.0).then_some((assembly_id, placements))
+            })
+            .collect();
+        Self {
+            genes,
+            placements,
+            geometry,
+        }
+    }
+
+    /// A model of marker genomes given as `(assembly id, gene lengths)`.
+    #[cfg(test)]
+    pub(crate) fn from_gene_lengths(genomes: &[(u32, &[u32])], geometry: FragmentGeometry) -> Self {
+        let mut reference_id = 0;
+        let genes = genomes
+            .iter()
+            .map(|&(assembly_id, lens)| {
+                let genes = lens
+                    .iter()
+                    .map(|&len| {
+                        reference_id += 1;
+                        Gene { reference_id, len }
+                    })
+                    .collect();
+                (assembly_id, genes)
+            })
+            .collect();
+        Self::new(genes, geometry)
     }
 
     pub(crate) fn is_marker_genome(&self, assembly_id: u32) -> bool {
         self.genes.contains_key(&assembly_id)
+    }
+
+    /// Fragment placements that the marker genes of a genome offer, summed
+    /// over its genes; `None` for a genome without marker genes or when no
+    /// gene can hold a read of this length. A genome of `G` bases offers
+    /// about `G` placements, so the fragments on its marker genes give the
+    /// depth of the whole genome over this length.
+    pub(crate) fn fragment_placements(&self, assembly_id: u32) -> Option<f64> {
+        self.placements.get(&assembly_id).copied()
     }
 
     /// Coverage of a marker genome, or `None` for a genome of another type or
@@ -415,5 +465,28 @@ mod tests {
             lengths.add(len);
         }
         assert_eq!(lengths.median(), Some(151));
+    }
+
+    #[test]
+    fn marker_genes_offer_their_summed_placements() {
+        // 150 bp pairs of 400 bases with lone mates: a gene of 1,000 bases
+        // offers 941 + 250 placements, one of 250 bases 2 x 191, and one of
+        // 100 bases none.
+        let genes = |lens: &[u32]| -> Vec<Gene> {
+            lens.iter()
+                .enumerate()
+                .map(|(reference_id, &len)| Gene {
+                    reference_id: reference_id as u32,
+                    len,
+                })
+                .collect()
+        };
+        let model = MarkerModel::new(
+            HashMap::from([(0, genes(&[1_000, 250, 100])), (1, genes(&[100]))]),
+            geometry(FragmentLayout::PairsAndLoneMates),
+        );
+        assert_eq!(model.fragment_placements(0), Some(1_191.0 + 382.0));
+        assert_eq!(model.fragment_placements(1), None);
+        assert_eq!(model.fragment_placements(2), None);
     }
 }
