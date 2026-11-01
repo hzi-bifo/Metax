@@ -211,6 +211,7 @@ struct MetamReferenceEntry {
     sampling_scale: f32,
     asm_len: f64,
     flex_len: usize,
+    is_marker: bool,
 }
 
 /// Statistics about alignment filtering.
@@ -683,6 +684,7 @@ impl CommunityProfiler {
                     sampling_scale,
                     asm_len,
                     flex_len,
+                    is_marker: reference.reference_type == ReferenceType::Markers,
                 },
             );
         }
@@ -913,6 +915,8 @@ impl CommunityProfiler {
                 span: (clamp_u32(start), clamp_u32(end)),
                 fixed_chunk: (clamp_u32(fixed_chunk_start), clamp_u32(fixed_chunk_end)),
                 flex_chunk: (clamp_u32(flex_chunk_start), clamp_u32(flex_chunk_end)),
+                reaches_marker_end: reference.is_marker
+                    && reaches_reference_end(start, end, reference.ref_len),
             },
         ))
     }
@@ -3142,6 +3146,12 @@ fn resolve_coordinate_evidence(
 /// sample of unknown or host DNA. Fragments placed only on marker genes, whose
 /// genome size is unknown, are left out. Equals the plain mapping rate for a
 /// database of whole genomes.
+/// Whether a 1-based, end-exclusive interval reaches the first or last base
+/// of a reference of `ref_len` bases.
+fn reaches_reference_end(start: usize, end: usize, ref_len: usize) -> bool {
+    start == 1 || end == ref_len.saturating_add(1)
+}
+
 fn genome_equivalent_mapping_rate(
     bundles: &[ReadBundle],
     total_reads: usize,
@@ -4870,6 +4880,13 @@ mod tests {
     }
 
     #[test]
+    fn an_alignment_reaches_a_reference_end_at_its_first_or_last_base() {
+        assert!(reaches_reference_end(1, 101, 1_000));
+        assert!(reaches_reference_end(900, 1_001, 1_000));
+        assert!(!reaches_reference_end(2, 1_000, 1_000));
+    }
+
+    #[test]
     fn expected_breadth_is_clamped_for_high_depths() {
         let expected = crate::profiler::evidence::expected_breadth(10.0, 5.0);
         approx_equal(expected, 1.0);
@@ -5632,6 +5649,7 @@ mod tests {
             span: (100, 100 + mapped_len),
             fixed_chunk: (1, 300 + mapped_len),
             flex_chunk: (1, 500 + mapped_len),
+            reaches_marker_end: false,
         }
     }
 
@@ -6350,6 +6368,7 @@ mod tests {
             span: (clamp_u32(raw.span.0), clamp_u32(raw.span.1)),
             fixed_chunk: (clamp_u32(raw.span.0), clamp_u32(raw.span.1)),
             flex_chunk: (clamp_u32(raw.span.0), clamp_u32(raw.span.1)),
+            reaches_marker_end: false,
         })
     }
 
@@ -7512,6 +7531,7 @@ mod tests {
             span: (1, 101),
             fixed_chunk: (1, 101),
             flex_chunk: (1, 101),
+            reaches_marker_end: false,
         };
         let mut higher_identity = lower_identity.clone();
         higher_identity.asm = Arc::<str>::from("fractional-genome");

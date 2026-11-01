@@ -61,6 +61,9 @@ pub(crate) struct EvidenceAlignment {
     pub(crate) span: (u32, u32),
     pub(crate) fixed_chunk: (u32, u32),
     pub(crate) flex_chunk: (u32, u32),
+    /// The alignment reaches the first or last base of a marker-gene
+    /// reference, so the read may continue beyond the gene.
+    pub(crate) reaches_marker_end: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1060,6 +1063,7 @@ pub(crate) struct CandidateScratch {
     by_taxon: HashMap<(u32, ProfileRank), TerminalCandidate>,
     paired_rows: HashMap<u32, ExplicitPairRows>,
     pair_order: Vec<u32>,
+    half_pair_mates: Vec<usize>,
     output: Vec<TerminalCandidate>,
 }
 
@@ -1085,6 +1089,7 @@ impl CandidateScratch {
         self.by_taxon.clear();
         self.paired_rows.clear();
         self.pair_order.clear();
+        self.half_pair_mates.clear();
         self.output.clear();
 
         match policy.mode {
@@ -1170,9 +1175,22 @@ impl CandidateScratch {
                 || r1.profile_taxid != r2.profile_taxid
                 || r1.profile_rank != r2.profile_rank
                 || r1.assembly_id != r2.assembly_id
-                || !paired_mate1_qualifies(r1, policy)
-                || !paired_mate2_qualifies(r2, policy)
             {
+                continue;
+            }
+            let r1_qualifies = paired_mate1_qualifies(r1, policy);
+            let r2_qualifies = paired_mate2_qualifies(r2, policy);
+            if !(r1_qualifies && r2_qualifies) {
+                // A mate that runs off a marker gene is clipped there and can
+                // fail its gate; its partner may still stand for the fragment.
+                if !r2_qualifies && r2.reaches_marker_end && single_mapping_qualifies(r1, policy) {
+                    self.half_pair_mates.push(r1_index);
+                } else if !r1_qualifies
+                    && r1.reaches_marker_end
+                    && single_mapping_qualifies(r2, policy)
+                {
+                    self.half_pair_mates.push(r2_index);
+                }
                 continue;
             }
             let placement = CandidatePlacement {
@@ -1196,15 +1214,20 @@ impl CandidateScratch {
         }
 
         // Without any pair, the fragment's evidence is a mate whose mate may
-        // lie beyond the end of its reference: the only rows without a pair
-        // that paired-end profiling admits.
+        // lie beyond the end of its reference, or a mate whose partner on the
+        // same marker gene was clipped at the gene's end: the only single
+        // mates that paired-end profiling admits.
         if self.by_taxon_assembly.is_empty() {
-            self.build_unpaired(rows, policy, |mapping| mapping.pair_id == 0);
+            let half_pair_mates = std::mem::take(&mut self.half_pair_mates);
+            self.build_unpaired(rows, policy, |index, mapping| {
+                mapping.pair_id == 0 || half_pair_mates.contains(&index)
+            });
+            self.half_pair_mates = half_pair_mates;
         }
     }
 
     fn build_single(&mut self, rows: &[EvidenceAlignment], policy: EvidencePolicy) {
-        self.build_unpaired(rows, policy, |_| true);
+        self.build_unpaired(rows, policy, |_, _| true);
     }
 
     /// One placement per qualifying single-read row accepted by `include`.
@@ -1212,10 +1235,10 @@ impl CandidateScratch {
         &mut self,
         rows: &[EvidenceAlignment],
         policy: EvidencePolicy,
-        include: impl Fn(&EvidenceAlignment) -> bool,
+        include: impl Fn(usize, &EvidenceAlignment) -> bool,
     ) {
         for (input_order, mapping) in rows.iter().enumerate() {
-            if !include(mapping) || !single_mapping_qualifies(mapping, policy) {
+            if !include(input_order, mapping) || !single_mapping_qualifies(mapping, policy) {
                 continue;
             }
             let placement = CandidatePlacement {
@@ -1488,6 +1511,7 @@ mod tests {
             span: (100, 100 + mapped),
             fixed_chunk: (1, 1_100 + mapped),
             flex_chunk: (1, 2_100 + mapped),
+            reaches_marker_end: false,
         }
     }
 
@@ -1600,6 +1624,50 @@ mod tests {
         let candidates = scratch.build(&rows, policy(EvidenceMode::Paired));
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].taxid, 3);
+    }
+
+    #[test]
+    fn a_mate_clipped_at_a_marker_gene_end_leaves_its_partner_as_evidence() {
+        // Species 1: mate 2 runs off a marker gene and aligns 60 of 100 bases.
+        let mut rows = vec![
+            mapping(1, 10, 1, 0.99, 100, 100, MappingRole::Mate1),
+            mapping(1, 10, 1, 1.00, 60, 100, MappingRole::Mate2),
+        ];
+        let mut scratch = CandidateScratch::default();
+        assert!(scratch
+            .build(&rows, policy(EvidenceMode::Paired))
+            .is_empty());
+
+        rows[1].reaches_marker_end = true;
+        let candidates = scratch.build(&rows, policy(EvidenceMode::Paired));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].taxid, 1);
+        assert_eq!(candidates[0].best.both_mapped, 100);
+
+        // The same with the mates swapped: mate 1 is clipped.
+        let mut swapped = vec![
+            mapping(1, 10, 1, 1.00, 60, 100, MappingRole::Mate1),
+            mapping(1, 10, 1, 0.99, 100, 100, MappingRole::Mate2),
+        ];
+        swapped[0].reaches_marker_end = true;
+        let candidates = scratch.build(&swapped, policy(EvidenceMode::Paired));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].best.both_mapped, 100);
+
+        // The good mate must pass the single-read gates itself.
+        let mut weak = rows.clone();
+        weak[0].identity = 0.90;
+        assert!(scratch
+            .build(&weak, policy(EvidenceMode::Paired))
+            .is_empty());
+
+        // A qualifying pair of the fragment on another taxon takes precedence.
+        let mut with_pair = rows.clone();
+        with_pair.push(mapping(2, 20, 2, 0.98, 100, 100, MappingRole::Mate1));
+        with_pair.push(mapping(2, 20, 2, 0.98, 100, 100, MappingRole::Mate2));
+        let candidates = scratch.build(&with_pair, policy(EvidenceMode::Paired));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].taxid, 2);
     }
 
     #[test]
