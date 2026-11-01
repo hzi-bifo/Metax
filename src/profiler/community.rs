@@ -584,6 +584,7 @@ impl CommunityProfiler {
         let (species_normalize_raw, mut species_to_genus_raw) =
             self.build_taxonomy_lookups(&profile_taxids);
         let normalize = |taxid: u32| species_normalize_raw.get(&taxid).copied().unwrap_or(taxid);
+        let mut marker_only_species: HashMap<u32, Option<u32>> = HashMap::new();
         if has_marker_genomes {
             // Genus fallback places reads that no species explains at the genus
             // of their best hit. A marker gene holds too little of a genome for
@@ -594,6 +595,14 @@ impl CommunityProfiler {
                 .iter()
                 .map(|&taxid| normalize(taxid))
                 .collect();
+            if self.cfg.removed_to_genus {
+                marker_only_species = profile_taxids
+                    .iter()
+                    .map(|&taxid| normalize(taxid))
+                    .filter(|species| !species_with_genomes.contains(species))
+                    .map(|species| (species, species_to_genus_raw.get(&species).copied()))
+                    .collect();
+            }
             species_to_genus_raw.retain(|species, _| species_with_genomes.contains(species));
         }
         // The roll-up needs every genus, also on a fractional database, where
@@ -626,6 +635,7 @@ impl CommunityProfiler {
             }));
             Arc::new(GenusRollup {
                 genus_of,
+                marker_only: marker_only_species,
                 layout,
                 fractional: db_is_subsampled,
             })
@@ -1299,6 +1309,32 @@ impl CommunityProfiler {
             )?;
             evidence_decisions = resolved.decisions;
             evidence_selected_taxa = resolved.selected_taxa;
+            if let Some(rollup) = genus_rollup.as_deref() {
+                let even = rollup.even_coverage_species(
+                    &evidence_decisions,
+                    |taxid| terminal_ranks.get(&taxid).copied(),
+                    min_chunk_breadth,
+                );
+                log::info!(
+                    target: "PROFILER",
+                    "Species reported for even coverage of their genome: {}.",
+                    even.len()
+                );
+                for taxid in even {
+                    if let Some(decision) = evidence_decisions.get_mut(&taxid) {
+                        decision.rescues.even_coverage = true;
+                    }
+                    evidence_selected_taxa.insert(taxid);
+                    if self.cfg.verbose || self.cfg.very_verbose {
+                        log::info!(
+                            target: "PROFILER",
+                            "  {} ({}) has even coverage.",
+                            self.taxonomy.get_name(taxid).unwrap_or("unknown"),
+                            taxid,
+                        );
+                    }
+                }
+            }
         }
 
         // Preserve only compact coordinate measurements for the optional raw

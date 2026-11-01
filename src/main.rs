@@ -304,7 +304,7 @@ struct ProfileArgs {
         action = ArgAction::SetTrue,
         conflicts_with = "strain",
         help_heading = "Genus fallback and low-map behavior",
-        help = "Report the reads of a species that the coverage evidence removes at the species' genus, when its own reads spread over its genome (chunk ratio of at least 0.40 and reads in at least half of the genome's windows) and the genus collects at least 200 fragments. Recovers the reads of divergent strains and of new species of a genus in the database. A reference that consists mostly of foreign DNA can still produce a false genus row. On a fractional database, genera with a kept species are skipped. Community profiling; species represented by marker genes do not take part. Off by default."
+        help = "Report the reads of a species that the coverage evidence removes at the species' genus, when its own reads spread over its genome (chunk ratio of at least 0.40 and reads in at least half of the genome's windows) and the genus collects at least 200 fragments. Recovers the reads of divergent strains and of new species of a genus in the database. A reference that consists mostly of foreign DNA can still produce a false genus row. On a fractional database, genera with a kept species are skipped. A removed species whose reads cover its whole genome evenly (at least 200 fragments, both coverage ratios 0.9-1.1, reads in at least 90 % of its windows) is reported at species instead when no taxon of its genus is kept; not on a fractional database. Community profiling; species represented by marker genes do not take part. Off by default."
     )]
     removed_to_genus: bool,
 

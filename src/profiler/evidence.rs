@@ -474,12 +474,18 @@ pub(crate) struct RescueKinds {
     pub(crate) platform: bool,
     pub(crate) high_specificity_low_amount: bool,
     pub(crate) low_abundance_pe: bool,
+    /// Removed by the amount tests, but the reads cover the whole genome
+    /// evenly and no taxon of the genus is kept.
+    pub(crate) even_coverage: bool,
 }
 
 impl RescueKinds {
     #[inline]
     pub(crate) fn any(self) -> bool {
-        self.platform || self.high_specificity_low_amount || self.low_abundance_pe
+        self.platform
+            || self.high_specificity_low_amount
+            || self.low_abundance_pe
+            || self.even_coverage
     }
 }
 
@@ -836,6 +842,8 @@ pub(crate) fn evaluate_ranked_witness(
                 platform: ordinary_platform_rescue(&features, thresholds, &ratios),
                 high_specificity_low_amount: high_specificity_low_amount_rescue(&features, &ratios),
                 low_abundance_pe: low_abundance_pe_rescue(&features, thresholds),
+                // Decided later, over the decisions of all taxa.
+                even_coverage: false,
             }
         } else {
             RescueKinds::default()
