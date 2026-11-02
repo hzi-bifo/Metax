@@ -3140,18 +3140,18 @@ fn resolve_coordinate_evidence(
     })
 }
 
-/// Mapped fragments as a share of the input fragments, each counting as the
-/// share of a genome it represents: the sampling scale of the genome of its
-/// best placement, so that an index of sampled genomes is not mistaken for a
-/// sample of unknown or host DNA. Fragments placed only on marker genes, whose
-/// genome size is unknown, are left out. Equals the plain mapping rate for a
-/// database of whole genomes.
 /// Whether a 1-based, end-exclusive interval reaches the first or last base
 /// of a reference of `ref_len` bases.
 fn reaches_reference_end(start: usize, end: usize, ref_len: usize) -> bool {
     start == 1 || end == ref_len.saturating_add(1)
 }
 
+/// Mapped fragments as a share of the input fragments, each counting as the
+/// share of a genome it represents: the sampling scale of the genome of its
+/// best placement, so that an index of sampled genomes is not mistaken for a
+/// sample of unknown or host DNA. Fragments placed only on marker genes, whose
+/// genome size is unknown, are left out. Equals the plain mapping rate for a
+/// database of whole genomes.
 fn genome_equivalent_mapping_rate(
     bundles: &[ReadBundle],
     total_reads: usize,
