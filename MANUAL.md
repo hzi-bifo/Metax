@@ -293,6 +293,8 @@ These options decide whether a mapping is strong enough for species/strain assig
 
 High-quality samples, FASTA input and short reads keep both defaults.
 
+**Qualities that over-state accuracy.** Some basecallers report higher qualities than their reads achieve. After loading the mappings, Metax therefore takes each read's best alignment (largest identity × mapped bases among those passing the length / fraction gate) and the upper quartile of their identities: reads from genomes the database holds well align at their sequencing accuracy, while divergent or poorly represented organisms lower only the lower quantiles. If this quartile is below the sampled accuracy, it takes the accuracy's place in the identity cutoff above (also for samples whose qualities claim `0.95` or more). The cutoff is only ever lowered. This applies to the automatic long-read community cutoff, including one saved in a mapping file by an automatic run; strain mode and an explicit `--min-identity` are unchanged.
+
 ### 5.6 Mapper options
 
 Options before `--` configure the profiler; options after `--` configure the mapper, i.e. which candidate mappings reach the profiler. Show the complete reference with:

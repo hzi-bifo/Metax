@@ -55,6 +55,9 @@ struct ResolvedProfilerThresholds {
     mapped_len: usize,
     fraction: f64,
     sampled_mean_base_accuracy: Option<f64>,
+    /// Claimed accuracy behind an automatic long-read identity cutoff, which
+    /// the profiler lowers when the reads align worse.
+    identity_check_accuracy: Option<f64>,
 }
 
 impl ResolvedProfilerThresholds {
@@ -171,7 +174,7 @@ fn is_noisy_long_read_accuracy(accuracy: f64) -> bool {
 /// base-quality accuracy reflects sequencing error only, not reference
 /// divergence, so a low-quality sample's reads align a little below their base
 /// quality; the margin absorbs that.
-fn adaptive_identity_from_accuracy(accuracy: f64, mode: ProfileMode) -> Option<f64> {
+pub(crate) fn adaptive_identity_from_accuracy(accuracy: f64, mode: ProfileMode) -> Option<f64> {
     if !is_noisy_long_read_accuracy(accuracy) {
         return None;
     }
@@ -673,6 +676,7 @@ impl MetaxApp {
             .or_else(|| recorded.map(|profile| profile.fraction));
         let mut sampled_mean_base_accuracy =
             mapping_metadata.and_then(|metadata| metadata.profiler.sampled_mean_base_accuracy);
+        let mut identity_check_accuracy = None;
 
         if recorded.is_some() {
             log::info!(
@@ -760,27 +764,31 @@ impl MetaxApp {
                         };
                     // Noisy long-read samples self-calibrate the identity cutoff
                     // from mean predicted base accuracy.
+                    let calibrated = sampled_mean_base_accuracy.and_then(|accuracy| {
+                        adaptive_identity_from_accuracy(accuracy, self.config.mode)
+                    });
+                    let automatic_identity = calibrated.unwrap_or(default_identity);
                     if identity.is_none() {
-                        let resolved_identity = sampled_mean_base_accuracy
-                            .and_then(|accuracy| {
-                                let cutoff =
-                                    adaptive_identity_from_accuracy(accuracy, self.config.mode)?;
-                                log::info!(
-                                    target: "PROFILER",
-                                    "Long-read identity threshold: {cutoff:.4} (auto-calibrated from {accuracy_source}: mean predicted accuracy {accuracy:.4} < {NOISY_LONG_READ_ACCURACY:.2}, floor {ADAPTIVE_IDENTITY_FLOOR:.2}).",
-                                );
-                                Some(cutoff)
-                            })
-                            .unwrap_or(default_identity);
-                        if let Some(accuracy) = sampled_mean_base_accuracy {
-                            if accuracy >= NOISY_LONG_READ_ACCURACY {
+                        match (calibrated, sampled_mean_base_accuracy) {
+                            (Some(cutoff), Some(accuracy)) => log::info!(
+                                target: "PROFILER",
+                                "Long-read identity threshold: {cutoff:.4} (auto-calibrated from {accuracy_source}: mean predicted accuracy {accuracy:.4} < {NOISY_LONG_READ_ACCURACY:.2}, floor {ADAPTIVE_IDENTITY_FLOOR:.2}).",
+                            ),
+                            (None, Some(accuracy)) if accuracy >= NOISY_LONG_READ_ACCURACY => {
                                 log::info!(
                                     target: "PROFILER",
                                     "Long-read identity: mean predicted base accuracy {accuracy:.4} from {accuracy_source} >= {NOISY_LONG_READ_ACCURACY:.2}; keeping the preset identity cutoff.",
-                                );
+                                )
                             }
+                            _ => {}
                         }
-                        identity = Some(resolved_identity);
+                        identity = Some(automatic_identity);
+                    }
+                    // The profiler lowers an automatic cutoff, also one saved by
+                    // an earlier automatic run, when the reads align worse than
+                    // their base qualities claim.
+                    if self.config.identity.is_none() && identity == Some(automatic_identity) {
+                        identity_check_accuracy = sampled_mean_base_accuracy;
                     }
                     mapped_len.get_or_insert(default_mapped);
                     fraction.get_or_insert(default_fraction);
@@ -816,6 +824,7 @@ impl MetaxApp {
             mapped_len: mapped_len.unwrap_or(0),
             fraction: fraction.unwrap_or(0.0),
             sampled_mean_base_accuracy,
+            identity_check_accuracy,
         }
     }
 
@@ -829,6 +838,7 @@ impl MetaxApp {
             identity,
             mapped_len,
             fraction,
+            identity_check_accuracy,
             ..
         } = thresholds;
         // Reject invalid resolved thresholds early.
@@ -889,6 +899,7 @@ impl MetaxApp {
             is_paired: self.config.is_paired,
             exact_ties: self.config.exact_ties,
             identity,
+            identity_check_accuracy,
             mapped_len,
             breadth: self.config.breadth,
             chunk_breadth: self.config.chunk_breadth,
@@ -1278,6 +1289,26 @@ mod tests {
         assert!((resolved.identity - 0.86).abs() < 1e-12);
         assert_eq!(resolved.mapped_len, 300);
         assert!((resolved.fraction - 0.20).abs() < 1e-12);
+    }
+
+    #[test]
+    fn only_an_automatic_long_read_cutoff_is_checked_against_alignments() {
+        let check = |identity: Option<f64>, recorded: f64| {
+            let mut cfg = test_app_config();
+            cfg.sequencer = Sequencer::Nanopore;
+            cfg.mode = ProfileMode::Default;
+            cfg.identity = identity;
+            let metadata =
+                recorded_long_read_metadata(ProfileMode::Default, recorded, 500, 0.20, Some(0.90));
+            MetaxApp { config: cfg }
+                .resolve_thresholds(Some(&metadata))
+                .identity_check_accuracy
+        };
+        let automatic = adaptive_identity_from_accuracy(0.90, ProfileMode::Default).unwrap();
+        // Saved by an automatic run, saved by a run that set it, set now.
+        assert_eq!(check(None, automatic), Some(0.90));
+        assert_eq!(check(None, 0.86), None);
+        assert_eq!(check(Some(automatic), automatic), None);
     }
 
     #[test]

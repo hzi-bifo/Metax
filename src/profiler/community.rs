@@ -436,36 +436,84 @@ impl CommunityProfiler {
     /// 2. Compute coverage metrics
     /// 3. Assign taxonomy
     /// 4. Write output files
-    pub fn run(&self) -> Result<()> {
+    pub fn run(mut self) -> Result<()> {
         log::info!(target: "PROFILER", "Initializing the profiler!");
 
         let mappings = self
             .cfg
             .mapper_mappings
-            .as_deref()
+            .clone()
             .ok_or_else(|| anyhow!("missing Metax mapping file"))?;
-        let db = self
-            .cfg
-            .db_metadata
-            .as_deref()
-            .ok_or_else(|| anyhow!("missing reference metadata for native mappings"))?;
-        let mapping_data = self.load_metam(Path::new(mappings), db)?;
+        let db = Arc::clone(
+            self.cfg
+                .db_metadata
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing reference metadata for native mappings"))?,
+        );
+        let mapping_data = self.load_metam(Path::new(&mappings), &db)?;
         self.profile(mapping_data)
     }
 
     pub fn run_with_metam_mappings(
-        &self,
+        mut self,
         receiver: MetamMappingReceiver,
         source: &str,
     ) -> Result<()> {
         log::info!(target: "PROFILER", "Initializing the profiler!");
-        let db = self
-            .cfg
-            .db_metadata
-            .as_deref()
-            .ok_or_else(|| anyhow!("missing Metax database metadata for streamed mappings"))?;
-        let mapping_data = self.load_metam_mappings(receiver, source, db)?;
+        let db = Arc::clone(
+            self.cfg
+                .db_metadata
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing Metax database metadata for streamed mappings"))?,
+        );
+        let mapping_data = self.load_metam_mappings(receiver, source, &db)?;
         self.profile(mapping_data)
+    }
+
+    /// Lower an automatic long-read identity cutoff when the reads align worse
+    /// than their base qualities claim, as when a basecaller over-states its
+    /// accuracy. The upper quartile of the reads' best alignment identities
+    /// then takes the claimed accuracy's place: reads from well-represented
+    /// genomes align at their sequencing accuracy, while divergent or poorly
+    /// represented organisms lower only the lower quantiles.
+    fn lower_identity_to_alignments(&mut self, reads: &[ReadBundle]) {
+        let cfg = &self.cfg;
+        let Some(claimed) = cfg.identity_check_accuracy else {
+            return;
+        };
+        let score = |aln: &&AlignmentEntry| f64::from(aln.identity) * f64::from(aln.mapped_len);
+        let mut best: Vec<f32> = reads
+            .iter()
+            .filter_map(|read| {
+                read.alignments
+                    .iter()
+                    .filter(|aln| {
+                        coverage_passes(
+                            aln.mapped_len as usize >= cfg.mapped_len,
+                            f64::from(aln.fraction) >= cfg.fraction,
+                            cfg.coverage_gate_is_or(),
+                        )
+                    })
+                    .max_by(|a, b| score(a).total_cmp(&score(b)))
+                    .map(|aln| aln.identity)
+            })
+            .collect();
+        if best.is_empty() {
+            return;
+        }
+        let upper = best.len() * 3 / 4;
+        let aligned = f64::from(*best.select_nth_unstable_by(upper, f32::total_cmp).1);
+        let lowered = (aligned < claimed)
+            .then(|| crate::adaptive_identity_from_accuracy(aligned, cfg.mode))
+            .flatten()
+            .filter(|&cutoff| cutoff < cfg.identity);
+        if let Some(cutoff) = lowered {
+            log::info!(
+                target: "PROFILER",
+                "Long-read identity threshold lowered to {cutoff:.4}: reads align worse than their base qualities claim (upper quartile of read identities {aligned:.4} < claimed accuracy {claimed:.4}).",
+            );
+            self.cfg.identity = cutoff;
+        }
     }
 
     fn load_metam_profile(&self, embedded: Option<MetamProfile>) -> Result<MetamProfile> {
@@ -478,7 +526,7 @@ impl CommunityProfiler {
         bail!("mapping file is missing embedded profile counters; rerun mapping with this Metax version")
     }
 
-    fn load_metam(&self, mappings_path: &Path, db: &DatabaseMetadata) -> Result<MappingData> {
+    fn load_metam(&mut self, mappings_path: &Path, db: &DatabaseMetadata) -> Result<MappingData> {
         if !mappings_path.exists() {
             bail!(
                 "Metam mapping file {} does not exist",
@@ -490,23 +538,19 @@ impl CommunityProfiler {
     }
 
     fn load_metam_reader<R: BufRead>(
-        &self,
+        &mut self,
         reader: R,
         source: &str,
         db: &DatabaseMetadata,
     ) -> Result<MappingData> {
+        let lenient = self.cfg.lenient_mapping_input;
         self.load_metam_records(source, db, |on_mapping| {
-            for_each_metam_mapping_record(
-                reader,
-                source,
-                self.cfg.lenient_mapping_input,
-                on_mapping,
-            )
+            for_each_metam_mapping_record(reader, source, lenient, on_mapping)
         })
     }
 
     fn load_metam_mappings(
-        &self,
+        &mut self,
         receiver: MetamMappingReceiver,
         source: &str,
         db: &DatabaseMetadata,
@@ -517,7 +561,7 @@ impl CommunityProfiler {
     }
 
     fn load_metam_records<F>(
-        &self,
+        &mut self,
         source: &str,
         db: &DatabaseMetadata,
         feed: F,
@@ -747,7 +791,7 @@ impl CommunityProfiler {
                 alignments,
             })
             .collect::<Vec<_>>();
-        let evidence_policy = EvidencePolicy::from_config(&self.cfg);
+        self.lower_identity_to_alignments(&read_alignments);
         let marker_model = if has_marker_genomes {
             let geometry =
                 sample_fragment_geometry(&self.cfg, &read_alignments, &read_lengths, lone_mates);
@@ -849,7 +893,6 @@ impl CommunityProfiler {
             species_to_genus,
             terminal_ranks: Arc::new(terminal_ranks),
             skipped_reference_at_load: num_skipped_reference,
-            evidence_policy,
             marker_model,
             genus_rollup,
         })
@@ -987,7 +1030,6 @@ impl CommunityProfiler {
             total_reads,
             aligned_reads,
             skipped_reference_at_load,
-            evidence_policy,
             marker_model,
             ..
         } = &mapping_data;
@@ -1007,11 +1049,13 @@ impl CommunityProfiler {
                 if *fallback_mode { "enabled" } else { "disabled" },
             );
         }
+        // Derived from the final configuration, after any identity check.
+        let evidence_policy = EvidencePolicy::from_config(&self.cfg);
         let mut assignment = self.assign_taxonomy(
             read_alignments,
             *fallback_mode,
             Arc::clone(species_to_genus),
-            *evidence_policy,
+            evidence_policy,
             marker_model.as_deref(),
         )?;
         // The `skipped_reference` diagnostic now accumulates two
@@ -1054,7 +1098,7 @@ impl CommunityProfiler {
                 "Profiling taxonomy abundance ..."
             );
         }
-        let final_classified = self.write_outputs(mapping_data, assignment)?;
+        let final_classified = self.write_outputs(mapping_data, assignment, evidence_policy)?;
         log::info!(
             target: "PROFILER",
             "Number of {} assigned to retained taxa: {}",
@@ -1242,6 +1286,7 @@ impl CommunityProfiler {
         &self,
         mapping_data: MappingData,
         mut assignment: AssignmentResult,
+        evidence_policy: Option<EvidencePolicy>,
     ) -> Result<usize> {
         let MappingData {
             asm_lengths,
@@ -1249,7 +1294,6 @@ impl CommunityProfiler {
             min_chunk_breadth,
             safeguard_min_chunk_breadth,
             has_scaled_genomes,
-            evidence_policy,
             terminal_ranks,
             marker_model,
             genus_rollup,
@@ -4812,10 +4856,6 @@ struct MappingData {
     /// `process_batch`.
     skipped_reference_at_load: usize,
 
-    /// Native coordinate-evidence policy. `None` disables it and preserves
-    /// the legacy behavior.
-    evidence_policy: Option<EvidencePolicy>,
-
     /// Marker genes and fragment geometry when the database has marker genomes.
     marker_model: Option<Arc<MarkerModel>>,
 
@@ -4914,6 +4954,7 @@ mod tests {
             is_paired: false,
             exact_ties: ExactTiePolicy::Ambiguous,
             identity: 0.95,
+            identity_check_accuracy: None,
             mapped_len: 50,
             breadth: Some(0.0),
             chunk_breadth: Some(0.0),
@@ -5031,7 +5072,6 @@ mod tests {
             species_to_genus: Arc::new(HashMap::new()),
             terminal_ranks: Arc::new(HashMap::new()),
             skipped_reference_at_load: 0,
-            evidence_policy: None,
             marker_model: None,
             genus_rollup: None,
         };
@@ -5234,7 +5274,12 @@ mod tests {
         baseline_cfg.chunk_breadth = Some(0.05);
         let baseline = CommunityProfiler::new(baseline_cfg, Arc::clone(&taxonomy)).unwrap();
         let (mapping_data, assignment) = raw_output_fixture();
-        assert_eq!(baseline.write_outputs(mapping_data, assignment).unwrap(), 1);
+        assert_eq!(
+            baseline
+                .write_outputs(mapping_data, assignment, None)
+                .unwrap(),
+            1
+        );
 
         let mut raw_cfg = make_cfg(Sequencer::Illumina, None);
         raw_cfg.outprefix = raw_prefix.to_string_lossy().into_owned();
@@ -5244,7 +5289,12 @@ mod tests {
         raw_cfg.chunk_breadth = Some(0.05);
         let with_raw = CommunityProfiler::new(raw_cfg, taxonomy).unwrap();
         let (mapping_data, assignment) = raw_output_fixture();
-        assert_eq!(with_raw.write_outputs(mapping_data, assignment).unwrap(), 1);
+        assert_eq!(
+            with_raw
+                .write_outputs(mapping_data, assignment, None)
+                .unwrap(),
+            1
+        );
 
         let baseline_profile =
             std::fs::read(format!("{}.profile.txt", baseline_prefix.to_string_lossy())).unwrap();
@@ -5283,7 +5333,12 @@ mod tests {
         let profiler = CommunityProfiler::new(cfg, taxonomy).unwrap();
         let (mapping_data, assignment) = raw_output_fixture();
 
-        assert_eq!(profiler.write_outputs(mapping_data, assignment).unwrap(), 0);
+        assert_eq!(
+            profiler
+                .write_outputs(mapping_data, assignment, None)
+                .unwrap(),
+            0
+        );
         assert!(
             std::fs::read(format!("{}.profile.txt", output.to_string_lossy()))
                 .unwrap()
@@ -5439,7 +5494,6 @@ mod tests {
             species_to_genus: Arc::new(HashMap::new()),
             terminal_ranks: Arc::new(HashMap::from([(101, ProfileRank::Species)])),
             skipped_reference_at_load: 0,
-            evidence_policy: Some(policy),
             marker_model: None,
             genus_rollup: None,
         };
@@ -5457,7 +5511,12 @@ mod tests {
             ..AssignmentResult::default()
         };
 
-        assert_eq!(profiler.write_outputs(mapping_data, assignment).unwrap(), 0);
+        assert_eq!(
+            profiler
+                .write_outputs(mapping_data, assignment, Some(policy))
+                .unwrap(),
+            0
+        );
         assert!(
             std::fs::read(format!("{}.profile.txt", output.to_string_lossy()))
                 .unwrap()
@@ -5495,7 +5554,6 @@ mod tests {
             species_to_genus: Arc::new(HashMap::new()),
             terminal_ranks: Arc::new(HashMap::from([(101, ProfileRank::Species)])),
             skipped_reference_at_load: 0,
-            evidence_policy: Some(policy),
             marker_model: None,
             genus_rollup: None,
         };
@@ -5516,7 +5574,12 @@ mod tests {
             ..AssignmentResult::default()
         };
 
-        assert_eq!(profiler.write_outputs(mapping_data, assignment).unwrap(), 1);
+        assert_eq!(
+            profiler
+                .write_outputs(mapping_data, assignment, Some(policy))
+                .unwrap(),
+            1
+        );
         let profile =
             std::fs::read_to_string(format!("{}.profile.txt", output.to_string_lossy())).unwrap();
         assert_eq!(profile.lines().count(), 1);
@@ -6209,6 +6272,45 @@ mod tests {
         assert_eq!(result.taxon_evidence[&101].clear_best_fragments, 0);
         assert_eq!(result.taxon_evidence[&102].clear_best_fragments, 0);
         assert_eq!(result.exact_ties.fragment_count(), 0);
+    }
+
+    #[test]
+    fn automatic_long_read_identity_follows_reads_that_align_worse() {
+        let unpaired = MappingRole::Unpaired;
+        let reads: Vec<ReadBundle> = [0.80_f32, 0.84, 0.88, 0.89]
+            .iter()
+            .enumerate()
+            .map(|(i, &identity)| ReadBundle {
+                read_name: format!("r{i}").into(),
+                alignments: vec![
+                    native_mapping(101, 10, 1, identity, 1_000, 2_000, unpaired),
+                    // Higher identity over fewer bases is not the read's best record.
+                    native_mapping(102, 20, 2, identity + 0.05, 600, 2_000, unpaired),
+                ],
+            })
+            .collect();
+        let resolved = |claimed: Option<f64>, identity: f64| {
+            let mut cfg = make_cfg(Sequencer::Nanopore, None);
+            cfg.mapped_len = 500;
+            cfg.fraction = 0.20;
+            cfg.identity = identity;
+            cfg.identity_check_accuracy = claimed;
+            let taxonomy = Taxonomy::from_parts(
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashSet::new(),
+            );
+            let mut profiler = CommunityProfiler::new(cfg, Arc::new(taxonomy)).unwrap();
+            profiler.lower_identity_to_alignments(&reads);
+            profiler.cfg.identity
+        };
+        // Upper quartile 0.89 below the claimed 0.94: cutoff 0.89 - 0.03.
+        assert!((resolved(Some(0.94), 0.91) - 0.86).abs() < 1e-6);
+        // Reads align as claimed, the cutoff would rise, or it is not automatic.
+        assert_eq!(resolved(Some(0.88), 0.85), 0.85);
+        assert_eq!(resolved(Some(0.99), 0.80), 0.80);
+        assert_eq!(resolved(None, 0.91), 0.91);
     }
 
     #[test]

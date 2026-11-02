@@ -627,6 +627,10 @@ pub struct ProfilerConfig {
     /// gap-compressed CIGAR identity.
     pub identity: f64,
 
+    /// Claimed base accuracy behind an automatic long-read identity cutoff.
+    /// When set, the cutoff is lowered if the reads align worse than this.
+    pub identity_check_accuracy: Option<f64>,
+
     /// Minimum number of mapped bases to keep a mapping
     pub mapped_len: usize,
 
@@ -1287,6 +1291,7 @@ mod chunk_basis_tests {
             is_paired: false,
             exact_ties: ExactTiePolicy::GuardedMap,
             identity: 0.97,
+            identity_check_accuracy: None,
             mapped_len: 50,
             breadth: None,
             chunk_breadth: None,

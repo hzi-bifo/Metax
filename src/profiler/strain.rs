@@ -2495,6 +2495,7 @@ mod tests {
             is_paired: false,
             exact_ties: ExactTiePolicy::Ambiguous,
             identity: 0.97,
+            identity_check_accuracy: None,
             mapped_len: 50,
             breadth: Some(0.0),
             chunk_breadth: Some(0.0),
