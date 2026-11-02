@@ -303,7 +303,7 @@ struct ProfileArgs {
         long = "strict-coverage",
         action = ArgAction::SetTrue,
         help_heading = "Genus fallback and low-map behavior",
-        help = "Report only the species kept by the coverage evidence; the reads of removed species are dropped. By default, a removed species whose reads cover its whole genome evenly (at least 200 fragments, both coverage ratios 0.9-1.1, reads in at least 90 % of its windows) is reported at species when no taxon of its genus is kept, and the reads of other removed species are reported at their genus when they spread over the species' genome (chunk ratio of at least 0.40 and reads in at least half of the genome's windows) and the genus collects at least 200 fragments. These recover large genomes at low depth, divergent strains and new species of a genus in the database; a reference that consists mostly of foreign DNA can still produce a false genus row. Community profiling; species represented by marker genes do not take part, and a fractional database gets no even-coverage species and no genus row for a genus with a kept species."
+        help = "Report only the species kept by the coverage evidence; the reads of removed species are dropped. Single-end short reads are always profiled this way. By default for paired-end short reads and long reads, a removed species whose reads cover its whole genome evenly (at least 200 fragments, both coverage ratios 0.9-1.1, reads in at least 90 % of its windows) is reported at species when no taxon of its genus is kept, and the reads of other removed species are reported at their genus when they spread over the species' genome (chunk ratio of at least 0.40 and reads in at least half of the genome's windows) and the genus collects at least 200 fragments. These recover large genomes at low depth, divergent strains and new species of a genus in the database; a reference that consists mostly of foreign DNA can still produce a false genus row. Community profiling; species represented by marker genes do not take part, and a fractional database gets no even-coverage species and no genus row for a genus with a kept species."
     )]
     strict_coverage: bool,
 
@@ -1061,6 +1061,10 @@ impl TryFrom<ProfileArgs> for AppConfig {
                     .then_some(DEFAULT_IDENTITY_MARGIN)
             })
         };
+        // Not for single-end short reads, where both add more false rows than
+        // they recover.
+        let removed_to_genus =
+            !args.strict_coverage && !args.strain && (is_paired || !sequencer.is_illumina());
         Ok(AppConfig {
             db: args.db,
             dmp_dir: args.dmp_dir,
@@ -1087,7 +1091,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             min_coebr: args.min_coebr,
             min_marker_genes: args.min_marker_genes,
             relative_identity_gap: args.relative_identity_gap,
-            removed_to_genus: !args.strict_coverage && !args.strain,
+            removed_to_genus,
             identity_margin,
             fraction: args.fraction,
             lowbiomass: args.lowbiomass,
@@ -1455,7 +1459,7 @@ mod tests {
     }
 
     #[test]
-    fn removed_species_are_reported_unless_strict_coverage_or_strain() {
+    fn removed_species_are_reported_for_pairs_and_long_reads_unless_strict_coverage_or_strain() {
         let rollup = |extra: &[&str]| {
             let argv = ["metax", "profile", "-d", "db", "-o", "out", "-i", "r1.fq"];
             let cli = Cli::try_parse_from(argv.iter().chain(extra)).unwrap();
@@ -1464,11 +1468,13 @@ mod tests {
             };
             AppConfig::try_from(args).unwrap().removed_to_genus
         };
-        assert!(rollup(&[]));
+        assert!(!rollup(&[]));
         assert!(rollup(&["-I", "r2.fq"]));
         assert!(rollup(&["--sequencer", "Nanopore"]));
-        assert!(!rollup(&["--strict-coverage"]));
-        assert!(!rollup(&["--strain"]));
+        assert!(rollup(&["--sequencer", "PacBio"]));
+        assert!(!rollup(&["-I", "r2.fq", "--strict-coverage"]));
+        assert!(!rollup(&["-I", "r2.fq", "--strain"]));
+        assert!(!rollup(&["--sequencer", "Nanopore", "--strict-coverage"]));
     }
 
     #[test]
