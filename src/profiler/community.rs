@@ -2131,7 +2131,8 @@ impl CommunityProfiler {
             target: "PROFILER",
             "Reads of removed species reported at genus: {} genus rows, {:.0} {} from {} species.",
             rows.len(),
-            rows.iter().map(|row| row.fragments).sum::<f64>(),
+            // A float sum of no rows is -0.0, printed "-0".
+            rows.iter().fold(0.0, |total, row| total + row.fragments),
             unit,
             rows.iter().map(|row| row.donors.len()).sum::<usize>(),
         );
