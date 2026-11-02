@@ -286,7 +286,12 @@ metax profile ... --min-identity 0.95 --mapped-len 100 --min-mapped-fraction 0.6
 
 These options decide whether a mapping is strong enough for species/strain assignment. They do not discard lower-identity records emitted by the mapper, which remain available to genus fallback (§7.9).
 
-**Adaptive long-read identity.** For Nanopore/PacBio community profiling, the identity in the table is the high-quality default. When `--min-identity` is omitted and reads are available, Metax samples the first 10,000 reads (up to 250 million quality bases) and computes the mean base accuracy from the Phred scores. If the accuracy is below `0.95`, the identity cutoff becomes `accuracy − margin`, where the margin is `0.03` (default), `0.04` (recall), or `0.02` (precision), never below `0.84`. High-quality samples, short reads, strain mode, and an explicit `--min-identity` keep the fixed preset.
+**Noisy long reads.** For Nanopore/PacBio reads, Metax samples the first 10,000 reads (up to 250 million quality bases) and computes the mean base accuracy from the Phred scores. Reads below `0.95` count as noisy, which changes two defaults:
+
+- **Identity.** For community profiling without `--min-identity`, the identity cutoff becomes `accuracy − margin`, where the margin is `0.03` (default), `0.04` (recall), or `0.02` (precision), never below `0.84`. The identity in the table is the high-quality default; strain mode and an explicit `--min-identity` keep the fixed preset.
+- **Seed lookup.** The mapper also looks a seed up by its first strobe alone, as it does for Illumina reads, because both strobes of a seed are rarely free of errors in such reads (§5.6). Many more noisy reads are mapped, at some cost in mapping time.
+
+High-quality samples, FASTA input and short reads keep both defaults.
 
 ### 5.6 Mapper options
 
@@ -303,6 +308,8 @@ Resolved mapper defaults:
 | Illumina single-end / assembly | 5 | 0.90 (0.80 in recall mode) | 2 | 0.80 | 0.50 |
 | Illumina paired-end | 50 | 0.50 | 1 | 0.80 | 0.50 |
 | Nanopore / PacBio | 10 | 0.70 | 3 | 0.80 | 0.30, or 300 mapped bases |
+
+Illumina reads and noisy long reads (§5.5) find a seed by its first strobe as well; accurate long reads require both strobes of the seed. `--allow-single-strobe-matches` and `--match-both-strobes` override this.
 
 The paired-end candidate set is deliberately broad so that the profiler can see competing species and keep conserved regions ambiguous; the modes differ in the evidence stage, not in candidate generation. Example overrides:
 

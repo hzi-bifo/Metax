@@ -143,29 +143,36 @@ pub struct AppConfig {
     pub extra_args: Vec<String>,
 }
 
-/// Head reads sampled to estimate long-read base quality for the adaptive
-/// identity cutoff (fewer if the sample is smaller).
+/// Head reads sampled to estimate long-read base quality (fewer if the sample
+/// is smaller).
 const QUALITY_SAMPLE_READS: usize = 10_000;
 /// Safety cap on quality bytes tallied while sampling, so a few pathologically
 /// long reads cannot stall startup.
 const QUALITY_SAMPLE_MAX_BASES: u64 = 250_000_000;
-/// Mean predicted per-base accuracy at or above which long reads keep the
-/// fixed preset identity cutoff. Below it, the cutoff self-calibrates.
-const ADAPTIVE_IDENTITY_CEILING: f64 = 0.95;
+/// Mean predicted per-base accuracy below which long reads count as noisy.
+pub(crate) const NOISY_LONG_READ_ACCURACY: f64 = 0.95;
 /// Hard lower bound for the self-calibrated long-read identity cutoff.
 const ADAPTIVE_IDENTITY_FLOOR: f64 = 0.84;
+
+/// Whether long reads with this sampled mean predicted base accuracy are
+/// noisy. Their identity cutoff self-calibrates, and the mapper also accepts
+/// seeds whose first strobe alone matches, because both strobes of a seed are
+/// rarely free of errors in such reads.
+fn is_noisy_long_read_accuracy(accuracy: f64) -> bool {
+    accuracy.is_finite() && accuracy < NOISY_LONG_READ_ACCURACY
+}
 
 /// Map a sampled mean predicted base accuracy to a self-calibrated long-read
 /// identity cutoff, or `None` to keep the preset cutoff.
 ///
-/// High-quality samples (accuracy >= [`ADAPTIVE_IDENTITY_CEILING`]) keep the
-/// preset. Otherwise the cutoff is `accuracy - margin`, where the margin is
-/// wider for recall and narrower for precision, and never below
-/// [`ADAPTIVE_IDENTITY_FLOOR`]. Note that base-quality accuracy reflects
-/// sequencing error only, not reference divergence, so a low-quality sample's
-/// reads align a little below their base quality; the margin absorbs that.
+/// Samples that are not noisy keep the preset. Otherwise the cutoff is
+/// `accuracy - margin`, where the margin is wider for recall and narrower for
+/// precision, and never below [`ADAPTIVE_IDENTITY_FLOOR`]. Note that
+/// base-quality accuracy reflects sequencing error only, not reference
+/// divergence, so a low-quality sample's reads align a little below their base
+/// quality; the margin absorbs that.
 fn adaptive_identity_from_accuracy(accuracy: f64, mode: ProfileMode) -> Option<f64> {
-    if !accuracy.is_finite() || accuracy >= ADAPTIVE_IDENTITY_CEILING {
+    if !is_noisy_long_read_accuracy(accuracy) {
         return None;
     }
     let margin = match mode {
@@ -377,7 +384,15 @@ impl MetaxApp {
             .map(|s| s.trim().to_string())
             .collect();
         // Invoke the in-process mapper with preset + mode parameters.
-        let mapper = Mapper::new(db.clone(), sequences, self.config.outprefix.clone());
+        let noisy_long_reads = profiler
+            .sampled_mean_base_accuracy
+            .is_some_and(is_noisy_long_read_accuracy);
+        let mapper = Mapper::new(
+            db.clone(),
+            sequences,
+            self.config.outprefix.clone(),
+            noisy_long_reads,
+        );
         if self.config.verbose || self.config.very_verbose {
             log::info!(
                 target: "MAIN",
@@ -604,9 +619,9 @@ impl MetaxApp {
         )
     }
 
-    /// Sample mean predicted base accuracy for adaptive long-read community
-    /// profiling. Best-effort: FASTA, empty input, or a read error leaves the
-    /// fixed preset in effect rather than failing an otherwise valid run.
+    /// Sample mean predicted base accuracy of long reads, which decides whether
+    /// they are noisy. Best-effort: FASTA, empty input, or a read error treats
+    /// the reads as accurate rather than failing an otherwise valid run.
     fn sample_long_read_base_accuracy(&self) -> Option<f64> {
         let first = self
             .config
@@ -624,7 +639,7 @@ impl MetaxApp {
             Err(error) => {
                 log::warn!(
                     target: "PROFILER",
-                    "Could not sample base quality from {first} for the adaptive long-read identity cutoff ({error:#}); keeping the preset identity cutoff.",
+                    "Could not sample base quality from {first} ({error:#}); treating the reads as accurate (preset identity cutoff, both seed strobes must match).",
                 );
                 None
             }
@@ -713,6 +728,17 @@ impl MetaxApp {
                 if batch_size == 0 {
                     batch_size = 5000;
                 }
+                // One sample of base accuracy serves the run: it tells the
+                // mapper whether the reads are noisy and self-calibrates the
+                // community identity cutoff. Reused mappings carry it, so
+                // same-mode reuse is exact and a deliberately changed mode can
+                // apply its own margin without the FASTQ.
+                let accuracy_source = if sampled_mean_base_accuracy.is_some() {
+                    "saved mapping metadata"
+                } else {
+                    sampled_mean_base_accuracy = self.sample_long_read_base_accuracy();
+                    "input base qualities"
+                };
                 // Strain profiling keeps its own long-read presets. Length and
                 // fraction are combined with OR for long reads.
                 if self.config.strain {
@@ -732,34 +758,25 @@ impl MetaxApp {
                             ProfileMode::Default => (0.92, 500, 0.20),
                             ProfileMode::Precision => (0.94, 500, 0.30),
                         };
-                    // Low-quality long-read samples self-calibrate the identity
-                    // cutoff from mean predicted base accuracy. Reused mappings
-                    // carry both the original resolved cutoff and sampled
-                    // accuracy, so same-mode reuse is exact and a deliberately
-                    // changed mode can apply its own margin without the FASTQ.
+                    // Noisy long-read samples self-calibrate the identity cutoff
+                    // from mean predicted base accuracy.
                     if identity.is_none() {
-                        let accuracy_source = if sampled_mean_base_accuracy.is_some() {
-                            "saved mapping metadata"
-                        } else {
-                            sampled_mean_base_accuracy = self.sample_long_read_base_accuracy();
-                            "input base qualities"
-                        };
                         let resolved_identity = sampled_mean_base_accuracy
                             .and_then(|accuracy| {
                                 let cutoff =
                                     adaptive_identity_from_accuracy(accuracy, self.config.mode)?;
                                 log::info!(
                                     target: "PROFILER",
-                                    "Long-read identity threshold: {cutoff:.4} (auto-calibrated from {accuracy_source}: mean predicted accuracy {accuracy:.4} < {ADAPTIVE_IDENTITY_CEILING:.2}, floor {ADAPTIVE_IDENTITY_FLOOR:.2}).",
+                                    "Long-read identity threshold: {cutoff:.4} (auto-calibrated from {accuracy_source}: mean predicted accuracy {accuracy:.4} < {NOISY_LONG_READ_ACCURACY:.2}, floor {ADAPTIVE_IDENTITY_FLOOR:.2}).",
                                 );
                                 Some(cutoff)
                             })
                             .unwrap_or(default_identity);
                         if let Some(accuracy) = sampled_mean_base_accuracy {
-                            if accuracy >= ADAPTIVE_IDENTITY_CEILING {
+                            if accuracy >= NOISY_LONG_READ_ACCURACY {
                                 log::info!(
                                     target: "PROFILER",
-                                    "Long-read identity: mean predicted base accuracy {accuracy:.4} from {accuracy_source} >= {ADAPTIVE_IDENTITY_CEILING:.2}; keeping the preset identity cutoff.",
+                                    "Long-read identity: mean predicted base accuracy {accuracy:.4} from {accuracy_source} >= {NOISY_LONG_READ_ACCURACY:.2}; keeping the preset identity cutoff.",
                                 );
                             }
                         }
@@ -1131,6 +1148,13 @@ mod tests {
                 fingerprint: 1,
             },
         }
+    }
+
+    #[test]
+    fn long_reads_are_noisy_below_the_accuracy_threshold() {
+        assert!(is_noisy_long_read_accuracy(0.9499));
+        assert!(!is_noisy_long_read_accuracy(NOISY_LONG_READ_ACCURACY));
+        assert!(!is_noisy_long_read_accuracy(f64::NAN));
     }
 
     #[test]
