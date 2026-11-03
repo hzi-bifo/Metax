@@ -365,13 +365,12 @@ struct CandidateKey {
 
 type CandidateMap = HashMap<CandidateKey, CandidateAccumulator, BuildHasherDefault<FastHasher>>;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ChainKey {
     ref_id: u32,
     strand: i8,
 }
 
-type ChainMap = HashMap<ChainKey, Vec<Anchor>, BuildHasherDefault<FastHasher>>;
 type Interval = (usize, usize, usize, usize);
 type FastExtensionChoice = (Interval, Identity, f64, i64);
 
@@ -1712,7 +1711,7 @@ where
     F: FnMut(SeedOccurrence) -> bool,
 {
     let rc = revcomp(read);
-    let mut groups: ChainMap = HashMap::with_capacity_and_hasher(64, BuildHasherDefault::default());
+    let mut hits = Vec::new();
     for (query, strand) in [(read, 1i8), (rc.as_slice(), -1i8)] {
         let query_seeds = seeds_with_strobe_start_distance(
             query,
@@ -1734,30 +1733,28 @@ where
                 if !accept(occ) {
                     continue;
                 }
-                groups
-                    .entry(ChainKey {
-                        ref_id: occ.ref_id,
-                        strand,
-                    })
-                    .or_default()
-                    .push(Anchor {
+                let key = ChainKey {
+                    ref_id: occ.ref_id,
+                    strand,
+                };
+                hits.push((
+                    key,
+                    Anchor {
                         q: seed.pos,
                         r: occ.pos,
-                    });
+                    },
+                ));
             }
         }
         profile.total_query_seeds += used_query_seeds;
     }
-    profile.candidate_groups += groups.len() as u64;
-
-    let k = index.header().k;
-    let read_len = read.len();
-    let mut candidates = Vec::with_capacity(groups.len());
-    for (key, mut anchors) in groups {
-        if let Some(candidate) = chain_anchors(key, &mut anchors, k, read_len, params.min_seeds) {
-            candidates.push(candidate);
-        }
-    }
+    let candidates = chain_hit_groups(
+        &mut hits,
+        index.header().k,
+        read.len(),
+        params.min_seeds,
+        profile,
+    );
     (rc, candidates)
 }
 
@@ -1826,8 +1823,7 @@ fn collect_cached_rescue_candidates(
 ) -> Vec<Candidate> {
     let k = index.header().k;
     if params.long_read_chaining {
-        let mut groups: ChainMap =
-            HashMap::with_capacity_and_hasher(64, BuildHasherDefault::default());
+        let mut chain_hits = Vec::new();
         for (hits, strand) in [
             (workspace.forward_hits.as_slice(), 1i8),
             (workspace.reverse_hits.as_slice(), -1i8),
@@ -1839,22 +1835,14 @@ fn collect_cached_rescue_candidates(
                 {
                     continue;
                 }
-                groups
-                    .entry(ChainKey { ref_id, strand })
-                    .or_default()
-                    .push(Anchor {
-                        q: hit.query_pos,
-                        r: occurrence.pos,
-                    });
+                let anchor = Anchor {
+                    q: hit.query_pos,
+                    r: occurrence.pos,
+                };
+                chain_hits.push((ChainKey { ref_id, strand }, anchor));
             }
         }
-        profile.candidate_groups += groups.len() as u64;
-        return groups
-            .into_iter()
-            .filter_map(|(key, mut anchors)| {
-                chain_anchors(key, &mut anchors, k, read_len, params.min_seeds)
-            })
-            .collect();
+        return chain_hit_groups(&mut chain_hits, k, read_len, params.min_seeds, profile);
     }
 
     let mut groups: CandidateMap =
@@ -1887,6 +1875,37 @@ fn collect_cached_rescue_candidates(
         .into_iter()
         .filter_map(|(key, acc)| acc.into_candidate(key, k, params.min_seeds))
         .collect()
+}
+
+/// Long-read candidates from seed hits: the hits are grouped by reference and strand by sorting
+/// one list, since a noisy read hits thousands of references once or twice, and only groups of
+/// at least `min_seeds` hits are chained.
+fn chain_hit_groups(
+    hits: &mut [(ChainKey, Anchor)],
+    k: usize,
+    read_len: usize,
+    min_seeds: usize,
+    profile: &mut MapProfile,
+) -> Vec<Candidate> {
+    hits.sort_unstable_by_key(|(key, _)| (key.ref_id, key.strand));
+    let mut candidates = Vec::new();
+    let mut anchors = Vec::new();
+    for group in hits.chunk_by(|a, b| a.0 == b.0) {
+        profile.candidate_groups += 1;
+        if group.len() < min_seeds {
+            continue;
+        }
+        anchors.clear();
+        anchors.extend(group.iter().map(|(_, anchor)| *anchor));
+        candidates.extend(chain_anchors(
+            group[0].0,
+            &mut anchors,
+            k,
+            read_len,
+            min_seeds,
+        ));
+    }
+    candidates
 }
 
 fn chain_anchors(
@@ -4046,6 +4065,33 @@ mod tests {
         assert_eq!(out[0].ref_id, "correct_species");
         assert!(out[0].identity > 0.99, "{out:?}");
         assert!(profile.identity_comparisons > 1);
+    }
+
+    #[test]
+    fn long_read_hits_are_chained_per_reference_and_strand() {
+        let hit = |ref_id, strand, q, r| (ChainKey { ref_id, strand }, Anchor { q, r });
+        // Interleaved hits: three on reference 2 forward, two on reference 1, one on reference 2 reverse.
+        let mut hits = vec![
+            hit(2, 1, 80, 1080),
+            hit(1, 1, 0, 500),
+            hit(2, -1, 10, 300),
+            hit(2, 1, 0, 1000),
+            hit(1, 1, 40, 540),
+            hit(2, 1, 40, 1040),
+        ];
+        let mut profile = MapProfile::default();
+        let candidates = chain_hit_groups(&mut hits, 16, 120, 3, &mut profile);
+        assert_eq!(profile.candidate_groups, 3);
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        let candidate = &candidates[0];
+        assert_eq!(
+            (candidate.ref_id, candidate.strand, candidate.seed_count),
+            (2, 1, 3)
+        );
+        assert_eq!(
+            (candidate.query_seed_start, candidate.ref_seed_start),
+            (0, 1000)
+        );
     }
 
     #[test]
