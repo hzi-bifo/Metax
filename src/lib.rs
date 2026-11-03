@@ -106,6 +106,7 @@ pub struct AppConfig {
     pub min_marker_genes: usize,
     pub relative_identity_gap: Option<f64>,
     pub removed_to_genus: bool,
+    pub estimate_unclassified: bool,
     pub identity_margin: Option<f64>,
     pub fraction: Option<f64>,
     pub lowbiomass: bool,
@@ -529,6 +530,9 @@ impl MetaxApp {
             if !self.config.removed_to_genus && !self.config.strain {
                 flags.push("--strict-coverage".to_string());
             }
+            if self.config.estimate_unclassified {
+                flags.push("--estimate-unclassified".to_string());
+            }
             if self.config.lenient_mapping_input {
                 flags.push("--lenient-mapping-input".to_string());
             }
@@ -910,6 +914,7 @@ impl MetaxApp {
             min_marker_genes: self.config.min_marker_genes,
             relative_identity_gap: self.config.relative_identity_gap,
             removed_to_genus: self.config.removed_to_genus,
+            estimate_unclassified: self.config.estimate_unclassified,
             identity_margin: self.config.identity_margin,
             fraction,
             lowbiomass: self.config.lowbiomass,
@@ -1057,6 +1062,7 @@ mod tests {
             min_marker_genes: 3,
             relative_identity_gap: None,
             removed_to_genus: false,
+            estimate_unclassified: false,
             identity_margin: None,
             fraction: None,
             lowbiomass: false,

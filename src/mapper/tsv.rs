@@ -938,6 +938,7 @@ mod tests {
                 effective_indexed_size: if fractional { 60 } else { 100 },
                 taxonomy_field: "s:8".to_string(),
                 reference_type: Default::default(),
+                declared_genome_size: None,
             }],
             is_fractional: fractional,
         }

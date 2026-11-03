@@ -56,6 +56,7 @@ mod pathogen;
 mod rollup;
 mod statistics;
 pub(crate) mod strain;
+mod unclassified;
 
 /// Read-name aggregation map with a stable, high-throughput hash builder.
 ///
@@ -669,6 +670,10 @@ pub struct ProfilerConfig {
     /// `--strict-coverage` or `--strain`.
     pub removed_to_genus: bool,
 
+    /// Estimate the share of the input that the profile does not explain and
+    /// append it as an `unclassified` row.
+    pub estimate_unclassified: bool,
+
     /// Report a species at its genus when the mean identity of its best
     /// placements lies more than this below the sample's baseline. Off when
     /// `None`.
@@ -888,6 +893,7 @@ pub(crate) fn log_resolved_profiler_parameters(
          \tmin_marker_genes             {}\n\
          \trelative_identity_gap        {}\n\
          \tremoved_to_genus             {}\n\
+         \testimate_unclassified        {}\n\
          \tidentity_margin              {}\n\
          \tby_mapped                    {}\n\
          \tgenus_fallback               {}\n\
@@ -928,6 +934,7 @@ pub(crate) fn log_resolved_profiler_parameters(
         cfg.min_marker_genes,
         display_option(cfg.relative_identity_gap),
         cfg.removed_to_genus,
+        cfg.estimate_unclassified,
         display_option(cfg.identity_margin),
         cfg.by_aligned,
         cfg.genus_fallback,
@@ -1302,6 +1309,7 @@ mod chunk_basis_tests {
             min_marker_genes: 3,
             relative_identity_gap: None,
             removed_to_genus: false,
+            estimate_unclassified: false,
             identity_margin: None,
             fraction: 0.7,
             lowbiomass: false,

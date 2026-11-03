@@ -3460,6 +3460,7 @@ mod tests {
             effective_indexed_size: 1_000,
             taxonomy_field: "s:8".to_string(),
             reference_type,
+            declared_genome_size: None,
         };
         let mixed = |is_fractional| DatabaseMetadata {
             metam_index: PathBuf::from("metax_db.mxi"),

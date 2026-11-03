@@ -308,6 +308,15 @@ struct ProfileArgs {
     strict_coverage: bool,
 
     #[arg(
+        long = "estimate-unclassified",
+        action = ArgAction::SetTrue,
+        conflicts_with_all = ["strain", "host"],
+        help_heading = "Genus fallback and low-map behavior",
+        help = "Estimate the share of input reads or fragments that the profile does not explain and append it as an 'unclassified' row (taxid 0; column 4 the unexplained fragments, column 6 their share in percent). Species represented by marker genes count as their whole genome, from the genome size declared in the reference FASTA. Community profiling. Off by default."
+    )]
+    estimate_unclassified: bool,
+
+    #[arg(
         long = "identity-margin",
         value_name = "FRACTION",
         num_args = 0..=1,
@@ -1092,6 +1101,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             min_marker_genes: args.min_marker_genes,
             relative_identity_gap: args.relative_identity_gap,
             removed_to_genus,
+            estimate_unclassified: args.estimate_unclassified,
             identity_margin,
             fraction: args.fraction,
             lowbiomass: args.lowbiomass,
@@ -1235,6 +1245,7 @@ mod tests {
                 effective_indexed_size: 100,
                 taxonomy_field: "s:8".to_string(),
                 reference_type: Default::default(),
+                declared_genome_size: None,
             }],
             is_fractional: false,
         };

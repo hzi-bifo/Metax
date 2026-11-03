@@ -70,6 +70,7 @@ fn run_index_info(path: &Path) -> Result<()> {
 fn print_metadata_summary(metadata: &DatabaseMetadata) {
     let mut genomes = HashSet::new();
     let mut marker_genomes = 0usize;
+    let mut sized_marker_genomes = 0usize;
     let mut reference_bases = 0u64;
     let mut full_genome_bases = 0u64;
     let mut effective_indexed_bases = 0u64;
@@ -80,12 +81,16 @@ fn print_metadata_summary(metadata: &DatabaseMetadata) {
             full_genome_bases += reference.full_genome_size as u64;
             effective_indexed_bases += reference.effective_indexed_size as u64;
             marker_genomes += usize::from(reference.reference_type == ReferenceType::Markers);
+            sized_marker_genomes += usize::from(reference.declared_genome_size.is_some());
         }
     }
     print_kv("reference_type", metadata.reference_type_label());
     print_kv("metadata_reference_count", metadata.references.len());
     print_kv("metadata_genome_count", genomes.len());
     print_kv("metadata_marker_genome_count", marker_genomes);
+    if marker_genomes > 0 {
+        print_kv("metadata_marker_genomes_with_size", sized_marker_genomes);
+    }
     print_kv("metadata_reference_bases", reference_bases);
     print_kv("metadata_full_genome_bases", full_genome_bases);
     print_kv("metadata_effective_indexed_bases", effective_indexed_bases);

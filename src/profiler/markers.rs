@@ -117,6 +117,15 @@ impl MarkerModel {
         self.placements.get(&assembly_id).copied()
     }
 
+    /// Fragments that a whole genome of `genome_size` bases offers per
+    /// fragment that its marker genes offer; `None` for a genome without
+    /// marker genes or when no gene can hold a read of this length.
+    pub(crate) fn genome_scale(&self, assembly_id: u32, genome_size: usize) -> Option<f64> {
+        let on_genes = self.fragment_placements(assembly_id)?;
+        let genome = self.geometry.placements(i64::try_from(genome_size).ok()?);
+        Some(genome / on_genes)
+    }
+
     /// Coverage of a marker genome, or `None` for a genome of another type or
     /// when no gene can hold a read of this length.
     pub(crate) fn coverage(
@@ -465,6 +474,16 @@ mod tests {
             lengths.add(len);
         }
         assert_eq!(lengths.median(), Some(151));
+    }
+
+    #[test]
+    fn a_whole_genome_offers_its_placements_over_those_of_its_genes() {
+        // Pairs of 400 bases: a gene of L bases offers L - 400 + 1 placements.
+        let geometry = FragmentGeometry::new(FragmentLayout::Pairs, 150, 400, 50, 0.7);
+        let model = MarkerModel::from_gene_lengths(&[(0, &[1_000, 500])], geometry);
+        let scale = model.genome_scale(0, 10_000).unwrap();
+        assert!((scale - 9_601.0 / 702.0).abs() < 1e-9);
+        assert_eq!(model.genome_scale(1, 10_000), None);
     }
 
     #[test]

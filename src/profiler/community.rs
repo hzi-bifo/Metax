@@ -79,6 +79,7 @@ use super::output::{
 use super::pathogen::{load_pathogen_table, PathogenEntry};
 use super::rollup::{GenomeLayout, GenusRollup, GenusRow, OrphanedFragments};
 use super::statistics::{coverage_deviation_pvalue, round5};
+use super::unclassified::{self, MarkerScales, ReferenceKind};
 use super::{
     coverage_passes, equivalent_read_count_passes_minimum, log_reference_taxonomy_adjustments,
     log_resolved_profiler_parameters, parse_reference_taxonomy, push_string_keyed_value,
@@ -800,6 +801,23 @@ impl CommunityProfiler {
         } else {
             None
         };
+        let unclassified_scales = self.cfg.estimate_unclassified.then(|| {
+            unclassified::marker_scales(
+                db.references
+                    .iter()
+                    .zip(&reference_taxonomies)
+                    .map(|(reference, taxonomy)| {
+                        let taxid = taxonomy.profile_taxid;
+                        ReferenceKind {
+                            taxid: species_normalize.get(&taxid).copied().unwrap_or(taxid),
+                            assembly_id: assembly_ids[reference.genome.as_str()],
+                            reference_type: reference.reference_type,
+                            declared_genome_size: reference.declared_genome_size,
+                        }
+                    }),
+                marker_model.as_deref(),
+            )
+        });
 
         let mapping_rate = if total_reads == 0 {
             0.0
@@ -895,6 +913,7 @@ impl CommunityProfiler {
             skipped_reference_at_load: num_skipped_reference,
             marker_model,
             genus_rollup,
+            unclassified_scales,
         })
     }
 
@@ -1297,6 +1316,8 @@ impl CommunityProfiler {
             terminal_ranks,
             marker_model,
             genus_rollup,
+            total_reads,
+            unclassified_scales,
             ..
         } = mapping_data;
         let verbose_logging = self.cfg.verbose || self.cfg.very_verbose;
@@ -2016,6 +2037,25 @@ impl CommunityProfiler {
                 }
             }
         }
+        // Before species move to their genus, while marker species still
+        // carry their own scale.
+        let unclassified = unclassified_scales.as_ref().map(|scales| {
+            let estimate = unclassified::estimate(&normalized, scales, total_reads);
+            match estimate {
+                Ok(estimate) => log::info!(
+                    target: "PROFILER",
+                    "Unclassified estimate: {:.2}% of {} input {} are not explained by the profile.",
+                    estimate.share * 100.0,
+                    total_reads,
+                    if self.cfg.is_paired { "fragments" } else { "reads" }
+                ),
+                Err(taxid) => log::warn!(
+                    target: "PROFILER",
+                    "Unclassified estimate unavailable: species {taxid} is represented by marker genes that declare no genome size or cannot hold a read of this length."
+                ),
+            }
+            estimate.ok()
+        });
         if let Some(margin) = self.cfg.identity_margin {
             let moved = self.report_low_identity_species_at_genus(
                 &mut normalized,
@@ -2094,6 +2134,9 @@ impl CommunityProfiler {
             .from_writer(File::create(&profile_path)?);
         for row in &normalized {
             row.write(&mut profile_writer)?;
+        }
+        if let Some(estimate) = unclassified {
+            unclassified::write_row(&mut profile_writer, estimate)?;
         }
         profile_writer.flush()?;
 
@@ -4862,6 +4905,9 @@ struct MappingData {
 
     /// Inputs of the genus roll-up; `None` when it is off (`--strict-coverage`).
     genus_rollup: Option<Arc<GenusRollup>>,
+
+    /// Inputs of `--estimate-unclassified`; `None` when it is off.
+    unclassified_scales: Option<MarkerScales>,
 }
 
 #[cfg(test)]
@@ -4966,6 +5012,7 @@ mod tests {
             min_marker_genes: 3,
             relative_identity_gap: None,
             removed_to_genus: false,
+            estimate_unclassified: false,
             identity_margin: None,
             fraction: 0.6,
             lowbiomass: false,
@@ -5075,6 +5122,7 @@ mod tests {
             skipped_reference_at_load: 0,
             marker_model: None,
             genus_rollup: None,
+            unclassified_scales: None,
         };
         (mapping_data, assignment)
     }
@@ -5497,6 +5545,7 @@ mod tests {
             skipped_reference_at_load: 0,
             marker_model: None,
             genus_rollup: None,
+            unclassified_scales: None,
         };
         let assignment = AssignmentResult {
             read_assignments: vec![ReadAssignment {
@@ -5557,6 +5606,7 @@ mod tests {
             skipped_reference_at_load: 0,
             marker_model: None,
             genus_rollup: None,
+            unclassified_scales: None,
         };
         let assignment = AssignmentResult {
             read_assignments: vec![ReadAssignment {

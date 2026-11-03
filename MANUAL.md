@@ -195,7 +195,8 @@ metax index genomes_and_markers.fa -o db_mixed --reference-type-table types.tsv 
 Marker genomes:
 
 - are indexed whole, also with `--fraction`;
-- have the summed marker length as genome size. A larger `genome_size` in the FASTA header is ignored: read counts (profile column 4) are the reads mapped to the marker genes, not full-genome equivalents, and coverage refers to the marker genes. Depth (profile column 5) is that of the whole genome: a fragment on a marker gene adds the length of its read over the placements that the genome's genes offer (§7.13). Marker genes are largely single-copy, so relative abundances of marker and genome taxa are comparable even though their read counts are not;
+- have the summed marker length as genome size: read counts (profile column 4) are the reads mapped to the marker genes, not full-genome equivalents, and coverage refers to the marker genes. Depth (profile column 5) is that of the whole genome: a fragment on a marker gene adds the length of its read over the placements that the genome's genes offer (§7.13). Marker genes are largely single-copy, so relative abundances of marker and genome taxa are comparable even though their read counts are not;
+- keep a `genome_size` from the FASTA header that is larger than their summed marker length as the size of the whole genome. It is used only for the unclassified estimate (§7.14) and never scales read counts; `metax info` reports how many marker genomes have one;
 - are evaluated by the genes their reads hit rather than by chunk breadth (§7.4);
 - never take part in genus fallback (§7.9).
 
@@ -435,6 +436,8 @@ With `--host`, three columns are appended:
 | 15 | host taxids |
 | 16 | diseases |
 
+With `--estimate-unclassified`, the profile ends with one more row: name and rank `unclassified`, taxid `0`, column 4 the input fragments (single-end and long reads: reads) that no row explains, column 6 their share of the input in percent, and `NA` in the other columns (§7.14). Column 6 of this row is a share of the input, not part of the normalized abundance of the other rows.
+
 For species represented by marker genes, columns 10 and 11 hold the fraction of marker genes hit, and column 12 the fraction expected to be hit by the same reads; column 13 is the p-value of the genes hit (§7.4).
 
 Terminal rows are normalized once across the whole profile, not per rank. A genus-only genome and species-resolved genomes from the same genus are reported as separate rows; Metax does not add the species rows back into the genus row.
@@ -634,6 +637,16 @@ Each fragment adds depth to its candidates: the mapped bases of its read (mate 1
 
 Reads with several retained candidates are redistributed by an expectation–maximization procedure that weights the candidates by these depths and iterates until the relative change falls below `1e-5` or `--max-em-iterations` is reached. Abundance is depth normalized across the taxa that pass the final filters. Read counts are reported in full-index equivalents.
 
+### 7.14 Unclassified estimate
+
+With `--estimate-unclassified`, Metax estimates how much of the input the profile does not explain. Every row explains the fragments in its column 4, which for a fractional database are already full-index equivalents. A species represented only by marker genomes explains more than its fragments on the marker genes: a genome of declared size `G` offers `placements(G)` fragment placements against `Σ placements(L_i)` for its genes of lengths `L_i`, with the placements per sequence of §7.4. Its fragments are multiplied by that ratio, averaged over its marker genomes. A species that also has genome references counts its fragments as they are. Then
+
+```text
+unclassified share = 1 − min(1, explained fragments / input fragments)
+```
+
+The estimate is taken after the relative identity guard and before species move to their genus (§7.12). Genus rows for the reads of removed species (§7.10) explain their fragments; other fragments of removed species, and fragments that fail the read-level gates, count as unexplained. When a reported marker species has no declared genome size, or none of its genes can hold a read of the sample's length, the estimate is unavailable: the log says which species, and the row holds `NA`. The share is also written to the log. The option applies to community profiling and cannot be combined with `--host` or strain profiling.
+
 ## 8. Common Recipes
 
 ### 8.1 High-sensitivity Illumina run
@@ -703,4 +716,5 @@ metax profile -d db_frac_10 -i R1.fastq.gz -I R2.fastq.gz -o sample_frac -t 32 \
 - Strain profiling is experimental (§5.9).
 - The genus rows for the reads of removed species cannot recognise a reference that consists mostly of foreign DNA (§7.10).
 - The identity margin also reports at genus a species present only as a strain that has diverged clearly from every reference of its species (§7.12).
+- The unclassified estimate counts reads failing the read-level gates, and reads of filtered species that no genus row takes, as unexplained, so it errs high; for marker databases it depends on the genome sizes declared in the reference FASTA (§7.14).
 - Windows is supported only through WSL.

@@ -2506,6 +2506,7 @@ mod tests {
             min_marker_genes: 3,
             relative_identity_gap: None,
             removed_to_genus: false,
+            estimate_unclassified: false,
             identity_margin: None,
             fraction: 0.8,
             lowbiomass: false,
