@@ -24,7 +24,7 @@ pub const INDEX_MAGIC: [u8; 8] = *b"METAMM02";
 pub const INDEX_VERSION: u32 = 6;
 const MIN_SUPPORTED_INDEX_VERSION: u32 = 4;
 const INDEX_CACHE_MAGIC: [u8; 8] = *b"METAMMC1";
-const INDEX_CACHE_VERSION: u32 = 6;
+const INDEX_CACHE_VERSION: u32 = 7;
 const INDEX_CACHE_IO_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const INDEX_SEQUENCE_CHUNK: usize = 1_000_000;
 const MAX_OPEN_PARTITION_WRITERS: usize = 4_096;
@@ -813,7 +813,8 @@ struct MappedReferenceMeta {
     id: String,
     len: u64,
     packed: std::ops::Range<usize>,
-    ambiguous: std::ops::Range<usize>,
+    mask_entries: std::ops::Range<usize>,
+    mask_blocks: std::ops::Range<usize>,
 }
 
 fn push_nonempty_range(ranges: &mut Vec<std::ops::Range<usize>>, range: std::ops::Range<usize>) {
@@ -826,7 +827,87 @@ pub struct MappedReference<'a> {
     id: &'a str,
     len: u64,
     packed_bases: &'a [u8],
-    ambiguous: &'a [u8],
+    mask: MappedMask<'a>,
+}
+
+/// Bases per block of a cached ambiguity mask.
+const MASK_BLOCK_BASES: usize = 4096;
+const MASK_BLOCK_BYTES: usize = MASK_BLOCK_BASES / 8;
+/// Entries of a cached mask block without and with only ambiguous bases; any other entry is one more than the
+/// number of the block's stored bits.
+const MASK_BLOCK_CLEAR: u32 = 0;
+const MASK_BLOCK_AMBIGUOUS: u32 = u32::MAX;
+
+/// A reference's ambiguity mask as the cache stores it: one entry per block of [`MASK_BLOCK_BASES`] bases, then the
+/// bits of the blocks in which some but not all bases are ambiguous. Empty when no base is ambiguous.
+struct CachedMask<'a> {
+    entries: Vec<u32>,
+    blocks: Vec<&'a [u8]>,
+}
+
+impl<'a> CachedMask<'a> {
+    /// `mask` holds one bit per base of a `len`-base reference, or nothing.
+    fn new(mask: &'a [u8], len: u64) -> Self {
+        let mut cached = Self {
+            entries: Vec::new(),
+            blocks: Vec::new(),
+        };
+        for (block, bits) in mask.chunks(MASK_BLOCK_BYTES).enumerate() {
+            let bases = (len - (block * MASK_BLOCK_BASES) as u64).min(MASK_BLOCK_BASES as u64);
+            let ambiguous: u64 = bits.iter().map(|byte| u64::from(byte.count_ones())).sum();
+            let entry = if ambiguous == 0 {
+                MASK_BLOCK_CLEAR
+            } else if ambiguous == bases {
+                MASK_BLOCK_AMBIGUOUS
+            } else {
+                cached.blocks.push(bits);
+                cached.blocks.len() as u32
+            };
+            cached.entries.push(entry);
+        }
+        cached
+    }
+
+    #[cfg(test)]
+    fn byte_len(&self) -> u64 {
+        (self.entries.len() * 4 + self.blocks.len() * MASK_BLOCK_BYTES) as u64
+    }
+
+    fn write<W: Write>(&self, writer: &mut W, pos: &mut u64) -> Result<()> {
+        for &entry in &self.entries {
+            write_u32_le(writer, pos, entry)?;
+        }
+        for bits in &self.blocks {
+            write_raw(writer, pos, bits)?;
+            write_raw(writer, pos, &[0; MASK_BLOCK_BYTES][bits.len()..])?;
+        }
+        Ok(())
+    }
+}
+
+/// A [`CachedMask`] in the memory-mapped cache.
+#[derive(Clone, Copy)]
+struct MappedMask<'a> {
+    entries: &'a [u8],
+    blocks: &'a [u8],
+}
+
+impl MappedMask<'_> {
+    #[inline]
+    fn is_ambiguous(&self, pos: usize) -> bool {
+        let entry = pos / MASK_BLOCK_BASES * 4;
+        let Some(entry) = self.entries.get(entry..entry + 4) else {
+            return false;
+        };
+        match u32::from_le_bytes(entry.try_into().expect("four bytes")) {
+            MASK_BLOCK_CLEAR => false,
+            MASK_BLOCK_AMBIGUOUS => true,
+            stored => {
+                let bit = (stored as usize - 1) * MASK_BLOCK_BASES + pos % MASK_BLOCK_BASES;
+                self.blocks[bit / 8] & (1 << (bit % 8)) != 0
+            }
+        }
+    }
 }
 
 pub struct MappedSeedTable {
@@ -1038,7 +1119,7 @@ impl ReferenceView<'_> {
 impl MappedReference<'_> {
     #[inline]
     fn code_at(&self, pos: usize) -> Option<u8> {
-        if mapped_ambiguous_get(self.ambiguous, pos) {
+        if self.mask.is_ambiguous(pos) {
             None
         } else {
             Some((self.packed_bases[pos / 4] >> (6 - 2 * (pos % 4))) & 3)
@@ -1051,12 +1132,6 @@ impl MappedReference<'_> {
             None => b'N',
         }
     }
-}
-
-fn mapped_ambiguous_get(bits: &[u8], i: usize) -> bool {
-    bits.get(i / 8)
-        .map(|byte| (byte & (1 << (i % 8))) != 0)
-        .unwrap_or(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1909,7 +1984,8 @@ struct CacheReferenceMetadata {
     id: String,
     len: u64,
     packed_len: u64,
-    ambiguous_len: u64,
+    mask_entries: u64,
+    mask_blocks: u64,
 }
 
 fn transcode_index_cache<R: Read>(
@@ -1969,6 +2045,7 @@ fn transcode_index_cache<R: Read>(
     let mut reference_storage_bytes = 0u64;
     let mut reference_metadata = Vec::with_capacity(reference_count);
     let mut copy_buffer = vec![0u8; INDEX_CACHE_IO_BUFFER_BYTES];
+    let mut mask = Vec::new();
     for _ in 0..reference_count {
         let id = read_string(reader)?;
         let len = read_varint(reader)?;
@@ -1985,13 +2062,20 @@ fn transcode_index_cache<R: Read>(
         if ambiguous_len != 0 && ambiguous_len != expected_ambiguous_len {
             bail!("index reference has an invalid ambiguity-mask length");
         }
-        copy_exact_cache_bytes(reader, writer, &mut pos, ambiguous_len, &mut copy_buffer)?;
+        mask.resize(
+            usize::try_from(ambiguous_len).context("index ambiguity mask exceeds address space")?,
+            0,
+        );
+        reader.read_exact(&mut mask)?;
+        let cached_mask = CachedMask::new(&mask, len);
+        cached_mask.write(writer, &mut pos)?;
 
         reference_metadata.push(CacheReferenceMetadata {
             id,
             len,
             packed_len,
-            ambiguous_len,
+            mask_entries: cached_mask.entries.len() as u64,
+            mask_blocks: cached_mask.blocks.len() as u64,
         });
 
         total_reference_bases = total_reference_bases
@@ -2011,7 +2095,8 @@ fn transcode_index_cache<R: Read>(
         write_cache_string(writer, &mut pos, &reference.id)?;
         write_u64_le(writer, &mut pos, reference.len)?;
         write_u64_le(writer, &mut pos, reference.packed_len)?;
-        write_u64_le(writer, &mut pos, reference.ambiguous_len)?;
+        write_u64_le(writer, &mut pos, reference.mask_entries)?;
+        write_u64_le(writer, &mut pos, reference.mask_blocks)?;
     }
     let reference_metadata_len = pos
         .checked_sub(reference_metadata_offset)
@@ -2576,15 +2661,25 @@ fn write_mapped_index_cache<W: Write>(
     write_u64_le(writer, &mut pos, index.header.created_unix_seconds)?;
 
     write_u64_le(writer, &mut pos, index.references.len() as u64)?;
-    let reference_storage_len = index.references.iter().try_fold(0u64, |total, reference| {
-        total
-            .checked_add(reference.packed_bases.len() as u64)
-            .and_then(|value| value.checked_add(reference.ambiguous.byte_len() as u64))
-            .context("index cache reference storage length overflow")
-    })?;
+    let masks: Vec<CachedMask> = index
+        .references
+        .iter()
+        .map(|reference| CachedMask::new(reference.ambiguous.as_bytes(), reference.len))
+        .collect();
+    let reference_storage_len =
+        index
+            .references
+            .iter()
+            .zip(&masks)
+            .try_fold(0u64, |total, (reference, mask)| {
+                total
+                    .checked_add(reference.packed_bases.len() as u64)
+                    .and_then(|value| value.checked_add(mask.byte_len()))
+                    .context("index cache reference storage length overflow")
+            })?;
     let reference_metadata_len = index.references.iter().try_fold(0u64, |total, reference| {
         total
-            .checked_add(32)
+            .checked_add(40)
             .and_then(|value| value.checked_add(reference.id.len() as u64))
             .context("index cache reference-metadata length overflow")
     })?;
@@ -2594,18 +2689,19 @@ fn write_mapped_index_cache<W: Write>(
         .context("index cache reference-metadata offset overflow")?;
     write_u64_le(writer, &mut pos, reference_metadata_offset)?;
     write_u64_le(writer, &mut pos, reference_metadata_len)?;
-    for reference in &index.references {
+    for (reference, mask) in index.references.iter().zip(&masks) {
         write_raw(writer, &mut pos, &reference.packed_bases)?;
-        write_raw(writer, &mut pos, &reference.ambiguous.clone().into_bytes())?;
+        mask.write(writer, &mut pos)?;
     }
     if pos != reference_metadata_offset {
         bail!("index cache reference storage length mismatch");
     }
-    for reference in &index.references {
+    for (reference, mask) in index.references.iter().zip(&masks) {
         write_cache_string(writer, &mut pos, &reference.id)?;
         write_u64_le(writer, &mut pos, reference.len)?;
         write_u64_le(writer, &mut pos, reference.packed_bases.len() as u64)?;
-        write_u64_le(writer, &mut pos, reference.ambiguous.byte_len() as u64)?;
+        write_u64_le(writer, &mut pos, mask.entries.len() as u64)?;
+        write_u64_le(writer, &mut pos, mask.blocks.len() as u64)?;
     }
     let reference_metadata_end = reference_metadata_offset
         .checked_add(reference_metadata_len)
@@ -2816,10 +2912,6 @@ impl MappedIndex {
         if reference_metadata_end > mmap.as_slice().len() {
             bail!("truncated index cache reference metadata");
         }
-        let stored_reference_bytes = reference_metadata_offset - reference_data_start;
-        if u64::try_from(stored_reference_bytes).ok() != Some(reference_storage_bytes) {
-            bail!("index cache reference storage length mismatch");
-        }
 
         let mut reference_data = CacheCursor::at(mmap.as_slice(), reference_data_start)?;
         let mut reference_metadata =
@@ -2835,19 +2927,19 @@ impl MappedIndex {
             if packed_len != len.div_ceil(4) {
                 bail!("index cache reference has an invalid packed sequence length");
             }
-            let ambiguous_len = reference_metadata.read_u64()?;
-            let expected_ambiguous_len = len.div_ceil(8);
-            if ambiguous_len != 0 && ambiguous_len != expected_ambiguous_len {
-                bail!("index cache reference has an invalid ambiguity-mask length");
+            let mask_entries = reference_metadata.read_u64()?;
+            let mask_blocks = reference_metadata.read_u64()?;
+            if mask_entries != 0 && mask_entries != len.div_ceil(MASK_BLOCK_BASES as u64)
+                || mask_blocks > mask_entries
+            {
+                bail!("index cache reference has an invalid ambiguity mask");
             }
             let packed = reference_data.read_range(
                 usize::try_from(packed_len)
                     .context("index cache packed sequence exceeds address space")?,
             )?;
-            let ambiguous = reference_data.read_range(
-                usize::try_from(ambiguous_len)
-                    .context("index cache ambiguity mask exceeds address space")?,
-            )?;
+            let mask_entries = reference_data.read_range(mask_entries as usize * 4)?;
+            let mask_blocks = reference_data.read_range(mask_blocks as usize * MASK_BLOCK_BYTES)?;
             found_total_reference_bases = found_total_reference_bases
                 .checked_add(len)
                 .context("index cache total reference length overflow")?;
@@ -2855,7 +2947,8 @@ impl MappedIndex {
                 id,
                 len,
                 packed,
-                ambiguous,
+                mask_entries,
+                mask_blocks,
             });
         }
         if reference_data.position() != reference_metadata_offset {
@@ -3116,7 +3209,10 @@ impl MappedIndex {
             id: &meta.id,
             len: meta.len,
             packed_bases: &bytes[meta.packed.clone()],
-            ambiguous: &bytes[meta.ambiguous.clone()],
+            mask: MappedMask {
+                entries: &bytes[meta.mask_entries.clone()],
+                blocks: &bytes[meta.mask_blocks.clone()],
+            },
         }
     }
 
@@ -4400,6 +4496,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_ambiguity_masks_keep_every_base() {
+        let block = MASK_BLOCK_BASES;
+        // Three full blocks and a partial one.
+        let mut mixed = b"ACGT".repeat((3 * block + 1000) / 4);
+        mixed[block - 1] = b'N';
+        mixed[block..2 * block].fill(b'N');
+        mixed[2 * block] = b'R';
+        mixed[3 * block..].fill(b'N');
+        let clean = b"ACGT".repeat(block / 2);
+        let cached_mask = |sequence: &[u8]| {
+            let mask = BitMask::from_ambiguous(sequence);
+            let cached = CachedMask::new(mask.as_bytes(), sequence.len() as u64);
+            (cached.entries, cached.blocks.len())
+        };
+        assert_eq!(
+            cached_mask(&mixed),
+            (vec![1, MASK_BLOCK_AMBIGUOUS, 2, MASK_BLOCK_AMBIGUOUS], 2)
+        );
+        assert_eq!(cached_mask(&clean), (Vec::new(), 0));
+
+        let mut seed_table = SeedTable::new(32);
+        seed_table.rebuild_lookup_index();
+        let mut index = test_index(seed_table, SeedMode::Minimizer);
+        index.references = [clean, mixed]
+            .into_iter()
+            .enumerate()
+            .map(|(i, seq)| {
+                Reference::from_record(&Record {
+                    id: format!("ref-{i}"),
+                    seq,
+                })
+            })
+            .collect();
+        index.header.reference_count = index.references.len();
+        index.header.total_reference_bases = index.references.iter().map(|r| r.len).sum();
+        index.header.reference_storage_bytes = index
+            .references
+            .iter()
+            .map(|r| r.packed_bases.len() as u64 + r.ambiguous.byte_len() as u64)
+            .sum();
+        assert_streaming_cache_matches_owned_writer(&index);
     }
 
     #[test]

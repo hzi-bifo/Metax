@@ -103,6 +103,10 @@ impl BitMask {
         self.bits.len()
     }
 
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bits
+    }
+
     pub fn from_bytes(bits: Vec<u8>) -> Self {
         Self { bits }
     }
