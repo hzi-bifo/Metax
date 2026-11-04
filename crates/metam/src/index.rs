@@ -24,7 +24,7 @@ pub const INDEX_MAGIC: [u8; 8] = *b"METAMM02";
 pub const INDEX_VERSION: u32 = 6;
 const MIN_SUPPORTED_INDEX_VERSION: u32 = 4;
 const INDEX_CACHE_MAGIC: [u8; 8] = *b"METAMMC1";
-const INDEX_CACHE_VERSION: u32 = 5;
+const INDEX_CACHE_VERSION: u32 = 6;
 const INDEX_CACHE_IO_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const INDEX_SEQUENCE_CHUNK: usize = 1_000_000;
 const MAX_OPEN_PARTITION_WRITERS: usize = 4_096;
@@ -173,7 +173,7 @@ impl SeedTable {
         self.occurrences.extend(
             occurrences
                 .iter()
-                .map(|occurrence| pack_occurrence(occurrence.ref_id, occurrence.pos)),
+                .map(|occurrence| OccurrenceLayout::WORD.pack(occurrence.ref_id, occurrence.pos)),
         );
         Ok(())
     }
@@ -195,7 +195,7 @@ impl SeedTable {
         self.occurrences.extend(
             seeds
                 .iter()
-                .map(|seed| pack_occurrence(seed.ref_id, seed.pos)),
+                .map(|seed| OccurrenceLayout::WORD.pack(seed.ref_id, seed.pos)),
         );
         Ok(())
     }
@@ -282,7 +282,7 @@ impl SeedTable {
             &self.fingerprints[start * width..end * width]
         };
         SeedOccurrences {
-            data: &self.occurrences[start..end],
+            positions: Positions::Words(&self.occurrences[start..end]),
             fingerprints,
             fingerprint_bits,
             target_fingerprint: if fingerprint_bits == 0 {
@@ -552,15 +552,48 @@ impl CacheSeedKeys {
 
 #[derive(Clone, Copy, Debug)]
 pub struct SeedOccurrences<'a> {
-    data: &'a [u64],
+    positions: Positions<'a>,
     fingerprints: &'a [u8],
     fingerprint_bits: u8,
     target_fingerprint: u32,
 }
 
+/// The positions of one lookup.
+#[derive(Clone, Copy, Debug)]
+enum Positions<'a> {
+    /// Words of the in-memory index.
+    Words(&'a [u64]),
+    /// `len` positions of a cache; `bytes` comes from [`PackedReader::lookup_bytes`].
+    Packed {
+        bytes: &'a [u8],
+        len: usize,
+        reader: PackedReader,
+    },
+}
+
+impl Positions<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Words(words) => words.len(),
+            Self::Packed { len, .. } => *len,
+        }
+    }
+
+    /// # Safety
+    /// `i < self.len()`.
+    #[inline]
+    unsafe fn get_unchecked(&self, i: usize) -> SeedOccurrence {
+        match *self {
+            Self::Words(words) => OccurrenceLayout::WORD.unpack(words[i]),
+            // SAFETY: `bytes` holds eight bytes from the start of each of the `len` positions, and i < len.
+            Self::Packed { bytes, reader, .. } => unsafe { reader.read_unchecked(bytes, i) },
+        }
+    }
+}
+
 fn empty_seed_occurrences() -> SeedOccurrences<'static> {
     SeedOccurrences {
-        data: &[],
+        positions: Positions::Words(&[]),
         fingerprints: &[],
         fingerprint_bits: 0,
         target_fingerprint: 0,
@@ -568,15 +601,18 @@ fn empty_seed_occurrences() -> SeedOccurrences<'static> {
 }
 
 impl SeedOccurrences<'_> {
+    fn matches(&self, i: usize) -> bool {
+        self.fingerprint_bits == 0
+            || packed_fingerprint(self.fingerprints, i, self.fingerprint_bits)
+                == self.target_fingerprint
+    }
+
     pub fn len(&self) -> usize {
         if self.fingerprint_bits == 0 {
-            self.data.len()
+            self.positions.len()
         } else {
-            (0..self.data.len())
-                .filter(|&i| {
-                    packed_fingerprint(self.fingerprints, i, self.fingerprint_bits)
-                        == self.target_fingerprint
-                })
+            (0..self.positions.len())
+                .filter(|&i| self.matches(i))
                 .count()
         }
     }
@@ -587,20 +623,14 @@ impl SeedOccurrences<'_> {
 
     pub fn iter(&self) -> SeedOccurrenceIter<'_> {
         SeedOccurrenceIter {
-            inner: self.data.iter(),
-            fingerprints: self.fingerprints,
-            fingerprint_bits: self.fingerprint_bits,
-            target_fingerprint: self.target_fingerprint,
+            occurrences: *self,
             index: 0,
         }
     }
 }
 
 pub struct SeedOccurrenceIter<'a> {
-    inner: std::slice::Iter<'a, u64>,
-    fingerprints: &'a [u8],
-    fingerprint_bits: u8,
-    target_fingerprint: u32,
+    occurrences: SeedOccurrences<'a>,
     index: usize,
 }
 
@@ -608,17 +638,15 @@ impl Iterator for SeedOccurrenceIter<'_> {
     type Item = SeedOccurrence;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let packed = *self.inner.next()?;
+        while self.index < self.occurrences.positions.len() {
             let index = self.index;
             self.index += 1;
-            if self.fingerprint_bits == 0
-                || packed_fingerprint(self.fingerprints, index, self.fingerprint_bits)
-                    == self.target_fingerprint
-            {
-                return Some(unpack_occurrence(packed));
+            if self.occurrences.matches(index) {
+                // SAFETY: index < len, checked by the loop.
+                return Some(unsafe { self.occurrences.positions.get_unchecked(index) });
             }
         }
+        None
     }
 }
 
@@ -813,6 +841,7 @@ pub struct MappedSeedTable {
     group_offset_len: usize,
     occurrences: std::ops::Range<usize>,
     occurrence_len: usize,
+    occurrence_reader: PackedReader,
     fingerprint_bits: u8,
     fingerprints: std::ops::Range<usize>,
     fingerprint_len: usize,
@@ -1987,6 +2016,13 @@ fn transcode_index_cache<R: Read>(
     let reference_metadata_len = pos
         .checked_sub(reference_metadata_offset)
         .context("index cache reference-metadata length underflow")?;
+    let longest_reference = reference_metadata
+        .iter()
+        .map(|reference| reference.len)
+        .max()
+        .unwrap_or(0);
+    let occurrence_layout =
+        OccurrenceLayout::for_references(reference_count_u64, longest_reference);
     drop(reference_metadata);
 
     let occurrence_count_u64 = read_varint(reader)?;
@@ -2089,11 +2125,14 @@ fn transcode_index_cache<R: Read>(
     };
 
     write_u64_le(writer, &mut pos, occurrence_count_u64)?;
-    align_writer(writer, &mut pos, std::mem::align_of::<u64>() as u64)?;
+    write_u8(writer, &mut pos, occurrence_layout.width)?;
+    write_u8(writer, &mut pos, occurrence_layout.pos_bits)?;
+    let occurrence_bytes =
+        cache_array_bytes(occurrence_count, usize::from(occurrence_layout.width))?;
     let occurrences = reserve_cache_range(
         writer,
         &mut pos,
-        cache_array_bytes(occurrence_count, std::mem::size_of::<u64>())?,
+        occurrence_bytes + occurrence_layout.padding() as u64,
     )?;
     write_u8(writer, &mut pos, fingerprint_bits)?;
     write_u64_le(writer, &mut pos, fingerprint_len as u64)?;
@@ -2139,7 +2178,6 @@ fn transcode_index_cache<R: Read>(
     let mut previous_hash = 0u64;
     let mut decoded_occurrences = 0usize;
     let mut key_bytes_written = 0u64;
-    let mut occurrence_bytes_written = 0u64;
 
     for group in 0..group_count {
         let hash_delta = read_varint(reader)?;
@@ -2204,8 +2242,8 @@ fn transcode_index_cache<R: Read>(
             let ref_id = u64::from(previous_ref)
                 .checked_add(ref_delta)
                 .context("reference ID delta overflow in index")?;
-            if ref_id > u64::from(u32::MAX) {
-                bail!("reference ID exceeds index format limit");
+            if ref_id >= reference_count_u64 {
+                bail!("reference ID out of range in index");
             }
             let pos_delta_or_abs = read_varint(reader)?;
             let reference_pos = if ref_delta == 0 {
@@ -2215,16 +2253,19 @@ fn transcode_index_cache<R: Read>(
             } else {
                 pos_delta_or_abs
             };
-            if reference_pos > u64::from(u32::MAX) {
-                bail!("reference position exceeds index format limit");
+            if reference_pos >= longest_reference {
+                bail!("reference position out of range in index");
             }
             previous_ref = ref_id as u32;
             previous_pos = reference_pos as u32;
-            let packed = pack_occurrence(previous_ref, previous_pos).to_le_bytes();
-            append_cache_bytes(&mut occurrence_writer, &mut occurrence_buffer, &packed)?;
-            occurrence_bytes_written = occurrence_bytes_written
-                .checked_add(8)
-                .context("index cache occurrence length overflow")?;
+            let packed = occurrence_layout
+                .pack(previous_ref, previous_pos)
+                .to_le_bytes();
+            append_cache_bytes(
+                &mut occurrence_writer,
+                &mut occurrence_buffer,
+                &packed[..usize::from(occurrence_layout.width)],
+            )?;
         }
         if let Some(offsets) = compact_group_offsets.as_mut() {
             offsets.push(decoded_occurrences)?;
@@ -2244,9 +2285,6 @@ fn transcode_index_cache<R: Read>(
 
     if key_bytes_written != ranges.seed_keys.end - ranges.seed_keys.start {
         bail!("index cache key array length mismatch");
-    }
-    if occurrence_bytes_written != ranges.occurrences.end - ranges.occurrences.start {
-        bail!("index cache occurrence array length mismatch");
     }
 
     write_u64_slice_at(writer, ranges.lookup_offsets.clone(), &lookup_values)?;
@@ -2626,8 +2664,22 @@ fn write_mapped_index_cache<W: Write>(
             }
         }
     }
+    let longest_reference = index
+        .references
+        .iter()
+        .map(|reference| reference.len)
+        .max()
+        .unwrap_or(0);
+    let layout = OccurrenceLayout::for_references(index.references.len() as u64, longest_reference);
     write_u64_le(writer, &mut pos, index.seed_table.occurrences.len() as u64)?;
-    write_aligned_u64_slice(writer, &mut pos, &index.seed_table.occurrences)?;
+    write_u8(writer, &mut pos, layout.width)?;
+    write_u8(writer, &mut pos, layout.pos_bits)?;
+    for &word in &index.seed_table.occurrences {
+        let occurrence = OccurrenceLayout::WORD.unpack(word);
+        let packed = layout.pack(occurrence.ref_id, occurrence.pos).to_le_bytes();
+        write_raw(writer, &mut pos, &packed[..usize::from(layout.width)])?;
+    }
+    write_raw(writer, &mut pos, &[0; 8][..layout.padding()])?;
     write_u8(writer, &mut pos, index.seed_table.fingerprint_bits)?;
     write_u64_le(writer, &mut pos, index.seed_table.fingerprints.len() as u64)?;
     write_raw(writer, &mut pos, &index.seed_table.fingerprints)?;
@@ -2774,9 +2826,11 @@ impl MappedIndex {
             CacheCursor::new(&mmap.as_slice()[reference_metadata_offset..reference_metadata_end]);
         let mut references = Vec::with_capacity(ref_count);
         let mut found_total_reference_bases = 0u64;
+        let mut longest_reference = 0u64;
         for _ in 0..ref_count {
             let id = reference_metadata.read_string()?;
             let len = reference_metadata.read_u64()?;
+            longest_reference = longest_reference.max(len);
             let packed_len = reference_metadata.read_u64()?;
             if packed_len != len.div_ceil(4) {
                 bail!("index cache reference has an invalid packed sequence length");
@@ -2835,7 +2889,21 @@ impl MappedIndex {
             _ => bail!("invalid seed-group offset width in index cache"),
         };
         let occurrence_len = cursor.read_u64()? as usize;
-        let occurrences = cursor.read_aligned_range::<u64>(occurrence_len)?;
+        let occurrence_layout = OccurrenceLayout {
+            width: cursor.read_u8()?,
+            pos_bits: cursor.read_u8()?,
+        };
+        if occurrence_layout
+            != OccurrenceLayout::for_references(ref_count as u64, longest_reference)
+        {
+            bail!("index cache seed positions have a non-canonical width");
+        }
+        let occurrences = cursor.read_range(
+            occurrence_len
+                .checked_mul(usize::from(occurrence_layout.width))
+                .and_then(|bytes| bytes.checked_add(occurrence_layout.padding()))
+                .context("index cache seed position array length overflow")?,
+        )?;
         let fingerprint_bits = cursor.read_u8()?;
         let fingerprint_len = cursor.read_u64()? as usize;
         let fingerprints = cursor.read_range(fingerprint_len)?;
@@ -2875,6 +2943,7 @@ impl MappedIndex {
                 group_offset_len,
                 occurrences,
                 occurrence_len,
+                occurrence_reader: PackedReader::new(occurrence_layout),
                 fingerprint_bits,
                 fingerprints,
                 fingerprint_len,
@@ -3023,7 +3092,6 @@ impl MappedIndex {
         }
 
         let _ = self.seed_table.offsets(self.mmap.as_slice());
-        let _ = self.seed_table.occurrences(self.mmap.as_slice());
         let _ = self.seed_table.fingerprints(self.mmap.as_slice());
         if self.seed_table.hash_bits <= 32 {
             let _ = self.seed_table.hashes32(self.mmap.as_slice());
@@ -3157,8 +3225,13 @@ impl MappedSeedTable {
         } else {
             &self.fingerprints(bytes)[start * width..end * width]
         };
+        let reader = self.occurrence_reader;
         SeedOccurrences {
-            data: &self.occurrences(bytes)[start..end],
+            positions: Positions::Packed {
+                bytes: reader.lookup_bytes(self.occurrences(bytes), start, end),
+                len: end - start,
+                reader,
+            },
             fingerprints,
             fingerprint_bits,
             target_fingerprint: if fingerprint_bits == 0 {
@@ -3211,9 +3284,9 @@ impl MappedSeedTable {
         typed_slice(bytes, self.hashes64.clone(), self.hashes64_len).expect("valid mmap hashes64")
     }
 
-    fn occurrences<'a>(&self, bytes: &'a [u8]) -> &'a [u64] {
-        typed_slice(bytes, self.occurrences.clone(), self.occurrence_len)
-            .expect("valid mmap occurrences")
+    /// The packed positions with their padding.
+    fn occurrences<'a>(&self, bytes: &'a [u8]) -> &'a [u8] {
+        &bytes[self.occurrences.clone()]
     }
 
     fn fingerprints<'a>(&self, bytes: &'a [u8]) -> &'a [u8] {
@@ -3497,14 +3570,93 @@ fn partition_for_hash(hash: u64, hash_bits: u8, partition_count: usize) -> usize
     partition.min(partition_count - 1)
 }
 
-fn pack_occurrence(ref_id: u32, pos: u32) -> u64 {
-    (u64::from(ref_id) << 32) | u64::from(pos)
+/// A seed position packed as `ref_id << pos_bits | pos` into `width` bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OccurrenceLayout {
+    width: u8,
+    pos_bits: u8,
 }
 
-fn unpack_occurrence(packed: u64) -> SeedOccurrence {
-    SeedOccurrence {
-        ref_id: (packed >> 32) as u32,
-        pos: packed as u32,
+impl OccurrenceLayout {
+    /// The in-memory index's words.
+    const WORD: Self = Self {
+        width: 8,
+        pos_bits: 32,
+    };
+
+    /// The fewest whole bytes that hold every reference number and position of these references.
+    fn for_references(reference_count: u64, longest_reference: u64) -> Self {
+        let bits_below = |n: u64| (u64::BITS - n.saturating_sub(1).leading_zeros()) as u8;
+        let pos_bits = bits_below(longest_reference);
+        let width = (pos_bits + bits_below(reference_count)).div_ceil(8).max(1);
+        Self { width, pos_bits }
+    }
+
+    /// Zero bytes after the last position, so that it too can be read as a whole word.
+    fn padding(self) -> usize {
+        8 - usize::from(self.width)
+    }
+
+    fn pack(self, ref_id: u32, pos: u32) -> u64 {
+        (u64::from(ref_id) << self.pos_bits) | u64::from(pos)
+    }
+
+    #[inline]
+    fn unpack(self, packed: u64) -> SeedOccurrence {
+        SeedOccurrence {
+            ref_id: (packed >> self.pos_bits) as u32,
+            pos: (packed & ((1u64 << self.pos_bits) - 1)) as u32,
+        }
+    }
+}
+
+/// Reads the positions of a cache; the masks and the shift are worked out once from its layout.
+#[derive(Clone, Copy, Debug)]
+struct PackedReader {
+    width: usize,
+    pos_bits: u32,
+    word_mask: u64,
+    pos_mask: u64,
+}
+
+impl PackedReader {
+    fn new(layout: OccurrenceLayout) -> Self {
+        Self {
+            width: usize::from(layout.width),
+            pos_bits: u32::from(layout.pos_bits),
+            word_mask: u64::MAX >> (8 * layout.padding()),
+            pos_mask: (1u64 << layout.pos_bits) - 1,
+        }
+    }
+
+    /// The bytes that positions `start..end` of the padded array `occurrences` are read from: eight from the start
+    /// of each.
+    fn lookup_bytes(self, occurrences: &[u8], start: usize, end: usize) -> &[u8] {
+        if start == end {
+            &[]
+        } else {
+            &occurrences[start * self.width..(end - 1) * self.width + 8]
+        }
+    }
+
+    /// Position `i` of `bytes`.
+    ///
+    /// # Safety
+    /// `bytes` holds eight bytes from byte `i * width` on.
+    #[inline]
+    unsafe fn read_unchecked(self, bytes: &[u8], i: usize) -> SeedOccurrence {
+        // SAFETY: the caller guarantees the eight bytes; the read needs no alignment.
+        let word = u64::from_le(unsafe {
+            bytes
+                .as_ptr()
+                .add(i * self.width)
+                .cast::<u64>()
+                .read_unaligned()
+        }) & self.word_mask;
+        SeedOccurrence {
+            ref_id: (word >> self.pos_bits) as u32,
+            pos: (word & self.pos_mask) as u32,
+        }
     }
 }
 
@@ -3833,7 +3985,7 @@ fn write_seed_table<W: Write>(writer: &mut W, seed_table: &SeedTable) -> Result<
             seed_table.occurrences[start..end]
                 .iter()
                 .copied()
-                .map(unpack_occurrence),
+                .map(|word| OccurrenceLayout::WORD.unpack(word)),
         )?;
         start = end;
     }
@@ -3984,7 +4136,7 @@ fn read_seed_table<R: Read>(
             previous_pos = pos as u32;
             seed_table
                 .occurrences
-                .push(pack_occurrence(previous_ref, previous_pos));
+                .push(OccurrenceLayout::WORD.pack(previous_ref, previous_pos));
         }
     }
     if seed_table.occurrence_count() != seed_count {
@@ -4199,6 +4351,53 @@ mod tests {
             for pos in 0..expected.len() {
                 assert_eq!(found.base_at(pos), expected.base_at(pos));
                 assert_eq!(found.code_at(pos), expected.code_at(pos));
+            }
+        }
+    }
+
+    #[test]
+    fn cached_positions_use_the_fewest_whole_bytes() {
+        let layout = |width, pos_bits| OccurrenceLayout { width, pos_bits };
+        // Fewer than 2^18 references, the longest 248,956,422 bases (human chromosome 1): 18 + 28 bits.
+        assert_eq!(
+            OccurrenceLayout::for_references(150_000, 248_956_422),
+            layout(6, 28)
+        );
+        assert_eq!(OccurrenceLayout::for_references(1, 1), layout(1, 0));
+        assert_eq!(OccurrenceLayout::for_references(256, 256), layout(2, 8));
+        assert_eq!(OccurrenceLayout::for_references(257, 256), layout(3, 8));
+        assert_eq!(
+            OccurrenceLayout::for_references(1 << 32, 1 << 32),
+            OccurrenceLayout::WORD
+        );
+        for (count, longest) in [
+            (1u64, 1u64),
+            (257, 256),
+            (150_000, 248_956_422),
+            (1 << 32, 1 << 32),
+        ] {
+            let layout = OccurrenceLayout::for_references(count, longest);
+            let positions = [
+                (0, 0),
+                ((count - 1) as u32, (longest - 1) as u32),
+                (0, (longest - 1) as u32),
+            ];
+            let mut bytes = Vec::new();
+            for (ref_id, pos) in positions {
+                bytes.extend_from_slice(
+                    &layout.pack(ref_id, pos).to_le_bytes()[..usize::from(layout.width)],
+                );
+            }
+            bytes.resize(bytes.len() + layout.padding(), 0);
+            let reader = PackedReader::new(layout);
+            assert!(reader.lookup_bytes(&bytes, 1, 1).is_empty());
+            for start in 0..positions.len() {
+                let lookup = reader.lookup_bytes(&bytes, start, positions.len());
+                for (i, &(ref_id, pos)) in positions[start..].iter().enumerate() {
+                    // SAFETY: lookup_bytes holds eight bytes from the start of each looked-up position.
+                    let found = unsafe { reader.read_unchecked(lookup, i) };
+                    assert_eq!(found, SeedOccurrence { ref_id, pos });
+                }
             }
         }
     }
@@ -4569,7 +4768,7 @@ mod tests {
         assert_eq!(decoded.header.strobe_start_dist, None);
         assert_eq!(decoded.lookup(seeds[0].hash).len(), 1);
         #[cfg(unix)]
-        assert_streaming_cache_matches_owned_writer(&index);
+        assert_streaming_cache_matches_owned_writer(&with_test_references(index, 2));
     }
 
     #[cfg(unix)]
@@ -4693,7 +4892,7 @@ mod tests {
         let mut seed_table = SeedTable::new(32);
         seed_table.push_occurrence_group(key, &occurrences).unwrap();
         seed_table.rebuild_lookup_index();
-        let index = test_index(seed_table, SeedMode::Minimizer);
+        let index = with_test_references(test_index(seed_table, SeedMode::Minimizer), 2);
         let source = IndexSourceFingerprint {
             size: 1,
             modified_secs: 2,
@@ -4731,7 +4930,7 @@ mod tests {
             expected.push((key, occurrences));
         }
         seed_table.rebuild_lookup_index();
-        let index = test_index(seed_table, SeedMode::Minimizer);
+        let index = with_test_references(test_index(seed_table, SeedMode::Minimizer), 12);
         let source = IndexSourceFingerprint {
             size: 4,
             modified_secs: 5,
@@ -4778,7 +4977,7 @@ mod tests {
             .push_occurrence_group(second_key, &second_occurrences)
             .unwrap();
         seed_table.rebuild_lookup_index();
-        let index = test_index(seed_table, SeedMode::Minimizer);
+        let index = with_test_references(test_index(seed_table, SeedMode::Minimizer), 7);
         let source = IndexSourceFingerprint {
             size: 10,
             modified_secs: 20,
@@ -4840,7 +5039,7 @@ mod tests {
         let mut seed_table = SeedTable::new(32);
         seed_table.push_occurrence_group(key, &occurrences).unwrap();
         seed_table.rebuild_lookup_index();
-        let index = test_index(seed_table, SeedMode::Minimizer);
+        let index = with_test_references(test_index(seed_table, SeedMode::Minimizer), 4);
         let dir = tempfile::TempDir::new().unwrap();
         let index_path = dir.path().join("index.mxi");
         let cache_path = dir.path().join("index.mxi.metamcache");
@@ -4906,6 +5105,6 @@ mod tests {
         assert_eq!(decoded.header.strobe_start_dist, None);
         assert_eq!(decoded.lookup(seeds[0].hash).len(), 2);
         #[cfg(unix)]
-        assert_streaming_cache_matches_owned_writer(&index);
+        assert_streaming_cache_matches_owned_writer(&with_test_references(index, 2));
     }
 }
