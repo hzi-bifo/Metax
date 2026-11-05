@@ -3612,7 +3612,8 @@ fn validate_hash_bits(hash_bits: u8) -> Result<()> {
     Ok(())
 }
 
-fn validate_index_identity(magic: [u8; 8], version: u32) -> Result<()> {
+/// Check an index's magic and format version.
+pub fn validate_index_identity(magic: [u8; 8], version: u32) -> Result<()> {
     if magic != INDEX_MAGIC {
         bail!("invalid index magic");
     }

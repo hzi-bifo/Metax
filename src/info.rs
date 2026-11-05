@@ -7,10 +7,6 @@ use anyhow::{bail, Context, Result};
 
 use crate::db::{DatabaseMetadata, ReferenceType};
 
-const INDEX_MAGIC: [u8; 8] = *b"METAMM02";
-const MIN_SUPPORTED_INDEX_VERSION: u32 = 4;
-const MAX_SUPPORTED_INDEX_VERSION: u32 = 6;
-
 #[derive(Debug)]
 struct IndexInfo {
     version: u32,
@@ -135,15 +131,9 @@ fn read_index_info(path: &Path) -> Result<IndexInfo> {
 
     let mut magic = [0u8; 8];
     reader.read_exact(&mut magic)?;
-    if magic != INDEX_MAGIC {
-        bail!("invalid index magic in {}", path.display());
-    }
     let version = read_varint(&mut reader)? as u32;
-    if !(MIN_SUPPORTED_INDEX_VERSION..=MAX_SUPPORTED_INDEX_VERSION).contains(&version) {
-        bail!(
-            "unsupported index version {version}; supported versions are {MIN_SUPPORTED_INDEX_VERSION} through {MAX_SUPPORTED_INDEX_VERSION}"
-        );
-    }
+    metam::index::validate_index_identity(magic, version)
+        .with_context(|| format!("cannot read index {}", path.display()))?;
     let metam_version = read_string(&mut reader)?;
     let k = read_varint(&mut reader)? as usize;
     let w = read_varint(&mut reader)? as usize;
