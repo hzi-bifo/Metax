@@ -175,6 +175,25 @@ impl MarkerModel {
             .map(|genes| genes.placements(self.geometry.gate_bases(read_len), read_len))
     }
 
+    /// Whole-genome reads that one gene hit of a long read of `read_len`
+    /// bases stands for on a genome of `G` bases, as `(a, b)` with the reads
+    /// `a G + b`: the placements of the whole genome, `G + read_len + 1 - 2 m`
+    /// for the bases `m` the gates need, over those of its genes. `None` for
+    /// a genome without marker genes and for other reads.
+    pub(crate) fn whole_genome_reads_per_hit(
+        &self,
+        assembly_id: u32,
+        read_len: u32,
+    ) -> Option<(f64, f64)> {
+        if self.geometry.layout != FragmentLayout::LongReads {
+            return None;
+        }
+        let on_genes = self.placements_for_read(assembly_id, read_len)?;
+        let read_len = i64::from(read_len.max(1));
+        let outside = read_len + 1 - 2 * self.geometry.gate_bases(read_len);
+        Some((1.0 / on_genes, outside as f64 / on_genes))
+    }
+
     /// Fragments that a whole genome of `genome_size` bases offers per
     /// fragment that its marker genes offer; `None` for a genome without
     /// marker genes or when no gene can hold a read of this length.
@@ -372,7 +391,8 @@ fn marker_coverage(
     if total_placements <= 0.0 {
         return None;
     }
-    let fragments = assembly.count as f64;
+    // Gene hits: a long read can cover several genes.
+    let fragments = (assembly.count + assembly.other_gene_hits) as f64;
     let marker_bases: f64 = genes.iter().map(|gene| f64::from(gene.len)).sum();
 
     let mut hit = vec![false; genes.len()];
@@ -529,6 +549,7 @@ mod tests {
         PresenceAssembly {
             asm_len: 0.0,
             count: hits.len() as u64,
+            other_gene_hits: 0,
             reference_span_bases: 150 * hits.len() as u64,
             intervals: hits
                 .iter()

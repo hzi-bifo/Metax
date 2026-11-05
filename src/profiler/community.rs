@@ -79,7 +79,7 @@ use super::output::{
 use super::pathogen::{load_pathogen_table, PathogenEntry};
 use super::rollup::{GenomeLayout, GenusRollup, GenusRow, OrphanedFragments};
 use super::statistics::{coverage_deviation_pvalue, round5};
-use super::unclassified::{self, MarkerScales, ReferenceKind};
+use super::unclassified::{self, GenomeReads, MarkerSpecies, ReferenceKind};
 use super::{
     coverage_passes, equivalent_read_count_passes_minimum, log_reference_taxonomy_adjustments,
     log_resolved_profiler_parameters, parse_reference_taxonomy, push_string_keyed_value,
@@ -294,6 +294,10 @@ struct AssignmentResult {
     boundary_ambiguous_fragments: usize,
 
     filter_stats: FilterStats,
+
+    /// Whole-genome reads that the long reads on each marker genome stand
+    /// for, by assembly id; filled only for `--estimate-unclassified`.
+    marker_genome_reads: HashMap<u32, GenomeReads>,
 }
 
 /// Rank at which a read is taxonomically assigned.
@@ -801,22 +805,18 @@ impl CommunityProfiler {
         } else {
             None
         };
-        let unclassified_scales = self.cfg.estimate_unclassified.then(|| {
-            unclassified::marker_scales(
-                db.references
-                    .iter()
-                    .zip(&reference_taxonomies)
-                    .map(|(reference, taxonomy)| {
-                        let taxid = taxonomy.profile_taxid;
-                        ReferenceKind {
-                            taxid: species_normalize.get(&taxid).copied().unwrap_or(taxid),
-                            assembly_id: assembly_ids[reference.genome.as_str()],
-                            reference_type: reference.reference_type,
-                            declared_genome_size: reference.declared_genome_size,
-                        }
-                    }),
-                marker_model.as_deref(),
-            )
+        let unclassified_species = self.cfg.estimate_unclassified.then(|| {
+            unclassified::marker_species(db.references.iter().zip(&reference_taxonomies).map(
+                |(reference, taxonomy)| {
+                    let taxid = taxonomy.profile_taxid;
+                    ReferenceKind {
+                        taxid: species_normalize.get(&taxid).copied().unwrap_or(taxid),
+                        assembly_id: assembly_ids[reference.genome.as_str()],
+                        reference_type: reference.reference_type,
+                        declared_genome_size: reference.declared_genome_size,
+                    }
+                },
+            ))
         });
 
         let mapping_rate = if total_reads == 0 {
@@ -913,7 +913,7 @@ impl CommunityProfiler {
             skipped_reference_at_load: num_skipped_reference,
             marker_model,
             genus_rollup,
-            unclassified_scales,
+            unclassified_species,
         })
     }
 
@@ -1232,10 +1232,20 @@ impl CommunityProfiler {
                     target.asm_len = presence.asm_len;
                 }
                 target.count = target.count.saturating_add(presence.count);
+                target.other_gene_hits = target
+                    .other_gene_hits
+                    .saturating_add(presence.other_gene_hits);
                 target.reference_span_bases = target
                     .reference_span_bases
                     .saturating_add(presence.reference_span_bases);
                 target.intervals.append(&mut presence.intervals);
+            }
+            for (assembly_id, reads) in result.marker_genome_reads {
+                final_result
+                    .marker_genome_reads
+                    .entry(assembly_id)
+                    .or_default()
+                    .merge(reads);
             }
             for (taxid, evidence) in result.taxon_evidence {
                 let target = final_result.taxon_evidence.entry(taxid).or_default();
@@ -1320,7 +1330,7 @@ impl CommunityProfiler {
             marker_model,
             genus_rollup,
             total_reads,
-            unclassified_scales,
+            unclassified_species,
             ..
         } = mapping_data;
         let verbose_logging = self.cfg.verbose || self.cfg.very_verbose;
@@ -2042,8 +2052,15 @@ impl CommunityProfiler {
         }
         // Before species move to their genus, while marker species still
         // carry their own scale.
-        let unclassified = unclassified_scales.as_ref().map(|scales| {
-            let estimate = unclassified::estimate(&normalized, scales, total_reads);
+        let unclassified = unclassified_species.as_ref().map(|species| {
+            // Long reads differ in length and in the genes each covers, so
+            // their scales come from the reads themselves.
+            let measured = self
+                .cfg
+                .coverage_gate_is_or()
+                .then_some(&assignment.marker_genome_reads);
+            let scales = unclassified::marker_scales(species, marker_model.as_deref(), measured);
+            let estimate = unclassified::estimate(&normalized, &scales, total_reads);
             match estimate {
                 Ok(estimate) => log::info!(
                     target: "PROFILER",
@@ -2054,7 +2071,7 @@ impl CommunityProfiler {
                 ),
                 Err(taxid) => log::warn!(
                     target: "PROFILER",
-                    "Unclassified estimate unavailable: species {taxid} is represented by marker genes that declare no genome size or cannot hold a read of this length."
+                    "Unclassified estimate unavailable: species {taxid} is represented by marker genes that declare no genome size, cannot hold a read of this length, or have no resolved long read."
                 ),
             }
             estimate.ok()
@@ -3299,8 +3316,10 @@ fn sample_fragment_geometry(
 /// genome length. A fragment on a marker gene stands for one fragment of the
 /// whole genome: it adds its whole read length, also when the read is clipped
 /// at a gene end, over the placements that the genome's genes offer a read of
-/// its length, so that marker and genome taxa have comparable depths. Marker
-/// genes that cannot hold a read keep mapped bases over their summed length.
+/// its length, so that marker and genome taxa have comparable depths; a long
+/// read adds this for every gene of the genome it covers, as the placements
+/// count every gene. Marker genes that cannot hold a read keep mapped bases
+/// over their summed length.
 fn fragment_depth(
     placement: CandidatePlacement,
     mapped: u32,
@@ -3309,7 +3328,9 @@ fn fragment_depth(
     match markers
         .and_then(|model| model.placements_for_read(placement.assembly_id, placement.read_len))
     {
-        Some(placements) => f64::from(placement.read_len) / placements,
+        Some(placements) => {
+            f64::from(1 + placement.other_genes) * f64::from(placement.read_len) / placements
+        }
         None => f64::from(mapped) / placement.asm_len.max(1.0),
     }
 }
@@ -3465,6 +3486,9 @@ fn process_evidence_batch(
                         presence.asm_len = placement.asm_len;
                     }
                     presence.count = presence.count.saturating_add(1);
+                    presence.other_gene_hits = presence
+                        .other_gene_hits
+                        .saturating_add(u64::from(placement.other_genes));
                     presence.reference_span_bases = presence.reference_span_bases.saturating_add(
                         u64::from(placement.span.1.saturating_sub(placement.span.0)),
                     );
@@ -3474,6 +3498,33 @@ fn process_evidence_batch(
                         fixed_chunk: placement.fixed_chunk,
                         flex_chunk: placement.flex_chunk,
                     });
+                    if cfg.estimate_unclassified {
+                        if let Some(per_hit) = markers.and_then(|model| {
+                            model.whole_genome_reads_per_hit(
+                                placement.assembly_id,
+                                placement.read_len,
+                            )
+                        }) {
+                            result
+                                .marker_genome_reads
+                                .entry(placement.assembly_id)
+                                .or_default()
+                                .add(1 + placement.other_genes, per_hit);
+                        }
+                    }
+                }
+                let resolved = &candidates[index];
+                for hit in &resolved.other_gene_hits {
+                    let key = PresenceKey {
+                        taxid: resolved.taxid,
+                        profile_rank: resolved.profile_rank,
+                        assembly_id: hit.assembly_id,
+                    };
+                    let presence = result.presence.entry(key).or_default();
+                    presence.reference_span_bases = presence.reference_span_bases.saturating_add(
+                        u64::from(hit.interval.span.1.saturating_sub(hit.interval.span.0)),
+                    );
+                    presence.intervals.push(hit.interval);
                 }
             }
             continue;
@@ -4907,7 +4958,7 @@ struct MappingData {
     genus_rollup: Option<Arc<GenusRollup>>,
 
     /// Inputs of `--estimate-unclassified`; `None` when it is off.
-    unclassified_scales: Option<MarkerScales>,
+    unclassified_species: Option<MarkerSpecies>,
 }
 
 #[cfg(test)]
@@ -4937,6 +4988,7 @@ mod tests {
             r1_mapped: mapped,
             both_mapped: mapped,
             read_len,
+            other_genes: 0,
             pair_errors: 0.0,
             long_score: 0.0,
             span: (1, 1 + mapped),
@@ -4944,6 +4996,24 @@ mod tests {
             flex_chunk: (1, 1 + mapped),
             input_order: 0,
         }
+    }
+
+    #[test]
+    fn a_long_read_adds_depth_for_every_marker_gene_it_covers() {
+        // Long reads of 3,000 bases on genes of 1,000 bases: 500 bases inside
+        // a gene, 1,000 - 1,000 + 3,001 = 3,001 placements per gene.
+        let geometry = FragmentGeometry::new(FragmentLayout::LongReads, 3_000, 3_000, 500, 0.2);
+        let markers = MarkerModel::from_gene_lengths(&[(7, &[1_000, 1_000])], geometry);
+        let mut read = placement(7, 900, 3_000);
+        approx_equal(fragment_depth(read, 900, Some(&markers)), 3_000.0 / 6_002.0);
+        read.other_genes = 1;
+        approx_equal(fragment_depth(read, 900, Some(&markers)), 6_000.0 / 6_002.0);
+        // A read of another length is placed by its own length.
+        let short = placement(7, 900, 1_000);
+        approx_equal(
+            fragment_depth(short, 900, Some(&markers)),
+            1_000.0 / (2.0 * (1_000.0 + 1_001.0 - 400.0)),
+        );
     }
 
     #[test]
@@ -5115,7 +5185,7 @@ mod tests {
             skipped_reference_at_load: 0,
             marker_model: None,
             genus_rollup: None,
-            unclassified_scales: None,
+            unclassified_species: None,
         };
         (mapping_data, assignment)
     }
@@ -5538,7 +5608,7 @@ mod tests {
             skipped_reference_at_load: 0,
             marker_model: None,
             genus_rollup: None,
-            unclassified_scales: None,
+            unclassified_species: None,
         };
         let assignment = AssignmentResult {
             read_assignments: vec![ReadAssignment {
@@ -5599,7 +5669,7 @@ mod tests {
             skipped_reference_at_load: 0,
             marker_model: None,
             genus_rollup: None,
-            unclassified_scales: None,
+            unclassified_species: None,
         };
         let assignment = AssignmentResult {
             read_assignments: vec![ReadAssignment {

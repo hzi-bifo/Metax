@@ -157,6 +157,9 @@ pub(crate) struct CandidatePlacement {
     pub(crate) both_mapped: u32,
     /// Length of the read that gives `r1_mapped`.
     pub(crate) read_len: u32,
+    /// Other marker genes of the same genome that a long read covers
+    /// ([`TerminalCandidate::other_gene_hits`]); 0 otherwise.
+    pub(crate) other_genes: u32,
     pub(crate) pair_errors: f64,
     pub(crate) long_score: f64,
     pub(crate) span: (u32, u32),
@@ -388,6 +391,16 @@ pub(crate) struct TerminalCandidate {
     pub(crate) candidate_boundary: CandidateBoundary,
     /// One independently evaluated placement per represented assembly.
     pub(crate) placements: Vec<CandidatePlacement>,
+    /// The other marker genes that a long read covers on the genomes of
+    /// `placements`, one per gene.
+    pub(crate) other_gene_hits: Vec<GeneHit>,
+}
+
+/// A marker gene that a long read covers besides the one of its placement.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GeneHit {
+    pub(crate) assembly_id: u32,
+    pub(crate) interval: PresenceInterval,
 }
 
 /// One independent terminal-taxon/assembly coordinate system. Reference
@@ -414,6 +427,9 @@ pub(crate) struct PresenceAssembly {
     /// actually receive mappings in a fractional index.
     pub(crate) asm_len: f64,
     pub(crate) count: u64,
+    /// Marker genes hit beyond one per fragment: the other genes that long
+    /// reads cover on this genome.
+    pub(crate) other_gene_hits: u64,
     pub(crate) reference_span_bases: u64,
     pub(crate) intervals: Vec<PresenceInterval>,
 }
@@ -1073,6 +1089,9 @@ pub(crate) fn witness_is_better(left: WitnessDecision, right: WitnessDecision) -
 #[derive(Default)]
 pub(crate) struct CandidateScratch {
     by_taxon_assembly: HashMap<(u32, ProfileRank, u32), CandidatePlacement>,
+    /// Best long-read placement per taxon, assembly and marker gene.
+    by_taxon_gene: HashMap<(u32, ProfileRank, u32, u32), CandidatePlacement>,
+    other_gene_hits: Vec<((u32, ProfileRank, u32), PresenceInterval)>,
     by_taxon: HashMap<(u32, ProfileRank), TerminalCandidate>,
     paired_rows: HashMap<u32, ExplicitPairRows>,
     pair_order: Vec<u32>,
@@ -1099,6 +1118,8 @@ impl CandidateScratch {
                 boundary.union(mapping.candidate_boundary)
             });
         self.by_taxon_assembly.clear();
+        self.by_taxon_gene.clear();
+        self.other_gene_hits.clear();
         self.by_taxon.clear();
         self.paired_rows.clear();
         self.pair_order.clear();
@@ -1123,6 +1144,7 @@ impl CandidateScratch {
                         best: placement,
                         candidate_boundary,
                         placements: vec![placement],
+                        other_gene_hits: Vec::new(),
                     });
                 }
                 Entry::Occupied(mut entry) => {
@@ -1132,6 +1154,14 @@ impl CandidateScratch {
                     }
                     taxon.placements.push(placement);
                 }
+            }
+        }
+        for ((taxid, profile_rank, assembly_id), interval) in self.other_gene_hits.drain(..) {
+            if let Some(taxon) = self.by_taxon.get_mut(&(taxid, profile_rank)) {
+                taxon.other_gene_hits.push(GeneHit {
+                    assembly_id,
+                    interval,
+                });
             }
         }
         self.output
@@ -1217,6 +1247,7 @@ impl CandidateScratch {
                 r1_mapped: r1.mapped_len,
                 both_mapped: r1.mapped_len.saturating_add(r2.mapped_len),
                 read_len: r1.read_len,
+                other_genes: 0,
                 pair_errors: estimated_errors(r1) + estimated_errors(r2),
                 long_score: 0.0,
                 span: r1.span,
@@ -1265,6 +1296,7 @@ impl CandidateScratch {
                 r1_mapped: mapping.mapped_len,
                 both_mapped: mapping.mapped_len,
                 read_len: mapping.read_len,
+                other_genes: 0,
                 pair_errors: estimated_errors(mapping),
                 long_score: 0.0,
                 span: mapping.span,
@@ -1291,6 +1323,7 @@ impl CandidateScratch {
                 r1_mapped: mapping.mapped_len,
                 both_mapped: mapping.mapped_len,
                 read_len: mapping.read_len,
+                other_genes: 0,
                 pair_errors: estimated_errors(mapping),
                 long_score: long_score(mapping),
                 span: mapping.span,
@@ -1298,8 +1331,50 @@ impl CandidateScratch {
                 flex_chunk: mapping.flex_chunk,
                 input_order,
             };
+            if mapping.marker_gene_len > 0 {
+                let gene = (
+                    placement.taxid,
+                    placement.profile_rank,
+                    placement.assembly_id,
+                    placement.reference_id,
+                );
+                match self.by_taxon_gene.entry(gene) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(placement);
+                    }
+                    Entry::Occupied(mut entry) => {
+                        if placement_is_better(&placement, entry.get(), policy.mode) {
+                            entry.insert(placement);
+                        }
+                    }
+                }
+            }
             self.insert_placement(placement, policy.mode);
         }
+        // A long read can run over several marker genes of one genome: its
+        // placement keeps the best of them and counts the others, whose
+        // coverage the read adds as well.
+        for ((taxid, profile_rank, assembly_id, reference_id), gene) in self.by_taxon_gene.drain() {
+            let key = (taxid, profile_rank, assembly_id);
+            let placement = self
+                .by_taxon_assembly
+                .get_mut(&key)
+                .expect("a placed gene belongs to a placement");
+            if reference_id != placement.reference_id {
+                placement.other_genes += 1;
+                self.other_gene_hits.push((
+                    key,
+                    PresenceInterval {
+                        reference_id,
+                        span: gene.span,
+                        fixed_chunk: gene.fixed_chunk,
+                        flex_chunk: gene.flex_chunk,
+                    },
+                ));
+            }
+        }
+        self.other_gene_hits
+            .sort_unstable_by_key(|&(key, interval)| (key, interval.reference_id));
     }
 
     fn insert_placement(&mut self, placement: CandidatePlacement, mode: EvidenceMode) {
@@ -1665,6 +1740,63 @@ mod tests {
         row.marker_gene_len = 480;
         row.identity = 0.85;
         assert!(!long_mapping_qualifies(&row, long_policy));
+    }
+
+    #[test]
+    fn a_long_read_counts_every_marker_gene_of_a_genome_it_covers() {
+        let long_policy = EvidencePolicy {
+            identity: 0.9,
+            mapped_len: 500,
+            fraction: 0.2,
+            ..policy(EvidenceMode::Long)
+        };
+        // One read over genes 10 and 11 of genome 1 and gene 12 of genome 2.
+        let mut rows = vec![
+            mapping(1, 10, 1, 0.99, 800, 3_000, MappingRole::Unpaired),
+            mapping(1, 11, 1, 0.98, 600, 3_000, MappingRole::Unpaired),
+            mapping(1, 12, 2, 0.97, 700, 3_000, MappingRole::Unpaired),
+        ];
+        for row in &mut rows {
+            row.marker_gene_len = 1_000;
+        }
+        let mut scratch = CandidateScratch::default();
+        let candidates = scratch.build(&rows, long_policy);
+        assert_eq!(candidates.len(), 1);
+        let placements: Vec<_> = candidates[0]
+            .placements
+            .iter()
+            .map(|placement| {
+                (
+                    placement.assembly_id,
+                    placement.reference_id,
+                    placement.other_genes,
+                )
+            })
+            .collect();
+        assert_eq!(placements, [(1, 10, 1), (2, 12, 0)]);
+        let others: Vec<_> = candidates[0]
+            .other_gene_hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit.assembly_id,
+                    hit.interval.reference_id,
+                    hit.interval.span,
+                )
+            })
+            .collect();
+        assert_eq!(others, [(1, 11, (100, 700))]);
+
+        // Genome references keep one placement per genome.
+        for row in &mut rows {
+            row.marker_gene_len = 0;
+        }
+        let candidates = scratch.build(&rows, long_policy);
+        assert!(candidates[0]
+            .placements
+            .iter()
+            .all(|placement| placement.other_genes == 0));
+        assert!(candidates[0].other_gene_hits.is_empty());
     }
 
     #[test]
@@ -2134,6 +2266,7 @@ mod tests {
         let mut assembly = PresenceAssembly {
             asm_len: 1_000.0,
             count: 3,
+            other_gene_hits: 0,
             reference_span_bases: 250,
             intervals: vec![
                 PresenceInterval {

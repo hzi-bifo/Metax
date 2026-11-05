@@ -527,7 +527,7 @@ pairs:                 c = L − T + 1
 pairs and lone mates:  c = min(L − 2a + T + 1, 2 × (L − 2a + R + 1))
 ```
 
-placements (none when `L < a`; every gene offers placements to long reads). With `n` fragments placed on the genome and `p_i = c_i / Σc`:
+placements (none when `L < a`; every gene offers placements to long reads). A long read can run over several genes of the genome; it counts on each gene it covers. With `n` gene hits (fragments, and for long reads every gene a read covers) on the genome and `p_i = c_i / Σc`:
 
 ```text
 genes_hit                 = genes with at least one placed fragment
@@ -636,19 +636,19 @@ The rule is on by default with `F = 0.025` for paired-end Illumina community pro
 
 ### 7.13 Abundance estimation
 
-Each fragment adds depth to its candidates: the mapped bases of its read (mate 1 of a pair) over the genome size, which for a fractional index is the effective indexed size. A fragment on a marker gene adds the length of its read, also when the read is clipped at the end of the gene, over `Σ placements(L_i)` for the genome's genes of lengths `L_i` (§7.4); for a long read these are the placements of its own length rather than of the median, since long reads differ widely in length. A genome of `G` bases offers about `G` placements, so this is the depth of the whole genome, comparable with the depth of a genome taxon. When no gene of a marker genome can hold a read of the sample's length, its fragments add mapped bases over the summed gene length.
+Each fragment adds depth to its candidates: the mapped bases of its read (mate 1 of a pair) over the genome size, which for a fractional index is the effective indexed size. A fragment on a marker gene adds the length of its read, also when the read is clipped at the end of the gene, over `Σ placements(L_i)` for the genome's genes of lengths `L_i` (§7.4); for a long read these are the placements of its own length rather than of the median, since long reads differ widely in length, and a long read adds this for every gene of the genome it covers. A genome of `G` bases offers about `G` placements, so this is the depth of the whole genome, comparable with the depth of a genome taxon. When no gene of a marker genome can hold a read of the sample's length, its fragments add mapped bases over the summed gene length.
 
 Reads with several retained candidates are redistributed by an expectation–maximization procedure that weights the candidates by these depths and iterates until the relative change falls below `1e-5` or `--max-em-iterations` is reached. Abundance is depth normalized across the taxa that pass the final filters. Read counts are reported in full-index equivalents.
 
 ### 7.14 Unclassified estimate
 
-With `--estimate-unclassified`, Metax estimates how much of the input the profile does not explain. Every row explains the fragments in its column 4, which for a fractional database are already full-index equivalents. A species represented only by marker genomes explains more than its fragments on the marker genes: a genome of declared size `G` offers `placements(G)` fragment placements against `Σ placements(L_i)` for its genes of lengths `L_i`, with the placements per sequence of §7.4. Its fragments are multiplied by that ratio, averaged over its marker genomes. A species that also has genome references counts its fragments as they are. Then
+With `--estimate-unclassified`, Metax estimates how much of the input the profile does not explain. Every row explains the fragments in its column 4, which for a fractional database are already full-index equivalents. A species represented only by marker genomes explains more than its fragments on the marker genes: a genome of declared size `G` offers `placements(G)` fragment placements against `Σ placements(L_i)` for its genes of lengths `L_i`, with the placements per sequence of §7.4. Its fragments are multiplied by that ratio, averaged over its marker genomes. Long reads differ in length and can cover several genes, so for them the ratio is measured on the reads resolved to the species' marker genomes: each gene hit of a read of length `R` stands for `placements(G) / Σ placements(L_i)` whole-genome reads at that length, and the ratio is their sum over the number of reads. A species that also has genome references counts its fragments as they are. Then
 
 ```text
 unclassified share = 1 − min(1, explained fragments / input fragments)
 ```
 
-The estimate is taken after the relative identity guard and before species move to their genus (§7.12). Genus rows for the reads of removed species (§7.10) explain their fragments; other fragments of removed species, and fragments that fail the read-level gates, count as unexplained. When a reported marker species has no declared genome size, or none of its genes can hold a read of the sample's length, the estimate is unavailable: the log says which species, and the row holds `NA`. The share is also written to the log. The option applies to community profiling and cannot be combined with `--host` or strain profiling.
+The estimate is taken after the relative identity guard and before species move to their genus (§7.12). Genus rows for the reads of removed species (§7.10) explain their fragments; other fragments of removed species, and fragments that fail the read-level gates, count as unexplained. When a reported marker species has no declared genome size, none of its genes can hold a read of the sample's length, or (long reads) no read is resolved to its marker genomes, the estimate is unavailable: the log says which species, and the row holds `NA`. The share is also written to the log. The option applies to community profiling and cannot be combined with `--host` or strain profiling.
 
 ## 8. Common Recipes
 
