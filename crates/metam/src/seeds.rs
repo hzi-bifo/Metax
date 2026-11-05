@@ -17,24 +17,36 @@ const PRIME_2: u64 = 0xC2B2_AE3D_27D4_EB4F;
 const PRIME_3: u64 = 0x1656_67B1_9E37_79F9;
 const PRIME_4: u64 = 0x85EB_CA77_C2B2_AE63;
 const PRIME_5: u64 = 0x27D4_EB2F_1656_67C5;
-const STROBE2_OFFSET_BITS: u32 = 8;
+/// Bit of a randstrobe hash that holds the second strobe's orientation.
+const STROBE2_ORIENTATION_BIT: u32 = 8;
 const DEFAULT_AUX_LEN: u8 = 17;
 pub const DEFAULT_STROBE_START_DIST_MIN: u16 = 30;
 pub const DEFAULT_STROBE_START_DIST_MAX: u16 = 90;
 pub const MAX_STROBE_START_DIST: u16 = 255;
 
-/// Meaningful bits in the final combined randstrobe hash.
-///
-/// The index relies on this mask being contiguous and anchored at bit 63 so it
-/// can split the hash into a high-bit lookup key and the remaining fingerprint.
-pub(crate) const RANDSTROBE_HASH_MASK: u64 = 0xFFFF_FFFF_FFFF_FE00;
-pub(crate) const RANDSTROBE_HASH_LOW_ZERO_BITS: u8 = RANDSTROBE_HASH_MASK.trailing_zeros() as u8;
-pub(crate) const RANDSTROBE_HASH_SPAN_BITS: u8 = u64::BITS as u8 - RANDSTROBE_HASH_LOW_ZERO_BITS;
+/// The bits a randstrobe hash keeps, contiguous from bit 63 so that an index can split the hash into a lookup key
+/// and the rest of the seed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RandstrobeHash {
+    /// Both strobes and their orientations.
+    Complete,
+    /// Without the second strobe's orientation, as in indexes before version 7.
+    WithoutStrobe2Orientation,
+}
 
-const _: () = {
-    assert!(RANDSTROBE_HASH_MASK != 0);
-    assert!(RANDSTROBE_HASH_MASK == u64::MAX << RANDSTROBE_HASH_MASK.trailing_zeros());
-};
+impl RandstrobeHash {
+    const fn mask(self) -> u64 {
+        match self {
+            Self::Complete => u64::MAX << STROBE2_ORIENTATION_BIT,
+            Self::WithoutStrobe2Orientation => u64::MAX << (STROBE2_ORIENTATION_BIT + 1),
+        }
+    }
+
+    /// Number of bits kept.
+    pub(crate) const fn bits(self) -> u8 {
+        (u64::BITS - self.mask().trailing_zeros()) as u8
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SeedMode {
@@ -102,8 +114,9 @@ struct RandstrobeParameters {
     window: Strobe2Window,
     q: u64,
     main_hash_mask: u64,
-    forward_main_hash_mask: u64,
+    strobe2_hash_mask: u64,
     partial_orientation_pos: u32,
+    hash: RandstrobeHash,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -141,7 +154,7 @@ pub fn validate_seed_params(k: usize, w: usize) -> Result<()> {
 }
 
 pub fn seeds(seq: &[u8], k: usize, w: usize, mode: SeedMode) -> Vec<Seed> {
-    seeds_with_strobe_start_distance(seq, k, w, mode, None)
+    seeds_with_strobe_start_distance(seq, k, w, mode, None, RandstrobeHash::Complete)
 }
 
 pub fn seeds_with_strobe_start_distance(
@@ -150,17 +163,18 @@ pub fn seeds_with_strobe_start_distance(
     w: usize,
     mode: SeedMode,
     strobe_start_dist: Option<StrobeStartDistance>,
+    hash: RandstrobeHash,
 ) -> Vec<Seed> {
     match mode {
         SeedMode::Minimizer => minimizer_seeds(seq, k, w),
         SeedMode::Randstrobe => {
-            randstrobe_seeds_with_strobe_start_distance(seq, k, w, strobe_start_dist)
+            randstrobe_seeds_with_strobe_start_distance(seq, k, w, strobe_start_dist, hash)
         }
     }
 }
 
 pub fn randstrobe_seeds(seq: &[u8], k: usize, w: usize) -> Vec<Seed> {
-    randstrobe_seeds_with_strobe_start_distance(seq, k, w, None)
+    randstrobe_seeds_with_strobe_start_distance(seq, k, w, None, RandstrobeHash::Complete)
 }
 
 pub fn randstrobe_seeds_with_strobe_start_distance(
@@ -168,12 +182,13 @@ pub fn randstrobe_seeds_with_strobe_start_distance(
     k: usize,
     w: usize,
     strobe_start_dist: Option<StrobeStartDistance>,
+    hash: RandstrobeHash,
 ) -> Vec<Seed> {
     if seq.len() < k {
         return Vec::new();
     }
     let syncmer = syncmer_parameters(k, w);
-    let randstrobe = randstrobe_parameters(k, w, strobe_start_dist);
+    let randstrobe = randstrobe_parameters(k, w, strobe_start_dist, hash);
     let syncmers = SyncmerIterator::new(seq, syncmer);
     let raw = RandstrobeIterator::new(syncmers, randstrobe)
         .map(|seed| Seed {
@@ -273,10 +288,14 @@ fn randstrobe_parameters(
     k: usize,
     w: usize,
     strobe_start_dist: Option<StrobeStartDistance>,
+    hash: RandstrobeHash,
 ) -> RandstrobeParameters {
     let q = (1u64 << 8) - 1;
     let main_hash_mask = !0u64 << (9 + DEFAULT_AUX_LEN);
     let partial_orientation_pos = main_hash_mask.trailing_zeros() - 1;
+    // Strobe 2's hash fills the bits between its own orientation and strobe 1's.
+    let strobe2_hash_mask =
+        !(u64::MAX << partial_orientation_pos) & (u64::MAX << (STROBE2_ORIENTATION_BIT + 1));
     let window = if let Some(distance) = strobe_start_dist {
         Strobe2Window::StartDistance(distance)
     } else {
@@ -293,8 +312,9 @@ fn randstrobe_parameters(
         window,
         q,
         main_hash_mask,
-        forward_main_hash_mask: main_hash_mask | (1u64 << partial_orientation_pos),
+        strobe2_hash_mask,
         partial_orientation_pos,
+        hash,
     }
 }
 
@@ -509,10 +529,10 @@ fn randstrobe_hash(strobe1: Syncmer, strobe2: Syncmer, params: &RandstrobeParame
     let is_forward1 = u64::from(strobe1.is_forward);
     let is_forward2 = u64::from(strobe2.is_forward);
     ((strobe1.hash & params.main_hash_mask)
-        | (strobe2.hash & !params.forward_main_hash_mask)
+        | (strobe2.hash & params.strobe2_hash_mask)
         | (is_forward1 << params.partial_orientation_pos)
-        | (is_forward2 << STROBE2_OFFSET_BITS))
-        & RANDSTROBE_HASH_MASK
+        | (is_forward2 << STROBE2_ORIENTATION_BIT))
+        & params.hash.mask()
 }
 
 fn rolling_canonical_hashes(seq: &[u8], k: usize) -> Vec<Option<u64>> {
@@ -586,24 +606,68 @@ mod tests {
         assert!(s.iter().all(|x| x.span >= 10));
     }
 
+    fn random_sequence(len: usize) -> Vec<u8> {
+        let mut state = 0x6eed_5eed_1234_5678u64;
+        (0..len)
+            .map(|i| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407 + i as u64);
+                b"ACGT"[((state >> 62) & 3) as usize]
+            })
+            .collect()
+    }
+
+    fn index_default_seeds(seq: &[u8], hash: RandstrobeHash) -> Vec<Seed> {
+        let distance = StrobeStartDistance::new(30, 90).unwrap();
+        randstrobe_seeds_with_strobe_start_distance(seq, 16, 37, Some(distance), hash)
+    }
+
+    #[test]
+    fn seeds_for_older_indexes_are_unchanged() {
+        // Count and digest of these seeds before the second strobe's orientation was kept.
+        let seeds = index_default_seeds(
+            &random_sequence(20_000),
+            RandstrobeHash::WithoutStrobe2Orientation,
+        );
+        let digest = seeds.iter().fold(0u64, |digest, seed| {
+            digest.rotate_left(7) ^ seed.hash ^ (u64::from(seed.pos) << 1) ^ u64::from(seed.span)
+        });
+        assert_eq!((seeds.len(), digest), (796, 0x71a3_4999_1805_3336));
+    }
+
+    #[test]
+    fn complete_hash_adds_the_second_strobe_orientation() {
+        let seq = random_sequence(20_000);
+        let complete = index_default_seeds(&seq, RandstrobeHash::Complete);
+        let older = index_default_seeds(&seq, RandstrobeHash::WithoutStrobe2Orientation);
+        let orientation = 1u64 << STROBE2_ORIENTATION_BIT;
+        assert_eq!(complete.len(), older.len());
+        for (seed, old) in complete.iter().zip(&older) {
+            assert_eq!(
+                (seed.pos, seed.span, seed.hash & !orientation),
+                (old.pos, old.span, old.hash)
+            );
+        }
+        let forward = complete
+            .iter()
+            .filter(|seed| seed.hash & orientation != 0)
+            .count();
+        assert!(0 < forward && forward < complete.len());
+    }
+
     #[test]
     fn randstrobe_start_distance_bounds_seed_span() {
-        let mut seq = Vec::with_capacity(2_000);
-        let mut state = 0x6eed_5eed_1234_5678u64;
-        for i in 0..2_000 {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407 + i as u64);
-            seq.push(match (state >> 62) & 3 {
-                0 => b'A',
-                1 => b'C',
-                2 => b'G',
-                _ => b'T',
-            });
-        }
+        let seq = random_sequence(2_000);
         let k = 15;
         let distance = StrobeStartDistance::new(30, 90).unwrap();
-        let seeds = randstrobe_seeds_with_strobe_start_distance(&seq, k, 15, Some(distance));
+        let seeds = randstrobe_seeds_with_strobe_start_distance(
+            &seq,
+            k,
+            15,
+            Some(distance),
+            RandstrobeHash::Complete,
+        );
         let paired = seeds.iter().filter(|seed| seed.span > k as u32).count();
 
         assert!(paired > 20, "expected paired randstrobes, got {paired}");

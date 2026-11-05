@@ -14,14 +14,16 @@ use serde::{Deserialize, Serialize};
 use crate::{
     io::{open_reader, FastaReader, Record},
     seeds::{
-        seeds_with_strobe_start_distance, validate_seed_params, Seed, SeedMode,
-        StrobeStartDistance, RANDSTROBE_HASH_LOW_ZERO_BITS, RANDSTROBE_HASH_SPAN_BITS,
+        seeds_with_strobe_start_distance, validate_seed_params, RandstrobeHash, Seed, SeedMode,
+        StrobeStartDistance,
     },
     sequence::{code_base, pack_dna_2bit, unpack_dna_2bit, BitMask},
 };
 
 pub const INDEX_MAGIC: [u8; 8] = *b"METAMM02";
-pub const INDEX_VERSION: u32 = 6;
+/// Version 7: seeds keep the second strobe's orientation.
+pub const INDEX_VERSION: u32 = 7;
+const STROBE2_ORIENTATION_INDEX_VERSION: u32 = 7;
 const MIN_SUPPORTED_INDEX_VERSION: u32 = 4;
 const INDEX_CACHE_MAGIC: [u8; 8] = *b"METAMMC1";
 const INDEX_CACHE_VERSION: u32 = 7;
@@ -146,16 +148,18 @@ impl SeedTable {
     }
 
     fn new_with_exact_randstrobe_match(hash_bits: u8, exact_randstrobe_match: bool) -> Self {
+        let fingerprint_bits =
+            randstrobe_fingerprint_bits(hash_bits, exact_randstrobe_match, INDEX_VERSION);
+        Self::with_fingerprint_bits(hash_bits, fingerprint_bits)
+    }
+
+    fn with_fingerprint_bits(hash_bits: u8, fingerprint_bits: u8) -> Self {
         Self {
             hash_bits,
             hashes32: Vec::new(),
             hashes64: Vec::new(),
             occurrences: Vec::new(),
-            fingerprint_bits: if exact_randstrobe_match {
-                randstrobe_fingerprint_bits(hash_bits)
-            } else {
-                0
-            },
+            fingerprint_bits,
             fingerprints: Vec::new(),
             lookup_index: SeedLookupIndex::default(),
         }
@@ -187,7 +191,7 @@ impl SeedTable {
             for seed in seeds {
                 push_packed_fingerprint(
                     &mut self.fingerprints,
-                    randstrobe_fingerprint(seed.hash, self.hash_bits),
+                    randstrobe_fingerprint(seed.hash, self.hash_bits, self.fingerprint_bits),
                     self.fingerprint_bits,
                 );
             }
@@ -288,7 +292,7 @@ impl SeedTable {
             target_fingerprint: if fingerprint_bits == 0 {
                 0
             } else {
-                randstrobe_fingerprint(hash, self.hash_bits)
+                randstrobe_fingerprint(hash, self.hash_bits, fingerprint_bits)
             },
         }
     }
@@ -678,6 +682,13 @@ pub struct IndexHeader {
     pub filtered_seed_hashes: u64,
     pub reference_storage_bytes: u64,
     pub created_unix_seconds: u64,
+}
+
+impl IndexHeader {
+    /// What this index's seeds keep of their randstrobe hash; reads are seeded the same way.
+    pub fn randstrobe_hash(&self) -> RandstrobeHash {
+        randstrobe_hash(self.version)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1387,6 +1398,8 @@ where
     let mut filtered_hashes = 0usize;
     let mut max_partition_seed_occurrences = 0usize;
     let mut previous_hash = 0u64;
+    let fingerprint_bits =
+        randstrobe_fingerprint_bits(hash_bits, exact_randstrobe_match, INDEX_VERSION);
     let mut fingerprint_scratch = Vec::new();
     for path in &partition_paths {
         let mut raw = read_partition(path)?;
@@ -1412,6 +1425,7 @@ where
                         writer,
                         &raw[i..j],
                         hash_bits,
+                        fingerprint_bits,
                         &mut fingerprint_scratch,
                     )?;
                 }
@@ -1751,7 +1765,14 @@ where
     F: FnMut(Seed) -> Result<()>,
 {
     if seq.len() <= INDEX_SEQUENCE_CHUNK {
-        for seed in seeds_with_strobe_start_distance(seq, k, w, mode, strobe_start_dist) {
+        for seed in seeds_with_strobe_start_distance(
+            seq,
+            k,
+            w,
+            mode,
+            strobe_start_dist,
+            randstrobe_hash(INDEX_VERSION),
+        ) {
             emit(seed)?;
         }
         return Ok(());
@@ -1768,9 +1789,14 @@ where
     while start < seq.len() {
         let core_end = start.saturating_add(INDEX_SEQUENCE_CHUNK).min(seq.len());
         let seq_end = core_end.saturating_add(overlap).min(seq.len());
-        for mut seed in
-            seeds_with_strobe_start_distance(&seq[start..seq_end], k, w, mode, strobe_start_dist)
-        {
+        for mut seed in seeds_with_strobe_start_distance(
+            &seq[start..seq_end],
+            k,
+            w,
+            mode,
+            strobe_start_dist,
+            randstrobe_hash(INDEX_VERSION),
+        ) {
             let global_pos = start + seed.pos as usize;
             if global_pos < core_end {
                 seed.pos = global_pos as u32;
@@ -2153,11 +2179,11 @@ fn transcode_index_cache<R: Read>(
     } else {
         0
     };
-    let fingerprint_bits = if metadata.exact_randstrobe_match {
-        randstrobe_fingerprint_bits(metadata.hash_bits)
-    } else {
-        0
-    };
+    let fingerprint_bits = randstrobe_fingerprint_bits(
+        metadata.hash_bits,
+        metadata.exact_randstrobe_match,
+        metadata.version,
+    );
     let fingerprint_len = occurrence_count
         .checked_mul(fingerprint_bytes(fingerprint_bits))
         .context("index fingerprint array length overflow")?;
@@ -3093,11 +3119,11 @@ impl MappedIndex {
         let indexed_seed_hashes = usize::try_from(self.header.indexed_seed_hashes)
             .context("index cache distinct seed-key count exceeds address space")?;
         let hash_count = self.seed_table.hash_count();
-        let expected_fingerprint_bits = if self.header.exact_randstrobe_match {
-            randstrobe_fingerprint_bits(self.header.hash_bits)
-        } else {
-            0
-        };
+        let expected_fingerprint_bits = randstrobe_fingerprint_bits(
+            self.header.hash_bits,
+            self.header.exact_randstrobe_match,
+            self.header.version,
+        );
         if self.seed_table.fingerprint_bits != expected_fingerprint_bits {
             bail!("index cache randstrobe fingerprint width mismatch");
         }
@@ -3333,7 +3359,7 @@ impl MappedSeedTable {
             target_fingerprint: if fingerprint_bits == 0 {
                 0
             } else {
-                randstrobe_fingerprint(hash, self.hash_bits)
+                randstrobe_fingerprint(hash, self.hash_bits, fingerprint_bits)
             },
         }
     }
@@ -3515,11 +3541,11 @@ fn validate_index(index: &Index) -> Result<()> {
     if index.seed_table.hash_count() != index.seed_table.occurrence_count() {
         bail!("index seed table arrays have inconsistent lengths");
     }
-    let expected_fingerprint_bits = if index.header.exact_randstrobe_match {
-        randstrobe_fingerprint_bits(index.header.hash_bits)
-    } else {
-        0
-    };
+    let expected_fingerprint_bits = randstrobe_fingerprint_bits(
+        index.header.hash_bits,
+        index.header.exact_randstrobe_match,
+        index.header.version,
+    );
     if index.seed_table.fingerprint_bits != expected_fingerprint_bits {
         bail!("index randstrobe fingerprint width mismatch");
     }
@@ -3629,21 +3655,35 @@ fn sort_raw_seeds(raw: &mut [RawSeed], hash_bits: u8) {
     raw.par_sort_unstable_by_key(|seed| (seed_key(seed.hash, hash_bits), seed.ref_id, seed.pos));
 }
 
-fn randstrobe_fingerprint_bits(hash_bits: u8) -> u8 {
-    RANDSTROBE_HASH_SPAN_BITS.saturating_sub(hash_bits)
+/// What the seeds of an index of this version keep of their randstrobe hash.
+fn randstrobe_hash(version: u32) -> RandstrobeHash {
+    if version >= STROBE2_ORIENTATION_INDEX_VERSION {
+        RandstrobeHash::Complete
+    } else {
+        RandstrobeHash::WithoutStrobe2Orientation
+    }
+}
+
+/// Bits of each seed's hash below its key that an index of this version stores, if it matches complete seeds.
+fn randstrobe_fingerprint_bits(hash_bits: u8, exact_randstrobe_match: bool, version: u32) -> u8 {
+    if exact_randstrobe_match {
+        randstrobe_hash(version).bits().saturating_sub(hash_bits)
+    } else {
+        0
+    }
 }
 
 fn fingerprint_bytes(fingerprint_bits: u8) -> usize {
     usize::from(fingerprint_bits.div_ceil(8))
 }
 
-fn randstrobe_fingerprint(hash: u64, hash_bits: u8) -> u32 {
-    let bits = randstrobe_fingerprint_bits(hash_bits);
-    if bits == 0 {
+/// The `fingerprint_bits` bits of `hash` right below its `hash_bits`-bit key.
+fn randstrobe_fingerprint(hash: u64, hash_bits: u8, fingerprint_bits: u8) -> u32 {
+    if fingerprint_bits == 0 {
         return 0;
     }
-    let mask = (1u64 << bits) - 1;
-    ((hash >> RANDSTROBE_HASH_LOW_ZERO_BITS) & mask) as u32
+    let shift = u64::BITS - u32::from(hash_bits) - u32::from(fingerprint_bits);
+    ((hash >> shift) & ((1u64 << fingerprint_bits) - 1)) as u32
 }
 
 fn push_packed_fingerprint(out: &mut Vec<u8>, fingerprint: u32, fingerprint_bits: u8) {
@@ -3981,7 +4021,8 @@ fn read_index_payload<R: Read>(reader: &mut R) -> Result<Index> {
             ambiguous,
         });
     }
-    let seed_table = read_seed_table(reader, hash_bits, exact_randstrobe_match)?;
+    let fingerprint_bits = randstrobe_fingerprint_bits(hash_bits, exact_randstrobe_match, version);
+    let seed_table = read_seed_table(reader, hash_bits, fingerprint_bits)?;
     let total_reference_bases = references.iter().map(|r| r.len).sum();
     let reference_storage_bytes = references
         .iter()
@@ -4112,9 +4153,9 @@ fn write_seed_fingerprints<W: Write>(
     writer: &mut W,
     seeds: &[RawSeed],
     hash_bits: u8,
+    fingerprint_bits: u8,
     scratch: &mut Vec<u8>,
 ) -> Result<()> {
-    let fingerprint_bits = randstrobe_fingerprint_bits(hash_bits);
     let width = fingerprint_bytes(fingerprint_bits);
     if width == 0 {
         scratch.clear();
@@ -4131,7 +4172,7 @@ fn write_seed_fingerprints<W: Write>(
     for seed in seeds {
         push_packed_fingerprint(
             scratch,
-            randstrobe_fingerprint(seed.hash, hash_bits),
+            randstrobe_fingerprint(seed.hash, hash_bits, fingerprint_bits),
             fingerprint_bits,
         );
     }
@@ -4184,12 +4225,11 @@ where
 fn read_seed_table<R: Read>(
     reader: &mut R,
     hash_bits: u8,
-    exact_randstrobe_match: bool,
+    fingerprint_bits: u8,
 ) -> Result<SeedTable> {
     let seed_count = read_varint(reader)? as usize;
     let group_count = read_varint(reader)? as usize;
-    let mut seed_table =
-        SeedTable::new_with_exact_randstrobe_match(hash_bits, exact_randstrobe_match);
+    let mut seed_table = SeedTable::with_fingerprint_bits(hash_bits, fingerprint_bits);
     if hash_bits <= 32 {
         seed_table.hashes32.reserve(seed_count);
     } else {
@@ -4318,11 +4358,16 @@ mod tests {
     }
 
     fn colliding_randstrobe_hashes() -> (u64, u64) {
+        // Equal keys; the rest differs in bits that indexes of every version store.
         let key = 0x1234_5678u64;
-        let a = (key << 32) | (0x12_345u64 << RANDSTROBE_HASH_LOW_ZERO_BITS);
-        let b = (key << 32) | (0x54_321u64 << RANDSTROBE_HASH_LOW_ZERO_BITS);
+        let a = (key << 32) | (0x1234u64 << 12);
+        let b = (key << 32) | (0x4321u64 << 12);
+        let bits = randstrobe_fingerprint_bits(32, true, INDEX_VERSION);
         assert_eq!(seed_key(a, 32), seed_key(b, 32));
-        assert_ne!(randstrobe_fingerprint(a, 32), randstrobe_fingerprint(b, 32));
+        assert_ne!(
+            randstrobe_fingerprint(a, 32, bits),
+            randstrobe_fingerprint(b, 32, bits)
+        );
         (a, b)
     }
 
@@ -4625,9 +4670,10 @@ mod tests {
 
     #[test]
     fn full_hash_span_needs_no_secondary_fingerprint() {
-        let hash_bits = RANDSTROBE_HASH_SPAN_BITS;
-        let a = 0xFEDC_BA98_7654_3200u64 & crate::seeds::RANDSTROBE_HASH_MASK;
-        let b = a ^ (1u64 << RANDSTROBE_HASH_LOW_ZERO_BITS);
+        let hash_bits = RandstrobeHash::Complete.bits();
+        let lowest_kept_bit = 1u64 << (64 - hash_bits);
+        let a = 0xFEDC_BA98_7654_3200u64 & !(lowest_kept_bit - 1);
+        let b = a ^ lowest_kept_bit;
         let key_a = seed_key(a, hash_bits);
         let key_b = seed_key(b, hash_bits);
         assert_ne!(key_a, key_b);
@@ -4874,7 +4920,8 @@ mod tests {
     #[test]
     fn version_five_index_remains_readable_with_legacy_strobe_distance() {
         let (key, seeds) = collision_group();
-        let mut seed_table = SeedTable::new_with_exact_randstrobe_match(32, true);
+        let mut seed_table =
+            SeedTable::with_fingerprint_bits(32, randstrobe_fingerprint_bits(32, true, 5));
         seed_table.push_group(key, &seeds).unwrap();
         seed_table.rebuild_lookup_index();
         let index = Index {

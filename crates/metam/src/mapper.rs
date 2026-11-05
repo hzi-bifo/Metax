@@ -1895,6 +1895,7 @@ where
             index.header().w,
             index.header().seed_mode,
             index.header().strobe_start_dist,
+            index.header().randstrobe_hash(),
         );
         let stride = params.query_seed_stride.max(1);
         let mut used_query_seeds = 0u64;
@@ -1950,6 +1951,7 @@ where
             index.header().w,
             index.header().seed_mode,
             index.header().strobe_start_dist,
+            index.header().randstrobe_hash(),
         );
         let stride = params.query_seed_stride.max(1);
         let mut used_query_seeds = 0u64;
@@ -2023,6 +2025,7 @@ fn collect_rescue_seed_hits(
         index.header().w,
         index.header().seed_mode,
         index.header().strobe_start_dist,
+        index.header().randstrobe_hash(),
     );
     let stride = params.query_seed_stride.max(1);
     let mut used_query_seeds = 0u64;

@@ -218,6 +218,8 @@ Seed scheme:
 - `--strobe-start-dist-min` / `--strobe-start-dist-max`: start-to-start distance range between the two strobes. Defaults `30` and `90`.
 - `--first-strobe-only`: compatibility mode that matches only the first strobe; more sensitive but less specific than the default full-pair verification.
 
+From index format version 7, a randstrobe seed keeps the orientation of both strobes. An index built by an earlier release keeps its own seeds, and reads are seeded to match them, so it maps as before; rebuild it to use the complete seeds.
+
 Resources:
 
 - `-t, --threads`: worker threads for sampling and parallel seed generation.
