@@ -1258,12 +1258,8 @@ fn extend_long_read_interval(
     let left_q = bound(qs, rs);
     let left_r = rs.min(left_q.saturating_add(extension_slack(left_q)));
     if left_q > 0 && left_r > 0 {
-        let query_left = query[qs - left_q..qs]
-            .iter()
-            .rev()
-            .copied()
-            .collect::<Vec<_>>();
-        let reference_left = reference_segment(reference, rs - left_r, rs, true);
+        let query_left = query_codes(query[qs - left_q..qs].iter().rev().copied());
+        let reference_left = reference_codes(reference, rs - left_r, rs, true);
         let (q_ext, r_ext) = banded_xdrop_extend(
             &query_left,
             &reference_left,
@@ -1278,10 +1274,10 @@ fn extend_long_read_interval(
     let right_q = bound(query.len().saturating_sub(qe), reference_right);
     let right_r = reference_right.min(right_q.saturating_add(extension_slack(right_q)));
     if right_q > 0 && right_r > 0 {
-        let query_right = &query[qe..qe + right_q];
-        let reference_right = reference_segment(reference, re, re + right_r, false);
+        let query_right = query_codes(query[qe..qe + right_q].iter().copied());
+        let reference_right = reference_codes(reference, re, re + right_r, false);
         let (q_ext, r_ext) = banded_xdrop_extend(
-            query_right,
+            &query_right,
             &reference_right,
             ignore_n,
             LONG_READ_EXTEND_XDROP,
@@ -1539,22 +1535,37 @@ fn extension_slack(query_bases: usize) -> usize {
     query_bases / 5 + 128
 }
 
-fn reference_segment(
+/// Code of a base that is not A, C, G or T in an extension.
+const OTHER_BASE: u8 = 4;
+
+/// Base codes of read bases, for [`banded_xdrop_extend`].
+fn query_codes(bases: impl Iterator<Item = u8>) -> Vec<u8> {
+    bases
+        .map(|base| base_code(base).unwrap_or(OTHER_BASE))
+        .collect()
+}
+
+/// Base codes of `start..end` of a reference, backwards when `reverse`, for
+/// [`banded_xdrop_extend`].
+fn reference_codes(
     reference: &ReferenceView<'_>,
     start: usize,
     end: usize,
     reverse: bool,
 ) -> Vec<u8> {
+    let code = |pos| reference.code_at(pos).unwrap_or(OTHER_BASE);
     if reverse {
-        (start..end)
-            .rev()
-            .map(|pos| reference.base_at(pos))
-            .collect()
+        (start..end).rev().map(code).collect()
     } else {
-        (start..end).map(|pos| reference.base_at(pos)).collect()
+        (start..end).map(code).collect()
     }
 }
 
+/// The query and reference bases of the best-scoring alignment of a prefix of
+/// `query` with a prefix of `reference` (base codes), stopping once a whole row
+/// falls `xdrop` below the best. The end is free, so the band holds only the
+/// drift of indels: 96 bases, or 5 % of the longer sequence. Each row keeps
+/// its cells by their offset from the diagonal, one sentinel at each end.
 fn banded_xdrop_extend(
     query: &[u8],
     reference: &[u8],
@@ -1566,71 +1577,57 @@ fn banded_xdrop_extend(
     if n == 0 || m == 0 {
         return (0, 0);
     }
-    let band = n.abs_diff(m).saturating_add(96).max(n.max(m) / 20);
-    let band = band.min(n.max(m)).max(16);
+    let band = (n.max(m) / 20).max(96).min(n.max(m)).max(16);
     let impossible = i32::MIN / 4;
-    let mut prev_start = 0usize;
-    let mut prev_end = m.min(band);
-    let mut prev = (prev_start..=prev_end)
-        .map(|j| -(j as i32) * 2)
-        .collect::<Vec<_>>();
+    let score = |q: u8, r: u8| {
+        if q == r && q != OTHER_BASE {
+            2
+        } else if ignore_n && (q == OTHER_BASE || r == OTHER_BASE) {
+            0
+        } else {
+            -3
+        }
+    };
+    // Cell (i, j) sits at 1 + j + band - i.
+    let mut prev = vec![impossible; 2 * band + 3];
+    let mut curr = prev.clone();
+    for j in 0..=m.min(band) {
+        prev[1 + j + band] = -2 * j as i32;
+    }
     let mut best_score = 0i32;
     let mut best = (0usize, 0usize);
 
     for i in 1..=n {
         let start = i.saturating_sub(band);
-        let end = i.saturating_add(band).min(m);
-        let mut curr = vec![impossible; end - start + 1];
+        let end = (i + band).min(m);
+        if start > end {
+            break;
+        }
+        curr.fill(impossible);
         let mut row_best = impossible;
         for j in start..=end {
-            let idx = j - start;
-            if j == 0 {
-                curr[idx] = -(i as i32) * 2;
+            let cell = 1 + j + band - i;
+            let value = if j == 0 {
+                -2 * i as i32
             } else {
-                let diag = if (prev_start..=prev_end).contains(&(j - 1)) {
-                    prev[j - 1 - prev_start]
-                        + extension_subst_score(query[i - 1], reference[j - 1], ignore_n)
-                } else {
-                    impossible
-                };
-                let deletion = if (prev_start..=prev_end).contains(&j) {
-                    prev[j - prev_start] - 2
-                } else {
-                    impossible
-                };
-                let insertion = if j > start {
-                    curr[idx - 1] - 2
-                } else {
-                    impossible
-                };
-                curr[idx] = diag.max(deletion).max(insertion);
-            }
-            row_best = row_best.max(curr[idx]);
-            if curr[idx] > best_score {
-                best_score = curr[idx];
+                let diagonal = prev[cell] + score(query[i - 1], reference[j - 1]);
+                let deletion = prev[cell + 1] - 2;
+                let insertion = curr[cell - 1] - 2;
+                diagonal.max(deletion).max(insertion)
+            };
+            curr[cell] = value;
+            row_best = row_best.max(value);
+            if value > best_score {
+                best_score = value;
                 best = (i, j);
             }
         }
         if row_best < best_score - xdrop {
             break;
         }
-        prev = curr;
-        prev_start = start;
-        prev_end = end;
+        std::mem::swap(&mut prev, &mut curr);
     }
     best
-}
-
-fn extension_subst_score(q: u8, r: u8, ignore_n: bool) -> i32 {
-    let qb = base_code(q);
-    let rb = base_code(r);
-    if ignore_n && (qb.is_none() || rb.is_none()) {
-        0
-    } else if matches!((qb, rb), (Some(a), Some(b)) if a == b) {
-        2
-    } else {
-        -3
-    }
 }
 
 fn mapping_score(
