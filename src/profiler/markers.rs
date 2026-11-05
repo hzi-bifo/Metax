@@ -40,29 +40,41 @@ pub(crate) struct MarkerModel {
     geometry: FragmentGeometry,
 }
 
-/// The genes of one genome for long reads: more than half of each gene,
-/// `len / 2 + 1` bases, sorted, and the summed gene length.
+/// The gene lengths of one genome for long reads, sorted, and their sum.
 #[derive(Debug)]
 struct GeneLengths {
-    halves: Box<[u32]>,
+    lens: Box<[u32]>,
     total: i64,
 }
 
 impl GeneLengths {
+    /// Index of the first gene that needs `inside` bases of a read; the
+    /// shorter genes before it need more than half of themselves,
+    /// `len / 2 + 1` bases.
+    fn first_full_gate(&self, inside: i64) -> usize {
+        self.lens
+            .partition_point(|&len| i64::from(len / 2 + 1) < inside)
+    }
+
     /// Read starts that put `min(inside, len / 2 + 1)` bases of a read of
     /// `read_len` bases inside each gene of `len` bases, summed over the
     /// genes: `sum(len + read_len + 1 - 2 min(inside, len / 2 + 1))`.
     fn placements(&self, inside: i64, read_len: i64) -> f64 {
-        let below = self
-            .halves
-            .partition_point(|&half| i64::from(half) < inside);
-        let below_bases: i64 = self.halves[..below]
+        let first = self.first_full_gate(inside);
+        let below_bases: i64 = self.lens[..first]
             .iter()
-            .map(|&half| i64::from(half))
+            .map(|&len| i64::from(len / 2 + 1))
             .sum();
-        let genes = self.halves.len() as i64;
-        let inside_bases = below_bases + inside * (genes - below as i64);
+        let genes = self.lens.len() as i64;
+        let inside_bases = below_bases + inside * (genes - first as i64);
         (self.total + genes * (read_len + 1) - 2 * inside_bases) as f64
+    }
+
+    /// [`Self::placements`] over the genes that need all `inside` bases.
+    fn full_gate_placements(&self, inside: i64, read_len: i64) -> f64 {
+        let genes = &self.lens[self.first_full_gate(inside)..];
+        let bases: i64 = genes.iter().map(|&len| i64::from(len)).sum();
+        (bases + genes.len() as i64 * (read_len + 1 - 2 * inside)) as f64
     }
 }
 
@@ -110,11 +122,10 @@ impl MarkerModel {
             genes
                 .iter()
                 .map(|(&assembly_id, genes)| {
-                    let mut halves: Box<[u32]> =
-                        genes.iter().map(|gene| gene.len / 2 + 1).collect();
-                    halves.sort_unstable();
-                    let total = genes.iter().map(|gene| i64::from(gene.len)).sum();
-                    (assembly_id, GeneLengths { halves, total })
+                    let mut lens: Box<[u32]> = genes.iter().map(|gene| gene.len).collect();
+                    lens.sort_unstable();
+                    let total = lens.iter().map(|&len| i64::from(len)).sum();
+                    (assembly_id, GeneLengths { lens, total })
                 })
                 .collect()
         } else {
@@ -175,23 +186,47 @@ impl MarkerModel {
             .map(|genes| genes.placements(self.geometry.gate_bases(read_len), read_len))
     }
 
-    /// Whole-genome reads that one gene hit of a long read of `read_len`
-    /// bases stands for on a genome of `G` bases, as `(a, b)` with the reads
-    /// `a G + b`: the placements of the whole genome, `G + read_len + 1 - 2 m`
-    /// for the bases `m` the gates need, over those of its genes. `None` for
-    /// a genome without marker genes and for other reads.
-    pub(crate) fn whole_genome_reads_per_hit(
+    /// Whole-genome reads that a long read of `read_len` bases with hits on
+    /// the genes `reference_ids` of a genome stands for: the hits that count
+    /// and, per hit, `(a, b)` with the reads `a G + b` for a genome of `G`
+    /// bases. Only genes that need all `m` bases the gates ask of the read
+    /// count, as a read's hits on them are found reliably, while hits on
+    /// shorter genes, which need more than half of the gene, are often
+    /// missed. A hit stands for the placements of the whole genome,
+    /// `G + read_len + 1 - 2 m`, over those of these genes. `None` for other
+    /// reads and for a genome without such genes.
+    pub(crate) fn whole_genome_reads(
         &self,
         assembly_id: u32,
         read_len: u32,
-    ) -> Option<(f64, f64)> {
+        reference_ids: impl IntoIterator<Item = u32>,
+    ) -> Option<(u32, (f64, f64))> {
         if self.geometry.layout != FragmentLayout::LongReads {
             return None;
         }
-        let on_genes = self.placements_for_read(assembly_id, read_len)?;
         let read_len = i64::from(read_len.max(1));
-        let outside = read_len + 1 - 2 * self.geometry.gate_bases(read_len);
-        Some((1.0 / on_genes, outside as f64 / on_genes))
+        let inside = self.geometry.gate_bases(read_len);
+        let on_genes = self
+            .long_read_genes
+            .get(&assembly_id)?
+            .full_gate_placements(inside, read_len);
+        if on_genes <= 0.0 {
+            return None;
+        }
+        let genes = self.genes.get(&assembly_id)?;
+        let hits = reference_ids
+            .into_iter()
+            .filter(|&reference_id| {
+                genes
+                    .binary_search_by_key(&reference_id, |gene| gene.reference_id)
+                    .is_ok_and(|index| i64::from(genes[index].len / 2 + 1) >= inside)
+            })
+            .count();
+        let outside = read_len + 1 - 2 * inside;
+        Some((
+            u32::try_from(hits).ok()?,
+            (1.0 / on_genes, outside as f64 / on_genes),
+        ))
     }
 
     /// Fragments that a whole genome of `genome_size` bases offers per
@@ -639,6 +674,32 @@ mod tests {
             pairs.placements_for_read(0, 10_000),
             pairs.fragment_placements(0)
         );
+    }
+
+    #[test]
+    fn the_estimate_counts_hits_on_genes_that_need_the_whole_gate() {
+        // Genes of 300, 800 and 2,000 bases: reference ids 1, 2 and 3.
+        let lens = [300u32, 800, 2_000];
+        let geometry = FragmentGeometry::new(FragmentLayout::LongReads, 3_000, 3_000, 500, 0.2);
+        let model = MarkerModel::from_gene_lengths(&[(0, &lens)], geometry);
+        // A 3,000-base read needs 500 bases: only the 2,000-base gene needs all.
+        let (hits, per_hit) = model.whole_genome_reads(0, 3_000, [1, 2, 3]).unwrap();
+        let on_genes = f64::from(2_000 + 3_001 - 2 * 500);
+        assert_eq!(hits, 1);
+        assert_eq!(
+            per_hit,
+            (1.0 / on_genes, f64::from(3_001 - 2 * 500) / on_genes)
+        );
+        // A 1,000-base read needs 200 bases: the 800- and 2,000-base genes count.
+        let (hits, (per_base, _)) = model.whole_genome_reads(0, 1_000, [1, 2]).unwrap();
+        assert_eq!(hits, 1);
+        assert_eq!(
+            per_base,
+            1.0 / f64::from(800 + 2_000 + 2 * (1_001 - 2 * 200))
+        );
+        // A read with hits on short genes only still counts, with no hit.
+        assert_eq!(model.whole_genome_reads(0, 3_000, [1]).unwrap().0, 0);
+        assert!(model.whole_genome_reads(1, 3_000, [1]).is_none());
     }
 
     #[test]

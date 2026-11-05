@@ -3499,17 +3499,25 @@ fn process_evidence_batch(
                         flex_chunk: placement.flex_chunk,
                     });
                     if cfg.estimate_unclassified {
-                        if let Some(per_hit) = markers.and_then(|model| {
-                            model.whole_genome_reads_per_hit(
+                        let genes = std::iter::once(placement.reference_id).chain(
+                            candidates[index]
+                                .other_gene_hits
+                                .iter()
+                                .filter(|hit| hit.assembly_id == placement.assembly_id)
+                                .map(|hit| hit.interval.reference_id),
+                        );
+                        if let Some((hits, per_hit)) = markers.and_then(|model| {
+                            model.whole_genome_reads(
                                 placement.assembly_id,
                                 placement.read_len,
+                                genes,
                             )
                         }) {
                             result
                                 .marker_genome_reads
                                 .entry(placement.assembly_id)
                                 .or_default()
-                                .add(1 + placement.other_genes, per_hit);
+                                .add(hits, per_hit);
                         }
                     }
                 }

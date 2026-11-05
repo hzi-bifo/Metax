@@ -6,7 +6,8 @@
 //! its whole genome offers more placements, by the ratio of the placements of
 //! a sequence of its declared genome size to those its genes offer. Long
 //! reads differ in length and can cover several genes, so for them the ratio
-//! is measured on the reads.
+//! is measured on the reads, from their hits on the genes that need all the
+//! bases the gates ask of a read.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
@@ -28,7 +29,7 @@ pub(crate) type MarkerSpecies = HashMap<u32, BTreeMap<u32, Option<usize>>>;
 
 /// The long reads resolved to a marker genome and the whole-genome reads they
 /// stand for, `per_base G + fixed` for a genome of `G` bases
-/// ([`MarkerModel::whole_genome_reads_per_hit`] summed over their gene hits).
+/// ([`MarkerModel::whole_genome_reads`] summed over the reads).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct GenomeReads {
     reads: u64,
