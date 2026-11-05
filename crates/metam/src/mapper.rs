@@ -147,6 +147,16 @@ impl RuntimeIndex {
                 .as_deref()
                 .is_some_and(|kinds| kinds[ref_id as usize] == ReferenceKind::MarkerGene)
     }
+
+    /// Seeds that a chain needs on a reference: at most two on a marker gene,
+    /// since a short gene holds few seeds; `min_seeds` otherwise.
+    fn chain_min_seeds(&self, ref_id: u32, min_seeds: usize) -> usize {
+        if self.is_marker_gene(ref_id) {
+            min_seeds.min(2)
+        } else {
+            min_seeds
+        }
+    }
 }
 
 /// Taxonomic endpoints used only to diversify the bounded mapper output.
@@ -1972,7 +1982,7 @@ where
         &mut hits,
         index.header().k,
         read.len(),
-        params.min_seeds,
+        |ref_id| index.chain_min_seeds(ref_id, params.min_seeds),
         profile,
     );
     (rc, candidates)
@@ -2062,7 +2072,13 @@ fn collect_cached_rescue_candidates(
                 chain_hits.push((ChainKey { ref_id, strand }, anchor));
             }
         }
-        return chain_hit_groups(&mut chain_hits, k, read_len, params.min_seeds, profile);
+        return chain_hit_groups(
+            &mut chain_hits,
+            k,
+            read_len,
+            |ref_id| index.chain_min_seeds(ref_id, params.min_seeds),
+            profile,
+        );
     }
 
     let mut groups: CandidateMap =
@@ -2099,12 +2115,12 @@ fn collect_cached_rescue_candidates(
 
 /// Long-read candidates from seed hits: the hits are grouped by reference and strand by sorting
 /// one list, since a noisy read hits thousands of references once or twice, and only groups of
-/// at least `min_seeds` hits are chained.
+/// at least `min_seeds(reference)` hits are chained.
 fn chain_hit_groups(
     hits: &mut [(ChainKey, Anchor)],
     k: usize,
     read_len: usize,
-    min_seeds: usize,
+    min_seeds: impl Fn(u32) -> usize,
     profile: &mut MapProfile,
 ) -> Vec<Candidate> {
     hits.sort_unstable_by_key(|(key, _)| (key.ref_id, key.strand));
@@ -2112,6 +2128,7 @@ fn chain_hit_groups(
     let mut anchors = Vec::new();
     for group in hits.chunk_by(|a, b| a.0 == b.0) {
         profile.candidate_groups += 1;
+        let min_seeds = min_seeds(group[0].0.ref_id);
         if group.len() < min_seeds {
             continue;
         }
@@ -4300,7 +4317,7 @@ mod tests {
             hit(2, 1, 40, 1040),
         ];
         let mut profile = MapProfile::default();
-        let candidates = chain_hit_groups(&mut hits, 16, 120, 3, &mut profile);
+        let candidates = chain_hit_groups(&mut hits, 16, 120, |_| 3, &mut profile);
         assert_eq!(profile.candidate_groups, 3);
         assert_eq!(candidates.len(), 1, "{candidates:?}");
         let candidate = &candidates[0];
@@ -4312,6 +4329,44 @@ mod tests {
             (candidate.query_seed_start, candidate.ref_seed_start),
             (0, 1000)
         );
+    }
+
+    #[test]
+    fn chains_on_marker_genes_need_two_seeds() {
+        let gene = deterministic_read(2_000);
+        let genome = deterministic_read(2_000)
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        let mut index = rescue_runtime_index(&[("gene", &gene), ("genome", &genome)]);
+        index
+            .set_reference_kinds(vec![ReferenceKind::MarkerGene, ReferenceKind::Genome])
+            .unwrap();
+        // Two hits on each reference.
+        let hit = |ref_id, q, r| (ChainKey { ref_id, strand: 1 }, Anchor { q, r });
+        let hits = [
+            hit(0, 0, 100),
+            hit(0, 40, 140),
+            hit(1, 0, 100),
+            hit(1, 40, 140),
+        ];
+        let chained = |index: &RuntimeIndex| {
+            let mut profile = MapProfile::default();
+            let mut hits = hits.to_vec();
+            chain_hit_groups(
+                &mut hits,
+                16,
+                1_000,
+                |ref_id| index.chain_min_seeds(ref_id, 3),
+                &mut profile,
+            )
+            .iter()
+            .map(|candidate| candidate.ref_id)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(chained(&index), [0]);
+        index.lookup_mode = SeedLookupMode::IgnoreRandstrobeFingerprint;
+        assert_eq!(chained(&index), [0]);
     }
 
     #[test]

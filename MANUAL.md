@@ -312,7 +312,7 @@ Resolved mapper defaults:
 | Illumina paired-end | 50 | 0.50 | 1 | 0.80 | 0.50 |
 | Nanopore / PacBio | 10 | 0.70 | 3 | 0.80 | 0.30, or 300 mapped bases |
 
-Illumina reads and noisy long reads (§5.5) find a seed by its first strobe as well; accurate long reads require both strobes of the seed. `--allow-single-strobe-matches` and `--match-both-strobes` override this.
+Illumina reads and noisy long reads (§5.5) find a seed by its first strobe as well; accurate long reads require both strobes of the seed. `--allow-single-strobe-matches` and `--match-both-strobes` override this. A short gene holds few seeds, so on a marker gene a chain needs at most two seeds instead of `min seeds`.
 
 The paired-end candidate set is deliberately broad so that the profiler can see competing species and keep conserved regions ambiguous; the modes differ in the evidence stage, not in candidate generation. Example overrides:
 
