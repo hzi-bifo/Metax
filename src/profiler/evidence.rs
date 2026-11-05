@@ -387,7 +387,8 @@ pub(crate) struct TerminalCandidate {
     pub(crate) taxid: u32,
     pub(crate) profile_rank: ProfileRank,
     pub(crate) best: CandidatePlacement,
-    /// Taxonomic candidate levels that may be incomplete.
+    /// Taxonomic candidate levels that may be incomplete; none for a long read
+    /// whose records all lie on marker genes.
     pub(crate) candidate_boundary: CandidateBoundary,
     /// One independently evaluated placement per represented assembly.
     pub(crate) placements: Vec<CandidatePlacement>,
@@ -1112,11 +1113,21 @@ impl CandidateScratch {
         rows: &[EvidenceAlignment],
         policy: EvidencePolicy,
     ) -> &'a [TerminalCandidate] {
-        let candidate_boundary = rows
-            .iter()
-            .fold(CandidateBoundary::COMPLETE, |boundary, mapping| {
-                boundary.union(mapping.candidate_boundary)
-            });
+        // A long read whose records all lie on marker genes is not held back by
+        // the mapper's candidate cut: the cut candidates are copies of the same
+        // genes in further relatives, and in a genus with many species the cut
+        // falls on the most conserved genes, which would otherwise be left
+        // without coordinate evidence.
+        let candidate_boundary = if policy.mode == EvidenceMode::Long
+            && rows.iter().all(|mapping| mapping.marker_gene_len > 0)
+        {
+            CandidateBoundary::COMPLETE
+        } else {
+            rows.iter()
+                .fold(CandidateBoundary::COMPLETE, |boundary, mapping| {
+                    boundary.union(mapping.candidate_boundary)
+                })
+        };
         self.by_taxon_assembly.clear();
         self.by_taxon_gene.clear();
         self.other_gene_hits.clear();
@@ -2048,6 +2059,36 @@ mod tests {
         assert!(candidates[0].candidate_boundary.profile_incomplete());
         assert_eq!(
             resolved_candidate_index(candidates, EvidenceMode::Single),
+            None
+        );
+    }
+
+    #[test]
+    fn candidate_cut_does_not_hold_back_a_long_read_on_marker_genes() {
+        let mut long_policy = policy(EvidenceMode::Long);
+        long_policy.identity = 0.92;
+        long_policy.mapped_len = 500;
+        long_policy.fraction = 0.20;
+        let mut rows = vec![
+            mapping(1, 10, 1, 0.99, 1_000, 2_000, MappingRole::Unpaired),
+            mapping(2, 20, 2, 0.95, 1_000, 2_000, MappingRole::Unpaired),
+        ];
+        for row in &mut rows {
+            row.candidate_boundary = CandidateBoundary::from_bits(1).unwrap();
+            row.marker_gene_len = 1_000;
+        }
+        let mut scratch = CandidateScratch::default();
+        let candidates = scratch.build(&rows, long_policy);
+        assert_eq!(
+            resolved_candidate_index(candidates, EvidenceMode::Long),
+            Some(0)
+        );
+
+        // A record on a genome reference keeps the cut in force.
+        rows[1].marker_gene_len = 0;
+        let candidates = scratch.build(&rows, long_policy);
+        assert_eq!(
+            resolved_candidate_index(candidates, EvidenceMode::Long),
             None
         );
     }
