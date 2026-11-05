@@ -34,7 +34,36 @@ pub(crate) struct MarkerModel {
     /// Fragment placements summed over the genes of every marker genome
     /// that can hold a read, by assembly id.
     placements: HashMap<u32, f64>,
+    /// Gene lengths of every marker genome by assembly id, for the
+    /// placements of each long read's own length; empty for other reads.
+    long_read_genes: HashMap<u32, GeneLengths>,
     geometry: FragmentGeometry,
+}
+
+/// The genes of one genome for long reads: more than half of each gene,
+/// `len / 2 + 1` bases, sorted, and the summed gene length.
+#[derive(Debug)]
+struct GeneLengths {
+    halves: Box<[u32]>,
+    total: i64,
+}
+
+impl GeneLengths {
+    /// Read starts that put `min(inside, len / 2 + 1)` bases of a read of
+    /// `read_len` bases inside each gene of `len` bases, summed over the
+    /// genes: `sum(len + read_len + 1 - 2 min(inside, len / 2 + 1))`.
+    fn placements(&self, inside: i64, read_len: i64) -> f64 {
+        let below = self
+            .halves
+            .partition_point(|&half| i64::from(half) < inside);
+        let below_bases: i64 = self.halves[..below]
+            .iter()
+            .map(|&half| i64::from(half))
+            .sum();
+        let genes = self.halves.len() as i64;
+        let inside_bases = below_bases + inside * (genes - below as i64);
+        (self.total + genes * (read_len + 1) - 2 * inside_bases) as f64
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -77,9 +106,24 @@ impl MarkerModel {
                 (placements > 0.0).then_some((assembly_id, placements))
             })
             .collect();
+        let long_read_genes = if geometry.layout == FragmentLayout::LongReads {
+            genes
+                .iter()
+                .map(|(&assembly_id, genes)| {
+                    let mut halves: Box<[u32]> =
+                        genes.iter().map(|gene| gene.len / 2 + 1).collect();
+                    halves.sort_unstable();
+                    let total = genes.iter().map(|gene| i64::from(gene.len)).sum();
+                    (assembly_id, GeneLengths { halves, total })
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
         Self {
             genes,
             placements,
+            long_read_genes,
             geometry,
         }
     }
@@ -117,6 +161,20 @@ impl MarkerModel {
         self.placements.get(&assembly_id).copied()
     }
 
+    /// Placements that the marker genes of a genome offer the fragment of a
+    /// read of `read_len` bases: for a long read, those of its own length,
+    /// since long reads differ widely in length; otherwise
+    /// [`Self::fragment_placements`].
+    pub(crate) fn placements_for_read(&self, assembly_id: u32, read_len: u32) -> Option<f64> {
+        if self.geometry.layout != FragmentLayout::LongReads {
+            return self.fragment_placements(assembly_id);
+        }
+        let read_len = i64::from(read_len.max(1));
+        self.long_read_genes
+            .get(&assembly_id)
+            .map(|genes| genes.placements(self.geometry.gate_bases(read_len), read_len))
+    }
+
     /// Fragments that a whole genome of `genome_size` bases offers per
     /// fragment that its marker genes offer; `None` for a genome without
     /// marker genes or when no gene can hold a read of this length.
@@ -142,8 +200,12 @@ impl MarkerModel {
 /// Which fragments the profiler counts on a gene.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FragmentLayout {
-    /// Single-end or long reads.
+    /// Single-end short reads.
     Reads,
+    /// Long reads, which count on a gene with the length or the read fraction
+    /// of the length-or-fraction gate inside it, or more than half of the
+    /// gene when that is shorter.
+    LongReads,
     /// Read pairs with both mates on the gene.
     Pairs,
     /// Read pairs, and lone mates whose mate lies beyond the gene end.
@@ -157,6 +219,9 @@ pub(crate) struct FragmentGeometry {
     layout: FragmentLayout,
     read_len: i64,
     template_len: i64,
+    min_mapped_len: i64,
+    min_fraction: f64,
+    /// [`Self::gate_bases`] of the sample's read length.
     min_inside: i64,
 }
 
@@ -170,35 +235,58 @@ impl FragmentGeometry {
         min_fraction: f64,
     ) -> Self {
         let read_len = i64::try_from(read_len.max(1)).unwrap_or(i64::MAX);
-        let by_fraction = (min_fraction.clamp(0.0, 1.0) * read_len as f64).ceil() as i64;
-        let min_inside = i64::try_from(min_mapped_len)
-            .unwrap_or(i64::MAX)
-            .max(by_fraction)
-            .clamp(1, read_len);
         let template_len = i64::try_from(template_len)
             .unwrap_or(i64::MAX)
             .max(read_len);
-        Self {
+        let mut geometry = Self {
             layout,
             read_len,
             template_len,
-            min_inside,
+            min_mapped_len: i64::try_from(min_mapped_len).unwrap_or(i64::MAX),
+            min_fraction: min_fraction.clamp(0.0, 1.0),
+            min_inside: 0,
+        };
+        geometry.min_inside = geometry.gate_bases(read_len);
+        geometry
+    }
+
+    /// Bases of a read of `read_len` bases that the read-level gates need on
+    /// a reference: both the mapped length and the read fraction for short
+    /// reads, either of them for long reads.
+    fn gate_bases(&self, read_len: i64) -> i64 {
+        let by_fraction = (self.min_fraction * read_len as f64).ceil() as i64;
+        let bases = if self.layout == FragmentLayout::LongReads {
+            self.min_mapped_len.min(by_fraction)
+        } else {
+            self.min_mapped_len.max(by_fraction)
+        };
+        bases.clamp(1, read_len)
+    }
+
+    /// Bases of a read needed inside a gene of `len` bases: for long reads at
+    /// most more than half of the gene.
+    fn min_inside(&self, len: i64) -> i64 {
+        if self.layout == FragmentLayout::LongReads {
+            self.min_inside.min(len / 2 + 1)
+        } else {
+            self.min_inside
         }
     }
 
-    /// Start positions of a read with at least `min_inside` bases on a gene.
+    /// Start positions of a read with enough bases on a gene.
     fn read_starts(&self, len: i64) -> i64 {
-        if len < self.min_inside {
+        let inside = self.min_inside(len);
+        if len < inside {
             return 0;
         }
-        len - 2 * self.min_inside + self.read_len + 1
+        len - 2 * inside + self.read_len + 1
     }
 
     /// Fragment placements that count on a gene of `len` bases.
     fn placements(&self, len: i64) -> f64 {
         let reads = self.read_starts(len);
         let placements = match self.layout {
-            FragmentLayout::Reads => reads,
+            FragmentLayout::Reads | FragmentLayout::LongReads => reads,
             FragmentLayout::Pairs => (len - self.template_len + 1).max(0),
             // Either mate places the fragment: the start ranges of the two
             // mates, offset by template minus read length, joined.
@@ -214,7 +302,10 @@ impl FragmentGeometry {
         match self.layout {
             // Both mates lie on the gene, so the reported mate does too.
             FragmentLayout::Pairs => (0, len - self.read_len),
-            _ => (self.min_inside - self.read_len, len - self.min_inside),
+            _ => (
+                self.min_inside(len) - self.read_len,
+                len - self.min_inside(len),
+            ),
         }
     }
 
@@ -229,16 +320,19 @@ impl FragmentGeometry {
         }
         // A base covered by `c` of the possible starts is covered by one
         // fragment with probability share * c / starts.
-        let covered: Vec<f64> = (0..=self.read_len)
-            .map(|c| 1.0 - (1.0 - share * c as f64 / starts as f64).powf(fragments))
-            .collect();
-        (0..len)
-            .map(|base| {
-                let c = (base.min(last) - (base - self.read_len + 1).max(first) + 1)
-                    .clamp(0, self.read_len);
-                covered[c as usize]
-            })
-            .sum()
+        let covered = |c: i64| 1.0 - (1.0 - share * c as f64 / starts as f64).powf(fragments);
+        let starts_over = |base: i64| {
+            (base.min(last) - (base - self.read_len + 1).max(first) + 1).clamp(0, self.read_len)
+        };
+        if self.read_len < len {
+            // Fewer start counts than bases: work each out once.
+            let by_starts: Vec<f64> = (0..=self.read_len).map(covered).collect();
+            (0..len)
+                .map(|base| by_starts[starts_over(base) as usize])
+                .sum()
+        } else {
+            (0..len).map(|base| covered(starts_over(base))).sum()
+        }
     }
 }
 
@@ -246,6 +340,13 @@ impl std::fmt::Display for FragmentGeometry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let layout = match self.layout {
             FragmentLayout::Reads => "reads",
+            FragmentLayout::LongReads => {
+                return write!(
+                    f,
+                    "long reads, median read length {}, at least {} bases of a read or more than half of a gene inside it",
+                    self.read_len, self.min_inside
+                );
+            }
             FragmentLayout::Pairs => "read pairs",
             FragmentLayout::PairsAndLoneMates => "read pairs and lone mates",
         };
@@ -474,6 +575,49 @@ mod tests {
             lengths.add(len);
         }
         assert_eq!(lengths.median(), Some(151));
+    }
+
+    #[test]
+    fn long_reads_count_on_genes_shorter_than_the_gates() {
+        // Either gate for long reads: 500 bases, as 20 % of 10,000 is more.
+        let long = FragmentGeometry::new(FragmentLayout::LongReads, 10_000, 10_000, 500, 0.2);
+        assert_eq!(long.min_inside, 500);
+        assert_eq!(long.placements(1_000), 10_001.0);
+        // A 300-base gene counts a read with more than half of it, 151 bases.
+        assert_eq!(long.placements(300), (300 - 2 * 151 + 10_001) as f64);
+        // Every base of a short gene can be covered.
+        assert!((long.expected_covered_bases(300, 1.0, 1e6) - 300.0).abs() < 1e-9);
+        // Short single-end reads need both gates.
+        let short = FragmentGeometry::new(FragmentLayout::Reads, 150, 150, 50, 0.7);
+        assert_eq!(short.min_inside, 105);
+        assert_eq!(short.placements(100), 0.0);
+    }
+
+    #[test]
+    fn a_long_read_is_placed_by_its_own_length() {
+        let lens = [300u32, 800, 2_000];
+        let at = |read_len: usize| {
+            FragmentGeometry::new(FragmentLayout::LongReads, read_len, read_len, 500, 0.2)
+        };
+        let model = MarkerModel::from_gene_lengths(&[(0, &lens)], at(3_000));
+        for read_len in [200u32, 1_000, 3_000, 10_000] {
+            let geometry = at(read_len as usize);
+            let expected: f64 = lens
+                .iter()
+                .map(|&len| geometry.placements(i64::from(len)))
+                .sum();
+            assert_eq!(model.placements_for_read(0, read_len), Some(expected));
+        }
+        assert_eq!(model.placements_for_read(1, 3_000), None);
+        // Other layouts keep the placements of the sample's lengths.
+        let pairs = MarkerModel::from_gene_lengths(
+            &[(0, &lens)],
+            FragmentGeometry::new(FragmentLayout::Pairs, 150, 400, 50, 0.7),
+        );
+        assert_eq!(
+            pairs.placements_for_read(0, 10_000),
+            pairs.fragment_placements(0)
+        );
     }
 
     #[test]

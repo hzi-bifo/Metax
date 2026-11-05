@@ -23,7 +23,7 @@ use metam::mapper::{
     mark_mates_beyond_reference_end, pair_compatibility, rescue_competing_mates_with_workspace,
     rescue_mate_with_workspace, set_mate_status, CandidateBoundary, IdentityMode,
     LongReadExtension, MapParams, MapProfile, Mapping, MappingWorkspace, PairStatus,
-    ReferenceCandidateGroups, RuntimeIndex, RuntimeIndexOptions,
+    ReferenceCandidateGroups, ReferenceKind, RuntimeIndex, RuntimeIndexOptions,
 };
 
 use crate::db::{DatabaseMetadata, ReferenceType};
@@ -927,7 +927,7 @@ impl Mapper {
             },
         );
         runtime_index.set_reference_candidate_groups(reference_candidate_groups)?;
-        runtime_index.set_open_ended_references(open_ended_references(&db))?;
+        runtime_index.set_reference_kinds(reference_kinds(&db))?;
         let runtime_index = Arc::new(runtime_index);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads.max(1))
@@ -1019,17 +1019,19 @@ fn build_reference_candidate_groups(
     Ok(groups)
 }
 
-/// The references on which a mate can be a lone mate, by numeric reference ID:
-/// marker genes, and every reference of a fractional database, whose sampled
-/// segments end inside the genome. In a mixed database each reference follows
-/// its own type. Database rows are in index order, which
-/// `build_reference_candidate_groups` has checked.
-fn open_ended_references(database: &DatabaseMetadata) -> Vec<bool> {
+/// The kind of every reference, by numeric reference ID: marker genes, and
+/// the sampled segments of a fractional database, which end inside the genome
+/// (the references on which a mate can be a lone mate). In a mixed database
+/// each reference follows its own type. Database rows are in index order,
+/// which `build_reference_candidate_groups` has checked.
+fn reference_kinds(database: &DatabaseMetadata) -> Vec<ReferenceKind> {
     database
         .references
         .iter()
-        .map(|reference| {
-            database.is_fractional || reference.reference_type == ReferenceType::Markers
+        .map(|reference| match reference.reference_type {
+            ReferenceType::Markers => ReferenceKind::MarkerGene,
+            ReferenceType::Genome if database.is_fractional => ReferenceKind::Segment,
+            ReferenceType::Genome => ReferenceKind::Genome,
         })
         .collect()
 }
@@ -3470,7 +3472,8 @@ mod tests {
             ],
             is_fractional,
         };
-        assert_eq!(open_ended_references(&mixed(false)), [false, true]);
-        assert_eq!(open_ended_references(&mixed(true)), [true, true]);
+        use ReferenceKind::{Genome, MarkerGene, Segment};
+        assert_eq!(reference_kinds(&mixed(false)), [Genome, MarkerGene]);
+        assert_eq!(reference_kinds(&mixed(true)), [Segment, MarkerGene]);
     }
 }

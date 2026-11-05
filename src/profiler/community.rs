@@ -977,8 +977,11 @@ impl CommunityProfiler {
                 span: (clamp_u32(start), clamp_u32(end)),
                 fixed_chunk: (clamp_u32(fixed_chunk_start), clamp_u32(fixed_chunk_end)),
                 flex_chunk: (clamp_u32(flex_chunk_start), clamp_u32(flex_chunk_end)),
-                reaches_marker_end: reference.is_marker
-                    && reaches_reference_end(start, end, reference.ref_len),
+                marker_gene_len: if reference.is_marker {
+                    clamp_u32(reference.ref_len)
+                } else {
+                    0
+                },
             },
         ))
     }
@@ -3228,12 +3231,6 @@ fn resolve_coordinate_evidence(
     })
 }
 
-/// Whether a 1-based, end-exclusive interval reaches the first or last base
-/// of a reference of `ref_len` bases.
-fn reaches_reference_end(start: usize, end: usize, ref_len: usize) -> bool {
-    start == 1 || end == ref_len.saturating_add(1)
-}
-
 /// Mapped fragments as a share of the input fragments, each counting as the
 /// share of a genome it represents: the sampling scale of the genome of its
 /// best placement, so that an index of sampled genomes is not mistaken for a
@@ -3289,6 +3286,7 @@ fn sample_fragment_geometry(
         }
     }
     let layout = match (cfg.is_paired, lone_mates) {
+        (false, _) if cfg.coverage_gate_is_or() => FragmentLayout::LongReads,
         (false, _) => FragmentLayout::Reads,
         (true, false) => FragmentLayout::Pairs,
         (true, true) => FragmentLayout::PairsAndLoneMates,
@@ -3300,15 +3298,17 @@ fn sample_fragment_geometry(
 /// Depth that one fragment adds to its candidate: its mapped bases over the
 /// genome length. A fragment on a marker gene stands for one fragment of the
 /// whole genome: it adds its whole read length, also when the read is clipped
-/// at a gene end, over the placements that the genome's genes offer, so that
-/// marker and genome taxa have comparable depths. Marker genes that cannot
-/// hold a read keep mapped bases over their summed length.
+/// at a gene end, over the placements that the genome's genes offer a read of
+/// its length, so that marker and genome taxa have comparable depths. Marker
+/// genes that cannot hold a read keep mapped bases over their summed length.
 fn fragment_depth(
     placement: CandidatePlacement,
     mapped: u32,
     markers: Option<&MarkerModel>,
 ) -> f64 {
-    match markers.and_then(|model| model.fragment_placements(placement.assembly_id)) {
+    match markers
+        .and_then(|model| model.placements_for_read(placement.assembly_id, placement.read_len))
+    {
         Some(placements) => f64::from(placement.read_len) / placements,
         None => f64::from(mapped) / placement.asm_len.max(1.0),
     }
@@ -4967,13 +4967,6 @@ mod tests {
     }
 
     #[test]
-    fn an_alignment_reaches_a_reference_end_at_its_first_or_last_base() {
-        assert!(reaches_reference_end(1, 101, 1_000));
-        assert!(reaches_reference_end(900, 1_001, 1_000));
-        assert!(!reaches_reference_end(2, 1_000, 1_000));
-    }
-
-    #[test]
     fn expected_breadth_is_clamped_for_high_depths() {
         let expected = crate::profiler::evidence::expected_breadth(10.0, 5.0);
         approx_equal(expected, 1.0);
@@ -5763,7 +5756,7 @@ mod tests {
             span: (100, 100 + mapped_len),
             fixed_chunk: (1, 300 + mapped_len),
             flex_chunk: (1, 500 + mapped_len),
-            reaches_marker_end: false,
+            marker_gene_len: 0,
         }
     }
 
@@ -6521,7 +6514,7 @@ mod tests {
             span: (clamp_u32(raw.span.0), clamp_u32(raw.span.1)),
             fixed_chunk: (clamp_u32(raw.span.0), clamp_u32(raw.span.1)),
             flex_chunk: (clamp_u32(raw.span.0), clamp_u32(raw.span.1)),
-            reaches_marker_end: false,
+            marker_gene_len: 0,
         })
     }
 
@@ -7684,7 +7677,7 @@ mod tests {
             span: (1, 101),
             fixed_chunk: (1, 101),
             flex_chunk: (1, 101),
-            reaches_marker_end: false,
+            marker_gene_len: 0,
         };
         let mut higher_identity = lower_identity.clone();
         higher_identity.asm = Arc::<str>::from("fractional-genome");

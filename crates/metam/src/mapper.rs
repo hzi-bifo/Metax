@@ -19,7 +19,19 @@ pub struct RuntimeIndex {
     ref_lookup: HashMap<String, usize>,
     lookup_mode: SeedLookupMode,
     reference_candidate_groups: Option<Box<[ReferenceCandidateGroups]>>,
-    open_ended_references: Option<Box<[bool]>>,
+    reference_kinds: Option<Box<[ReferenceKind]>>,
+    has_marker_genes: bool,
+}
+
+/// What a reference sequence is, for what may lie beyond its ends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceKind {
+    /// An assembled genome sequence, whose ends mostly end the molecule.
+    Genome,
+    /// A sampled segment of a genome, which continues past its ends.
+    Segment,
+    /// A marker gene, cut from a genome that continues past its ends.
+    MarkerGene,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -50,7 +62,8 @@ impl RuntimeIndex {
             ref_lookup,
             lookup_mode,
             reference_candidate_groups: None,
-            open_ended_references: None,
+            reference_kinds: None,
+            has_marker_genes: false,
         }
     }
 
@@ -73,20 +86,23 @@ impl RuntimeIndex {
         Ok(())
     }
 
-    /// Install which references are open-ended: cut from a longer sequence
-    /// that continues past their ends, as marker genes and sampled segments
-    /// are, so that a fragment can reach beyond them. Only these get lone
-    /// mates (see [`mark_mates_beyond_reference_end`]). The table is indexed by
-    /// numeric reference ID. Without a table, every reference is open-ended.
-    pub fn set_open_ended_references(&mut self, open_ended: Vec<bool>) -> Result<()> {
-        if open_ended.len() != self.index.reference_count() {
+    /// Install the kind of every reference, indexed by numeric reference ID.
+    /// Marker genes and sampled segments are open-ended: cut from a longer
+    /// sequence that continues past their ends, so that a fragment can reach
+    /// beyond them. Only these get lone mates (see
+    /// [`mark_mates_beyond_reference_end`]), and long reads count on marker
+    /// genes by the part of the gene they cover. Without a table, every
+    /// reference is open-ended and none is a marker gene.
+    pub fn set_reference_kinds(&mut self, kinds: Vec<ReferenceKind>) -> Result<()> {
+        if kinds.len() != self.index.reference_count() {
             bail!(
-                "open-ended reference count {} does not match index reference count {}",
-                open_ended.len(),
+                "reference kind count {} does not match index reference count {}",
+                kinds.len(),
                 self.index.reference_count()
             );
         }
-        self.open_ended_references = Some(open_ended.into_boxed_slice());
+        self.has_marker_genes = kinds.contains(&ReferenceKind::MarkerGene);
+        self.reference_kinds = Some(kinds.into_boxed_slice());
         Ok(())
     }
 
@@ -119,9 +135,17 @@ impl RuntimeIndex {
     }
 
     fn is_open_ended(&self, ref_id: u32) -> bool {
-        self.open_ended_references
+        self.reference_kinds
             .as_deref()
-            .is_none_or(|open_ended| open_ended[ref_id as usize])
+            .is_none_or(|kinds| kinds[ref_id as usize] != ReferenceKind::Genome)
+    }
+
+    fn is_marker_gene(&self, ref_id: u32) -> bool {
+        self.has_marker_genes
+            && self
+                .reference_kinds
+                .as_deref()
+                .is_some_and(|kinds| kinds[ref_id as usize] == ReferenceKind::MarkerGene)
     }
 }
 
@@ -856,7 +880,12 @@ fn evaluate_candidate_interval(
             }
         }
     }
-    if !passes && !length_rescues(&ident, params) {
+    let kept = passes
+        || length_rescues(&ident, params)
+        || (params.long_read_chaining
+            && index.is_marker_gene(candidate.ref_id)
+            && aligns_over_half_of_marker_gene(&ident, reference.len(), params));
+    if !kept {
         return None;
     }
     let score = mapping_score(
@@ -1043,6 +1072,12 @@ fn length_rescues(ident: &Identity, params: MapParams) -> bool {
         && params
             .min_mapped_len
             .is_some_and(|min_len| ident.compared >= min_len)
+}
+
+/// A long read on a marker gene is also kept when it aligns to more than half
+/// of the gene, so that a read longer than a short gene can count on it.
+fn aligns_over_half_of_marker_gene(ident: &Identity, gene_len: usize, params: MapParams) -> bool {
+    ident.compared > 0 && ident.value >= params.min_identity && 2 * ident.compared > gene_len
 }
 
 fn should_use_fast_extended_interval(
@@ -3044,7 +3079,7 @@ pub fn set_mate_status(r1: &mut [Mapping], r2: &mut [Mapping]) {
 /// beyond the reference end: the insert window on the mate's side (after a
 /// forward read, before a reverse one) runs past the end, so mate rescue could
 /// search only part of it. Only open-ended references are marked
-/// ([`RuntimeIndex::set_open_ended_references`]): the end of a marker gene or
+/// ([`RuntimeIndex::set_reference_kinds`]): the end of a marker gene or
 /// a sampled segment cuts the sequence a fragment came from, the end of an
 /// assembled genome sequence mostly does not.
 pub fn mark_mates_beyond_reference_end(
@@ -4723,6 +4758,54 @@ mod tests {
     }
 
     #[test]
+    fn a_long_read_is_kept_on_more_than_half_of_a_marker_gene() {
+        let params = MapParams {
+            top_n: 10,
+            score_ratio: 0.7,
+            min_seeds: 3,
+            min_identity: 0.8,
+            min_mapped_frac: 0.3,
+            min_mapped_len: Some(300),
+            no_identity_filter: false,
+            ignore_n: false,
+            identity_mode: IdentityMode::Gapped,
+            diag_bin_size: 128,
+            extension_max_mismatches: 40,
+            full_read_interval: false,
+            fast_long_read_identity: true,
+            long_read_chaining: true,
+            long_read_extension: LongReadExtension::None,
+            query_seed_stride: 1,
+            long_read_rescue: true,
+            long_read_rescue_limit: None,
+        };
+        let aligned = |compared, value| Identity {
+            matches: compared,
+            compared,
+            denom: compared,
+            value,
+        };
+        // 250 aligned bases of a 3,000-base read: neither 300 bases nor 30 %
+        // of the read, but more than half of a 480-base gene.
+        assert!(aligns_over_half_of_marker_gene(
+            &aligned(250, 1.0),
+            480,
+            params
+        ));
+        assert!(!aligns_over_half_of_marker_gene(
+            &aligned(250, 1.0),
+            500,
+            params
+        ));
+        // The identity cutoff still applies.
+        assert!(!aligns_over_half_of_marker_gene(
+            &aligned(250, 0.7),
+            480,
+            params
+        ));
+    }
+
+    #[test]
     fn lone_mates_are_marked_only_on_open_ended_references() {
         let gene = deterministic_read(2_000);
         let genome = deterministic_read(2_000)
@@ -4730,8 +4813,12 @@ mod tests {
             .rev()
             .collect::<Vec<_>>();
         let mut index = rescue_runtime_index(&[("gene", &gene), ("genome", &genome)]);
-        assert!(index.set_open_ended_references(vec![true]).is_err());
-        index.set_open_ended_references(vec![true, false]).unwrap();
+        assert!(index
+            .set_reference_kinds(vec![ReferenceKind::MarkerGene])
+            .is_err());
+        index
+            .set_reference_kinds(vec![ReferenceKind::MarkerGene, ReferenceKind::Genome])
+            .unwrap();
         // Both placements end 100 bases before their reference does.
         let mut reads = ["gene", "genome"].map(|reference| {
             let mut mapping = test_mapping("pair", reference, 1_800, 1_900, 100, 1.0, 100);

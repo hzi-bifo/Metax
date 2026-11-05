@@ -200,7 +200,7 @@ Marker genomes:
 - are evaluated by the genes their reads hit rather than by chunk breadth (§7.4);
 - never take part in genus fallback (§7.9).
 
-A read counts on a marker gene only when enough of it lies inside the gene, so marker databases are meant for short reads.
+A read counts on a marker gene only when enough of it lies inside the gene; a long read also counts on a gene shorter than that when it aligns to more than half of the gene (§7.4).
 
 In a mixed database, reads from the part of a marker-only genome that is not indexed can map to the genomes of related species of type `genome`. With `--dmp-dir`, `metax index` lists the genera that hold species of both types; give the species of one genus the same type where possible.
 
@@ -516,15 +516,16 @@ Fixed and flexible chunks are merged per contig in the same way; the flexible ch
 
 For a fractional index, `G` is the effective indexed size, and support and abundance are scaled per genome as described in §4.2.
 
-**Marker genomes.** Each reference sequence of a marker genome is one gene, and a fragment counts on a gene only when enough of a read lies inside it. Chunks of equal length would expect more coverage than reads can give, most of all for short genes, so the genes themselves serve as chunks. From the sample's mappings Metax takes the median read length `R`, the median template length `T` of the pairs, and the bases `a` that a read needs inside a gene to pass the mapped-length and mapped-fraction gates. A gene of length `L` then offers
+**Marker genomes.** Each reference sequence of a marker genome is one gene, and a fragment counts on a gene only when enough of a read lies inside it. Chunks of equal length would expect more coverage than reads can give, most of all for short genes, so the genes themselves serve as chunks. From the sample's mappings Metax takes the median read length `R`, the median template length `T` of the pairs, and the bases `a` that a read needs inside a gene to pass the mapped-length and mapped-fraction gates (both gates for short reads, either of them for long reads). A long read also counts on a gene when it aligns to more than half of the gene, so it needs `m = min(a, ⌊L/2⌋ + 1)` bases inside a gene of length `L`. A gene of length `L` then offers
 
 ```text
 reads:                 c = L − 2a + R + 1
+long reads:            c = L − 2m + R + 1
 pairs:                 c = L − T + 1
 pairs and lone mates:  c = min(L − 2a + T + 1, 2 × (L − 2a + R + 1))
 ```
 
-placements (none when `L < a`). With `n` fragments placed on the genome and `p_i = c_i / Σc`:
+placements (none when `L < a`; every gene offers placements to long reads). With `n` fragments placed on the genome and `p_i = c_i / Σc`:
 
 ```text
 genes_hit                 = genes with at least one placed fragment
@@ -633,7 +634,7 @@ The rule is on by default with `F = 0.025` for paired-end Illumina community pro
 
 ### 7.13 Abundance estimation
 
-Each fragment adds depth to its candidates: the mapped bases of its read (mate 1 of a pair) over the genome size, which for a fractional index is the effective indexed size. A fragment on a marker gene adds the length of its read, also when the read is clipped at the end of the gene, over `Σ placements(L_i)` for the genome's genes of lengths `L_i` (§7.4). A genome of `G` bases offers about `G` placements, so this is the depth of the whole genome, comparable with the depth of a genome taxon. When no gene of a marker genome can hold a read of the sample's length, its fragments add mapped bases over the summed gene length.
+Each fragment adds depth to its candidates: the mapped bases of its read (mate 1 of a pair) over the genome size, which for a fractional index is the effective indexed size. A fragment on a marker gene adds the length of its read, also when the read is clipped at the end of the gene, over `Σ placements(L_i)` for the genome's genes of lengths `L_i` (§7.4); for a long read these are the placements of its own length rather than of the median, since long reads differ widely in length. A genome of `G` bases offers about `G` placements, so this is the depth of the whole genome, comparable with the depth of a genome taxon. When no gene of a marker genome can hold a read of the sample's length, its fragments add mapped bases over the summed gene length.
 
 Reads with several retained candidates are redistributed by an expectation–maximization procedure that weights the candidates by these depths and iterates until the relative change falls below `1e-5` or `--max-em-iterations` is reached. Abundance is depth normalized across the taxa that pass the final filters. Read counts are reported in full-index equivalents.
 

@@ -360,7 +360,7 @@ mod tests {
             span: (1, 1 + bases),
             fixed_chunk: (1, 1 + bases),
             flex_chunk: (1, 1 + bases),
-            reaches_marker_end: false,
+            marker_gene_len: 0,
         }
     }
 

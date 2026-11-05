@@ -61,9 +61,22 @@ pub(crate) struct EvidenceAlignment {
     pub(crate) span: (u32, u32),
     pub(crate) fixed_chunk: (u32, u32),
     pub(crate) flex_chunk: (u32, u32),
-    /// The alignment reaches the first or last base of a marker-gene
-    /// reference, so the read may continue beyond the gene.
-    pub(crate) reaches_marker_end: bool,
+    /// Length of the reference when it is a marker gene; 0 otherwise.
+    pub(crate) marker_gene_len: u32,
+}
+
+impl EvidenceAlignment {
+    /// The alignment reaches the first or last base of a marker gene, so the
+    /// read may continue beyond the gene.
+    pub(crate) fn reaches_marker_end(&self) -> bool {
+        self.marker_gene_len > 0
+            && (self.span.0 == 1 || self.span.1 == self.marker_gene_len.saturating_add(1))
+    }
+
+    /// The read aligns to more than half of a marker gene.
+    fn aligns_over_half_of_marker_gene(&self) -> bool {
+        self.marker_gene_len > 0 && 2 * u64::from(self.mapped_len) > u64::from(self.marker_gene_len)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1183,10 +1196,11 @@ impl CandidateScratch {
             if !(r1_qualifies && r2_qualifies) {
                 // A mate that runs off a marker gene is clipped there and can
                 // fail its gate; its partner may still stand for the fragment.
-                if !r2_qualifies && r2.reaches_marker_end && single_mapping_qualifies(r1, policy) {
+                if !r2_qualifies && r2.reaches_marker_end() && single_mapping_qualifies(r1, policy)
+                {
                     self.half_pair_mates.push(r1_index);
                 } else if !r1_qualifies
-                    && r1.reaches_marker_end
+                    && r1.reaches_marker_end()
                     && single_mapping_qualifies(r2, policy)
                 {
                     self.half_pair_mates.push(r2_index);
@@ -1331,10 +1345,14 @@ fn single_mapping_qualifies(mapping: &EvidenceAlignment, policy: EvidencePolicy)
 }
 
 #[inline]
+/// Long reads pass with the mapped length or the read fraction, and on a
+/// marker gene also with more than half of the gene, so that a read longer
+/// than a short gene can count on it.
 fn long_mapping_qualifies(mapping: &EvidenceAlignment, policy: EvidencePolicy) -> bool {
     evidence_identity(mapping) >= policy.identity
         && (mapping.mapped_len as usize >= policy.mapped_len
-            || fraction_at_least(mapping.fraction, policy.fraction))
+            || fraction_at_least(mapping.fraction, policy.fraction)
+            || mapping.aligns_over_half_of_marker_gene())
         && mapping.span.1 > mapping.span.0
 }
 
@@ -1511,7 +1529,7 @@ mod tests {
             span: (100, 100 + mapped),
             fixed_chunk: (1, 1_100 + mapped),
             flex_chunk: (1, 2_100 + mapped),
-            reaches_marker_end: false,
+            marker_gene_len: 0,
         }
     }
 
@@ -1627,6 +1645,44 @@ mod tests {
     }
 
     #[test]
+    fn a_long_read_counts_on_more_than_half_of_a_marker_gene() {
+        let long_policy = EvidencePolicy {
+            identity: 0.9,
+            mapped_len: 500,
+            fraction: 0.2,
+            ..policy(EvidenceMode::Long)
+        };
+        // 250 bases of a 3,000-base read: neither 500 bases nor 20 % of it.
+        let mut row = mapping(1, 10, 1, 0.95, 250, 3_000, MappingRole::Unpaired);
+        assert!(!long_mapping_qualifies(&row, long_policy));
+        // More than half of a 480-base gene.
+        row.marker_gene_len = 480;
+        assert!(long_mapping_qualifies(&row, long_policy));
+        // Half of a 500-base gene is not enough.
+        row.marker_gene_len = 500;
+        assert!(!long_mapping_qualifies(&row, long_policy));
+        // The identity cutoff still applies.
+        row.marker_gene_len = 480;
+        row.identity = 0.85;
+        assert!(!long_mapping_qualifies(&row, long_policy));
+    }
+
+    #[test]
+    fn an_alignment_reaches_a_marker_gene_end_at_its_first_or_last_base() {
+        let mut row = mapping(1, 10, 1, 1.0, 100, 100, MappingRole::Unpaired);
+        let mut reaches = |span, gene_len| {
+            row.span = span;
+            row.marker_gene_len = gene_len;
+            row.reaches_marker_end()
+        };
+        assert!(reaches((1, 101), 1_000));
+        assert!(reaches((900, 1_001), 1_000));
+        assert!(!reaches((2, 1_000), 1_000));
+        // Not a marker gene.
+        assert!(!reaches((1, 101), 0));
+    }
+
+    #[test]
     fn a_mate_clipped_at_a_marker_gene_end_leaves_its_partner_as_evidence() {
         // Species 1: mate 2 runs off a marker gene and aligns 60 of 100 bases.
         let mut rows = vec![
@@ -1638,7 +1694,7 @@ mod tests {
             .build(&rows, policy(EvidenceMode::Paired))
             .is_empty());
 
-        rows[1].reaches_marker_end = true;
+        rows[1].marker_gene_len = rows[1].span.1 - 1;
         let candidates = scratch.build(&rows, policy(EvidenceMode::Paired));
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].taxid, 1);
@@ -1649,7 +1705,7 @@ mod tests {
             mapping(1, 10, 1, 1.00, 60, 100, MappingRole::Mate1),
             mapping(1, 10, 1, 0.99, 100, 100, MappingRole::Mate2),
         ];
-        swapped[0].reaches_marker_end = true;
+        swapped[0].marker_gene_len = swapped[0].span.1 - 1;
         let candidates = scratch.build(&swapped, policy(EvidenceMode::Paired));
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].best.both_mapped, 100);
