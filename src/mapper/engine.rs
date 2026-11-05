@@ -770,17 +770,18 @@ impl Mapper {
     ) -> Result<ResolvedMappingRun> {
         let db = DatabaseMetadata::load(Path::new(&self.db))?;
         let inputs = self.input_sequences(sequencer, is_paired)?;
+        let has_marker_genes = db.uniform_reference_type() != Some(ReferenceType::Genome);
         let config = MappingConfig::resolve(
             sequencer,
             is_paired,
-            self.noisy_long_reads,
+            self.noisy_long_reads || has_marker_genes,
             mode,
             extra_args,
         )?;
-        if self.noisy_long_reads && config.allow_single_strobe_matches {
+        if config.preset == MappingPreset::Ont && config.allow_single_strobe_matches {
             log::info!(
                 target: "MAPPER",
-                "Noisy long reads: a seed also matches by its first strobe alone."
+                "Long reads: a seed also matches by its first strobe alone."
             );
         }
         validate_mapping_config(&config, inputs.reads2.as_deref())?;
@@ -1098,7 +1099,7 @@ impl MappingConfig {
     fn resolve(
         sequencer: Sequencer,
         is_paired: bool,
-        noisy_long_reads: bool,
+        first_strobe_long_reads: bool,
         mode: ProfileMode,
         extra_args: &[String],
     ) -> Result<Self> {
@@ -1113,9 +1114,11 @@ impl MappingConfig {
         let mut score_ratio = overrides.score_ratio;
         let allow_single_strobe_override = overrides.allow_single_strobe_matches;
         // Both strobes of a seed are rarely free of errors in noisy long reads,
-        // so they, like short reads, also look a seed up by its first strobe.
+        // and a short marker gene holds few seeds, so long reads that are noisy
+        // or mapped to marker genes, like short reads, also look a seed up by
+        // its first strobe.
         let mut allow_single_strobe_matches = allow_single_strobe_override
-            .unwrap_or(preset == MappingPreset::Illumina || noisy_long_reads);
+            .unwrap_or(preset == MappingPreset::Illumina || first_strobe_long_reads);
         // Paired-end profiling benefits from retaining a broad candidate set:
         // competing species must remain visible so the profiler can preserve
         // conserved-region ambiguity instead of force-assigning a fragment.
@@ -1194,8 +1197,8 @@ impl MappingConfig {
 /// The default summary is generated from the same resolver used for real
 /// mapping runs, so changing a preset cannot silently leave the help stale.
 pub fn mapper_options_help() -> String {
-    let defaults = |sequencer, paired, noisy, mode| {
-        MappingConfig::resolve(sequencer, paired, noisy, mode, &[])
+    let defaults = |sequencer, paired, first_strobe, mode| {
+        MappingConfig::resolve(sequencer, paired, first_strobe, mode, &[])
             .expect("built-in mapper defaults must always resolve")
     };
     let illumina_se = defaults(Sequencer::Illumina, false, false, ProfileMode::Default);
@@ -1234,7 +1237,8 @@ Resolved defaults (before mapper overrides):
     top-n={long_top_n}, score-ratio={long_score_ratio:.2}, min-seeds={long_min_seeds},
     min-identity={long_identity:.2}, min-mapped-frac={long_fraction:.2},
     mapped-length OR gate={long_length_gate} bases, single-strobe-matches={long_single_strobe}
-    ({noisy_single_strobe} for noisy reads, sampled base accuracy below {noisy_accuracy:.2}),
+    ({noisy_single_strobe} for noisy reads, sampled base accuracy below {noisy_accuracy:.2},
+    and on a database with marker genes),
     batch-size={long_batch_size} (also capped at 1 GiB of read bases per batch)
 
 Recall mode changes unpaired Illumina score-ratio to {recall_score_ratio:.2};
@@ -1257,7 +1261,8 @@ Candidate discovery and retention:
   --allow-single-strobe-matches
       Permit lookup by strobe1 when the complete randstrobe pair differs.
       Improves recall but increases seed hits, runtime, and potentially memory.
-      Default for Illumina reads and for noisy long reads.
+      Default for Illumina reads, for noisy long reads and for long reads on a
+      database with marker genes.
   --match-both-strobes
       Require the complete randstrobe pair (alias: --require-both-strobes).
       This conflicts with --allow-single-strobe-matches.

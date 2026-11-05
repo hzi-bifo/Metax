@@ -292,7 +292,7 @@ These options decide whether a mapping is strong enough for species/strain assig
 - **Identity.** For community profiling without `--min-identity`, the identity cutoff becomes `accuracy − margin`, where the margin is `0.03` (default), `0.04` (recall), or `0.02` (precision), never below `0.84`. The identity in the table is the high-quality default; strain mode and an explicit `--min-identity` keep the fixed preset.
 - **Seed lookup.** The mapper also looks a seed up by its first strobe alone, as it does for Illumina reads, because both strobes of a seed are rarely free of errors in such reads (§5.6). Many more noisy reads are mapped, at some cost in mapping time.
 
-High-quality samples, FASTA input and short reads keep both defaults.
+High-quality samples, FASTA input and short reads keep both defaults; on a database with marker genes, long reads always use this seed lookup (§5.6).
 
 **Qualities that over-state accuracy.** Some basecallers report higher qualities than their reads achieve. After loading the mappings, Metax therefore takes each read's best alignment (largest identity × mapped bases among those passing the length / fraction gate) and the upper quartile of their identities: reads from genomes the database holds well align at their sequencing accuracy, while divergent or poorly represented organisms lower only the lower quantiles. If this quartile is below the sampled accuracy, it takes the accuracy's place in the identity cutoff above (also for samples whose qualities claim `0.95` or more). The cutoff is only ever lowered. This applies to the automatic long-read community cutoff, including one saved in a mapping file by an automatic run; strain mode and an explicit `--min-identity` are unchanged.
 
@@ -312,7 +312,7 @@ Resolved mapper defaults:
 | Illumina paired-end | 50 | 0.50 | 1 | 0.80 | 0.50 |
 | Nanopore / PacBio | 10 | 0.70 | 3 | 0.80 | 0.30, or 300 mapped bases |
 
-Illumina reads and noisy long reads (§5.5) find a seed by its first strobe as well; accurate long reads require both strobes of the seed. `--allow-single-strobe-matches` and `--match-both-strobes` override this. A short gene holds few seeds, so on a marker gene a chain needs at most two seeds instead of `min seeds`.
+Illumina reads and noisy long reads (§5.5) find a seed by its first strobe as well; accurate long reads require both strobes of the seed. A short gene holds few seeds, so on a database with marker genes long reads also find a seed by its first strobe, and on a marker gene a chain needs at most two seeds instead of `min seeds`. `--allow-single-strobe-matches` and `--match-both-strobes` override the seed lookup.
 
 The paired-end candidate set is deliberately broad so that the profiler can see competing species and keep conserved regions ambiguous; the modes differ in the evidence stage, not in candidate generation. Example overrides:
 
