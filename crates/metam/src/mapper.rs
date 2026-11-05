@@ -609,12 +609,117 @@ pub fn map_read_with_workspace(
         return Vec::new();
     }
 
-    let (rc, mut candidates) = collect_candidates(read, index, params, profile, |_| true);
+    let (rc, candidates) = collect_candidates(read, index, params, profile, |_| true);
 
     profile.candidates_before_filtering += candidates.len() as u64;
     if candidates.is_empty() {
         return Vec::new();
     }
+    let mut mappings = match marker_gene_read_parts(&candidates, read.len(), index, params) {
+        Some(parts) => {
+            let mut mappings = Vec::new();
+            for part in parts {
+                mappings.extend(select_mappings(
+                    read_id, read, &rc, part, index, params, profile, workspace,
+                ));
+            }
+            mappings.sort_unstable_by(mapping_order);
+            mappings
+        }
+        None => select_mappings(
+            read_id, read, &rc, candidates, index, params, profile, workspace,
+        ),
+    };
+    profile.candidates_after_filtering += mappings.len() as u64;
+    set_ranks(&mut mappings);
+    mappings
+}
+
+/// The candidates of a long read whose candidates all lie on marker genes,
+/// split by the part of the read they cover, since one read can run over
+/// several genes of a genome: candidates whose read intervals overlap by at
+/// least half of the shorter interval, directly or through others, compete
+/// only with each other. `None` when this does not apply or all candidates
+/// cover one part.
+fn marker_gene_read_parts(
+    candidates: &[Candidate],
+    read_len: usize,
+    index: &RuntimeIndex,
+    params: MapParams,
+) -> Option<Vec<Vec<Candidate>>> {
+    if !params.long_read_chaining
+        || candidates.len() < 2
+        || !candidates
+            .iter()
+            .all(|candidate| index.is_marker_gene(candidate.ref_id))
+    {
+        return None;
+    }
+    let read_interval = |candidate: &Candidate| {
+        if candidate.strand == 1 {
+            (candidate.query_seed_start, candidate.query_seed_end)
+        } else {
+            (
+                read_len - candidate.query_seed_end,
+                read_len - candidate.query_seed_start,
+            )
+        }
+    };
+    let intervals: Vec<(usize, usize)> = candidates.iter().map(read_interval).collect();
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_unstable_by_key(|&i| intervals[i]);
+    // Union-find over the candidates; only intervals still open at a start
+    // can overlap it.
+    let mut parent: Vec<usize> = (0..candidates.len()).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let mut open: Vec<usize> = Vec::new();
+    for &i in &order {
+        let (start, end) = intervals[i];
+        open.retain(|&j| intervals[j].1 > start);
+        for &j in &open {
+            let (other_start, other_end) = intervals[j];
+            let overlap = end.min(other_end).saturating_sub(start.max(other_start));
+            let shorter = (end - start).min(other_end - other_start);
+            if 2 * overlap >= shorter {
+                let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                parent[a.max(b)] = a.min(b);
+            }
+        }
+        open.push(i);
+    }
+    let mut part_of_root: HashMap<usize, usize> = HashMap::new();
+    let mut parts: Vec<Vec<Candidate>> = Vec::new();
+    for (i, candidate) in candidates.iter().enumerate() {
+        let next = parts.len();
+        let part = *part_of_root.entry(root(&mut parent, i)).or_insert(next);
+        if part == next {
+            parts.push(Vec::new());
+        }
+        parts[part].push(candidate.clone());
+    }
+    (parts.len() > 1).then_some(parts)
+}
+
+/// Mappings of a read from its candidates: score-ratio selection,
+/// evaluation, long-read rescue and the top-n limit. Each mapping records
+/// whether candidates were left out.
+#[allow(clippy::too_many_arguments)]
+fn select_mappings(
+    read_id: &str,
+    read: &[u8],
+    rc: &[u8],
+    mut candidates: Vec<Candidate>,
+    index: &RuntimeIndex,
+    params: MapParams,
+    profile: &mut MapProfile,
+    workspace: &mut MappingWorkspace,
+) -> Vec<Mapping> {
     candidates.sort_unstable_by(|a, b| {
         b.score
             .cmp(&a.score)
@@ -641,7 +746,7 @@ pub fn map_read_with_workspace(
         if let Some(mapping) = evaluate_candidate(
             read_id,
             read,
-            rc.as_slice(),
+            rc,
             &candidates[index_in_candidates],
             index,
             params,
@@ -669,7 +774,7 @@ pub fn map_read_with_workspace(
             if let Some(mapping) = evaluate_candidate(
                 read_id,
                 read,
-                rc.as_slice(),
+                rc,
                 candidate,
                 index,
                 params,
@@ -712,7 +817,7 @@ pub fn map_read_with_workspace(
     if params.long_read_extension == LongReadExtension::Retained {
         extend_retained_long_read_mappings(
             read,
-            rc.as_slice(),
+            rc,
             index,
             params,
             profile,
@@ -730,8 +835,6 @@ pub fn map_read_with_workspace(
             mapping.candidate_boundary = mapping.candidate_boundary.union(candidate_boundary);
         }
     }
-    profile.candidates_after_filtering += mappings.len() as u64;
-    set_ranks(&mut mappings);
     mappings
 }
 
@@ -4943,6 +5046,58 @@ mod tests {
         let mappings = map_read("ont", &read, &index, params, &mut profile);
         assert_eq!(mappings.len(), 1, "{mappings:?}");
         assert!(mappings[0].ref_end <= 175, "{mappings:?}");
+    }
+
+    #[test]
+    fn genes_on_different_parts_of_a_long_read_do_not_compete() {
+        // A 4,000-base read runs over an 800-base and a 400-base gene; the
+        // shorter gene has fewer seeds, below the score ratio of the longer.
+        let read = deterministic_read(4_000);
+        let long_gene = read[500..1_300].to_vec();
+        let short_gene = read[2_500..2_900].to_vec();
+        let params = MapParams {
+            top_n: 10,
+            score_ratio: 0.7,
+            min_seeds: 3,
+            min_identity: 0.8,
+            min_mapped_frac: 0.3,
+            min_mapped_len: Some(300),
+            no_identity_filter: false,
+            ignore_n: false,
+            identity_mode: IdentityMode::Gapped,
+            diag_bin_size: 128,
+            extension_max_mismatches: 40,
+            full_read_interval: false,
+            fast_long_read_identity: true,
+            long_read_chaining: true,
+            long_read_extension: LongReadExtension::None,
+            query_seed_stride: 1,
+            long_read_rescue: true,
+            long_read_rescue_limit: None,
+        };
+        let mut index = rescue_runtime_index(&[("long", &long_gene), ("short", &short_gene)]);
+        let mut profile = MapProfile::default();
+        // A segment competes with the gene over the whole read.
+        index
+            .set_reference_kinds(vec![ReferenceKind::MarkerGene, ReferenceKind::Segment])
+            .unwrap();
+        let mappings = map_read("ont", &read, &index, params, &mut profile);
+        assert_eq!(mappings.len(), 1, "{mappings:?}");
+        assert_eq!(mappings[0].ref_id, "long");
+
+        index
+            .set_reference_kinds(vec![ReferenceKind::MarkerGene; 2])
+            .unwrap();
+        let mappings = map_read("ont", &read, &index, params, &mut profile);
+        let mut found: Vec<_> = mappings
+            .iter()
+            .map(|mapping| (mapping.ref_id.as_str(), mapping.ref_start, mapping.ref_end))
+            .collect();
+        found.sort_unstable();
+        assert_eq!(found, [("long", 0, 800), ("short", 0, 400)]);
+        // Ranks run over both parts, best first.
+        assert_eq!(mappings[0].ref_id, "long");
+        assert_eq!((mappings[1].rank, mappings[1].num_mappings), (2, 2));
     }
 
     #[test]
