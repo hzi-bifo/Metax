@@ -851,10 +851,30 @@ fn evaluate_candidate_interval(
         edit_distance,
     );
     if params.long_read_chaining
+        && index.is_marker_gene(candidate.ref_id)
+        && should_attempt_long_read_extension(ident, passes, params)
+    {
+        (interval, ident) = extend_into_marker_gene(
+            query,
+            reference,
+            interval,
+            ident,
+            params,
+            profile,
+            edit_distance,
+        );
+        mapped_frac = ident.compared as f64 / read.len() as f64;
+        passes = params.no_identity_filter
+            || (ident.compared > 0
+                && ident.value >= params.min_identity
+                && mapped_frac >= params.min_mapped_frac);
+    }
+    if params.long_read_chaining
         && params.long_read_extension == LongReadExtension::Candidate
         && should_attempt_long_read_extension(ident, passes, params)
     {
-        let extended = extend_long_read_interval(query, reference, interval, params.ignore_n);
+        let extended =
+            extend_long_read_interval(query, reference, interval, params.ignore_n, false);
         if extended != interval {
             let (extended_interval, extended_ident, extended_mapped_frac, extended_passes) =
                 evaluate_interval_identity(
@@ -1113,14 +1133,26 @@ fn fast_extension_flank_passes(base: Identity, extended: Identity, min_identity:
     flank_identity >= min_flank_identity
 }
 
+/// Extends an alignment interval at both ends with a banded x-drop alignment of
+/// the read flanks. `within_reference` bounds each read flank by the reference
+/// bases left on its side, as for a gene that the read runs past.
 fn extend_long_read_interval(
     query: &[u8],
     reference: &ReferenceView<'_>,
     interval: (usize, usize, usize, usize),
     ignore_n: bool,
+    within_reference: bool,
 ) -> (usize, usize, usize, usize) {
     let (mut qs, mut qe, mut rs, mut re) = interval;
-    let left_q = qs.min(LONG_READ_EXTEND_MAX_SIDE);
+    let bound = |query_bases: usize, reference_bases: usize| {
+        let bases = if within_reference {
+            query_bases.min(reference_bases.saturating_add(extension_slack(reference_bases)))
+        } else {
+            query_bases
+        };
+        bases.min(LONG_READ_EXTEND_MAX_SIDE)
+    };
+    let left_q = bound(qs, rs);
     let left_r = rs.min(left_q.saturating_add(extension_slack(left_q)));
     if left_q > 0 && left_r > 0 {
         let query_left = query[qs - left_q..qs]
@@ -1139,14 +1171,9 @@ fn extend_long_read_interval(
         rs -= r_ext;
     }
 
-    let right_q = query
-        .len()
-        .saturating_sub(qe)
-        .min(LONG_READ_EXTEND_MAX_SIDE);
-    let right_r = reference
-        .len()
-        .saturating_sub(re)
-        .min(right_q.saturating_add(extension_slack(right_q)));
+    let reference_right = reference.len().saturating_sub(re);
+    let right_q = bound(query.len().saturating_sub(qe), reference_right);
+    let right_r = reference_right.min(right_q.saturating_add(extension_slack(right_q)));
     if right_q > 0 && right_r > 0 {
         let query_right = &query[qe..qe + right_q];
         let reference_right = reference_segment(reference, re, re + right_r, false);
@@ -1345,6 +1372,64 @@ fn identity_denom(identity: f64, matches: usize) -> usize {
     } else {
         matches
     }
+}
+
+/// The alignment of a long read on a marker gene extended into the gene: both
+/// strobes of a seed must lie inside a gene, so the seeds stop short of its
+/// ends. Each end follows the read for as long as it keeps matching (banded
+/// x-drop) and is kept when that flank aligns at the identity cutoff.
+fn extend_into_marker_gene(
+    query: &[u8],
+    reference: &ReferenceView<'_>,
+    interval: (usize, usize, usize, usize),
+    ident: Identity,
+    params: MapParams,
+    profile: &mut MapProfile,
+    edit_distance: &mut EditDistanceWorkspace,
+) -> ((usize, usize, usize, usize), Identity) {
+    let (qs, qe, rs, re) = interval;
+    let (ext_qs, ext_qe, ext_rs, ext_re) =
+        extend_long_read_interval(query, reference, interval, params.ignore_n, true);
+    let mut flank = |q: std::ops::Range<usize>, r: std::ops::Range<usize>| {
+        if q.is_empty() && r.is_empty() {
+            return None;
+        }
+        let flank = flank_identity(
+            &query[q],
+            reference,
+            r.start,
+            r.end,
+            params.ignore_n,
+            params.identity_mode,
+            params.fast_long_read_identity,
+            edit_distance,
+        );
+        profile.identity_comparisons += 1;
+        (flank.compared > 0 && flank.value >= params.min_identity).then_some(flank)
+    };
+    let (mut start, mut end, mut joined) = ((qs, rs), (qe, re), ident);
+    for (side, flank) in [
+        (0, flank(ext_qs..qs, ext_rs..rs)),
+        (1, flank(qe..ext_qe, re..ext_re)),
+    ] {
+        let Some(flank) = flank else {
+            continue;
+        };
+        if side == 0 {
+            start = (ext_qs, ext_rs);
+        } else {
+            end = (ext_qe, ext_re);
+        }
+        joined.matches += flank.matches;
+        joined.compared += flank.compared;
+        joined.denom += flank.denom;
+    }
+    joined.value = if joined.denom == 0 {
+        0.0
+    } else {
+        joined.matches as f64 / joined.denom as f64
+    };
+    ((start.0, end.0, start.1, end.1), joined)
 }
 
 fn extension_slack(query_bases: usize) -> usize {
@@ -4803,6 +4888,61 @@ mod tests {
             480,
             params
         ));
+    }
+
+    #[test]
+    fn a_long_read_is_aligned_to_the_ends_of_a_marker_gene() {
+        // A 3,000-base read that runs over a whole 250-base gene.
+        let read = deterministic_read(3_000);
+        let gene = read[1_400..1_650].to_vec();
+        let params = MapParams {
+            top_n: 10,
+            score_ratio: 0.7,
+            min_seeds: 3,
+            min_identity: 0.8,
+            min_mapped_frac: 0.3,
+            min_mapped_len: Some(300),
+            no_identity_filter: false,
+            ignore_n: false,
+            identity_mode: IdentityMode::Gapped,
+            diag_bin_size: 128,
+            extension_max_mismatches: 40,
+            full_read_interval: false,
+            fast_long_read_identity: true,
+            long_read_chaining: true,
+            long_read_extension: LongReadExtension::None,
+            query_seed_stride: 1,
+            long_read_rescue: true,
+            long_read_rescue_limit: None,
+        };
+        let mut index = rescue_runtime_index(&[("gene", &gene)]);
+        // As a genome sequence it holds too little of the read.
+        index
+            .set_reference_kinds(vec![ReferenceKind::Genome])
+            .unwrap();
+        let mut profile = MapProfile::default();
+        assert!(map_read("ont", &read, &index, params, &mut profile).is_empty());
+
+        index
+            .set_reference_kinds(vec![ReferenceKind::MarkerGene])
+            .unwrap();
+        let mappings = map_read("ont", &read, &index, params, &mut profile);
+        assert_eq!(mappings.len(), 1, "{mappings:?}");
+        let mapping = &mappings[0];
+        assert_eq!((mapping.ref_start, mapping.ref_end), (0, 250));
+        assert_eq!((mapping.mapped_bases, mapping.identity), (250, 1.0));
+
+        // The alignment does not follow the read into gene bases it does not match.
+        let mut gene = gene;
+        let other = deterministic_read(600);
+        gene[170..].copy_from_slice(&other[520..600]);
+        let mut index = rescue_runtime_index(&[("gene", &gene)]);
+        index
+            .set_reference_kinds(vec![ReferenceKind::MarkerGene])
+            .unwrap();
+        let mappings = map_read("ont", &read, &index, params, &mut profile);
+        assert_eq!(mappings.len(), 1, "{mappings:?}");
+        assert!(mappings[0].ref_end <= 175, "{mappings:?}");
     }
 
     #[test]
