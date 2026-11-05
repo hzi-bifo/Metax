@@ -774,7 +774,8 @@ impl Mapper {
         let config = MappingConfig::resolve(
             sequencer,
             is_paired,
-            self.noisy_long_reads || has_marker_genes,
+            self.noisy_long_reads,
+            has_marker_genes,
             mode,
             extra_args,
         )?;
@@ -1099,7 +1100,8 @@ impl MappingConfig {
     fn resolve(
         sequencer: Sequencer,
         is_paired: bool,
-        first_strobe_long_reads: bool,
+        noisy_long_reads: bool,
+        marker_genes: bool,
         mode: ProfileMode,
         extra_args: &[String],
     ) -> Result<Self> {
@@ -1118,7 +1120,7 @@ impl MappingConfig {
         // or mapped to marker genes, like short reads, also look a seed up by
         // its first strobe.
         let mut allow_single_strobe_matches = allow_single_strobe_override
-            .unwrap_or(preset == MappingPreset::Illumina || first_strobe_long_reads);
+            .unwrap_or(preset == MappingPreset::Illumina || noisy_long_reads || marker_genes);
         // Paired-end profiling benefits from retaining a broad candidate set:
         // competing species must remain visible so the profiler can preserve
         // conserved-region ambiguity instead of force-assigning a fragment.
@@ -1126,6 +1128,14 @@ impl MappingConfig {
         // applied by the profiler's evidence thresholds.
         if preset == MappingPreset::Illumina && is_paired {
             top_n.get_or_insert(50);
+            score_ratio.get_or_insert(0.50);
+        }
+        // Near-identical marker genes of sister species share most seeds of a
+        // short read, and seed sampling can give the gene the read came from
+        // fewer seed hits than one of them; an unpaired short read therefore
+        // keeps candidates down to half of the best seed score, as a pair does,
+        // and alignment identity decides between them.
+        if preset == MappingPreset::Illumina && !is_paired && marker_genes {
             score_ratio.get_or_insert(0.50);
         }
         if mode == ProfileMode::Recall && preset == MappingPreset::Illumina {
@@ -1197,8 +1207,8 @@ impl MappingConfig {
 /// The default summary is generated from the same resolver used for real
 /// mapping runs, so changing a preset cannot silently leave the help stale.
 pub fn mapper_options_help() -> String {
-    let defaults = |sequencer, paired, first_strobe, mode| {
-        MappingConfig::resolve(sequencer, paired, first_strobe, mode, &[])
+    let defaults = |sequencer, paired, noisy, mode| {
+        MappingConfig::resolve(sequencer, paired, noisy, false, mode, &[])
             .expect("built-in mapper defaults must always resolve")
     };
     let illumina_se = defaults(Sequencer::Illumina, false, false, ProfileMode::Default);
@@ -1206,6 +1216,15 @@ pub fn mapper_options_help() -> String {
     let long_reads = defaults(Sequencer::Nanopore, false, false, ProfileMode::Default);
     let noisy_long_reads = defaults(Sequencer::Nanopore, false, true, ProfileMode::Default);
     let illumina_recall = defaults(Sequencer::Illumina, false, false, ProfileMode::Recall);
+    let illumina_se_markers = MappingConfig::resolve(
+        Sequencer::Illumina,
+        false,
+        false,
+        true,
+        ProfileMode::Default,
+        &[],
+    )
+    .expect("built-in mapper defaults must always resolve");
     let long_length_gate = long_reads
         .params
         .min_mapped_len
@@ -1224,7 +1243,8 @@ profiler. Resolved values for a real run are shown by --very-verbose.
 
 Resolved defaults (before mapper overrides):
   Illumina single-end / assembly:
-    top-n={se_top_n}, score-ratio={se_score_ratio:.2}, min-seeds={se_min_seeds},
+    top-n={se_top_n}, score-ratio={se_score_ratio:.2}
+    ({se_marker_score_ratio:.2} on a database with marker genes), min-seeds={se_min_seeds},
     min-identity={se_identity:.2}, min-mapped-frac={se_fraction:.2},
     single-strobe-matches={se_single_strobe}, batch-size={se_batch_size}
   Illumina paired-end:
@@ -1241,7 +1261,7 @@ Resolved defaults (before mapper overrides):
     and on a database with marker genes),
     batch-size={long_batch_size} (also capped at 1 GiB of read bases per batch)
 
-Recall mode changes unpaired Illumina score-ratio to {recall_score_ratio:.2};
+Recall mode changes unpaired Illumina score-ratio to {recall_score_ratio:.2} on a genome database;
 paired-end and long-read mapper defaults are mode-independent. Precision and
 recall otherwise differ through profiler evidence thresholds.
 
@@ -1333,6 +1353,7 @@ Example:
 "#,
         se_top_n = illumina_se.params.top_n,
         se_score_ratio = illumina_se.params.score_ratio,
+        se_marker_score_ratio = illumina_se_markers.params.score_ratio,
         se_min_seeds = illumina_se.params.min_seeds,
         se_identity = illumina_se.params.min_identity,
         se_fraction = illumina_se.params.min_mapped_frac,
@@ -2675,9 +2696,15 @@ mod tests {
 
     #[test]
     fn illumina_uses_large_default_mapping_batch() {
-        let config =
-            MappingConfig::resolve(Sequencer::Illumina, true, false, ProfileMode::Default, &[])
-                .unwrap();
+        let config = MappingConfig::resolve(
+            Sequencer::Illumina,
+            true,
+            false,
+            false,
+            ProfileMode::Default,
+            &[],
+        )
+        .unwrap();
         assert_eq!(config.batch_size, DEFAULT_ILLUMINA_BATCH_SIZE);
         assert_eq!(config.batch_base_limit, None);
         assert_eq!(config.params.min_seeds, 1);
@@ -2695,7 +2722,7 @@ mod tests {
             ProfileMode::Precision,
         ] {
             let config =
-                MappingConfig::resolve(Sequencer::Illumina, true, false, mode, &[]).unwrap();
+                MappingConfig::resolve(Sequencer::Illumina, true, false, false, mode, &[]).unwrap();
             assert_eq!(config.params.top_n, 50);
             assert!((config.params.score_ratio - 0.50).abs() < f64::EPSILON);
         }
@@ -2703,13 +2730,52 @@ mod tests {
 
     #[test]
     fn illumina_single_end_keeps_two_seed_default() {
-        let config =
-            MappingConfig::resolve(Sequencer::Illumina, false, false, ProfileMode::Default, &[])
-                .unwrap();
+        let config = MappingConfig::resolve(
+            Sequencer::Illumina,
+            false,
+            false,
+            false,
+            ProfileMode::Default,
+            &[],
+        )
+        .unwrap();
         assert_eq!(config.params.min_seeds, 2);
         assert_eq!(config.params.top_n, 5);
         assert!((config.params.score_ratio - 0.90).abs() < f64::EPSILON);
         assert_eq!(config.paired_emission, PairedEmissionPolicy::All);
+    }
+
+    #[test]
+    fn unpaired_short_reads_keep_half_score_candidates_on_marker_genes() {
+        for mode in [
+            ProfileMode::Recall,
+            ProfileMode::Default,
+            ProfileMode::Precision,
+        ] {
+            for (sequencer, paired, expected) in [
+                (Sequencer::Illumina, false, 0.50),
+                (Sequencer::Assembly, false, 0.50),
+                (Sequencer::Illumina, true, 0.50),
+                (Sequencer::Nanopore, false, 0.70),
+            ] {
+                let config =
+                    MappingConfig::resolve(sequencer, paired, false, true, mode, &[]).unwrap();
+                assert!((config.params.score_ratio - expected).abs() < f64::EPSILON);
+            }
+        }
+        let args = vec!["--score-ratio=0.75".to_string()];
+        let config = MappingConfig::resolve(
+            Sequencer::Illumina,
+            false,
+            false,
+            true,
+            ProfileMode::Default,
+            &args,
+        )
+        .unwrap();
+        assert!((config.params.score_ratio - 0.75).abs() < f64::EPSILON);
+        assert_eq!(config.params.top_n, 5);
+        assert_eq!(config.params.min_seeds, 2);
     }
 
     #[test]
@@ -2722,11 +2788,17 @@ mod tests {
             (Sequencer::Assembly, false, 0.90),
         ] {
             let default =
-                MappingConfig::resolve(sequencer, paired, false, ProfileMode::Default, &[])
+                MappingConfig::resolve(sequencer, paired, false, false, ProfileMode::Default, &[])
                     .unwrap();
-            let precision =
-                MappingConfig::resolve(sequencer, paired, false, ProfileMode::Precision, &[])
-                    .unwrap();
+            let precision = MappingConfig::resolve(
+                sequencer,
+                paired,
+                false,
+                false,
+                ProfileMode::Precision,
+                &[],
+            )
+            .unwrap();
             assert!((default.params.score_ratio - expected).abs() < f64::EPSILON);
             assert_eq!(precision.params.score_ratio, default.params.score_ratio);
         }
@@ -2736,7 +2808,8 @@ mod tests {
     fn recall_widens_unpaired_non_long_read_candidate_ratios() {
         for (sequencer, expected) in [(Sequencer::Illumina, 0.80), (Sequencer::Assembly, 0.80)] {
             let config =
-                MappingConfig::resolve(sequencer, false, false, ProfileMode::Recall, &[]).unwrap();
+                MappingConfig::resolve(sequencer, false, false, false, ProfileMode::Recall, &[])
+                    .unwrap();
             assert!((config.params.score_ratio - expected).abs() < f64::EPSILON);
         }
     }
@@ -2749,7 +2822,8 @@ mod tests {
                 ProfileMode::Default,
                 ProfileMode::Precision,
             ] {
-                let config = MappingConfig::resolve(sequencer, false, false, mode, &[]).unwrap();
+                let config =
+                    MappingConfig::resolve(sequencer, false, false, false, mode, &[]).unwrap();
                 assert!((config.params.score_ratio - 0.70).abs() < f64::EPSILON);
             }
         }
@@ -2761,6 +2835,7 @@ mod tests {
         let config = MappingConfig::resolve(
             Sequencer::Illumina,
             true,
+            false,
             false,
             ProfileMode::Default,
             &args,
@@ -2777,6 +2852,7 @@ mod tests {
             Sequencer::Illumina,
             true,
             false,
+            false,
             ProfileMode::Default,
             &args,
         )
@@ -2786,9 +2862,15 @@ mod tests {
 
     #[test]
     fn long_reads_use_large_count_batch_with_byte_safety_limit() {
-        let config =
-            MappingConfig::resolve(Sequencer::Nanopore, false, false, ProfileMode::Default, &[])
-                .unwrap();
+        let config = MappingConfig::resolve(
+            Sequencer::Nanopore,
+            false,
+            false,
+            false,
+            ProfileMode::Default,
+            &[],
+        )
+        .unwrap();
         assert_eq!(config.batch_size, DEFAULT_LONG_READ_BATCH_SIZE);
         assert_eq!(
             config.batch_base_limit,
@@ -2819,6 +2901,7 @@ mod tests {
             Sequencer::Nanopore,
             false,
             false,
+            false,
             ProfileMode::Default,
             &args,
         )
@@ -2832,9 +2915,15 @@ mod tests {
             "--seed-stride=3".to_string(),
             "--no-long-read-rescue".to_string(),
         ];
-        let config =
-            MappingConfig::resolve(Sequencer::PacBio, false, false, ProfileMode::Default, &args)
-                .unwrap();
+        let config = MappingConfig::resolve(
+            Sequencer::PacBio,
+            false,
+            false,
+            false,
+            ProfileMode::Default,
+            &args,
+        )
+        .unwrap();
         assert_eq!(config.params.query_seed_stride, 3);
         assert!(!config.params.long_read_rescue);
     }
@@ -2842,14 +2931,21 @@ mod tests {
     #[test]
     fn illumina_single_strobe_default_can_be_disabled() {
         let args = vec!["--match-both-strobes".to_string()];
-        let config =
-            MappingConfig::resolve(Sequencer::Illumina, true, false, ProfileMode::Recall, &args)
-                .unwrap();
+        let config = MappingConfig::resolve(
+            Sequencer::Illumina,
+            true,
+            false,
+            false,
+            ProfileMode::Recall,
+            &args,
+        )
+        .unwrap();
         assert!(!config.allow_single_strobe_matches);
 
         let args = vec!["--require-both-strobes".to_string()];
         let config = MappingConfig::resolve(
             Sequencer::Illumina,
+            false,
             false,
             false,
             ProfileMode::Default,
@@ -2863,7 +2959,7 @@ mod tests {
     fn noisy_long_reads_match_seeds_by_first_strobe_unless_told_otherwise() {
         for sequencer in [Sequencer::Nanopore, Sequencer::PacBio] {
             let resolve = |noisy, args: &[String]| {
-                MappingConfig::resolve(sequencer, false, noisy, ProfileMode::Default, args)
+                MappingConfig::resolve(sequencer, false, noisy, false, ProfileMode::Default, args)
                     .unwrap()
                     .allow_single_strobe_matches
             };
@@ -2883,6 +2979,7 @@ mod tests {
             Sequencer::Illumina,
             false,
             false,
+            false,
             ProfileMode::Default,
             &args,
         )
@@ -2895,6 +2992,7 @@ mod tests {
         for option in ["--with-strand", "--debug-output"] {
             let error = MappingConfig::resolve(
                 Sequencer::Illumina,
+                false,
                 false,
                 false,
                 ProfileMode::Default,
@@ -2914,6 +3012,7 @@ mod tests {
             Sequencer::Illumina,
             true,
             false,
+            false,
             ProfileMode::Default,
             &args,
         )
@@ -2932,6 +3031,7 @@ mod tests {
             Sequencer::Illumina,
             true,
             false,
+            false,
             ProfileMode::Default,
             &args,
         )
@@ -2944,6 +3044,7 @@ mod tests {
             Sequencer::Illumina,
             true,
             false,
+            false,
             ProfileMode::Default,
             &args,
         )
@@ -2954,6 +3055,7 @@ mod tests {
         let config = MappingConfig::resolve(
             Sequencer::Illumina,
             true,
+            false,
             false,
             ProfileMode::Default,
             &args,
@@ -2967,15 +3069,22 @@ mod tests {
 
     #[test]
     fn mate_rescue_taxa_has_a_default_and_can_be_overridden() {
-        let config =
-            MappingConfig::resolve(Sequencer::Illumina, true, false, ProfileMode::Default, &[])
-                .unwrap();
+        let config = MappingConfig::resolve(
+            Sequencer::Illumina,
+            true,
+            false,
+            false,
+            ProfileMode::Default,
+            &[],
+        )
+        .unwrap();
         assert_eq!(config.mate_rescue_taxa, DEFAULT_MATE_RESCUE_TAXA);
 
         let args = vec!["--mate-rescue-taxa".to_string(), "0".to_string()];
         let config = MappingConfig::resolve(
             Sequencer::Illumina,
             true,
+            false,
             false,
             ProfileMode::Default,
             &args,
@@ -2987,6 +3096,7 @@ mod tests {
         let config = MappingConfig::resolve(
             Sequencer::Illumina,
             true,
+            false,
             false,
             ProfileMode::Default,
             &args,
@@ -3039,9 +3149,15 @@ mod tests {
         r2: &[u8],
         pair_aware: bool,
     ) -> Vec<(String, u8, usize, u32)> {
-        let mut config =
-            MappingConfig::resolve(Sequencer::Illumina, true, false, ProfileMode::Default, &[])
-                .unwrap();
+        let mut config = MappingConfig::resolve(
+            Sequencer::Illumina,
+            true,
+            false,
+            false,
+            ProfileMode::Default,
+            &[],
+        )
+        .unwrap();
         config.pair_aware = pair_aware;
         let record = |seq: &[u8]| Record {
             id: "pair".to_string(),

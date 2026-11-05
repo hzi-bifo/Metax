@@ -308,11 +308,11 @@ Resolved mapper defaults:
 
 | Input | top-n | score ratio | min seeds | mapper identity | mapper fraction |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Illumina single-end / assembly | 5 | 0.90 (0.80 in recall mode) | 2 | 0.80 | 0.50 |
+| Illumina single-end / assembly | 5 | 0.90 (0.80 in recall mode; 0.50 on a database with marker genes) | 2 | 0.80 | 0.50 |
 | Illumina paired-end | 50 | 0.50 | 1 | 0.80 | 0.50 |
 | Nanopore / PacBio | 10 | 0.70 | 3 | 0.80 | 0.30, or 300 mapped bases |
 
-Illumina reads and noisy long reads (§5.5) find a seed by its first strobe as well; accurate long reads require both strobes of the seed. A short gene holds few seeds, so on a database with marker genes long reads also find a seed by its first strobe, and on a marker gene a chain needs at most two seeds instead of `min seeds`. `--allow-single-strobe-matches` and `--match-both-strobes` override the seed lookup.
+Near-identical marker genes of sister species share most seeds of a short read, and seed sampling can give the gene a read came from fewer seed hits than one of them, so on a database with marker genes an unpaired short read keeps candidates down to half of the best seed score, as a pair does, and alignment identity decides. Illumina reads and noisy long reads (§5.5) find a seed by its first strobe as well; accurate long reads require both strobes of the seed. A short gene holds few seeds, so on a database with marker genes long reads also find a seed by its first strobe, and on a marker gene a chain needs at most two seeds instead of `min seeds`. `--allow-single-strobe-matches` and `--match-both-strobes` override the seed lookup.
 
 The paired-end candidate set is deliberately broad so that the profiler can see competing species and keep conserved regions ambiguous; the modes differ in the evidence stage, not in candidate generation. Example overrides:
 
