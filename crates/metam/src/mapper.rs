@@ -645,12 +645,13 @@ pub fn map_read_with_workspace(
     mappings
 }
 
-/// The candidates of a long read whose candidates all lie on marker genes,
-/// split by the part of the read they cover, since one read can run over
-/// several genes of a genome: candidates whose read intervals overlap by at
-/// least half of the shorter interval, directly or through others, compete
-/// only with each other. `None` when this does not apply or all candidates
-/// cover one part.
+/// The candidates of a long read with a candidate on a marker gene, split by
+/// the part of the read they cover, since one read can run over several
+/// genes of a genome: candidates whose read intervals overlap by at least
+/// half of the shorter interval, directly or through others, compete only
+/// with each other. Candidates on other references join the parts they
+/// overlap, so a read placed along a genome stays one part. `None` when this
+/// does not apply or all candidates cover one part.
 fn marker_gene_read_parts(
     candidates: &[Candidate],
     read_len: usize,
@@ -661,7 +662,7 @@ fn marker_gene_read_parts(
         || candidates.len() < 2
         || !candidates
             .iter()
-            .all(|candidate| index.is_marker_gene(candidate.ref_id))
+            .any(|candidate| index.is_marker_gene(candidate.ref_id))
     {
         return None;
     }
@@ -5127,29 +5128,53 @@ mod tests {
             long_read_rescue: true,
             long_read_rescue_limit: None,
         };
-        let mut index = rescue_runtime_index(&[("long", &long_gene), ("short", &short_gene)]);
         let mut profile = MapProfile::default();
-        // A segment competes with the gene over the whole read.
+        // A genome along the whole read keeps the read one part, where the
+        // genes compete with it.
+        let mut index = rescue_runtime_index(&[
+            ("long", &long_gene),
+            ("short", &short_gene),
+            ("genome", &read),
+        ]);
         index
-            .set_reference_kinds(vec![ReferenceKind::MarkerGene, ReferenceKind::Segment])
+            .set_reference_kinds(vec![
+                ReferenceKind::MarkerGene,
+                ReferenceKind::MarkerGene,
+                ReferenceKind::Genome,
+            ])
             .unwrap();
         let mappings = map_read("ont", &read, &index, params, &mut profile);
         assert_eq!(mappings.len(), 1, "{mappings:?}");
-        assert_eq!(mappings[0].ref_id, "long");
+        assert_eq!(mappings[0].ref_id, "genome");
 
-        index
-            .set_reference_kinds(vec![ReferenceKind::MarkerGene; 2])
-            .unwrap();
-        let mappings = map_read("ont", &read, &index, params, &mut profile);
-        let mut found: Vec<_> = mappings
-            .iter()
-            .map(|mapping| (mapping.ref_id.as_str(), mapping.ref_start, mapping.ref_end))
-            .collect();
-        found.sort_unstable();
-        assert_eq!(found, [("long", 0, 800), ("short", 0, 400)]);
-        // Ranks run over both parts, best first.
-        assert_eq!(mappings[0].ref_id, "long");
-        assert_eq!((mappings[1].rank, mappings[1].num_mappings), (2, 2));
+        // Otherwise the parts do not compete, also when one lies on another
+        // kind of reference; only alignments on marker genes reach the gene
+        // ends.
+        let mut index = rescue_runtime_index(&[("long", &long_gene), ("short", &short_gene)]);
+        for (kinds, short_span) in [
+            (vec![ReferenceKind::MarkerGene; 2], Some((0, 400))),
+            (
+                vec![ReferenceKind::MarkerGene, ReferenceKind::Segment],
+                None,
+            ),
+        ] {
+            index.set_reference_kinds(kinds).unwrap();
+            let mappings = map_read("ont", &read, &index, params, &mut profile);
+            let mut found: Vec<_> = mappings
+                .iter()
+                .map(|mapping| (mapping.ref_id.as_str(), mapping.ref_start, mapping.ref_end))
+                .collect();
+            found.sort_unstable();
+            assert_eq!(found.len(), 2, "{found:?}");
+            assert_eq!(found[0], ("long", 0, 800));
+            assert_eq!(found[1].0, "short");
+            if let Some(span) = short_span {
+                assert_eq!((found[1].1, found[1].2), span);
+            }
+            // Ranks run over both parts, best first.
+            assert_eq!(mappings[0].ref_id, "long");
+            assert_eq!((mappings[1].rank, mappings[1].num_mappings), (2, 2));
+        }
     }
 
     #[test]
