@@ -157,7 +157,7 @@ pub(crate) struct CandidatePlacement {
     pub(crate) both_mapped: u32,
     /// Length of the read that gives `r1_mapped`.
     pub(crate) read_len: u32,
-    /// Other marker genes of the same genome that a long read covers
+    /// Other marker genes of the same genome that the fragment covers
     /// ([`TerminalCandidate::other_gene_hits`]); 0 otherwise.
     pub(crate) other_genes: u32,
     pub(crate) pair_errors: f64,
@@ -392,12 +392,12 @@ pub(crate) struct TerminalCandidate {
     pub(crate) candidate_boundary: CandidateBoundary,
     /// One independently evaluated placement per represented assembly.
     pub(crate) placements: Vec<CandidatePlacement>,
-    /// The other marker genes that a long read covers on the genomes of
+    /// The other marker genes that the fragment covers on the genomes of
     /// `placements`, one per gene.
     pub(crate) other_gene_hits: Vec<GeneHit>,
 }
 
-/// A marker gene that a long read covers besides the one of its placement.
+/// A marker gene that a fragment covers besides the one of its placement.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GeneHit {
     pub(crate) assembly_id: u32,
@@ -428,8 +428,8 @@ pub(crate) struct PresenceAssembly {
     /// actually receive mappings in a fractional index.
     pub(crate) asm_len: f64,
     pub(crate) count: u64,
-    /// Marker genes hit beyond one per fragment: the other genes that long
-    /// reads cover on this genome.
+    /// Marker genes hit beyond one per fragment: the other genes that
+    /// fragments cover on this genome.
     pub(crate) other_gene_hits: u64,
     pub(crate) reference_span_bases: u64,
     pub(crate) intervals: Vec<PresenceInterval>,
@@ -1315,8 +1315,9 @@ impl CandidateScratch {
                 flex_chunk: mapping.flex_chunk,
                 input_order,
             };
-            self.insert_placement(placement, policy.mode);
+            self.insert_row_placement(placement, mapping, policy.mode);
         }
+        self.count_other_genes();
     }
 
     fn build_long(&mut self, rows: &[EvidenceAlignment], policy: EvidencePolicy) {
@@ -1342,29 +1343,45 @@ impl CandidateScratch {
                 flex_chunk: mapping.flex_chunk,
                 input_order,
             };
-            if mapping.marker_gene_len > 0 {
-                let gene = (
-                    placement.taxid,
-                    placement.profile_rank,
-                    placement.assembly_id,
-                    placement.reference_id,
-                );
-                match self.by_taxon_gene.entry(gene) {
-                    Entry::Vacant(entry) => {
+            self.insert_row_placement(placement, mapping, policy.mode);
+        }
+        self.count_other_genes();
+    }
+
+    /// [`Self::insert_placement`] for the placement of one row, which is also
+    /// kept as the best on its marker gene when the row lies on one.
+    fn insert_row_placement(
+        &mut self,
+        placement: CandidatePlacement,
+        mapping: &EvidenceAlignment,
+        mode: EvidenceMode,
+    ) {
+        if mapping.marker_gene_len > 0 {
+            let gene = (
+                placement.taxid,
+                placement.profile_rank,
+                placement.assembly_id,
+                placement.reference_id,
+            );
+            match self.by_taxon_gene.entry(gene) {
+                Entry::Vacant(entry) => {
+                    entry.insert(placement);
+                }
+                Entry::Occupied(mut entry) => {
+                    if placement_is_better(&placement, entry.get(), mode) {
                         entry.insert(placement);
-                    }
-                    Entry::Occupied(mut entry) => {
-                        if placement_is_better(&placement, entry.get(), policy.mode) {
-                            entry.insert(placement);
-                        }
                     }
                 }
             }
-            self.insert_placement(placement, policy.mode);
         }
-        // A long read can run over several marker genes of one genome: its
-        // placement keeps the best of them and counts the others, whose
-        // coverage the read adds as well.
+        self.insert_placement(placement, mode);
+    }
+
+    /// A fragment can lie on several marker genes of one genome: a long read
+    /// that runs over them, or the two mates of a pair on two neighbouring
+    /// genes. Its placement keeps the best gene and counts the others, whose
+    /// coverage the fragment adds as well.
+    fn count_other_genes(&mut self) {
         for ((taxid, profile_rank, assembly_id, reference_id), gene) in self.by_taxon_gene.drain() {
             let key = (taxid, profile_rank, assembly_id);
             let placement = self
@@ -1728,6 +1745,38 @@ mod tests {
         let candidates = scratch.build(&rows, policy(EvidenceMode::Paired));
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].taxid, 3);
+    }
+
+    #[test]
+    fn lone_mates_on_two_marker_genes_count_on_both() {
+        // The two mates of one fragment on two marker genes of genome 1.
+        let mut rows = vec![
+            mapping(1, 10, 1, 0.99, 100, 100, MappingRole::Mate1),
+            mapping(1, 11, 1, 0.98, 100, 100, MappingRole::Mate2),
+        ];
+        for row in &mut rows {
+            row.pair_id = 0;
+            row.marker_gene_len = 1_000;
+        }
+        let mut scratch = CandidateScratch::default();
+        let candidates = scratch.build(&rows, policy(EvidenceMode::Paired));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].best.reference_id, 10);
+        assert_eq!(candidates[0].best.other_genes, 1);
+        let others: Vec<_> = candidates[0]
+            .other_gene_hits
+            .iter()
+            .map(|hit| (hit.assembly_id, hit.interval.reference_id))
+            .collect();
+        assert_eq!(others, [(1, 11)]);
+
+        // On genome references the fragment keeps one placement.
+        for row in &mut rows {
+            row.marker_gene_len = 0;
+        }
+        let candidates = scratch.build(&rows, policy(EvidenceMode::Paired));
+        assert_eq!(candidates[0].best.other_genes, 0);
+        assert!(candidates[0].other_gene_hits.is_empty());
     }
 
     #[test]

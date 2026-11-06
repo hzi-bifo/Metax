@@ -4,10 +4,12 @@
 //! for a fractional genome is already scaled to the whole genome. A species
 //! represented by marker genes counts only the fragments on its genes there;
 //! its whole genome offers more placements, by the ratio of the placements of
-//! a sequence of its declared genome size to those its genes offer. Long
-//! reads differ in length and can cover several genes, so for them the ratio
-//! is measured on the reads, from their hits on the genes that need all the
-//! bases the gates ask of a read.
+//! a sequence of its declared genome size to those its genes offer. Those
+//! placements count a fragment on every gene it lies on, so the ratio is
+//! multiplied by the gene hits per fragment, which exceed 1 where the two
+//! mates of a pair lie on two genes. Long reads differ in length and can
+//! cover several genes, so for them the ratio is measured on the reads, from
+//! their hits on the genes that need all the bases the gates ask of a read.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
@@ -27,18 +29,26 @@ pub(crate) type MarkerScales = HashMap<u32, Option<f64>>;
 /// species: assembly id and declared genome size.
 pub(crate) type MarkerSpecies = HashMap<u32, BTreeMap<u32, Option<usize>>>;
 
-/// The long reads resolved to a marker genome and the whole-genome reads they
-/// stand for, `per_base G + fixed` for a genome of `G` bases
-/// ([`MarkerModel::whole_genome_reads`] summed over the reads).
+/// The fragments resolved to a marker genome: for short reads their hits on
+/// its genes, for long reads the whole-genome reads they stand for, `per_base
+/// G + fixed` for a genome of `G` bases ([`MarkerModel::whole_genome_reads`]
+/// summed over the reads).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct GenomeReads {
     reads: u64,
+    gene_hits: u64,
     per_base: f64,
     fixed: f64,
 }
 
 impl GenomeReads {
-    /// One read with `gene_hits` hits of `(per_base, fixed)` each.
+    /// One short-read fragment with `gene_hits` hits on the genome's genes.
+    pub(crate) fn add_fragment(&mut self, gene_hits: u32) {
+        self.reads += 1;
+        self.gene_hits += u64::from(gene_hits);
+    }
+
+    /// One long read with `gene_hits` hits of `(per_base, fixed)` each.
     pub(crate) fn add(&mut self, gene_hits: u32, (per_base, fixed): (f64, f64)) {
         let hits = f64::from(gene_hits);
         self.reads += 1;
@@ -48,8 +58,18 @@ impl GenomeReads {
 
     pub(crate) fn merge(&mut self, other: Self) {
         self.reads += other.reads;
+        self.gene_hits += other.gene_hits;
         self.per_base += other.per_base;
         self.fixed += other.fixed;
+    }
+
+    /// Gene hits per short-read fragment, 1 without fragments.
+    fn hits_per_fragment(&self) -> f64 {
+        if self.reads == 0 {
+            1.0
+        } else {
+            self.gene_hits as f64 / self.reads as f64
+        }
     }
 }
 
@@ -84,33 +104,37 @@ pub(crate) fn marker_species(references: impl IntoIterator<Item = ReferenceKind>
     marker_genomes
 }
 
-/// Scale of every marker species: averaged over its marker genomes from the
-/// marker model, or for long reads (`measured`) the whole-genome reads of
-/// its resolved reads over their number.
+/// Scale of every marker species: averaged over its marker genomes, the
+/// marker model's times the gene hits per fragment of the fragments
+/// `resolved` to the genome, or for long reads the whole-genome reads of its
+/// resolved reads over their number.
 pub(crate) fn marker_scales(
     species: &MarkerSpecies,
     model: Option<&MarkerModel>,
-    measured: Option<&HashMap<u32, GenomeReads>>,
+    resolved: &HashMap<u32, GenomeReads>,
+    long_reads: bool,
 ) -> MarkerScales {
     species
         .iter()
         .map(|(&taxid, genomes)| {
-            let scale = || match measured {
-                Some(measured) => {
+            let scale = || {
+                if long_reads {
                     let (mut reads, mut whole_genome) = (0, 0.0);
                     for (assembly_id, &size) in genomes {
-                        if let Some(genome) = measured.get(assembly_id) {
+                        if let Some(genome) = resolved.get(assembly_id) {
                             reads += genome.reads;
                             whole_genome += genome.per_base * size? as f64 + genome.fixed;
                         }
                     }
                     (reads > 0).then(|| whole_genome / reads as f64)
-                }
-                None => {
+                } else {
                     let model = model?;
                     let mut sum = 0.0;
                     for (&assembly_id, &size) in genomes {
-                        sum += model.genome_scale(assembly_id, size?)?;
+                        let hits = resolved
+                            .get(&assembly_id)
+                            .map_or(1.0, GenomeReads::hits_per_fragment);
+                        sum += model.genome_scale(assembly_id, size?)? * hits;
                     }
                     Some(sum / genomes.len() as f64)
                 }
@@ -187,6 +211,7 @@ pub(crate) fn write_row<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profiler::markers::{FragmentGeometry, FragmentLayout};
 
     fn row(taxid: u32, fragments: f64) -> ProfileRow {
         ProfileRow {
@@ -245,10 +270,35 @@ mod tests {
         ];
         let species = marker_species(references);
         // Without a marker model no scale can be computed.
-        let scales = marker_scales(&species, None, None);
+        let scales = marker_scales(&species, None, &HashMap::new(), false);
         assert_eq!(scales.get(&1), None);
         assert_eq!(scales.get(&2), Some(&None));
         assert_eq!(scales.get(&3), Some(&None));
+    }
+
+    #[test]
+    fn pairs_on_two_genes_raise_the_scale_by_their_gene_hits() {
+        let geometry = FragmentGeometry::new(FragmentLayout::PairsAndLoneMates, 150, 400, 50, 0.7);
+        let model =
+            MarkerModel::from_gene_lengths(&[(1, &[1_000, 1_000]), (2, &[1_000])], geometry);
+        let species = MarkerSpecies::from([(
+            7,
+            BTreeMap::from([(1, Some(1_000_000)), (2, Some(500_000))]),
+        )]);
+        // Genome 1: four fragments, one with its two mates on the two genes;
+        // none resolved to genome 2.
+        let mut resolved = HashMap::new();
+        for hits in [1, 2, 1, 1] {
+            resolved
+                .entry(1)
+                .or_insert_with(GenomeReads::default)
+                .add_fragment(hits);
+        }
+        let scales = marker_scales(&species, Some(&model), &resolved, false);
+        let expected = (model.genome_scale(1, 1_000_000).unwrap() * 1.25
+            + model.genome_scale(2, 500_000).unwrap())
+            / 2.0;
+        assert_eq!(scales[&7], Some(expected));
     }
 
     #[test]
@@ -273,7 +323,7 @@ mod tests {
             .entry(3)
             .or_insert_with(GenomeReads::default)
             .add(1, (0.001, 0.0));
-        let scales = marker_scales(&species, None, Some(&reads));
+        let scales = marker_scales(&species, None, &reads, true);
         // (2 x (1 + 1) + 6) whole-genome reads over 2 reads.
         assert_eq!(scales[&2], Some(5.0));
         // No declared size, or no read to measure on.

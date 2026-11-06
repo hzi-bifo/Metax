@@ -295,8 +295,9 @@ struct AssignmentResult {
 
     filter_stats: FilterStats,
 
-    /// Whole-genome reads that the long reads on each marker genome stand
-    /// for, by assembly id; filled only for `--estimate-unclassified`.
+    /// The fragments resolved to each marker genome, their gene hits and, for
+    /// long reads, the whole-genome reads they stand for, by assembly id;
+    /// filled only for `--estimate-unclassified`.
     marker_genome_reads: HashMap<u32, GenomeReads>,
 }
 
@@ -2055,11 +2056,12 @@ impl CommunityProfiler {
         let unclassified = unclassified_species.as_ref().map(|species| {
             // Long reads differ in length and in the genes each covers, so
             // their scales come from the reads themselves.
-            let measured = self
-                .cfg
-                .coverage_gate_is_or()
-                .then_some(&assignment.marker_genome_reads);
-            let scales = unclassified::marker_scales(species, marker_model.as_deref(), measured);
+            let scales = unclassified::marker_scales(
+                species,
+                marker_model.as_deref(),
+                &assignment.marker_genome_reads,
+                self.cfg.coverage_gate_is_or(),
+            );
             let estimate = unclassified::estimate(&normalized, &scales, total_reads);
             match estimate {
                 Ok(estimate) => log::info!(
@@ -3499,25 +3501,35 @@ fn process_evidence_batch(
                         flex_chunk: placement.flex_chunk,
                     });
                     if cfg.estimate_unclassified {
-                        let genes = std::iter::once(placement.reference_id).chain(
-                            candidates[index]
-                                .other_gene_hits
-                                .iter()
-                                .filter(|hit| hit.assembly_id == placement.assembly_id)
-                                .map(|hit| hit.interval.reference_id),
-                        );
-                        if let Some((hits, per_hit)) = markers.and_then(|model| {
-                            model.whole_genome_reads(
-                                placement.assembly_id,
-                                placement.read_len,
-                                genes,
-                            )
-                        }) {
+                        if cfg.coverage_gate_is_or() {
+                            let genes = std::iter::once(placement.reference_id).chain(
+                                candidates[index]
+                                    .other_gene_hits
+                                    .iter()
+                                    .filter(|hit| hit.assembly_id == placement.assembly_id)
+                                    .map(|hit| hit.interval.reference_id),
+                            );
+                            if let Some((hits, per_hit)) = markers.and_then(|model| {
+                                model.whole_genome_reads(
+                                    placement.assembly_id,
+                                    placement.read_len,
+                                    genes,
+                                )
+                            }) {
+                                result
+                                    .marker_genome_reads
+                                    .entry(placement.assembly_id)
+                                    .or_default()
+                                    .add(hits, per_hit);
+                            }
+                        } else if markers
+                            .is_some_and(|model| model.is_marker_genome(placement.assembly_id))
+                        {
                             result
                                 .marker_genome_reads
                                 .entry(placement.assembly_id)
                                 .or_default()
-                                .add(hits, per_hit);
+                                .add_fragment(1 + placement.other_genes);
                         }
                     }
                 }

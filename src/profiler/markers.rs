@@ -426,7 +426,8 @@ fn marker_coverage(
     if total_placements <= 0.0 {
         return None;
     }
-    // Gene hits: a long read can cover several genes.
+    // Gene hits: a long read, or the two mates of a pair, can cover several
+    // genes.
     let fragments = (assembly.count + assembly.other_gene_hits) as f64;
     let marker_bases: f64 = genes.iter().map(|gene| f64::from(gene.len)).sum();
 
