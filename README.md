@@ -140,7 +140,7 @@ Add `--dmp-dir <dump_dir>` to use a specific taxonomy directory. The first run a
   column 2:  Taxon ID
   column 3:  Taxon rank
   column 4:  Number of reads (full-index equivalents; reads on the marker genes for marker genomes)
-  column 5:  Depth of coverage
+  column 5:  Depth of coverage from abundance estimation
   column 6:  Relative abundance (%)
   column 7:  Breadth of coverage
   column 8:  Expected breadth of coverage
@@ -149,16 +149,20 @@ Add `--dmp-dir <dump_dir>` to use a specific taxonomy directory. The first run a
   column 11: Flex chunk breadth of coverage
   column 12: Expected flex chunk breadth of coverage
   column 13: P-value of the flex chunk breadth deviation
+  column 14: Depth of the coverage evidence on the best-fit genome, before abundance estimation
+  column 15: Accession of the best-fit genome
   ```
+
+  Columns 7 to 15 of a species come from its best-fit genome; columns 14 and 15 are `NA` for rows not kept by the coverage evidence.
 
   For species represented by marker genes, columns 10 and 11 hold the fraction of marker genes hit, column 12 the expected fraction, and column 13 the p-value of the genes hit.
 
   When `--host` is used, three columns are appended:
 
   ```text
-  column 14: Host names
-  column 15: Host taxonomy IDs
-  column 16: Associated diseases
+  column 16: Host names
+  column 17: Host taxonomy IDs
+  column 18: Associated diseases
   ```
 
 - Run log: `<output_prefix>.log`

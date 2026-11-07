@@ -74,7 +74,7 @@ use super::identity::{
 };
 use super::markers::{FragmentGeometry, FragmentLayout, LengthHistogram, MarkerModel};
 use super::output::{
-    ClassificationSource, ProfileAnnotations, ProfileRow, ResolvedClassifications,
+    BestFitReport, ClassificationSource, ProfileAnnotations, ProfileRow, ResolvedClassifications,
 };
 use super::pathogen::{load_pathogen_table, PathogenEntry};
 use super::rollup::{GenomeLayout, GenusRollup, GenusRow, OrphanedFragments};
@@ -670,11 +670,13 @@ impl CommunityProfiler {
             species_to_genus_raw
         });
         let mut assembly_ids: HashMap<&str, u32> = HashMap::new();
+        let mut assembly_names: Vec<Arc<str>> = Vec::new();
         for reference in &db.references {
             if !assembly_ids.contains_key(reference.genome.as_str()) {
                 let next = u32::try_from(assembly_ids.len())
                     .context("database contains more than 2^32 assemblies")?;
                 assembly_ids.insert(reference.genome.as_str(), next);
+                assembly_names.push(Arc::from(reference.genome.as_str()));
             }
         }
         let genus_rollup = rollup_genus_of.map(|genus_of| {
@@ -915,6 +917,7 @@ impl CommunityProfiler {
             marker_model,
             genus_rollup,
             unclassified_species,
+            assembly_names,
         })
     }
 
@@ -1325,6 +1328,7 @@ impl CommunityProfiler {
             genus_rollup,
             total_reads,
             unclassified_species,
+            assembly_names,
             ..
         } = mapping_data;
         let verbose_logging = self.cfg.verbose || self.cfg.very_verbose;
@@ -1370,6 +1374,7 @@ impl CommunityProfiler {
 
         let mut evidence_decisions: HashMap<u32, WitnessDecision> = HashMap::new();
         let mut evidence_selected_taxa: HashSet<u32> = HashSet::new();
+        let mut best_fit: HashMap<u32, BestFitGenome> = HashMap::new();
         if let Some(policy) = evidence_policy {
             let resolved = resolve_coordinate_evidence(
                 &self.cfg,
@@ -1388,6 +1393,7 @@ impl CommunityProfiler {
                 &resolved.best_fit,
                 marker_model.as_deref(),
             );
+            best_fit = resolved.best_fit;
             evidence_decisions = resolved.decisions;
             evidence_selected_taxa = resolved.selected_taxa;
             if let Some(rollup) = genus_rollup.as_deref() {
@@ -1997,6 +2003,18 @@ impl CommunityProfiler {
             else {
                 continue;
             };
+            // A taxon kept by the coverage evidence also reports its best-fit
+            // genome and the depth of that evidence there before abundance.
+            let best_fit_report = best_fit
+                .get(&taxid)
+                .filter(|_| evidence_selected_taxa.contains(&taxid))
+                .zip(evidence_metrics)
+                .and_then(|(genome, metrics)| {
+                    Some(BestFitReport {
+                        genome: Arc::clone(assembly_names.get(genome.assembly_id as usize)?),
+                        evidence_depth: metrics.depth,
+                    })
+                });
             out_taxa_list.push(ProfileRow {
                 taxname: taxname.to_string(),
                 taxid,
@@ -2011,6 +2029,7 @@ impl CommunityProfiler {
                 flex_chunk,
                 expected_flex_chunk,
                 chunk_pvalue: chunkcov_prob,
+                best_fit: best_fit_report,
                 annotations,
             });
         }
@@ -2371,6 +2390,7 @@ impl CommunityProfiler {
                 flex_chunk,
                 expected_flex_chunk,
                 chunk_pvalue: chunkcov_prob,
+                best_fit: None,
                 annotations,
             });
         }
@@ -5148,6 +5168,9 @@ struct MappingData {
 
     /// Inputs of `--estimate-unclassified`; `None` when it is off.
     unclassified_species: Option<MarkerSpecies>,
+
+    /// Genome accession of each assembly id.
+    assembly_names: Vec<Arc<str>>,
 }
 
 #[cfg(test)]
@@ -5376,6 +5399,7 @@ mod tests {
             marker_model: None,
             genus_rollup: None,
             unclassified_species: None,
+            assembly_names: Vec::new(),
         };
         (mapping_data, assignment)
     }
@@ -5688,6 +5712,7 @@ mod tests {
             flex_chunk: 0.1,
             expected_flex_chunk: 0.1,
             chunk_pvalue: Some(1.0),
+            best_fit: None,
             annotations: None,
         };
         let evidence: HashMap<u32, TaxonEvidence> = [
@@ -5749,6 +5774,7 @@ mod tests {
             flex_chunk: 0.1,
             expected_flex_chunk: 0.1,
             chunk_pvalue: Some(1.0),
+            best_fit: None,
             annotations: None,
         };
         let selected = HashSet::new();
@@ -5799,6 +5825,7 @@ mod tests {
             marker_model: None,
             genus_rollup: None,
             unclassified_species: None,
+            assembly_names: Vec::new(),
         };
         let assignment = AssignmentResult {
             read_assignments: vec![ReadAssignment {
@@ -5860,6 +5887,7 @@ mod tests {
             marker_model: None,
             genus_rollup: None,
             unclassified_species: None,
+            assembly_names: Vec::new(),
         };
         let assignment = AssignmentResult {
             read_assignments: vec![ReadAssignment {

@@ -420,7 +420,7 @@ The profile is tab-separated, has no header row, and contains one row per report
 | 2 | taxid |
 | 3 | rank |
 | 4 | number of reads, in full-index equivalents (scaled for fractional databases; for marker genomes, the reads mapped to the marker genes) |
-| 5 | depth of coverage (for marker genomes, of the whole genome; §7.13) |
+| 5 | depth of coverage from abundance estimation, each fragment counted once (for marker genomes, of the whole genome; §7.13) |
 | 6 | relative abundance (%), normalized over the reported taxa |
 | 7 | observed breadth of coverage |
 | 8 | expected breadth of coverage |
@@ -429,14 +429,16 @@ The profile is tab-separated, has no header row, and contains one row per report
 | 11 | flexible chunk breadth |
 | 12 | expected flexible chunk breadth |
 | 13 | p-value of the flexible chunk breadth deviation (`NA` when not computed) |
+| 14 | depth of the coverage evidence on the best-fit genome before abundance estimation, each fragment counted once (`NA` for rows not kept by the coverage evidence, §7.3) |
+| 15 | accession of the best-fit genome whose coverage columns 7–14 report (`NA` as for column 14) |
 
-With `--host`, three columns are appended:
+Columns 7–15 of a species come from its best-fit genome, the genome its presence is decided and reported on; column 5 comes from abundance estimation over all its fragments, including those it shares with other taxa. With `--host`, three columns are appended:
 
 | Column | Meaning |
 | ---: | --- |
-| 14 | host names |
-| 15 | host taxids |
-| 16 | diseases |
+| 16 | host names |
+| 17 | host taxids |
+| 18 | diseases |
 
 With `--estimate-unclassified`, the profile ends with one more row: name and rank `unclassified`, taxid `0`, column 4 the input fragments (single-end and long reads: reads) that no row explains, column 6 their share of the input in percent, and `NA` in the other columns (§7.14). Column 6 of this row is a share of the input, not part of the normalized abundance of the other rows.
 

@@ -473,6 +473,7 @@ mod tests {
             flex_chunk: 1.0,
             expected_flex_chunk: 1.0,
             chunk_pvalue: None,
+            best_fit: None,
             annotations: None,
         }
     }

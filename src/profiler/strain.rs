@@ -2396,6 +2396,7 @@ impl StrainProfiler {
                 flex_chunk,
                 expected_flex_chunk,
                 chunk_pvalue: chunkcov_prob,
+                best_fit: None,
                 annotations,
             });
         }
@@ -2799,6 +2800,7 @@ mod tests {
             flex_chunk: 0.1,
             expected_flex_chunk: 0.1,
             chunk_pvalue: Some(1.0),
+            best_fit: None,
             annotations: None,
         };
         assert!(!strain_profile_row_passes(&row(0.499_996), &cfg, 0.5, true));

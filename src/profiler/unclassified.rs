@@ -204,7 +204,7 @@ pub(crate) fn write_row<W: Write>(
     fields.push(fragments);
     fields.push("NA".to_string());
     fields.push(share);
-    fields.extend(std::iter::repeat_n("NA".to_string(), 7));
+    fields.extend(std::iter::repeat_n("NA".to_string(), 9));
     writer.write_record(fields)
 }
 
@@ -228,6 +228,7 @@ mod tests {
             flex_chunk: 0.0,
             expected_flex_chunk: 0.0,
             chunk_pvalue: None,
+            best_fit: None,
             annotations: None,
         }
     }
@@ -346,7 +347,7 @@ mod tests {
         .unwrap();
         write_row(&mut writer, None).unwrap();
         let text = String::from_utf8(writer.into_inner().unwrap()).unwrap();
-        let na = ["NA"; 7].join("\t");
+        let na = ["NA"; 9].join("\t");
         assert_eq!(
             text,
             format!(
