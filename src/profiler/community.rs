@@ -1383,6 +1383,11 @@ impl CommunityProfiler {
                     layout: genus_rollup.as_deref().map(|rollup| &rollup.layout),
                 },
             )?;
+            rescale_to_best_fit(
+                &mut assignment.read_assignments,
+                &resolved.best_fit,
+                marker_model.as_deref(),
+            );
             evidence_decisions = resolved.decisions;
             evidence_selected_taxa = resolved.selected_taxa;
             if let Some(rollup) = genus_rollup.as_deref() {
@@ -2584,6 +2589,43 @@ type IntervalMap = HashMap<u32, (AccKey, (usize, usize), (usize, usize), (usize,
 struct CoordinateEvidenceResult {
     decisions: HashMap<u32, WitnessDecision>,
     selected_taxa: HashSet<u32>,
+    /// The genome each present taxon is reported on.
+    best_fit: HashMap<u32, BestFitGenome>,
+}
+
+/// A present taxon's best-fit genome, which also sets its abundance.
+#[derive(Clone, Copy, Debug)]
+struct BestFitGenome {
+    assembly_id: u32,
+    asm_len: f64,
+    sampling_scale: f64,
+}
+
+/// A taxon's abundance comes from the genome it is reported on: each
+/// fragment's depth for a present taxon is its mapped bases over that
+/// genome's length, with that genome's sampling scale, whichever of the
+/// taxon's genomes the fragment placed best on. Depths on marker genomes keep
+/// their gene model.
+fn rescale_to_best_fit(
+    assignments: &mut [ReadAssignment],
+    best_fit: &HashMap<u32, BestFitGenome>,
+    markers: Option<&MarkerModel>,
+) {
+    for assignment in assignments
+        .iter_mut()
+        .filter(|assignment| assignment.requires_terminal_evidence)
+    {
+        for (index, taxid) in assignment.taxids.iter().enumerate() {
+            let Some(genome) = best_fit.get(taxid) else {
+                continue;
+            };
+            if markers.is_some_and(|model| model.is_marker_genome(genome.assembly_id)) {
+                continue;
+            }
+            assignment.depths[index] = assignment.mapped_lens[index] / genome.asm_len.max(1.0);
+            assignment.sampling_scales[index] = genome.sampling_scale;
+        }
+    }
 }
 
 /// Choose the one descendant witness whose coverage a majority-LCA row should
@@ -2723,8 +2765,17 @@ fn keyed_witness_is_better(
     left.0 < right.0
 }
 
-/// Fits and fragments of each witness genome, from its resolved fragments.
-type GenomeSupport = HashMap<PresenceKey, (u64, u64)>;
+/// What choosing and using a best-fit genome needs of each witness genome:
+/// fits and fragments from its resolved fragments, length and sampling scale.
+#[derive(Clone, Copy, Debug, Default)]
+struct WitnessGenome {
+    fits: u64,
+    count: u64,
+    asm_len: f64,
+    sampling_scale: f64,
+}
+
+type GenomeSupport = HashMap<PresenceKey, WitnessGenome>;
 
 /// Report each present taxon on its best-fit genome: of its genomes among
 /// `witnesses` that pass, the one on which most of its resolved fragments
@@ -2735,12 +2786,12 @@ fn report_best_fit(
     decisions: &mut HashMap<u32, WitnessDecision>,
     witnesses: impl IntoIterator<Item = (PresenceKey, WitnessDecision)>,
     support: &GenomeSupport,
-) {
+) -> HashMap<u32, BestFitGenome> {
     let rank = |(key, decision): &(PresenceKey, WitnessDecision)| {
-        let (fits, count) = support.get(key).copied().unwrap_or_default();
+        let genome = support.get(key).copied().unwrap_or_default();
         (
-            fits,
-            count,
+            genome.fits,
+            genome.count,
             decision.metrics.fixed_chunk,
             Reverse(key.assembly_id),
         )
@@ -2767,9 +2818,18 @@ fn report_best_fit(
             }
         }
     }
-    for (taxid, (_, decision)) in best {
-        decisions.insert(taxid, decision);
-    }
+    best.into_iter()
+        .map(|(taxid, (key, decision))| {
+            decisions.insert(taxid, decision);
+            let genome = support.get(&key).copied().unwrap_or_default();
+            let best_fit = BestFitGenome {
+                assembly_id: key.assembly_id,
+                asm_len: genome.asm_len,
+                sampling_scale: genome.sampling_scale,
+            };
+            (taxid, best_fit)
+        })
+        .collect()
 }
 
 /// A species absent before MAP may be added on a witness that passes after MAP
@@ -3089,9 +3149,17 @@ fn resolve_coordinate_evidence(
         .collect::<HashSet<_>>();
     let support: GenomeSupport = presence
         .iter()
-        .map(|(key, assembly)| (*key, (assembly.fits, assembly.count)))
+        .map(|(key, assembly)| {
+            let genome = WitnessGenome {
+                fits: assembly.fits,
+                count: assembly.count,
+                asm_len: assembly.asm_len,
+                sampling_scale: assembly.sampling_scale,
+            };
+            (*key, genome)
+        })
         .collect();
-    report_best_fit(
+    let baseline_best_fit = report_best_fit(
         &mut baseline_decisions,
         baseline_evaluations.iter().copied(),
         &support,
@@ -3120,6 +3188,7 @@ fn resolve_coordinate_evidence(
         return Ok(CoordinateEvidenceResult {
             decisions: baseline_decisions,
             selected_taxa: baseline_selected,
+            best_fit: baseline_best_fit,
         });
     }
 
@@ -3133,6 +3202,7 @@ fn resolve_coordinate_evidence(
         return Ok(CoordinateEvidenceResult {
             decisions: baseline_decisions,
             selected_taxa: baseline_selected,
+            best_fit: baseline_best_fit,
         });
     }
 
@@ -3142,6 +3212,7 @@ fn resolve_coordinate_evidence(
         return Ok(CoordinateEvidenceResult {
             decisions: baseline_decisions,
             selected_taxa: baseline_selected,
+            best_fit: baseline_best_fit,
         });
     }
     // Guarded MAP is a calibrated species-only policy. Higher-rank terminal
@@ -3164,6 +3235,7 @@ fn resolve_coordinate_evidence(
         return Ok(CoordinateEvidenceResult {
             decisions: baseline_decisions,
             selected_taxa: baseline_selected,
+            best_fit: baseline_best_fit,
         });
     }
     let baseline_by_key = baseline_evaluations
@@ -3299,7 +3371,7 @@ fn resolve_coordinate_evidence(
         .chain(baseline_evaluations.iter().copied().filter(|(key, _)| {
             baseline_selected.contains(&key.taxid) && !passes_after_map.contains(&key.taxid)
         }));
-    report_best_fit(&mut post_decisions, deciding, &support);
+    let best_fit = report_best_fit(&mut post_decisions, deciding, &support);
 
     if cfg.verbose || cfg.very_verbose {
         let posterior_mean = if resolved_ties == 0 {
@@ -3339,6 +3411,7 @@ fn resolve_coordinate_evidence(
     Ok(CoordinateEvidenceResult {
         decisions: post_decisions,
         selected_taxa,
+        best_fit,
     })
 }
 
@@ -3579,6 +3652,7 @@ fn process_evidence_batch(
                     let presence = result.presence.entry(key).or_default();
                     if presence.asm_len <= 0.0 {
                         presence.asm_len = placement.asm_len;
+                        presence.sampling_scale = placement.sampling_scale;
                     }
                     presence.count = presence.count.saturating_add(1);
                     presence.fits += u64::from(placement.assembly_id == best_assembly);
@@ -6631,6 +6705,33 @@ mod tests {
     }
 
     #[test]
+    fn abundance_uses_the_best_fit_genome_of_each_present_taxon() {
+        let mut assignments = vec![ReadAssignment {
+            read: Arc::from("r"),
+            rank: AssignRank::Mixed,
+            requires_terminal_evidence: true,
+            taxids: vec![1, 2],
+            depths: vec![150.0 / 1_000.0, 150.0 / 1_000.0],
+            mapped_lens: vec![150.0, 150.0],
+            sampling_scales: vec![1.0, 1.0],
+            best: 0,
+        }];
+        let best_fit = HashMap::from([(
+            1,
+            BestFitGenome {
+                assembly_id: 7,
+                asm_len: 1_500.0,
+                sampling_scale: 2.0,
+            },
+        )]);
+        rescale_to_best_fit(&mut assignments, &best_fit, None);
+        // Taxon 1 is measured on its 1,500-base genome; taxon 2, not present,
+        // keeps the genome of its own placement.
+        assert_eq!(assignments[0].depths, vec![0.1, 0.15]);
+        assert_eq!(assignments[0].sampling_scales, vec![2.0, 1.0]);
+    }
+
+    #[test]
     fn a_present_taxon_is_reported_on_its_best_fit_passing_genome() {
         let key = |taxid, assembly_id| PresenceKey {
             taxid,
@@ -6648,16 +6749,21 @@ mod tests {
             rescues: RescueKinds::default(),
             required_premap_guard: PremapChunkGuard::None,
         };
+        let fit = |fits, count| WitnessGenome {
+            fits,
+            count,
+            ..WitnessGenome::default()
+        };
         let support = GenomeSupport::from([
-            (key(1, 5), (3, 9)),
-            (key(1, 6), (4, 4)),
-            (key(1, 7), (9, 9)),
-            (key(2, 8), (2, 5)),
-            (key(2, 9), (2, 6)),
-            (key(3, 1), (1, 1)),
-            (key(3, 2), (1, 1)),
-            (key(4, 4), (1, 1)),
-            (key(4, 3), (1, 1)),
+            (key(1, 5), fit(3, 9)),
+            (key(1, 6), fit(4, 4)),
+            (key(1, 7), fit(9, 9)),
+            (key(2, 8), fit(2, 5)),
+            (key(2, 9), fit(2, 6)),
+            (key(3, 1), fit(1, 1)),
+            (key(3, 2), fit(1, 1)),
+            (key(4, 4), fit(1, 1)),
+            (key(4, 3), fit(1, 1)),
         ]);
         let mut decisions = HashMap::new();
         report_best_fit(

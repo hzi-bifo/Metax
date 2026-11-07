@@ -443,12 +443,15 @@ pub(crate) struct PresenceAssembly {
     /// Resolved fragments whose best placement within their taxon is on this
     /// genome.
     pub(crate) fits: u64,
+    /// Full-index equivalents of one fragment on this genome (§4.2).
+    pub(crate) sampling_scale: f64,
 }
 
 impl PresenceAssembly {
     pub(crate) fn merge(&mut self, mut other: PresenceAssembly) {
         if self.asm_len <= 0.0 {
             self.asm_len = other.asm_len;
+            self.sampling_scale = other.sampling_scale;
         }
         self.count = self.count.saturating_add(other.count);
         self.other_gene_hits = self.other_gene_hits.saturating_add(other.other_gene_hits);
@@ -2463,6 +2466,7 @@ mod tests {
             other_gene_hits: 0,
             reference_span_bases: 250,
             fits: 0,
+            sampling_scale: 1.0,
             intervals: vec![
                 PresenceInterval {
                     reference_id: 1,

@@ -598,6 +598,7 @@ mod tests {
                 })
                 .collect(),
             fits: 0,
+            sampling_scale: 1.0,
         }
     }
 
