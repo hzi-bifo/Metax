@@ -256,9 +256,18 @@ struct ProfileArgs {
         value_name = "FRACTION",
         value_parser = parse_probability,
         help_heading = "Species and strain evidence",
-        help = "Minimum identity for species/strain assignment (0-1). A preset default is used when omitted; the long-read default auto-calibrates from base quality. It does not discard lower-identity mapper output or change --genus-identity."
+        help = "Minimum identity for species/strain assignment (0-1). When omitted, the preset is lowered by the reads' sequencing error rate from base quality (short reads: averaged over both mates; long reads: when noisy); a value given here is used as is. It does not discard lower-identity mapper output or change --genus-identity."
     )]
     identity: Option<f64>,
+
+    #[arg(
+        long = "base-accuracy",
+        value_name = "FRACTION",
+        value_parser = parse_probability,
+        hide = true,
+        help = "Mean base accuracy of the short reads (both mates of pairs) for a saved mapping that does not record it."
+    )]
+    base_accuracy: Option<f64>,
 
     #[arg(
         short = 'm',
@@ -1091,6 +1100,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             max_em_iterations: args.max_em_iterations,
             lenient_mapping_input: args.lenient_mapping_input,
             identity: args.identity,
+            base_accuracy: args.base_accuracy,
             mapped_len: args.mapped_len,
             breadth: args.breadth,
             chunk_breadth: args.chunk_breadth,

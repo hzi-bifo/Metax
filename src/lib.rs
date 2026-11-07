@@ -94,6 +94,9 @@ pub struct AppConfig {
     pub max_em_iterations: usize,
     pub lenient_mapping_input: bool,
     pub identity: Option<f64>,
+    /// Mean base accuracy of the reads, for a saved mapping that does not
+    /// record it.
+    pub base_accuracy: Option<f64>,
     pub mapped_len: Option<usize>,
     pub breadth: Option<f64>,
     pub chunk_breadth: Option<f64>,
@@ -157,6 +160,10 @@ const QUALITY_SAMPLE_MAX_BASES: u64 = 250_000_000;
 pub(crate) const NOISY_LONG_READ_ACCURACY: f64 = 0.95;
 /// Hard lower bound for the self-calibrated long-read identity cutoff.
 const ADAPTIVE_IDENTITY_FLOOR: f64 = 0.84;
+/// Hard lower bound for the short-read identity cutoff set from base accuracy:
+/// qualities that are wrong or under-stated never let a species claim reads
+/// below the usual species boundary.
+const SHORT_READ_IDENTITY_FLOOR: f64 = 0.95;
 
 /// Whether long reads with this sampled mean predicted base accuracy are
 /// noisy. Their identity cutoff self-calibrates, and the mapper also accepts
@@ -179,12 +186,21 @@ pub(crate) fn adaptive_identity_from_accuracy(accuracy: f64, mode: ProfileMode) 
     if !is_noisy_long_read_accuracy(accuracy) {
         return None;
     }
+    Some(identity_below_accuracy(accuracy, mode))
+}
+
+/// An identity cutoff that leaves the profile mode's room for divergence from
+/// the reference below the reads' own base accuracy: wider for recall,
+/// narrower for precision, never below [`ADAPTIVE_IDENTITY_FLOOR`]. For short
+/// reads the room equals the gap between error-free reads and the preset
+/// cutoff, so error-free reads keep the preset.
+fn identity_below_accuracy(accuracy: f64, mode: ProfileMode) -> f64 {
     let margin = match mode {
         ProfileMode::Recall => 0.04,
         ProfileMode::Default => 0.03,
         ProfileMode::Precision => 0.02,
     };
-    Some((accuracy - margin).max(ADAPTIVE_IDENTITY_FLOOR))
+    (accuracy - margin).max(ADAPTIVE_IDENTITY_FLOOR)
 }
 
 impl MetaxApp {
@@ -388,9 +404,12 @@ impl MetaxApp {
             .map(|s| s.trim().to_string())
             .collect();
         // Invoke the in-process mapper with preset + mode parameters.
-        let noisy_long_reads = profiler
-            .sampled_mean_base_accuracy
-            .is_some_and(is_noisy_long_read_accuracy);
+        // Short reads record their accuracy too, for their identity cutoff;
+        // only long reads switch the mapper's seeding.
+        let noisy_long_reads = self.config.sequencer.is_long_read()
+            && profiler
+                .sampled_mean_base_accuracy
+                .is_some_and(is_noisy_long_read_accuracy);
         let mapper = Mapper::new(
             db.clone(),
             sequences,
@@ -626,19 +645,20 @@ impl MetaxApp {
         )
     }
 
-    /// Sample mean predicted base accuracy of long reads, which decides whether
-    /// they are noisy. Best-effort: FASTA, empty input, or a read error treats
-    /// the reads as accurate rather than failing an otherwise valid run.
-    fn sample_long_read_base_accuracy(&self) -> Option<f64> {
-        let first = self
+    /// Sample mean predicted base accuracy of the reads of input file `index`
+    /// (0: single-end or first mate, 1: second mate). Best-effort: FASTA, empty
+    /// input, or a read error treats the reads as accurate rather than failing
+    /// an otherwise valid run.
+    fn sample_base_accuracy(&self, index: usize) -> Option<f64> {
+        let path = self
             .config
             .input_sequences
             .as_deref()?
             .split(',')
-            .next()
+            .nth(index)
             .filter(|path| !path.is_empty())?;
         match metam::io::sample_mean_base_accuracy(
-            first,
+            path,
             QUALITY_SAMPLE_READS,
             QUALITY_SAMPLE_MAX_BASES,
         ) {
@@ -646,7 +666,7 @@ impl MetaxApp {
             Err(error) => {
                 log::warn!(
                     target: "PROFILER",
-                    "Could not sample base quality from {first} ({error:#}); treating the reads as accurate (preset identity cutoff, both seed strobes must match).",
+                    "Could not sample base quality from {path} ({error:#}); treating the reads as accurate (preset identity cutoff, both seed strobes must match).",
                 );
                 None
             }
@@ -731,6 +751,41 @@ impl MetaxApp {
                         }
                     }
                 }
+                // The cutoff leaves the profile mode's room for divergence below
+                // the reads' own base accuracy, averaged over both mates' files
+                // for pairs, so second reads, which carry more sequencing
+                // errors, and lower-quality runs are not held to the error-free
+                // standard. A cutoff the user sets, now or when the mapping was
+                // saved (which then records no accuracy), stays fixed.
+                if !self.config.strain && self.config.identity.is_none() {
+                    let accuracy_source = if sampled_mean_base_accuracy.is_some() {
+                        "saved mapping metadata"
+                    } else if mapping_metadata.is_some() {
+                        sampled_mean_base_accuracy = self.config.base_accuracy;
+                        "--base-accuracy"
+                    } else {
+                        let first = self.sample_base_accuracy(0);
+                        let second = self
+                            .config
+                            .is_paired
+                            .then(|| self.sample_base_accuracy(1))
+                            .flatten();
+                        sampled_mean_base_accuracy = match (first, second) {
+                            (Some(first), Some(second)) => Some(0.5 * (first + second)),
+                            (first, second) => first.or(second),
+                        };
+                        "input base qualities"
+                    };
+                    if let Some(accuracy) = sampled_mean_base_accuracy {
+                        let cutoff = identity_below_accuracy(accuracy, self.config.mode)
+                            .max(SHORT_READ_IDENTITY_FLOOR);
+                        log::info!(
+                            target: "PROFILER",
+                            "Short-read identity cutoff: {cutoff:.4} (mean base accuracy {accuracy:.4} from {accuracy_source}).",
+                        );
+                        identity = Some(cutoff);
+                    }
+                }
             }
             Sequencer::Nanopore | Sequencer::PacBio => {
                 if batch_size == 0 {
@@ -744,7 +799,7 @@ impl MetaxApp {
                 let accuracy_source = if sampled_mean_base_accuracy.is_some() {
                     "saved mapping metadata"
                 } else {
-                    sampled_mean_base_accuracy = self.sample_long_read_base_accuracy();
+                    sampled_mean_base_accuracy = self.sample_base_accuracy(0);
                     "input base qualities"
                 };
                 // Strain profiling keeps its own long-read presets. Length and
@@ -1052,6 +1107,7 @@ mod tests {
             max_em_iterations: 200,
             lenient_mapping_input: false,
             identity: None,
+            base_accuracy: None,
             mapped_len: None,
             breadth: None,
             chunk_breadth: None,
@@ -1318,17 +1374,75 @@ mod tests {
     }
 
     #[test]
-    fn short_reads_ignore_the_adaptive_long_read_path() {
-        // Illumina keeps its fixed preset even with a low-quality FASTQ.
+    fn short_reads_lower_the_preset_by_their_error_rate() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("reads.fastq");
-        std::fs::write(&path, "@a\nACGT\n+\n++++\n").unwrap();
-        let mut cfg = test_app_config();
-        cfg.sequencer = Sequencer::Illumina;
-        cfg.mode = ProfileMode::Default;
-        cfg.input_sequences = Some(path.to_str().unwrap().to_string());
-        let (_, identity, _, _) = resolve(cfg);
-        assert!((identity - 0.97).abs() < 1e-12, "identity={identity}");
+        // Phred 30 ('?', accuracy 0.999) and Phred 20 ('5', accuracy 0.99).
+        let first = dir.path().join("reads_1.fastq");
+        let second = dir.path().join("reads_2.fastq");
+        std::fs::write(&first, "@a/1\nACGT\n+\n????\n").unwrap();
+        std::fs::write(&second, "@a/2\nACGT\n+\n5555\n").unwrap();
+        let illumina = |inputs: Vec<&std::path::Path>, identity: Option<f64>| {
+            let mut cfg = test_app_config();
+            cfg.sequencer = Sequencer::Illumina;
+            cfg.mode = ProfileMode::Default;
+            cfg.is_paired = inputs.len() == 2;
+            cfg.identity = identity;
+            let paths = inputs
+                .iter()
+                .map(|path| path.to_str().unwrap())
+                .collect::<Vec<_>>();
+            cfg.input_sequences = Some(paths.join(","));
+            MetaxApp { config: cfg }.resolve_thresholds(None)
+        };
+        // Single-end: 0.97 less the error rate of 0.001.
+        let single = illumina(vec![&first], None);
+        assert!(
+            (single.identity - 0.969).abs() < 1e-9,
+            "{}",
+            single.identity
+        );
+        // Pairs: the accuracy averaged over both mates' files, 0.9945.
+        let paired = illumina(vec![&first, &second], None);
+        assert!(
+            (paired.identity - 0.9645).abs() < 1e-9,
+            "{}",
+            paired.identity
+        );
+        assert!((paired.sampled_mean_base_accuracy.unwrap() - 0.9945).abs() < 1e-12);
+        // Qualities claiming much lower accuracy stop at the floor.
+        let poor = dir.path().join("poor.fastq");
+        std::fs::write(&poor, "@a\nACGT\n+\n++++\n").unwrap();
+        let floored = illumina(vec![&poor], None);
+        assert_eq!(
+            floored.identity.to_bits(),
+            SHORT_READ_IDENTITY_FLOOR.to_bits()
+        );
+        // A cutoff the user sets stays fixed and records no accuracy.
+        let explicit = illumina(vec![&first, &second], Some(0.97));
+        assert_eq!(explicit.identity.to_bits(), 0.97_f64.to_bits());
+        assert_eq!(explicit.sampled_mean_base_accuracy, None);
+    }
+
+    #[test]
+    fn short_read_reuse_takes_the_recorded_accuracy() {
+        let reused = |accuracy: Option<f64>, option: Option<f64>| {
+            let mut metadata =
+                recorded_long_read_metadata(ProfileMode::Default, 0.97, 50, 0.7, accuracy);
+            metadata.sequencer = Sequencer::Illumina;
+            metadata.is_paired = true;
+            let mut cfg = test_app_config();
+            cfg.sequencer = Sequencer::Illumina;
+            cfg.is_paired = true;
+            cfg.mode = ProfileMode::Default;
+            cfg.base_accuracy = option;
+            MetaxApp { config: cfg }
+                .resolve_thresholds(Some(&metadata))
+                .identity
+        };
+        assert!((reused(Some(0.98), None) - 0.95).abs() < 1e-9);
+        // A mapping saved without it keeps its cutoff, unless one is passed.
+        assert_eq!(reused(None, None).to_bits(), 0.97_f64.to_bits());
+        assert!((reused(None, Some(0.99)) - 0.96).abs() < 1e-9);
     }
 
     // ------------------------------------------------------------------

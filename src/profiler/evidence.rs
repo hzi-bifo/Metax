@@ -1306,18 +1306,16 @@ impl CandidateScratch {
             {
                 continue;
             }
-            let r1_qualifies = paired_mate1_qualifies(r1, policy);
-            let r2_qualifies = paired_mate2_qualifies(r2, policy);
-            if !(r1_qualifies && r2_qualifies) {
+            if !pair_qualifies(r1, r2, policy) {
                 // A mate that runs off a marker gene is clipped there and can
-                // fail its gate; its partner may still stand for the fragment.
-                if !r2_qualifies && r2.reaches_marker_end() && single_mapping_qualifies(r1, policy)
-                {
+                // fail its gates; its partner may still stand for the fragment.
+                let (r1_alone, r2_alone) = (
+                    single_mapping_qualifies(r1, policy),
+                    single_mapping_qualifies(r2, policy),
+                );
+                if !r2_alone && r2.reaches_marker_end() && r1_alone {
                     self.half_pair_mates.push(r1_index);
-                } else if !r1_qualifies
-                    && r1.reaches_marker_end()
-                    && single_mapping_qualifies(r2, policy)
-                {
+                } else if !r1_alone && r1.reaches_marker_end() && r2_alone {
                     self.half_pair_mates.push(r2_index);
                 }
                 continue;
@@ -1502,16 +1500,28 @@ impl CandidateScratch {
     }
 }
 
+/// A pair is one fragment: each mate passes the length and fraction gates,
+/// and the identity over the bases of both mates passes the identity gate.
 #[inline]
-fn paired_mate1_qualifies(mapping: &EvidenceAlignment, policy: EvidencePolicy) -> bool {
-    evidence_identity(mapping) >= policy.identity
-        && mapping.mapped_len as usize >= policy.mapped_len
-        && fraction_at_least(mapping.fraction, policy.fraction)
-        && mapping.span.1 > mapping.span.0
+fn pair_qualifies(r1: &EvidenceAlignment, r2: &EvidenceAlignment, policy: EvidencePolicy) -> bool {
+    mate_extent_qualifies(r1, policy)
+        && mate_extent_qualifies(r2, policy)
+        && pair_identity(r1, r2) >= policy.identity
+}
+
+/// Identity of a pair: one minus the mismatches of both mates over their
+/// mapped bases, i.e. the mapped-length-weighted mean of the two identities,
+/// canonicalized like a single mapping's identity.
+#[inline]
+fn pair_identity(r1: &EvidenceAlignment, r2: &EvidenceAlignment) -> f64 {
+    let (len1, len2) = (f64::from(r1.mapped_len), f64::from(r2.mapped_len));
+    let identity =
+        (evidence_identity(r1) * len1 + evidence_identity(r2) * len2) / (len1 + len2).max(1.0);
+    canonical_mapping_identity(identity)
 }
 
 #[inline]
-fn paired_mate2_qualifies(mapping: &EvidenceAlignment, policy: EvidencePolicy) -> bool {
+fn mate_extent_qualifies(mapping: &EvidenceAlignment, policy: EvidencePolicy) -> bool {
     mapping.mapped_len as usize >= policy.mapped_len
         && fraction_at_least(mapping.fraction, policy.fraction)
         && mapping.span.1 > mapping.span.0
@@ -1997,22 +2007,32 @@ mod tests {
     }
 
     #[test]
-    fn paired_candidate_requires_identity_only_on_mate1() {
-        let rows = vec![
-            mapping(1, 10, 1, 0.98, 100, 100, MappingRole::Mate1),
-            mapping(1, 10, 1, 0.80, 100, 100, MappingRole::Mate2),
-        ];
-        let mut scratch = CandidateScratch::default();
-        let candidates = scratch.build(&rows, policy(EvidenceMode::Paired));
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].best.both_mapped, 200);
+    fn paired_candidate_requires_identity_over_both_mates() {
+        let pair = |mate1, mate2| {
+            let rows = vec![
+                mapping(1, 10, 1, mate1, 100, 100, MappingRole::Mate1),
+                mapping(1, 10, 1, mate2, 100, 100, MappingRole::Mate2),
+            ];
+            let mut scratch = CandidateScratch::default();
+            scratch
+                .build(&rows, policy(EvidenceMode::Paired))
+                .iter()
+                .map(|candidate| candidate.best.both_mapped)
+                .collect::<Vec<_>>()
+        };
+        // 0.9725 over both mates passes, whichever mate is the weaker one.
+        assert_eq!(pair(0.99, 0.955), vec![200]);
+        assert_eq!(pair(0.955, 0.99), vec![200]);
+        // The cutoff is inclusive; 0.965 over both mates fails.
+        assert_eq!(pair(0.97, 0.97), vec![200]);
+        assert!(pair(0.98, 0.95).is_empty());
     }
 
     #[test]
     fn compact_identity_and_fraction_preserve_canonical_inclusive_thresholds() {
         let rows = vec![
             mapping(1, 10, 1, 0.97, 70, 100, MappingRole::Mate1),
-            mapping(1, 10, 1, 0.80, 70, 100, MappingRole::Mate2),
+            mapping(1, 10, 1, 0.97, 70, 100, MappingRole::Mate2),
         ];
         // 0.70 is represented slightly below 0.70 as f32 on common targets;
         // the inclusive profiler cutoff must nevertheless accept it.
