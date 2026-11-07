@@ -498,7 +498,7 @@ This prevents a read from creating breadth for several taxa merely because it ma
 
 **Single-end Illumina.** Mappings are ranked by `estimated_errors = (1 − identity) × mapped_bases`. One best placement is retained per `(terminal taxid, assembly)`. A read contributes coordinates only when it has a single candidate endpoint or the runner-up is worse by at least `0.5` estimated errors.
 
-**Paired-end Illumina.** Mate 1 must pass the identity threshold, both mates must pass the length and fraction gates, and both must belong to a concordant same-reference pair. Pair errors are the sum over both mates. A fragment contributes coordinates only when it has a single candidate endpoint or `runner_up_pair_errors − best_pair_errors ≥ 1.0`. Mate 1 supplies the mapped bases used for depth and the intervals used for coverage; mate 2 contributes to pair discrimination. A fragment without any pair is placed by its lone mates (§7.1), each of which must pass all read-level gates and is treated like a single-end read. Such a fragment is placed in the same way by a mate of a pair on a marker gene whose partner fails its gates and reaches the first or last base of the gene: that partner runs off the gene and is clipped there, as the mate of a lone mate would be.
+**Paired-end Illumina.** Mate 1 must pass the identity threshold, both mates must pass the length and fraction gates, and both must belong to a concordant same-reference pair. Pair errors are the sum over both mates. A fragment contributes coordinates only when it has a single candidate endpoint or `runner_up_pair_errors − best_pair_errors ≥ 1.0`. Mate 1 supplies the mapped bases used for depth and places the chunks; breadth counts the bases of both mates (§7.4). A fragment without any pair is placed by its lone mates (§7.1), each of which must pass all read-level gates and is treated like a single-end read. Such a fragment is placed in the same way by a mate of a pair on a marker gene whose partner fails its gates and reaches the first or last base of the gene: that partner runs off the gene and is clipped there, as the mate of a lone mate would be.
 
 **Nanopore/PacBio.** Candidates are ranked by `long_score = mapped_bases × (2 × identity − 1)`. Coordinate evidence requires the best terminal score to exceed the runner-up by at least 1 % of the best score. Exact ties keep the mapper's first-ranked placement.
 
@@ -506,15 +506,17 @@ Exact and near-exact cross-species ties stay in the EM candidate set and create 
 
 ### 7.4 Coverage metrics
 
-For fixed-chunk coverage, every accepted read span is extended by 1,000 bases on both sides and clamped to its contig. For a witness with assembly coordinate size `G`, `n` resolved fragments, and accepted spans `span_i`:
+For fixed-chunk coverage, every accepted read span is extended by 1,000 bases on both sides and clamped to its contig. For a witness with assembly coordinate size `G`, `n` resolved fragments, and accepted spans `span_i` (the first read of a pair) and `read_bases_i` (the bases both mates of a pair cover, counted once where they overlap; `span_i` for a single read):
 
 ```text
-observed_breadth   = merged_span_bases / G
+observed_breadth   = merged bases of all reads, both mates of a pair / G
 depth              = sum(span_i) / G
-mean_span_fraction = clamp(depth / n, 0, 1)
+mean_span_fraction = clamp(sum(read_bases_i) / G / n, 0, 1)
 expected_breadth   = 1 − (1 − mean_span_fraction)^n
 OEBR               = observed_breadth / expected_breadth
 ```
+
+Observed and expected breadth thus come from the same bases. The reported depth counts each fragment once, by its first read, as abundance does (§7.13).
 
 Fixed and flexible chunks are merged per contig in the same way; the flexible chunk count scales with the square root of the genome length. `COEBR` is the observed/expected ratio for flexible chunk breadth.
 

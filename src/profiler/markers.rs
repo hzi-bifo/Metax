@@ -592,6 +592,7 @@ mod tests {
                 .map(|&(reference_id, start)| PresenceInterval {
                     reference_id,
                     span: (start, start + 150),
+                    mate_span: (0, 0),
                     fixed_chunk: (start, start + 150),
                     flex_chunk: (start, start + 150),
                 })

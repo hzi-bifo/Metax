@@ -2926,6 +2926,7 @@ fn add_exact_tie_placement(
     assembly.intervals.push(PresenceInterval {
         reference_id: placement.reference_id,
         span: placement.span,
+        mate_span: placement.mate_span,
         fixed_chunk: placement.fixed_chunk,
         flex_chunk: placement.flex_chunk,
     });
@@ -3497,6 +3498,7 @@ fn process_evidence_batch(
                     presence.intervals.push(PresenceInterval {
                         reference_id: placement.reference_id,
                         span: placement.span,
+                        mate_span: placement.mate_span,
                         fixed_chunk: placement.fixed_chunk,
                         flex_chunk: placement.flex_chunk,
                     });
@@ -5012,6 +5014,7 @@ mod tests {
             pair_errors: 0.0,
             long_score: 0.0,
             span: (1, 1 + mapped),
+            mate_span: (0, 0),
             fixed_chunk: (1, 1 + mapped),
             flex_chunk: (1, 1 + mapped),
             input_order: 0,

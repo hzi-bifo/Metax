@@ -163,6 +163,9 @@ pub(crate) struct CandidatePlacement {
     pub(crate) pair_errors: f64,
     pub(crate) long_score: f64,
     pub(crate) span: (u32, u32),
+    /// Span of the other mate of a pair on the same reference; empty for a
+    /// single read.
+    pub(crate) mate_span: (u32, u32),
     pub(crate) fixed_chunk: (u32, u32),
     pub(crate) flex_chunk: (u32, u32),
     /// Stable order of the representative mapping in the mapper output.
@@ -179,6 +182,7 @@ pub(crate) struct ExactTiePlacement {
     pub(crate) reference_id: u32,
     pub(crate) assembly_id: u32,
     pub(crate) span: (u32, u32),
+    pub(crate) mate_span: (u32, u32),
     pub(crate) fixed_chunk: (u32, u32),
     pub(crate) flex_chunk: (u32, u32),
 }
@@ -190,6 +194,7 @@ impl From<&CandidatePlacement> for ExactTiePlacement {
             reference_id: placement.reference_id,
             assembly_id: placement.assembly_id,
             span: placement.span,
+            mate_span: placement.mate_span,
             fixed_chunk: placement.fixed_chunk,
             flex_chunk: placement.flex_chunk,
         }
@@ -418,6 +423,8 @@ pub(crate) struct PresenceKey {
 pub(crate) struct PresenceInterval {
     pub(crate) reference_id: u32,
     pub(crate) span: (u32, u32),
+    /// The other mate of a pair; empty for a single read.
+    pub(crate) mate_span: (u32, u32),
     pub(crate) fixed_chunk: (u32, u32),
     pub(crate) flex_chunk: (u32, u32),
 }
@@ -726,15 +733,19 @@ pub(crate) fn calculate_coverage(
     multiple_testing_taxa: usize,
 ) -> EvidenceCoverage {
     let genome_size = assembly.asm_len.max(1.0);
-    let span_bases = merged_interval_bases(&mut assembly.intervals, |record| record.span);
+    let (span_bases, second_mate_bases) = read_bases(&mut assembly.intervals);
     let fixed_bases = merged_interval_bases(&mut assembly.intervals, |record| record.fixed_chunk);
     let flex_bases = merged_interval_bases(&mut assembly.intervals, |record| record.flex_chunk);
     let count = usize::try_from(assembly.count).unwrap_or(usize::MAX);
+    // Breadth counts the bases of both mates of a pair, and so do the depth
+    // its expectation and p-value come from. The reported depth counts each
+    // fragment once, by its first read, as abundance does.
     let depth = assembly.reference_span_bases as f64 / genome_size;
+    let read_depth = (assembly.reference_span_bases + second_mate_bases) as f64 / genome_size;
     let breadth = (span_bases as f64 / genome_size).min(1.0);
     let fixed_chunk = (fixed_bases as f64 / genome_size).min(1.0);
     let flex_chunk = (flex_bases as f64 / genome_size).min(1.0);
-    let expected_breadth = expected_breadth(depth, assembly.count as f64);
+    let expected_breadth = expected_breadth(read_depth, assembly.count as f64);
     // Deliberately an assembly-level expectation: it assumes a full window per
     // mapping, while observed chunks are clamped to the contig each mapping
     // landed on. The mismatch is load-bearing rather than an approximation to
@@ -748,8 +759,14 @@ pub(crate) fn calculate_coverage(
     let oebr = ratio_or_nan(breadth, expected_breadth);
     let coebr = ratio_or_nan(flex_chunk, expected_flex_chunk);
     let tests = multiple_testing_taxa.max(1) as f64;
-    let breadth_pvalue =
-        adjusted_deviation_pvalue(count, Some(depth), breadth, expected_breadth, oebr, tests);
+    let breadth_pvalue = adjusted_deviation_pvalue(
+        count,
+        Some(read_depth),
+        breadth,
+        expected_breadth,
+        oebr,
+        tests,
+    );
     let chunk_pvalue =
         adjusted_deviation_pvalue(count, None, flex_chunk, expected_flex_chunk, coebr, tests);
     EvidenceCoverage {
@@ -767,6 +784,42 @@ pub(crate) fn calculate_coverage(
         marker_genes_hit: None,
         window_spread: None,
     }
+}
+
+/// Bases the fragments' reads cover, merged per contig, and the bases that
+/// second mates add beyond their first mate, summed over fragments. Without
+/// pairs this is the merged span alone.
+fn read_bases(intervals: &mut [PresenceInterval]) -> (u64, u64) {
+    let has_mate = |record: &PresenceInterval| record.mate_span.1 > record.mate_span.0;
+    if !intervals.iter().any(has_mate) {
+        return (merged_interval_bases(intervals, |record| record.span), 0);
+    }
+    let mut reads = Vec::with_capacity(2 * intervals.len());
+    let mut second_mate_bases = 0u64;
+    for record in intervals.iter() {
+        reads.push((record.reference_id, record.span));
+        if has_mate(record) {
+            let (span, mate) = (record.span, record.mate_span);
+            let overlap = mate.1.min(span.1).saturating_sub(mate.0.max(span.0));
+            second_mate_bases += u64::from(mate.1 - mate.0 - overlap);
+            reads.push((record.reference_id, mate));
+        }
+    }
+    reads.sort_unstable();
+    let mut covered = 0u64;
+    let (mut reference, mut current) = reads[0];
+    for &(id, span) in &reads[1..] {
+        if id == reference && span.0 <= current.1 {
+            current.1 = current.1.max(span.1);
+        } else {
+            covered += u64::from(current.1.saturating_sub(current.0));
+            (reference, current) = (id, span);
+        }
+    }
+    (
+        covered + u64::from(current.1.saturating_sub(current.0)),
+        second_mate_bases,
+    )
 }
 
 pub(crate) fn merged_interval_bases<F>(intervals: &mut [PresenceInterval], select: F) -> u64
@@ -1262,6 +1315,7 @@ impl CandidateScratch {
                 pair_errors: estimated_errors(r1) + estimated_errors(r2),
                 long_score: 0.0,
                 span: r1.span,
+                mate_span: r2.span,
                 fixed_chunk: r1.fixed_chunk,
                 flex_chunk: r1.flex_chunk,
                 input_order: r1_index.min(r2_index),
@@ -1311,6 +1365,7 @@ impl CandidateScratch {
                 pair_errors: estimated_errors(mapping),
                 long_score: 0.0,
                 span: mapping.span,
+                mate_span: (0, 0),
                 fixed_chunk: mapping.fixed_chunk,
                 flex_chunk: mapping.flex_chunk,
                 input_order,
@@ -1339,6 +1394,7 @@ impl CandidateScratch {
                 pair_errors: estimated_errors(mapping),
                 long_score: long_score(mapping),
                 span: mapping.span,
+                mate_span: (0, 0),
                 fixed_chunk: mapping.fixed_chunk,
                 flex_chunk: mapping.flex_chunk,
                 input_order,
@@ -1395,6 +1451,7 @@ impl CandidateScratch {
                     PresenceInterval {
                         reference_id,
                         span: gene.span,
+                        mate_span: (0, 0),
                         fixed_chunk: gene.fixed_chunk,
                         flex_chunk: gene.flex_chunk,
                     },
@@ -2352,6 +2409,35 @@ mod tests {
     }
 
     #[test]
+    fn paired_breadth_counts_both_mates_and_expects_their_bases() {
+        let fragment = |span: (u32, u32), mate_span: (u32, u32)| PresenceInterval {
+            reference_id: 1,
+            span,
+            mate_span,
+            fixed_chunk: span,
+            flex_chunk: span,
+        };
+        let mut assembly = PresenceAssembly {
+            asm_len: 10_000.0,
+            count: 2,
+            reference_span_bases: 200,
+            intervals: vec![
+                fragment((0, 100), (300, 400)),
+                // Its second mate overlaps the first mate of the other fragment.
+                fragment((350, 450), (600, 700)),
+            ],
+            ..PresenceAssembly::default()
+        };
+        let coverage = calculate_coverage(&mut assembly, 1);
+        // (0, 100), (300, 450) and (600, 700).
+        assert!((coverage.breadth - 0.035).abs() < 1e-12);
+        // Each fragment covers 200 bases: 1 - (1 - 200 / 10,000)^2.
+        assert!((coverage.expected_breadth - 0.0396).abs() < 1e-12);
+        // The reported depth counts each fragment once, by its first read.
+        assert!((coverage.depth - 0.02).abs() < 1e-12);
+    }
+
+    #[test]
     fn coverage_merges_within_contigs_but_not_across_contigs() {
         let mut assembly = PresenceAssembly {
             asm_len: 1_000.0,
@@ -2362,18 +2448,21 @@ mod tests {
                 PresenceInterval {
                     reference_id: 1,
                     span: (0, 100),
+                    mate_span: (0, 0),
                     fixed_chunk: (0, 200),
                     flex_chunk: (0, 300),
                 },
                 PresenceInterval {
                     reference_id: 1,
                     span: (50, 150),
+                    mate_span: (0, 0),
                     fixed_chunk: (100, 300),
                     flex_chunk: (200, 400),
                 },
                 PresenceInterval {
                     reference_id: 2,
                     span: (0, 50),
+                    mate_span: (0, 0),
                     fixed_chunk: (0, 100),
                     flex_chunk: (0, 100),
                 },
