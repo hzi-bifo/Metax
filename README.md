@@ -187,6 +187,13 @@ This error indicates that your CPU does not support some modern instruction sets
 
 We thank Gary Robertson for IT support, Dr. Mohammad-Hadi Foroughmand-Araabi for advice on statistical formulations, and Hesham Almessady for software testing.
 
+## Citations
+
+If you use Metax in your research, you can cite the following references.
+- Deng, Zhi-Luo, Safaei, Nasim, and McHardy, Alice Carolyn (**2026**). Metax enables accurate cross-domain taxonomic profiling of metagenomes. Cell, 189(22), 7196–7211.e7. DOI 10.1016/j.cell.2026.08.024.
+- Deng, Zhi-Luo (**2023**). Metax: Improved taxonomic profiling of low-ranking taxa using coverage information (Version 0.80) [Software]. Zenodo. DOI 10.5281/zenodo.10085101.
+
+
 
 ## AI-assisted development
 
