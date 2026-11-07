@@ -597,6 +597,7 @@ mod tests {
                     flex_chunk: (start, start + 150),
                 })
                 .collect(),
+            fits: 0,
         }
     }
 

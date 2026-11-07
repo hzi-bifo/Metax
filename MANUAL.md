@@ -492,7 +492,7 @@ Native single-end Illumina, paired-end Illumina, Nanopore, and PacBio community 
 - every qualifying terminal-taxon candidate remains available to fractional EM abundance estimation;
 - only a clearly resolved best terminal taxon may create coordinate coverage;
 - coordinates are evaluated in one assembly coordinate system at a time — contigs of the same assembly may be combined, but coordinates from different assemblies are never unioned;
-- the strongest coherent assembly witness determines presence.
+- each genome of a taxon is tested on its own, and the taxon is present when one of them passes; it is reported on its best-fit genome: of its passing genomes, the one on which most of its resolved fragments have their best placement (equal: more fragments placed on it, then the larger fixed chunk breadth, then the database order).
 
 This prevents a read from creating breadth for several taxa merely because it maps to a region they share.
 

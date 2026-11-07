@@ -37,7 +37,7 @@
 //! - `TaxonCoverage`: Coverage metrics aggregated at the terminal taxon
 //! - `ReadAssignment`: Final taxonomic assignment for a read
 
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufWriter, Write};
@@ -1227,19 +1227,12 @@ impl CommunityProfiler {
                     .or_default()
                     .extend(intervals);
             }
-            for (key, mut presence) in result.presence {
-                let target = final_result.presence.entry(key).or_default();
-                if target.asm_len <= 0.0 {
-                    target.asm_len = presence.asm_len;
-                }
-                target.count = target.count.saturating_add(presence.count);
-                target.other_gene_hits = target
-                    .other_gene_hits
-                    .saturating_add(presence.other_gene_hits);
-                target.reference_span_bases = target
-                    .reference_span_bases
-                    .saturating_add(presence.reference_span_bases);
-                target.intervals.append(&mut presence.intervals);
+            for (key, presence) in result.presence {
+                final_result
+                    .presence
+                    .entry(key)
+                    .or_default()
+                    .merge(presence);
             }
             for (assembly_id, reads) in result.marker_genome_reads {
                 final_result
@@ -2730,6 +2723,77 @@ fn keyed_witness_is_better(
     left.0 < right.0
 }
 
+/// Fits and fragments of each witness genome, from its resolved fragments.
+type GenomeSupport = HashMap<PresenceKey, (u64, u64)>;
+
+/// Report each present taxon on its best-fit genome: of its genomes among
+/// `witnesses` that pass, the one on which most of its resolved fragments
+/// have their best placement; equal: more fragments placed on it, the larger
+/// fixed chunk breadth, then the lower assembly id. Which taxa are present is
+/// unchanged.
+fn report_best_fit(
+    decisions: &mut HashMap<u32, WitnessDecision>,
+    witnesses: impl IntoIterator<Item = (PresenceKey, WitnessDecision)>,
+    support: &GenomeSupport,
+) {
+    let rank = |(key, decision): &(PresenceKey, WitnessDecision)| {
+        let (fits, count) = support.get(key).copied().unwrap_or_default();
+        (
+            fits,
+            count,
+            decision.metrics.fixed_chunk,
+            Reverse(key.assembly_id),
+        )
+    };
+    let mut best: HashMap<u32, (PresenceKey, WitnessDecision)> = HashMap::new();
+    for witness in witnesses
+        .into_iter()
+        .filter(|(_, decision)| decision.accepted())
+    {
+        match best.entry(witness.0.taxid) {
+            Entry::Vacant(entry) => {
+                entry.insert(witness);
+            }
+            Entry::Occupied(mut entry) => {
+                let (left, right) = (rank(&witness), rank(entry.get()));
+                let better = (left.0, left.1)
+                    .cmp(&(right.0, right.1))
+                    .then_with(|| left.2.total_cmp(&right.2))
+                    .then_with(|| left.3.cmp(&right.3))
+                    .is_gt();
+                if better {
+                    entry.insert(witness);
+                }
+            }
+        }
+    }
+    for (taxid, (_, decision)) in best {
+        decisions.insert(taxid, decision);
+    }
+}
+
+/// A species absent before MAP may be added on a witness that passes after MAP
+/// and already met the pre-MAP fixed-chunk guard on the same genome.
+fn map_addition_qualifies(
+    key: PresenceKey,
+    post: WitnessDecision,
+    baseline_selected: &HashSet<u32>,
+    baseline_by_key: &HashMap<PresenceKey, WitnessDecision>,
+    min_chunk_breadth: f64,
+) -> bool {
+    if !key.profile_rank.is_species() || baseline_selected.contains(&key.taxid) {
+        return false;
+    }
+    let Some(premap_fraction) = post.required_premap_guard.fraction() else {
+        return false;
+    };
+    let Some(pre) = baseline_by_key.get(&key) else {
+        return false;
+    };
+    let premap_threshold = min_chunk_breadth * premap_fraction;
+    pre.metrics.fixed_chunk.partial_cmp(&premap_threshold) == Some(Ordering::Greater)
+}
+
 /// Select MAP-only species additions without allowing MAP evidence to satisfy
 /// its own independent-coverage guard.
 ///
@@ -2744,20 +2808,13 @@ fn guarded_map_additions(
 ) -> HashMap<u32, WitnessDecision> {
     let mut additions: HashMap<u32, (PresenceKey, WitnessDecision)> = HashMap::new();
     for &(key, post) in post_evaluations {
-        if !key.profile_rank.is_species() {
-            continue;
-        }
-        if baseline_selected.contains(&key.taxid) {
-            continue;
-        }
-        let Some(premap_fraction) = post.required_premap_guard.fraction() else {
-            continue;
-        };
-        let Some(pre) = baseline_by_key.get(&key) else {
-            continue;
-        };
-        let premap_threshold = min_chunk_breadth * premap_fraction;
-        if pre.metrics.fixed_chunk.partial_cmp(&premap_threshold) != Some(Ordering::Greater) {
+        if !map_addition_qualifies(
+            key,
+            post,
+            baseline_selected,
+            baseline_by_key,
+            min_chunk_breadth,
+        ) {
             continue;
         }
         match additions.entry(key.taxid) {
@@ -3025,11 +3082,20 @@ fn resolve_coordinate_evidence(
             })
             .collect::<Vec<_>>()
     });
-    let baseline_decisions = strongest_witnesses(&baseline_evaluations);
+    let mut baseline_decisions = strongest_witnesses(&baseline_evaluations);
     let baseline_selected = baseline_decisions
         .iter()
         .filter_map(|(&taxid, decision)| decision.accepted().then_some(taxid))
         .collect::<HashSet<_>>();
+    let support: GenomeSupport = presence
+        .iter()
+        .map(|(key, assembly)| (*key, (assembly.fits, assembly.count)))
+        .collect();
+    report_best_fit(
+        &mut baseline_decisions,
+        baseline_evaluations.iter().copied(),
+        &support,
+    );
 
     if !policy.collect_exact_ties {
         if cfg.verbose || cfg.very_verbose {
@@ -3209,6 +3275,31 @@ fn resolve_coordinate_evidence(
             }
         }
     }
+    // Each present species is reported on its best-fit genome among the
+    // witnesses that decided it: those passing after MAP (for an addition,
+    // also meeting the pre-MAP guard), or the baseline ones it was retained on.
+    let passes_after_map = post_evaluations
+        .iter()
+        .filter(|(_, decision)| decision.accepted())
+        .map(|(key, _)| key.taxid)
+        .collect::<HashSet<_>>();
+    let deciding = post_evaluations
+        .iter()
+        .copied()
+        .filter(|&(key, post)| {
+            baseline_selected.contains(&key.taxid)
+                || map_addition_qualifies(
+                    key,
+                    post,
+                    &baseline_selected,
+                    &baseline_by_key,
+                    safeguard_min_chunk_breadth,
+                )
+        })
+        .chain(baseline_evaluations.iter().copied().filter(|(key, _)| {
+            baseline_selected.contains(&key.taxid) && !passes_after_map.contains(&key.taxid)
+        }));
+    report_best_fit(&mut post_decisions, deciding, &support);
 
     if cfg.verbose || cfg.very_verbose {
         let posterior_mean = if resolved_ties == 0 {
@@ -3346,7 +3437,7 @@ fn fragment_depth(
 /// only a platform-specific, margin-resolved best endpoint contributes
 /// intervals. Guarded MAP can later add an exact short-read tie only when its
 /// posterior guard passes. Each represented assembly remains an independent
-/// witness.
+/// witness; the one of a fragment's best placement is credited with a fit.
 fn process_evidence_batch(
     chunk: &[ReadBundle],
     cfg: &ProfilerConfig,
@@ -3478,6 +3569,7 @@ fn process_evidence_batch(
                     .or_default();
                 evidence.best_fragments = evidence.best_fragments.saturating_add(1);
                 evidence.clear_best_fragments = evidence.clear_best_fragments.saturating_add(1);
+                let best_assembly = candidates[index].best.assembly_id;
                 for placement in &candidates[index].placements {
                     let key = PresenceKey {
                         taxid: placement.taxid,
@@ -3489,6 +3581,7 @@ fn process_evidence_batch(
                         presence.asm_len = placement.asm_len;
                     }
                     presence.count = presence.count.saturating_add(1);
+                    presence.fits += u64::from(placement.assembly_id == best_assembly);
                     presence.other_gene_hits = presence
                         .other_gene_hits
                         .saturating_add(u64::from(placement.other_genes));
@@ -6525,6 +6618,76 @@ mod tests {
             profile_rank: ProfileRank::Species,
             assembly_id: 2,
         }));
+        // The fragment fits genome 1 best.
+        let fits = |assembly_id| {
+            result.presence[&PresenceKey {
+                taxid: 101,
+                profile_rank: ProfileRank::Species,
+                assembly_id,
+            }]
+                .fits
+        };
+        assert_eq!((fits(1), fits(2)), (1, 0));
+    }
+
+    #[test]
+    fn a_present_taxon_is_reported_on_its_best_fit_passing_genome() {
+        let key = |taxid, assembly_id| PresenceKey {
+            taxid,
+            profile_rank: ProfileRank::Species,
+            assembly_id,
+        };
+        // Depth tags the genome a decision was measured on.
+        let witness = |assembly_id: u32, passes: bool, fixed_chunk: f64| WitnessDecision {
+            metrics: EvidenceCoverage {
+                depth: f64::from(assembly_id),
+                fixed_chunk,
+                ..EvidenceCoverage::default()
+            },
+            standard: passes,
+            rescues: RescueKinds::default(),
+            required_premap_guard: PremapChunkGuard::None,
+        };
+        let support = GenomeSupport::from([
+            (key(1, 5), (3, 9)),
+            (key(1, 6), (4, 4)),
+            (key(1, 7), (9, 9)),
+            (key(2, 8), (2, 5)),
+            (key(2, 9), (2, 6)),
+            (key(3, 1), (1, 1)),
+            (key(3, 2), (1, 1)),
+            (key(4, 4), (1, 1)),
+            (key(4, 3), (1, 1)),
+        ]);
+        let mut decisions = HashMap::new();
+        report_best_fit(
+            &mut decisions,
+            [
+                // Most fits among the passing genomes; genome 7 fits more
+                // fragments best but fails.
+                (key(1, 5), witness(5, true, 0.9)),
+                (key(1, 6), witness(6, true, 0.1)),
+                (key(1, 7), witness(7, false, 0.9)),
+                // Equal fits: more fragments placed.
+                (key(2, 8), witness(8, true, 0.9)),
+                (key(2, 9), witness(9, true, 0.1)),
+                // Equal fits and fragments: the larger fixed chunk breadth.
+                (key(3, 1), witness(1, true, 0.2)),
+                (key(3, 2), witness(2, true, 0.3)),
+                // All equal: the lower assembly id.
+                (key(4, 4), witness(4, true, 0.5)),
+                (key(4, 3), witness(3, true, 0.5)),
+                // No passing genome: nothing to report.
+                (key(5, 1), witness(1, false, 0.9)),
+            ],
+            &support,
+        );
+        let genome = |taxid: u32| decisions[&taxid].metrics.depth;
+        assert_eq!(decisions.len(), 4);
+        assert_eq!(
+            (genome(1), genome(2), genome(3), genome(4)),
+            (6.0, 9.0, 2.0, 3.0)
+        );
     }
 
     /// Intermediate synthetic alignment used inside tests.

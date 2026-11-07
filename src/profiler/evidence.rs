@@ -440,6 +440,24 @@ pub(crate) struct PresenceAssembly {
     pub(crate) other_gene_hits: u64,
     pub(crate) reference_span_bases: u64,
     pub(crate) intervals: Vec<PresenceInterval>,
+    /// Resolved fragments whose best placement within their taxon is on this
+    /// genome.
+    pub(crate) fits: u64,
+}
+
+impl PresenceAssembly {
+    pub(crate) fn merge(&mut self, mut other: PresenceAssembly) {
+        if self.asm_len <= 0.0 {
+            self.asm_len = other.asm_len;
+        }
+        self.count = self.count.saturating_add(other.count);
+        self.other_gene_hits = self.other_gene_hits.saturating_add(other.other_gene_hits);
+        self.reference_span_bases = self
+            .reference_span_bases
+            .saturating_add(other.reference_span_bases);
+        self.intervals.append(&mut other.intervals);
+        self.fits = self.fits.saturating_add(other.fits);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2444,6 +2462,7 @@ mod tests {
             count: 3,
             other_gene_hits: 0,
             reference_span_bases: 250,
+            fits: 0,
             intervals: vec![
                 PresenceInterval {
                     reference_id: 1,
