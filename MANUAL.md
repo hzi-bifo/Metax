@@ -546,7 +546,7 @@ COEBR                     = genes_hit / expected_genes_hit
 expected_breadth          = Σ over marker bases of 1 − (1 − p_i × k_b / s_i)^n, divided by the marker length
 ```
 
-where `k_b` is the number of the `s_i` possible read starts on gene `i` whose read covers base `b`, so bases near gene ends are expected to be covered less often. The p-value of the genes hit is the exact probability of hitting at most `genes_hit` genes (multiplied by the number of tests), and the breadth p-value is computed as for genomes. A marker species must hit at least `--min-marker-genes` genes (default `3`) in every evidence tier.
+where `k_b` is the number of the `s_i` possible read starts on gene `i` whose read covers base `b`, so bases near gene ends are expected to be covered less often. The p-value of the genes hit is `1.0` when COEBR lies within `[0.9, 1.2]`, as for the genome p-values (§7.7); outside it, it is the exact probability of hitting at most `genes_hit` genes (multiplied by the number of tests). The breadth p-value is computed as for genomes. A marker species must hit at least `--min-marker-genes` genes (default `3`) in every evidence tier.
 
 ### 7.5 Automatic chunk-breadth cutoff
 

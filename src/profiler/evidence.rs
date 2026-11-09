@@ -15,7 +15,7 @@ use std::sync::Arc;
 use metam::format::canonical_mapping_identity;
 use metam::mapper::CandidateBoundary;
 
-use super::statistics::{calc_breadth_pvalue, Tail};
+use super::statistics::{calc_breadth_pvalue, Tail, NEUTRAL_RATIO};
 use super::{ExactTiePolicy, ProfileRank, ProfilerConfig};
 
 const SCORE_EPSILON: f64 = 1e-9;
@@ -904,7 +904,7 @@ pub(crate) fn adjusted_deviation_pvalue(
     if !ratio.is_finite() {
         return None;
     }
-    if (0.90..=1.20).contains(&ratio) {
+    if NEUTRAL_RATIO.contains(&ratio) {
         return Some(1.0);
     }
     let side = if observed < expected {

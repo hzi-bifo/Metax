@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use super::evidence::{
     adjusted_deviation_pvalue, merged_interval_bases, EvidenceCoverage, PresenceAssembly,
 };
+use super::statistics::NEUTRAL_RATIO;
 use crate::db::{DatabaseMetadata, ReferenceType};
 
 /// Marker genes of the marker genomes and how this sample's fragments land on them.
@@ -464,6 +465,12 @@ fn marker_coverage(
     let oebr = ratio(breadth, expected_breadth);
     let coebr = ratio(genes_hit as f64, expected_genes);
     let tests = tests.max(1) as f64;
+    // Too few genes hit, tested only outside the window the genome p-values use.
+    let chunk_pvalue = if NEUTRAL_RATIO.contains(&coebr) {
+        1.0
+    } else {
+        (at_most(&hit_probabilities, genes_hit) * tests).min(1.0)
+    };
     Some(EvidenceCoverage {
         count,
         depth,
@@ -482,7 +489,7 @@ fn marker_coverage(
             oebr,
             tests,
         ),
-        chunk_pvalue: Some((at_most(&hit_probabilities, genes_hit) * tests).min(1.0)),
+        chunk_pvalue: Some(chunk_pvalue),
         marker_genes_hit: Some(genes_hit),
         window_spread: None,
     })
@@ -625,6 +632,31 @@ mod tests {
         assert!(clumped.coebr < 0.2, "{clumped:?}");
         assert!(clumped.chunk_pvalue.unwrap() < 1e-5, "{clumped:?}");
         assert_eq!(clumped.fixed_chunk, 0.1);
+    }
+
+    #[test]
+    fn a_small_gene_shortfall_with_many_reads_is_not_tested() {
+        let genes: Vec<Gene> = (0..200)
+            .map(|reference_id| Gene {
+                reference_id,
+                len: 1_000,
+            })
+            .collect();
+        let geometry = geometry(FragmentLayout::PairsAndLoneMates);
+        let coverage = |genes_hit: u32| {
+            let hits: Vec<(u32, u32)> = (0..4_000).map(|read| (read % genes_hit, 400)).collect();
+            marker_coverage(&genes, &geometry, &mut assembly(&hits), 1).unwrap()
+        };
+        // 4,000 fragments reach nearly every gene, so the exact test alone
+        // would reject 190 of 200 genes.
+        let p = 1.0 - (1.0 - 1.0 / 200.0f64).powf(4_000.0);
+        assert!(at_most(&[p; 200], 190) < 1e-5);
+        let near = coverage(190);
+        assert!(NEUTRAL_RATIO.contains(&near.coebr), "{near:?}");
+        assert_eq!(near.chunk_pvalue, Some(1.0));
+        let short = coverage(170);
+        assert!(short.coebr < 0.9, "{short:?}");
+        assert!(short.chunk_pvalue.unwrap() < 1e-5, "{short:?}");
     }
 
     #[test]

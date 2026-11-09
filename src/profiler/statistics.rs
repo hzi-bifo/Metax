@@ -407,13 +407,18 @@ pub(crate) fn round5(value: f64) -> f64 {
     (value * 100000.0).round() / 100000.0
 }
 
+/// Observed-to-expected coverage ratios that agree with the model. A coverage
+/// p-value inside this window is 1.0 without testing: with many reads any small
+/// deviation would test as significant, so a p-value would only measure
+/// sampling depth.
+pub(crate) const NEUTRAL_RATIO: std::ops::RangeInclusive<f64> = 0.9..=1.2;
+
 /// Significance of a coverage observation against its expectation, corrected
 /// for the number of taxa tested.
 ///
-/// Ratios inside the neutral window are reported as 1.0 without testing: the
-/// observation already agrees with the model, so a p-value would only measure
-/// sampling noise. Outside it, the deviation is tested one-sided towards
-/// whichever direction it fell.
+/// Ratios inside [`NEUTRAL_RATIO`] are reported as 1.0 without testing.
+/// Outside it, the deviation is tested one-sided towards whichever direction
+/// it fell.
 ///
 /// `depth` is supplied for breadth, where it identifies the genome length the
 /// occupancy model needs, and omitted for chunk coverage, which infers its own.
@@ -431,7 +436,7 @@ pub(crate) fn coverage_deviation_pvalue(
     if !ratio.is_finite() {
         return None;
     }
-    if (0.9..=1.2).contains(&ratio) {
+    if NEUTRAL_RATIO.contains(&ratio) {
         return Some(1.0);
     }
     let side = if observed < expected {
