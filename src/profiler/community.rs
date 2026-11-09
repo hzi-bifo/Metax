@@ -1702,136 +1702,19 @@ impl CommunityProfiler {
         };
         let rolled_up_genera: HashSet<u32> = rollup_metrics.keys().copied().collect();
 
-        let mut species_count_depth = unambiguous.clone();
-        let mut ambiguous_fraction: HashMap<Vec<u32>, HashMap<u32, f64>> = HashMap::new();
         let mut em_groups = ambiguous_counts.iter().collect::<Vec<_>>();
         em_groups.sort_unstable_by(|left, right| left.0.cmp(right.0));
         let mut em_taxids = unambiguous.keys().copied().collect::<Vec<_>>();
         em_taxids.sort_unstable();
-        let mut iterations = 0;
-        loop {
-            let mut total = unambiguous.clone();
-            for &(taxids, ambiguous) in &em_groups {
-                let sum_depth: f64 = taxids
-                    .iter()
-                    .map(|taxid| {
-                        species_count_depth
-                            .get(taxid)
-                            .map(|totals| totals.depth)
-                            .unwrap_or(0.0)
-                    })
-                    .sum();
-                if sum_depth <= f64::EPSILON {
-                    continue;
-                }
-                let mut paired: Vec<(u32, f64, f64, f64, f64)> = taxids
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, taxid)| {
-                        let fraction = species_count_depth
-                            .get(taxid)
-                            .map(|totals| totals.depth / sum_depth)
-                            .unwrap_or(0.0);
-                        (
-                            *taxid,
-                            ambiguous.depths[idx],
-                            ambiguous.mapped_lens[idx],
-                            ambiguous.equivalent_support_sums[idx],
-                            fraction,
-                        )
-                    })
-                    .collect();
-                paired.sort_by(|left, right| {
-                    right
-                        .4
-                        .total_cmp(&left.4)
-                        .then_with(|| left.0.cmp(&right.0))
-                });
-                // `entry` would take ownership of the key, cloning the taxid
-                // vector on every EM iteration for every ambiguous group even
-                // though the group is only ever inserted once. Look the key up
-                // by reference and clone it only on the first iteration.
-                if !ambiguous_fraction.contains_key(taxids) {
-                    ambiguous_fraction.insert(taxids.clone(), HashMap::new());
-                }
-                let entry = ambiguous_fraction
-                    .get_mut(taxids)
-                    .expect("ambiguous fraction entry was just inserted");
-                entry.clear();
-                let mut consumed = false;
-                for (taxid, depth, maplen, equivalent_sum, fraction) in paired {
-                    let total_entry = total.entry(taxid).or_default();
-                    if fraction >= 0.99 {
-                        total_entry.support.add_weighted(
-                            ambiguous.observed_count,
-                            equivalent_sum,
-                            1.0,
-                        );
-                        total_entry.depth += depth;
-                        total_entry.mapped_len += maplen;
-                        entry.insert(taxid, 1.0);
-                        consumed = true;
-                        break;
-                    }
-                    total_entry.support.add_weighted(
-                        ambiguous.observed_count,
-                        equivalent_sum,
-                        fraction,
-                    );
-                    total_entry.depth += depth * fraction;
-                    total_entry.mapped_len += maplen * fraction;
-                    entry.insert(taxid, round5(fraction));
-                }
-                if !consumed {
-                    normalize_map(entry);
-                }
-            }
-            if verbose_logging && iterations % 5 == 0 {
-                log::info!(
-                    target: "PROFILER",
-                    "Profiling in EM iteration {} ...",
-                    iterations
-                );
-            }
-            let numerator: f64 = em_taxids
-                .iter()
-                .map(|taxid| {
-                    let depth = total.get(taxid).map_or(0.0, |totals| totals.depth);
-                    let previous_depth = species_count_depth
-                        .get(taxid)
-                        .map(|previous| previous.depth)
-                        .unwrap_or(0.0);
-                    (depth - previous_depth).abs()
-                })
-                .sum::<f64>();
-            let denominator: f64 = em_taxids
-                .iter()
-                .map(|taxid| species_count_depth.get(taxid).map_or(0.0, |totals| totals.depth))
-                .sum::<f64>()
-                .max(1e-12);
-            if numerator / denominator <= 1e-5 {
-                species_count_depth = total;
-                break;
-            }
-            iterations += 1;
-            if iterations >= self.cfg.max_em_iterations {
-                log::warn!(
-                    target: "PROFILER",
-                    "Community EM reached the maximum of {} iterations before convergence.",
-                    self.cfg.max_em_iterations
-                );
-                species_count_depth = total;
-                break;
-            }
-            species_count_depth = total;
-        }
-        if verbose_logging {
-            log::info!(
-                target: "PROFILER",
-                "Finished profiling with {} EM iterations",
-                iterations
-            );
-        }
+        let em = shared_read_em(
+            &unambiguous,
+            &em_groups,
+            self.cfg.max_em_iterations,
+            "Community",
+            verbose_logging,
+        );
+        let mut ambiguous_fraction = group_shares(&em_groups, &em.previous);
+        let species_count_depth = em.totals;
 
         let norm_factor: f64 = 0.01
             * em_taxids
@@ -4516,103 +4399,167 @@ fn estimate_unfiltered_taxon_totals(
         entry.mapped_len += maplen_mean;
     }
 
-    let base = unambiguous;
-    let mut current = base.clone();
     let mut em_groups = em_groups.iter().collect::<Vec<_>>();
     em_groups.sort_unstable_by(|left, right| left.0.cmp(right.0));
-    let mut em_taxids = base.keys().copied().collect::<Vec<_>>();
-    for (taxids, _) in &em_groups {
-        em_taxids.extend(taxids.iter().copied());
+    Ok(shared_read_em(
+        &unambiguous,
+        &em_groups,
+        max_iterations,
+        "Raw-profile",
+        verbose_logging,
+    )
+    .totals)
+}
+
+/// Result of [`shared_read_em`]: the final totals and the totals its last
+/// round started from, whose shares classify each group's reads.
+struct SharedReadEm {
+    totals: HashMap<u32, TaxonTotals>,
+    previous: HashMap<u32, TaxonTotals>,
+}
+
+/// How a group of shared reads is divided among its candidates.
+enum Shares {
+    /// One candidate holds at least 0.99 of the group's depth and takes it all.
+    Whole(usize),
+    /// Each candidate takes the share of its depth.
+    Split(Vec<f64>),
+}
+
+/// Shares of a group's candidates in proportion to their depth in `totals`,
+/// or `None` when they have no depth.
+fn depth_shares(candidates: &[u32], totals: &HashMap<u32, TaxonTotals>) -> Option<Shares> {
+    let depth = |taxid: &u32| totals.get(taxid).map_or(0.0, |totals| totals.depth);
+    let sum_depth = candidates.iter().map(depth).sum::<f64>();
+    if sum_depth <= f64::EPSILON || !sum_depth.is_finite() {
+        return None;
     }
-    em_taxids.sort_unstable();
-    em_taxids.dedup();
+    let shares = candidates
+        .iter()
+        .map(|taxid| depth(taxid) / sum_depth)
+        .collect::<Vec<_>>();
+    let (top, &largest) = shares
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.total_cmp(right.1))?;
+    Some(if largest >= 0.99 {
+        Shares::Whole(top)
+    } else {
+        Shares::Split(shares)
+    })
+}
+
+/// Add candidate `index` of a group, weighted by `share`, to its totals.
+fn add_share(
+    totals: &mut HashMap<u32, TaxonTotals>,
+    taxid: u32,
+    group: &AmbiguousTotals,
+    index: usize,
+    share: f64,
+) {
+    let entry = totals.entry(taxid).or_default();
+    entry.support.add_weighted(
+        group.observed_count,
+        group.equivalent_support_sums[index],
+        share,
+    );
+    entry.depth += group.depths[index] * share;
+    entry.mapped_len += group.mapped_lens[index] * share;
+}
+
+/// Divide the reads of each group shared by several taxa among its candidates
+/// in proportion to their depth, starting from the reads each taxon has alone
+/// (`base`), until the summed depth changes by at most 1e-5 (relative) or
+/// `max_iterations` rounds have run.
+fn shared_read_em(
+    base: &HashMap<u32, TaxonTotals>,
+    groups: &[(&Vec<u32>, &AmbiguousTotals)],
+    max_iterations: usize,
+    label: &str,
+    verbose: bool,
+) -> SharedReadEm {
+    let mut taxids = base.keys().copied().collect::<Vec<_>>();
+    for (candidates, _) in groups {
+        taxids.extend(candidates.iter().copied());
+    }
+    taxids.sort_unstable();
+    taxids.dedup();
+    let depth = |totals: &HashMap<u32, TaxonTotals>, taxid: &u32| {
+        totals.get(taxid).map_or(0.0, |totals| totals.depth)
+    };
     let max_iterations = max_iterations.max(1);
+    let mut current = base.clone();
+    let mut previous = HashMap::new();
     for iteration in 0..max_iterations {
         let mut next = base.clone();
-        for &(taxids, totals) in &em_groups {
-            let sum_depth = taxids
-                .iter()
-                .map(|taxid| current.get(taxid).map_or(0.0, |value| value.depth))
-                .sum::<f64>();
-            if sum_depth <= f64::EPSILON || !sum_depth.is_finite() {
-                continue;
-            }
-            let mut weighted = taxids
-                .iter()
-                .enumerate()
-                .map(|(index, &taxid)| {
-                    let fraction = current.get(&taxid).map_or(0.0, |value| value.depth) / sum_depth;
-                    (taxid, index, fraction)
-                })
-                .collect::<Vec<_>>();
-            weighted.sort_by(|left, right| {
-                right
-                    .2
-                    .partial_cmp(&left.2)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| left.0.cmp(&right.0))
-            });
-            for (taxid, index, fraction) in weighted {
-                let entry = next.entry(taxid).or_default();
-                if fraction >= 0.99 {
-                    entry.support.add_weighted(
-                        totals.observed_count,
-                        totals.equivalent_support_sums[index],
-                        1.0,
-                    );
-                    entry.depth += totals.depths[index];
-                    entry.mapped_len += totals.mapped_lens[index];
-                    break;
+        for &(candidates, group) in groups {
+            match depth_shares(candidates, &current) {
+                Some(Shares::Whole(top)) => add_share(&mut next, candidates[top], group, top, 1.0),
+                Some(Shares::Split(shares)) => {
+                    for (index, share) in shares.into_iter().enumerate() {
+                        add_share(&mut next, candidates[index], group, index, share);
+                    }
                 }
-                entry.support.add_weighted(
-                    totals.observed_count,
-                    totals.equivalent_support_sums[index],
-                    fraction,
-                );
-                entry.depth += totals.depths[index] * fraction;
-                entry.mapped_len += totals.mapped_lens[index] * fraction;
+                None => {}
             }
         }
-
-        if verbose_logging && iteration % 5 == 0 {
-            log::info!(
-                target: "PROFILER",
-                "Raw-profile EM iteration {} ...",
-                iteration
-            );
+        if verbose && iteration % 5 == 0 {
+            log::info!(target: "PROFILER", "{label} EM iteration {iteration} ...");
         }
-        let numerator = em_taxids
+        let change = taxids
             .iter()
-            .map(|taxid| {
-                let depth = next.get(taxid).map_or(0.0, |totals| totals.depth);
-                let previous = current.get(taxid).map_or(0.0, |value| value.depth);
-                (depth - previous).abs()
-            })
+            .map(|taxid| (depth(&next, taxid) - depth(&current, taxid)).abs())
             .sum::<f64>();
-        let denominator = em_taxids
+        let scale = taxids
             .iter()
-            .map(|taxid| current.get(taxid).map_or(0.0, |totals| totals.depth))
+            .map(|taxid| depth(&current, taxid))
             .sum::<f64>()
             .max(1e-12);
-        current = next;
-        if numerator / denominator <= 1e-5 {
-            if verbose_logging {
-                log::info!(
-                    target: "PROFILER",
-                    "Finished raw-profile EM with {} iterations",
-                    iteration
-                );
+        previous = std::mem::replace(&mut current, next);
+        if change / scale <= 1e-5 {
+            if verbose {
+                log::info!(target: "PROFILER", "{label} EM finished after {iteration} iterations.");
             }
-            return Ok(current);
+            return SharedReadEm {
+                totals: current,
+                previous,
+            };
         }
     }
-
     log::warn!(
         target: "PROFILER",
-        "Raw-profile EM reached the maximum of {} iterations before convergence.",
-        max_iterations
+        "{label} EM reached the maximum of {max_iterations} iterations before convergence."
     );
-    Ok(current)
+    SharedReadEm {
+        totals: current,
+        previous,
+    }
+}
+
+/// Shares of each group's reads among its candidates, from the totals the
+/// last EM round started from, for the read classifications.
+fn group_shares(
+    groups: &[(&Vec<u32>, &AmbiguousTotals)],
+    totals: &HashMap<u32, TaxonTotals>,
+) -> HashMap<Vec<u32>, HashMap<u32, f64>> {
+    let mut fractions = HashMap::with_capacity(groups.len());
+    for &(candidates, _) in groups {
+        let shares = match depth_shares(candidates, totals) {
+            Some(Shares::Whole(top)) => HashMap::from([(candidates[top], 1.0)]),
+            Some(Shares::Split(shares)) => {
+                let mut map = candidates
+                    .iter()
+                    .zip(shares)
+                    .map(|(&taxid, share)| (taxid, round5(share)))
+                    .collect();
+                normalize_map(&mut map);
+                map
+            }
+            None => continue,
+        };
+        fractions.insert(candidates.clone(), shares);
+    }
+    fractions
 }
 
 fn merge_ambiguous_totals(
@@ -6070,6 +6017,32 @@ mod tests {
 
         cfg.is_paired = true;
         assert!(EvidencePolicy::from_config(&cfg).is_none());
+    }
+
+    #[test]
+    fn a_candidate_with_nearly_all_depth_takes_the_whole_group() {
+        let totals = |depths: &[(u32, f64)]| {
+            depths
+                .iter()
+                .map(|&(taxid, depth)| {
+                    (
+                        taxid,
+                        TaxonTotals {
+                            depth,
+                            ..TaxonTotals::default()
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        };
+        let whole = depth_shares(&[1, 2], &totals(&[(1, 1.0), (2, 99.0)]));
+        assert!(matches!(whole, Some(Shares::Whole(1))));
+        let Some(Shares::Split(shares)) = depth_shares(&[1, 2], &totals(&[(1, 1.0), (2, 3.0)]))
+        else {
+            panic!("expected a split");
+        };
+        assert_eq!(shares, vec![0.25, 0.75]);
+        assert!(depth_shares(&[1, 2], &totals(&[])).is_none());
     }
 
     #[test]
