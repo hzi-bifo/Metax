@@ -573,7 +573,6 @@ fn parse_sequencer(value: &str) -> Result<Sequencer> {
         "illumina" => Ok(Sequencer::Illumina),
         "nanopore" | "ont" => Ok(Sequencer::Nanopore),
         "pacbio" => Ok(Sequencer::PacBio),
-        "assembly" => Ok(Sequencer::Assembly),
         _ => bail!("unsupported sequencer '{value}' in mapping metadata"),
     }
 }

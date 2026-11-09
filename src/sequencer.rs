@@ -15,8 +15,6 @@ pub enum Sequencer {
     Nanopore,
     #[value(name = "PacBio")]
     PacBio,
-    #[value(name = "assembly")]
-    Assembly,
 }
 
 impl Sequencer {
@@ -30,17 +28,11 @@ impl Sequencer {
         matches!(self, Self::Nanopore | Self::PacBio)
     }
 
-    #[inline]
-    pub const fn is_read_platform(self) -> bool {
-        matches!(self, Self::Illumina | Self::Nanopore | Self::PacBio)
-    }
-
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Illumina => "Illumina",
             Self::Nanopore => "Nanopore",
             Self::PacBio => "PacBio",
-            Self::Assembly => "assembly",
         }
     }
 }
@@ -69,15 +61,12 @@ mod tests {
         );
         assert_eq!(Sequencer::from_str("ont", true), Ok(Sequencer::Nanopore));
         assert_eq!(Sequencer::from_str("pacbio", true), Ok(Sequencer::PacBio));
-        assert_eq!(
-            Sequencer::from_str("ASSEMBLY", true),
-            Ok(Sequencer::Assembly)
-        );
     }
 
     #[test]
     fn unknown_values_are_rejected() {
         assert!(Sequencer::from_str("illuminaa", true).is_err());
         assert!(Sequencer::from_str("unknown", true).is_err());
+        assert!(Sequencer::from_str("assembly", true).is_err());
     }
 }

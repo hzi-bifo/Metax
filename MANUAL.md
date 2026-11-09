@@ -279,7 +279,6 @@ metax profile -d db --dmp-dir taxonomy -i pacbio_reads.fastq.gz -s PacBio -o sam
 | Illumina strain | identity 0.96; 50 bases; fraction 0.65 | identity 0.97; 50 bases; fraction 0.80 | identity 0.98; 60 bases; fraction 0.80 | length AND fraction |
 | Nanopore/PacBio community | identity 0.90; 300 bases; fraction 0.20 | identity 0.92; 500 bases; fraction 0.20 | identity 0.94; 500 bases; fraction 0.30 | length OR fraction |
 | Nanopore/PacBio strain | identity 0.90; 500 bases; fraction 0.30 | identity 0.92; 500 bases; fraction 0.30 | identity 0.94; 500 bases; fraction 0.30 | length OR fraction |
-| Assembly | identity 0.92; 400 bases; fraction 0.55 | identity 0.93; 500 bases; fraction 0.60 | identity 0.95; 600 bases; fraction 0.70 | length AND fraction |
 
 Override any of them explicitly:
 
@@ -312,7 +311,7 @@ Resolved mapper defaults:
 
 | Input | top-n | score ratio | min seeds | mapper identity | mapper fraction |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Illumina single-end / assembly | 5 | 0.90 (0.80 in recall mode; 0.50 on a database with marker genes) | 2 | 0.80 | 0.50 |
+| Illumina single-end | 5 | 0.90 (0.80 in recall mode; 0.50 on a database with marker genes) | 2 | 0.80 | 0.50 |
 | Illumina paired-end | 50 | 0.50 | 1 | 0.80 | 0.50 |
 | Nanopore / PacBio | 10 | 0.70 | 3 | 0.80 | 0.30, or 300 mapped bases |
 
@@ -487,7 +486,7 @@ A proper pair on one taxon does not end the search. Seeding can place a second t
 
 ### 7.2 Read-level gates
 
-Each mapping is tested against the profiler's identity, mapped-length, and mapped-fraction thresholds (§5.5). Short reads and assemblies require both the length and the fraction gate; long reads pass with either. Mappings that fail remain available only to genus fallback.
+Each mapping is tested against the profiler's identity, mapped-length, and mapped-fraction thresholds (§5.5). Short reads require both the length and the fraction gate; long reads pass with either. Mappings that fail remain available only to genus fallback.
 
 ### 7.3 Coordinate evidence and read assignment
 
@@ -506,7 +505,7 @@ This prevents a read from creating breadth for several taxa merely because it ma
 
 **Nanopore/PacBio.** Candidates are ranked by `long_score = mapped_bases × (2 × identity − 1)`. Coordinate evidence requires the best terminal score to exceed the runner-up by at least 1 % of the best score. Exact ties keep the mapper's first-ranked placement.
 
-Exact and near-exact cross-species ties stay in the EM candidate set and create no coordinate evidence, unless resolved by guarded MAP (§7.8). Reads that map competitively across terminal ranks may be reported at their lowest common ancestor when that rank has sufficient retained evidence; otherwise they remain unclassified. Assembly input and strain profiling use the legacy evidence rules instead of this policy; strain profiling uses pairs only.
+Exact and near-exact cross-species ties stay in the EM candidate set and create no coordinate evidence, unless resolved by guarded MAP (§7.8). Reads that map competitively across terminal ranks may be reported at their lowest common ancestor when that rank has sufficient retained evidence; otherwise they remain unclassified. Strain profiling uses the legacy evidence rules instead of this policy, and pairs only.
 
 ### 7.4 Coverage metrics
 
@@ -605,7 +604,7 @@ Standard species evidence requires the chunk-breadth amount, OEBR and COEBR with
 
 Rescue tiers apply to species only; direct higher-rank endpoints use the standard rule. Explicit `--strict`, `--min-oebr`, and `--min-coebr` remain authoritative for every tier, and explicit breadth and chunk-breadth cutoffs are applied to every reported taxon afterwards.
 
-**Guarded MAP.** Native Illumina community profiling resolves exact top-score cross-species ties by default (`--exact-ties guarded-map`). It seeds an EM prior from species with independent unique-candidate support, requires a single largest posterior of at least `0.95`, preserves every species selected by the margin rule, and requires independent pre-MAP fixed-chunk breadth on the same assembly: above `0.50 × cutoff` for paired-end (or `0.05 × cutoff` for a species meeting the low-abundance tier) and above the full cutoff for single-end. MAP affects coordinate evidence only; abundance still uses fractional EM over all retained candidates. Use `--exact-ties ambiguous` to keep every exact tie ambiguous. Guarded MAP is not applied to long reads, strain profiling, or assembly input, and it falls back to `ambiguous` when `--low-biomass` or `--min-chunk-breadth 0` removes the chunk-breadth safeguard.
+**Guarded MAP.** Native Illumina community profiling resolves exact top-score cross-species ties by default (`--exact-ties guarded-map`). It seeds an EM prior from species with independent unique-candidate support, requires a single largest posterior of at least `0.95`, preserves every species selected by the margin rule, and requires independent pre-MAP fixed-chunk breadth on the same assembly: above `0.50 × cutoff` for paired-end (or `0.05 × cutoff` for a species meeting the low-abundance tier) and above the full cutoff for single-end. MAP affects coordinate evidence only; abundance still uses fractional EM over all retained candidates. Use `--exact-ties ambiguous` to keep every exact tie ambiguous. Guarded MAP is not applied to long reads or strain profiling, and it falls back to `ambiguous` when `--low-biomass` or `--min-chunk-breadth 0` removes the chunk-breadth safeguard.
 
 ### 7.9 Genus fallback
 

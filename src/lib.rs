@@ -853,28 +853,6 @@ impl MetaxApp {
                     fraction.get_or_insert(default_fraction);
                 }
             }
-            Sequencer::Assembly => {
-                if batch_size == 0 {
-                    batch_size = 5000;
-                }
-                match self.config.mode {
-                    ProfileMode::Recall => {
-                        identity.get_or_insert(0.92);
-                        mapped_len.get_or_insert(400);
-                        fraction.get_or_insert(0.55);
-                    }
-                    ProfileMode::Precision => {
-                        identity.get_or_insert(0.95);
-                        mapped_len.get_or_insert(600);
-                        fraction.get_or_insert(0.70);
-                    }
-                    ProfileMode::Default => {
-                        identity.get_or_insert(0.93);
-                        mapped_len.get_or_insert(500);
-                        fraction.get_or_insert(0.60);
-                    }
-                }
-            }
         }
 
         ResolvedProfilerThresholds {

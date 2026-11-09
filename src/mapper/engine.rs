@@ -1149,7 +1149,7 @@ impl MappingConfig {
         // Precision is enforced by evidence thresholds, not by hiding close
         // competitors from the profiler. Unless explicitly overridden, it
         // therefore retains the same mapper score ratio as Default (0.90 for
-        // unpaired Illumina/assembly input, 0.70 for long reads, and the
+        // unpaired Illumina input, 0.70 for long reads, and the
         // mode-independent 0.50 paired-end policy above). Illumina recall
         // alone widens candidate acquisition.
         let pair_aware = overrides.pair_aware || (preset == MappingPreset::Illumina && is_paired);
@@ -2754,7 +2754,6 @@ mod tests {
         ] {
             for (sequencer, paired, expected) in [
                 (Sequencer::Illumina, false, 0.50),
-                (Sequencer::Assembly, false, 0.50),
                 (Sequencer::Illumina, true, 0.50),
                 (Sequencer::Nanopore, false, 0.70),
             ] {
@@ -2785,7 +2784,6 @@ mod tests {
             (Sequencer::Illumina, true, 0.50),
             (Sequencer::Nanopore, false, 0.70),
             (Sequencer::PacBio, false, 0.70),
-            (Sequencer::Assembly, false, 0.90),
         ] {
             let default =
                 MappingConfig::resolve(sequencer, paired, false, false, ProfileMode::Default, &[])
@@ -2805,13 +2803,17 @@ mod tests {
     }
 
     #[test]
-    fn recall_widens_unpaired_non_long_read_candidate_ratios() {
-        for (sequencer, expected) in [(Sequencer::Illumina, 0.80), (Sequencer::Assembly, 0.80)] {
-            let config =
-                MappingConfig::resolve(sequencer, false, false, false, ProfileMode::Recall, &[])
-                    .unwrap();
-            assert!((config.params.score_ratio - expected).abs() < f64::EPSILON);
-        }
+    fn recall_widens_unpaired_short_read_candidate_ratios() {
+        let config = MappingConfig::resolve(
+            Sequencer::Illumina,
+            false,
+            false,
+            false,
+            ProfileMode::Recall,
+            &[],
+        )
+        .unwrap();
+        assert!((config.params.score_ratio - 0.80).abs() < f64::EPSILON);
     }
 
     #[test]

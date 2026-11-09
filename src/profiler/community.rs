@@ -89,21 +89,9 @@ use super::{
     ResolvedProfilerParameters, StableReadMap,
 };
 
-/// Fixed coordinate radius used by the native single-end, paired-end, and
-/// long-read evidence policies.
+/// Fixed coordinate radius around each accepted read span for fixed-chunk
+/// coverage.
 const NATIVE_FIXED_FLANK_LEN: usize = 1_000;
-
-/// Fixed coordinate radius used for assembly input.
-const ASSEMBLY_FIXED_FLANK_LEN: usize = 2_000;
-
-#[inline]
-fn native_fixed_flank_len(cfg: &ProfilerConfig) -> usize {
-    if cfg.sequencer.is_illumina() || cfg.sequencer.is_long_read() {
-        NATIVE_FIXED_FLANK_LEN
-    } else {
-        ASSEMBLY_FIXED_FLANK_LEN
-    }
-}
 
 fn record_terminal_rank(
     ranks: &mut HashMap<u32, ProfileRank>,
@@ -578,7 +566,7 @@ impl CommunityProfiler {
         ) -> Result<MetamParseStats>,
     {
         log::info!(target: "PROFILER", "Loading Metam coordinate mappings ...");
-        let fixed_flank_len = native_fixed_flank_len(&self.cfg);
+        let fixed_flank_len = NATIVE_FIXED_FLANK_LEN;
         let mut asm_lengths_raw: HashMap<String, f64> = HashMap::new();
         let mut genome_sampling_scales: HashMap<String, f64> = HashMap::new();
         let mut profile_taxids: HashSet<u32> = HashSet::new();
@@ -4313,10 +4301,8 @@ fn automatic_recall_chunk_breadth_scale(cfg: &ProfilerConfig, basis_reads: usize
         let millions = basis_reads as f64 / 1_000_000.0;
         (SHORT_RECALL_CHUNK_SCALE_FLOOR + (1.0 - SHORT_RECALL_CHUNK_SCALE_FLOOR) / millions)
             .clamp(SHORT_RECALL_CHUNK_SCALE_FLOOR, 1.0)
-    } else if cfg.sequencer.is_long_read() {
-        LONG_RECALL_CHUNK_SCALE
     } else {
-        1.0
+        LONG_RECALL_CHUNK_SCALE
     }
 }
 
@@ -5919,39 +5905,6 @@ mod tests {
     }
 
     #[test]
-    fn native_fixed_flank_uses_validated_radius_for_all_read_inputs() {
-        let mut illumina = make_cfg(Sequencer::Illumina, None);
-        assert_eq!(
-            native_fixed_flank_len(&illumina),
-            NATIVE_FIXED_FLANK_LEN,
-            "single-end Illumina uses the validated one-kilobase radius"
-        );
-
-        illumina.is_paired = true;
-        assert_eq!(
-            native_fixed_flank_len(&illumina),
-            NATIVE_FIXED_FLANK_LEN,
-            "paired-end evidence uses the validated one-kilobase radius"
-        );
-
-        for sequencer in [Sequencer::Nanopore, Sequencer::PacBio] {
-            let long_read = make_cfg(sequencer, None);
-            assert_eq!(
-                native_fixed_flank_len(&long_read),
-                NATIVE_FIXED_FLANK_LEN,
-                "{sequencer} evidence must not inherit the two-kilobase single-end radius"
-            );
-        }
-
-        let assembly = make_cfg(Sequencer::Assembly, None);
-        assert_eq!(
-            native_fixed_flank_len(&assembly),
-            ASSEMBLY_FIXED_FLANK_LEN,
-            "assembly profiling is outside the recalibrated native evidence policy"
-        );
-    }
-
-    #[test]
     fn conflicting_terminal_rank_for_one_taxid_is_rejected() {
         let mut ranks = HashMap::new();
         record_terminal_rank(&mut ranks, 111, ProfileRank::Genus, "genus-ref").unwrap();
@@ -6255,9 +6208,6 @@ mod tests {
         );
 
         cfg.is_paired = true;
-        assert!(EvidencePolicy::from_config(&cfg).is_none());
-        cfg.is_paired = false;
-        cfg.sequencer = Sequencer::Assembly;
         assert!(EvidencePolicy::from_config(&cfg).is_none());
     }
 
@@ -6948,9 +6898,6 @@ mod tests {
                 "expected fallback disabled for high-map {seq}"
             );
         }
-        // Assembly input is not a read platform -> never auto-triggers.
-        let cfg = make_cfg(Sequencer::Assembly, None);
-        assert!(!fallback_gate_active(&cfg, 0.0));
     }
 
     #[test]
@@ -7043,11 +6990,9 @@ mod tests {
         // Pathogen mode on disables auto-force.
         let cfg_host = make_cfg(Sequencer::Illumina, Some("9606"));
         assert!(!cfg_host.resolve_by_aligned(0.10));
-        // Long-read platforms now also auto-force on low map; assembly does not.
+        // Long-read platforms also auto-force on low map.
         let cfg_np = make_cfg(Sequencer::Nanopore, None);
         assert!(cfg_np.resolve_by_aligned(0.10));
-        let cfg_asm = make_cfg(Sequencer::Assembly, None);
-        assert!(!cfg_asm.resolve_by_aligned(0.10));
     }
 
     #[test]
@@ -7293,12 +7238,6 @@ mod tests {
         assert_eq!(precision.standard.to_bits(), precision.safeguard.to_bits());
 
         cfg.mode = ProfileMode::Recall;
-        cfg.sequencer = Sequencer::Assembly;
-        approx_equal(
-            resolve_community_chunk_breadth(&cfg, 20_000_000).recall_scale,
-            1.0,
-        );
-        cfg.sequencer = Sequencer::Illumina;
         cfg.strain = true;
         approx_equal(
             resolve_community_chunk_breadth(&cfg, 20_000_000).recall_scale,

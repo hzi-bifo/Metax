@@ -774,17 +774,12 @@ impl ProfilerConfig {
     /// the chunk-breadth basis / genus-fallback gate.
     ///
     /// Requires all of:
-    /// 1. sequencer is a read platform — Illumina, Nanopore, or PacBio
-    ///    (case-insensitive). Assembly / unknown input is excluded because a
-    ///    contig "mapping rate" is not comparable to a per-read rate.
-    /// 2. pathogen-detection mode is off (`host` is `None`),
-    /// 3. `mapping_rate < low_map_rate_threshold` (strict `<`).
+    /// 1. pathogen-detection mode is off (`host` is `None`),
+    /// 2. `mapping_rate < low_map_rate_threshold` (strict `<`).
     ///
     /// Non-finite `mapping_rate` values always return `false`.
     pub fn is_low_map_run(&self, mapping_rate: f64) -> bool {
-        let read_platform = self.sequencer.is_read_platform();
         mapping_rate.is_finite()
-            && read_platform
             && self.host.is_none()
             && mapping_rate < self.low_map_rate_threshold
     }
@@ -1383,7 +1378,7 @@ mod chunk_basis_tests {
         let mut cfg = minimal_cfg();
         // Every read platform honours the low-map auto-trigger, so genus
         // fallback and the mapped-read basis reach long reads without an
-        // explicit flag. Assembly input is excluded.
+        // explicit flag.
         for seq in [Sequencer::Illumina, Sequencer::Nanopore, Sequencer::PacBio] {
             cfg.sequencer = seq;
             assert!(cfg.is_low_map_run(0.10), "{seq}: low rate must be low-map");
@@ -1395,9 +1390,6 @@ mod chunk_basis_tests {
                 "{seq}"
             );
         }
-        // Assembly input is not a read platform -> never auto low-map.
-        cfg.sequencer = Sequencer::Assembly;
-        assert!(!cfg.is_low_map_run(0.10));
         // Pathogen-detection mode (host set) suppresses it on any platform.
         cfg.sequencer = Sequencer::Nanopore;
         cfg.host = Some("human".to_string());
