@@ -17,7 +17,7 @@
 //!
 //! Both profilers follow a similar pipeline:
 //!
-//! 1. **Load mappings**: Parse Metam mappings or SAM/BAM records and extract reference metadata
+//! 1. **Load mappings**: Parse Metam mappings and extract reference metadata
 //! 2. **Compute coverage**: Calculate breadth and depth for each reference
 //! 3. **Assign taxonomy**: Map read mappings to taxonomic units
 //! 4. **Resolve ambiguity**: Use EM algorithm for multi-mapping reads
@@ -623,9 +623,8 @@ pub struct ProfilerConfig {
     /// evidence.
     pub exact_ties: ExactTiePolicy,
 
-    /// Minimum mapping identity threshold (0.0-1.0). Native mappings use the
-    /// mapper's canonical per-base identity; legacy SAM/BAM retains its
-    /// gap-compressed CIGAR identity.
+    /// Minimum mapping identity threshold (0.0-1.0), against the mapper's
+    /// canonical per-base identity.
     pub identity: f64,
 
     /// Claimed base accuracy behind an automatic long-read identity cutoff.

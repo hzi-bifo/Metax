@@ -118,11 +118,11 @@ fn record_terminal_rank(
 /// Information about a single alignment of a read to a reference.
 ///
 /// Derived fields are computed once where the alignment enters the profiler --
-/// [`CommunityProfiler::entry_from_metam_mapping`] for coordinate mappings,
-/// [`parse_alignment_line`] for SAM/BAM -- and stored here ready to use. They
+/// in [`CommunityProfiler::entry_from_metam_mapping`] -- and stored here ready
+/// to use. They
 /// are invariant for a given alignment, so the taxonomy-assignment loop is
-/// purely arithmetic and touches no `HashMap`, `String::split` or CIGAR
-/// scanner per alignment.
+/// purely arithmetic and touches no `HashMap` or `String::split` per
+/// alignment.
 type AlignmentEntry = EvidenceAlignment;
 
 /// Narrow a genomic coordinate/length to `u32` for the packed
@@ -339,9 +339,8 @@ struct ReadAssignment {
 
     /// `true` when this assignment came from the native terminal-evidence
     /// resolver and its candidates must pass the assembly-coherent presence
-    /// policy. Legacy SAM/BAM and genus-fallback assignments use their
-    /// existing coverage path even when their taxid is also a direct database
-    /// endpoint.
+    /// policy. Genus-fallback assignments use the pooled coverage path even
+    /// when their taxid is also a direct database endpoint.
     requires_terminal_evidence: bool,
 
     /// Candidate terminal taxids (may be >1 for multi-mappers).
@@ -980,8 +979,7 @@ impl CommunityProfiler {
 
     /// Precompute taxonomy lookups used during per-read assignment.
     ///
-    /// Given the set of raw taxids observed in the SAM/BAM @SQ headers
-    /// (third `|`-separated field), this produces:
+    /// Given the set of raw taxids of the database references, this produces:
     ///
     /// - `species_normalize`: sparse `raw -> species` map. Only contains
     ///   entries where the raw taxid is **below** species rank and a
@@ -1064,7 +1062,9 @@ impl CommunityProfiler {
             );
         }
         // Derived from the final configuration, after any identity check.
-        let evidence_policy = EvidencePolicy::from_config(&self.cfg);
+        let evidence_policy = EvidencePolicy::from_config(&self.cfg).ok_or_else(|| {
+            anyhow!("community profiling takes Illumina reads or single-end long reads")
+        })?;
         let mut assignment = self.assign_taxonomy(
             read_alignments,
             *fallback_mode,
@@ -1072,11 +1072,9 @@ impl CommunityProfiler {
             evidence_policy,
             marker_model.as_deref(),
         )?;
-        // The `skipped_reference` diagnostic now accumulates two
-        // streams: parser-time rejections (unparsable species taxid /
-        // missing assembly length; moved here from `process_batch`)
-        // plus any future process_batch-time rejections (currently
-        // none).
+        // The `skipped_reference` diagnostic counts the mapping records
+        // rejected at load (unparsable species taxid or missing assembly
+        // length).
         assignment.filter_stats.skipped_reference += *skipped_reference_at_load;
         if verbose_logging {
             log::info!(target: "PROFILER", "Assigning taxonomy finished!");
@@ -1146,7 +1144,7 @@ impl CommunityProfiler {
         read_alignments: &[ReadBundle],
         fallback_mode: bool,
         species_to_genus: Arc<HashMap<u32, u32>>,
-        evidence_policy: Option<EvidencePolicy>,
+        evidence_policy: EvidencePolicy,
         markers: Option<&MarkerModel>,
     ) -> Result<AssignmentResult> {
         let batch_size = self.cfg.batch_size.max(1);
@@ -1169,18 +1167,14 @@ impl CommunityProfiler {
             read_alignments
                 .par_chunks(batch_size)
                 .map_with(progress, |progress_bar, chunk| {
-                    let result = if let Some(policy) = evidence_policy {
-                        process_evidence_batch(
-                            chunk,
-                            &cfg,
-                            policy,
-                            fallback_mode,
-                            species_to_genus.as_ref(),
-                            markers,
-                        )
-                    } else {
-                        process_batch(chunk, &cfg, fallback_mode, species_to_genus.as_ref())
-                    };
+                    let result = process_evidence_batch(
+                        chunk,
+                        &cfg,
+                        evidence_policy,
+                        fallback_mode,
+                        species_to_genus.as_ref(),
+                        markers,
+                    );
                     progress_bar.inc(chunk.len() as u64);
                     result
                 })
@@ -1303,7 +1297,7 @@ impl CommunityProfiler {
         &self,
         mapping_data: MappingData,
         mut assignment: AssignmentResult,
-        evidence_policy: Option<EvidencePolicy>,
+        evidence_policy: EvidencePolicy,
     ) -> Result<usize> {
         let MappingData {
             asm_lengths,
@@ -1324,7 +1318,7 @@ impl CommunityProfiler {
         // witnesses. Resolve the same platform mode here so their default
         // ratio bounds come from the standard evidence policy rather than the
         // older output-only genus/species defaults.
-        let lca_ratio_mode = EvidencePolicy::from_config(&self.cfg).map(|policy| policy.mode);
+        let lca_ratio_mode = evidence_policy.mode;
 
         let mut taxon_coverage: HashMap<u32, TaxonCoverage> = HashMap::new();
         let mut coverage_keys = assignment.acc_intervals.keys().collect::<Vec<_>>();
@@ -1360,54 +1354,49 @@ impl CommunityProfiler {
             coverage.flex_chunk += total_flex as f64 / asm_len;
         }
 
-        let mut evidence_decisions: HashMap<u32, WitnessDecision> = HashMap::new();
-        let mut evidence_selected_taxa: HashSet<u32> = HashSet::new();
-        let mut best_fit: HashMap<u32, BestFitGenome> = HashMap::new();
-        if let Some(policy) = evidence_policy {
-            let resolved = resolve_coordinate_evidence(
-                &self.cfg,
-                policy,
-                &mut assignment,
-                min_breadth,
+        let resolved = resolve_coordinate_evidence(
+            &self.cfg,
+            evidence_policy,
+            &mut assignment,
+            min_breadth,
+            min_chunk_breadth,
+            safeguard_min_chunk_breadth,
+            CoverageModel {
+                markers: marker_model.as_deref(),
+                layout: genus_rollup.as_deref().map(|rollup| &rollup.layout),
+            },
+        )?;
+        rescale_to_best_fit(
+            &mut assignment.read_assignments,
+            &resolved.best_fit,
+            marker_model.as_deref(),
+        );
+        let best_fit = resolved.best_fit;
+        let mut evidence_decisions = resolved.decisions;
+        let mut evidence_selected_taxa = resolved.selected_taxa;
+        if let Some(rollup) = genus_rollup.as_deref() {
+            let even = rollup.even_coverage_species(
+                &evidence_decisions,
+                |taxid| terminal_ranks.get(&taxid).copied(),
                 min_chunk_breadth,
-                safeguard_min_chunk_breadth,
-                CoverageModel {
-                    markers: marker_model.as_deref(),
-                    layout: genus_rollup.as_deref().map(|rollup| &rollup.layout),
-                },
-            )?;
-            rescale_to_best_fit(
-                &mut assignment.read_assignments,
-                &resolved.best_fit,
-                marker_model.as_deref(),
             );
-            best_fit = resolved.best_fit;
-            evidence_decisions = resolved.decisions;
-            evidence_selected_taxa = resolved.selected_taxa;
-            if let Some(rollup) = genus_rollup.as_deref() {
-                let even = rollup.even_coverage_species(
-                    &evidence_decisions,
-                    |taxid| terminal_ranks.get(&taxid).copied(),
-                    min_chunk_breadth,
-                );
-                log::info!(
-                    target: "PROFILER",
-                    "Species reported for even coverage of their genome: {}.",
-                    even.len()
-                );
-                for taxid in even {
-                    if let Some(decision) = evidence_decisions.get_mut(&taxid) {
-                        decision.rescues.even_coverage = true;
-                    }
-                    evidence_selected_taxa.insert(taxid);
-                    if self.cfg.verbose || self.cfg.very_verbose {
-                        log::info!(
-                            target: "PROFILER",
-                            "  {} ({}) has even coverage.",
-                            self.taxonomy.get_name(taxid).unwrap_or("unknown"),
-                            taxid,
-                        );
-                    }
+            log::info!(
+                target: "PROFILER",
+                "Species reported for even coverage of their genome: {}.",
+                even.len()
+            );
+            for taxid in even {
+                if let Some(decision) = evidence_decisions.get_mut(&taxid) {
+                    decision.rescues.even_coverage = true;
+                }
+                evidence_selected_taxa.insert(taxid);
+                if self.cfg.verbose || self.cfg.very_verbose {
+                    log::info!(
+                        target: "PROFILER",
+                        "  {} ({}) has even coverage.",
+                        self.taxonomy.get_name(taxid).unwrap_or("unknown"),
+                        taxid,
+                    );
                 }
             }
         }
@@ -1532,9 +1521,9 @@ impl CommunityProfiler {
         // one globally strongest coherent descendant witness for that LCA
         // instead of letting HashMap iteration order choose the last group.
         let mut coherent_lca_witnesses: HashMap<u32, (u32, WitnessDecision)> = HashMap::new();
-        // Compatibility SAM input has no native evidence decisions. Keep its
-        // established per-field maxima in a separate map so an LCA group cannot
-        // overwrite coverage already accumulated for the taxon itself.
+        // Groups of genus-fallback reads have no evidence decisions. Keep their
+        // per-field maxima in a separate map so an LCA group cannot overwrite
+        // coverage already accumulated for the taxon itself.
         let mut legacy_lca_coverage: HashMap<u32, TaxonCoverage> = HashMap::new();
         let mut taxids_with_any_ambiguous: Vec<Vec<u32>> = Vec::new();
         let mut ambiguous_removed: HashMap<Vec<u32>, AmbiguousTotals> = HashMap::new();
@@ -1628,9 +1617,9 @@ impl CommunityProfiler {
                             witness,
                         );
                     } else {
-                        // No member has coordinate evidence (the compatibility
-                        // SAM path has no witnesses at all). Retain the
-                        // established maxima over legacy coverage.
+                        // No member has coordinate evidence (a group of
+                        // genus-fallback reads). Retain the maxima over their
+                        // pooled coverage.
                         let pick = |select: fn(&TaxonCoverage) -> f64| {
                             taxids
                                 .iter()
@@ -2649,8 +2638,8 @@ fn rescale_to_best_fit(
 ///
 /// Selection is the codebase's existing witness preference, made total with a
 /// lowest-taxid tiebreak so the choice cannot depend on candidate order.
-/// Returns `None` when no member has coordinate evidence at all, which is the
-/// normal case for the compatibility SAM path.
+/// Returns `None` when no member has coordinate evidence at all, as for a
+/// group of genus-fallback reads.
 fn coherent_lca_witness(
     taxids: &[u32],
     evidence_decisions: &HashMap<u32, WitnessDecision>,
@@ -2701,8 +2690,8 @@ fn retain_coherent_lca_witness(
     }
 }
 
-/// Merge compatibility-SAM LCA coverage without mutating direct taxon
-/// coverage. This preserves the established component-wise maxima while making
+/// Merge the pooled LCA coverage of genus-fallback groups without mutating
+/// direct taxon coverage. This preserves the established component-wise maxima while making
 /// the result independent of ambiguous-group iteration order.
 fn merge_legacy_lca_coverage(
     coverage: &mut HashMap<u32, TaxonCoverage>,
@@ -3792,142 +3781,6 @@ fn homogeneous_candidate_rank(candidates: &[super::evidence::TerminalCandidate])
     }
 }
 
-/// Process a batch of reads for rank-aware taxonomy assignment.
-///
-/// Per-read precedence:
-/// 1. Evaluate species-qualified alignments (identity/mapped_len/fraction
-///    thresholds from `cfg`).
-/// 2. Only when no species hit qualifies AND `fallback_mode` is `true`
-///    AND a genus taxid can be resolved for the alignment's species,
-///    evaluate the genus fallback thresholds (`identity >= cfg.genus_identity`,
-///    mapped length >= the platform-specific genus floor (50 for Illumina,
-///    `cfg.mapped_len` otherwise), and fraction >=
-///    [`GENUS_FALLBACK_MIN_FRACTION`]).
-///
-/// Coverage intervals are attributed to the assigned taxid (species or
-/// genus). Reference header genus fields are *not* consulted; the genus
-/// taxid comes from `species_to_genus`, which was precomputed from the
-/// NCBI taxonomy lineage.
-///
-/// NOTE: Each alignment in `chunk` has already been parsed and
-/// normalized by [`parse_alignment_line`] — its species taxid, asm id,
-/// accession, assembly length, identity, and fraction are all pre-
-/// computed. This function therefore does **no** string splitting,
-/// **no** `HashMap<String, _>` lookups, and **no** CIGAR scanning in
-/// the per-alignment hot loop. It only does arithmetic comparisons
-/// against `cfg` thresholds plus a single `species_to_genus` lookup
-/// when the fallback path fires.
-fn process_batch(
-    chunk: &[ReadBundle],
-    cfg: &ProfilerConfig,
-    fallback_mode: bool,
-    species_to_genus: &HashMap<u32, u32>,
-) -> AssignmentResult {
-    let genus_fb_mapped_min = genus_fallback_min_mapped_len(cfg);
-    let mut result = AssignmentResult::default();
-
-    // Per-read bookkeeping hoisted OUTSIDE the read loop so we reuse
-    // the allocation across all reads in this batch. A fresh
-    // `HashMap::new()` every iteration would allocate/drop once per
-    // read (6 maps × #reads); `.clear()` keeps capacity and skips the
-    // allocator traffic entirely.
-    let mut species_best: BestMap = HashMap::new();
-    let mut species_order: Vec<u32> = Vec::new();
-    let mut species_intervals: IntervalMap = HashMap::new();
-    let mut genus_best: BestMap = HashMap::new();
-    let mut genus_order: Vec<u32> = Vec::new();
-    let mut genus_intervals: IntervalMap = HashMap::new();
-
-    for read in chunk {
-        species_best.clear();
-        species_order.clear();
-        species_intervals.clear();
-        genus_best.clear();
-        genus_order.clear();
-        genus_intervals.clear();
-
-        for aln in &read.alignments {
-            // All the pre-computed bits are already validated
-            // (asm_len > 0, species_taxid parseable) by the parser, so
-            // we just read them as f64 / u32 fields here.
-            let depth = aln.mapped_len as f64 / aln.asm_len;
-            let identity = f64::from(aln.identity);
-            let fraction = f64::from(aln.fraction);
-
-            // --- Step 1: species criteria (unchanged thresholds) ---
-            let length_ok = aln.mapped_len as usize >= cfg.mapped_len;
-            let fraction_ok = fraction >= cfg.fraction;
-            let species_qualified = identity >= cfg.identity
-                && coverage_passes(length_ok, fraction_ok, cfg.coverage_gate_is_or());
-
-            if species_qualified {
-                update_best(
-                    &mut species_best,
-                    &mut species_order,
-                    &mut species_intervals,
-                    aln.profile_taxid,
-                    identity,
-                    depth,
-                    aln,
-                );
-                // Even if this alignment also satisfies the fallback
-                // thresholds, precedence says the species hit wins for
-                // this read; we still keep parsing other alignments to
-                // find the best species candidate.
-                continue;
-            }
-
-            // --- Step 2: genus fallback (only when gate is active) ---
-            if !fallback_mode {
-                continue;
-            }
-            let fb_length_ok = aln.mapped_len as usize >= genus_fb_mapped_min;
-            let fb_fraction_ok = fraction >= GENUS_FALLBACK_MIN_FRACTION;
-            let fallback_qualified = identity >= cfg.genus_identity
-                && coverage_passes(fb_length_ok, fb_fraction_ok, cfg.coverage_gate_is_or());
-            if !fallback_qualified {
-                continue;
-            }
-            let genus_taxid = match species_to_genus.get(&aln.profile_taxid).copied() {
-                Some(g) => g,
-                // No genus ancestor resolvable => skip fallback for this alignment.
-                None => continue,
-            };
-            update_best(
-                &mut genus_best,
-                &mut genus_order,
-                &mut genus_intervals,
-                genus_taxid,
-                identity,
-                depth,
-                aln,
-            );
-        }
-
-        // Species-first precedence: commit species if any, else genus (gated).
-        if !species_order.is_empty() {
-            commit_assignment(
-                &mut result,
-                &read.read_name,
-                AssignRank::Species,
-                &species_order,
-                &species_best,
-                &mut species_intervals,
-            );
-        } else if fallback_mode && !genus_order.is_empty() {
-            commit_assignment(
-                &mut result,
-                &read.read_name,
-                AssignRank::Genus,
-                &genus_order,
-                &genus_best,
-                &mut genus_intervals,
-            );
-        }
-    }
-    result
-}
-
 /// Update per-taxid best-alignment bookkeeping, keeping the alignment with
 /// the highest identity as representative for coverage intervals.
 ///
@@ -4002,7 +3855,7 @@ fn update_best(
 ///
 /// The caller passes borrowed views of the per-read bookkeeping
 /// (`order`, `best`, `intervals`) because those are hoisted outside
-/// the read loop in [`process_batch`] and reused across reads. The
+/// the read loop in [`process_evidence_batch`] and reused across reads. The
 /// intervals map is drained (`remove(&taxid)`) so the next read can
 /// `.clear()` it cheaply. To keep the three interval maps keyed by
 /// the same `AccKey`, the key is cloned into the first two maps and moved
@@ -4235,8 +4088,7 @@ impl CommunityChunkBreadthThresholds {
     }
 }
 
-/// Resolve community chunk-breadth thresholds once for both native mappings
-/// and the compatibility SAM path.
+/// Resolve community chunk-breadth thresholds once.
 fn resolve_community_chunk_breadth(
     cfg: &ProfilerConfig,
     basis_reads: usize,
@@ -4425,13 +4277,13 @@ fn rank_filter_lower_bound(rank: &str) -> f64 {
 }
 
 /// Resolve the standard evidence-tier ratio defaults for a majority-LCA rank.
-/// Unsupported taxonomy ranks and non-read modes retain the established
-/// compatibility filter rather than guessing a new policy.
+/// Unsupported taxonomy ranks retain the established filter rather than
+/// guessing a new policy.
 #[inline]
-fn standard_lca_ratio_lower_bounds(rank: &str, mode: Option<EvidenceMode>) -> Option<(f64, f64)> {
+fn standard_lca_ratio_lower_bounds(rank: &str, mode: EvidenceMode) -> Option<(f64, f64)> {
     Some(standard_ratio_lower_bounds(
         ProfileRank::from_taxonomy_rank(rank)?,
-        mode?,
+        mode,
     ))
 }
 
@@ -5087,7 +4939,7 @@ fn write_community_classifications(
     Ok(classified)
 }
 
-/// Aggregated data from SAM file loading.
+/// Aggregated data from mapping loading.
 ///
 /// Contains all information needed for the profiling phase.
 struct MappingData {
@@ -5112,7 +4964,7 @@ struct MappingData {
     /// Whether at least one genome has a full/effective size multiplier > 1.
     has_scaled_genomes: bool,
 
-    /// Total distinct reads observed in the SAM/BAM input.
+    /// Total reads in the input.
     total_reads: usize,
 
     /// Distinct reads that produced at least one retained alignment.
@@ -5134,16 +4986,13 @@ struct MappingData {
     /// Species without a resolvable genus are simply absent from this map.
     species_to_genus: Arc<HashMap<u32, u32>>,
 
-    /// Most-specific reference-supported rank for every native terminal taxid.
-    /// Legacy SAM/BAM inputs leave this empty and use taxonomy lookup instead.
+    /// Most-specific reference-supported rank for every terminal taxid. Other
+    /// rows (genus fallback, LCA) take their rank from the taxonomy.
     terminal_ranks: Arc<HashMap<u32, ProfileRank>>,
 
-    /// Alignments that were discarded during SAM/BAM parsing because
-    /// their reference name did not carry a parsable species taxid /
-    /// assembly length. Seeds [`FilterStats::skipped_reference`] so
-    /// the diagnostic counter preserves its historical semantics even
-    /// now that the check happens in the worker instead of
-    /// `process_batch`.
+    /// Mapping records discarded at load because their reference had no
+    /// parsable species taxid or assembly length. Seeds
+    /// [`FilterStats::skipped_reference`].
     skipped_reference_at_load: usize,
 
     /// Marker genes and fragment geometry when the database has marker genomes.
@@ -5588,7 +5437,11 @@ mod tests {
         let (mapping_data, assignment) = raw_output_fixture();
         assert_eq!(
             baseline
-                .write_outputs(mapping_data, assignment, None)
+                .write_outputs(
+                    mapping_data,
+                    assignment,
+                    EvidencePolicy::from_config(&baseline.cfg).unwrap()
+                )
                 .unwrap(),
             1
         );
@@ -5603,7 +5456,11 @@ mod tests {
         let (mapping_data, assignment) = raw_output_fixture();
         assert_eq!(
             with_raw
-                .write_outputs(mapping_data, assignment, None)
+                .write_outputs(
+                    mapping_data,
+                    assignment,
+                    EvidencePolicy::from_config(&with_raw.cfg).unwrap()
+                )
                 .unwrap(),
             1
         );
@@ -5647,7 +5504,11 @@ mod tests {
 
         assert_eq!(
             profiler
-                .write_outputs(mapping_data, assignment, None)
+                .write_outputs(
+                    mapping_data,
+                    assignment,
+                    EvidencePolicy::from_config(&profiler.cfg).unwrap()
+                )
                 .unwrap(),
             0
         );
@@ -5829,7 +5690,7 @@ mod tests {
 
         assert_eq!(
             profiler
-                .write_outputs(mapping_data, assignment, Some(policy))
+                .write_outputs(mapping_data, assignment, policy)
                 .unwrap(),
             0
         );
@@ -5894,7 +5755,7 @@ mod tests {
 
         assert_eq!(
             profiler
-                .write_outputs(mapping_data, assignment, Some(policy))
+                .write_outputs(mapping_data, assignment, policy)
                 .unwrap(),
             1
         );
@@ -6807,12 +6668,11 @@ mod tests {
         }
     }
 
-    /// Convert a [`RawAln`] into a production [`AlignmentEntry`] by
-    /// running the exact pre-parsing that
-    /// [`parse_alignment_line`] does in the worker. Returns `None` when
-    /// the synthetic alignment would be rejected at parse time
-    /// (unparsable species taxid, unknown assembly length, etc.) so
-    /// tests can still cover those error paths.
+    /// Convert a [`RawAln`] (reference name `assembly|…|taxid|accession`)
+    /// into an [`AlignmentEntry`] with the derived fields the profiler uses.
+    /// Returns `None` when the synthetic alignment has no parsable species
+    /// taxid or no known assembly length, so tests can cover rejected
+    /// records.
     fn build_aln(
         raw: &RawAln,
         asm_lengths: &HashMap<String, f64>,
@@ -7441,7 +7301,7 @@ mod tests {
     #[test]
     fn majority_lca_uses_standard_rank_and_platform_ratio_defaults() {
         let short_species =
-            standard_lca_ratio_lower_bounds("species", Some(EvidenceMode::Paired)).unwrap();
+            standard_lca_ratio_lower_bounds("species", EvidenceMode::Paired).unwrap();
         assert_eq!(short_species, (0.70, 0.75));
         assert!(ratio_filter_passes_with_defaults(
             0.70,
@@ -7462,8 +7322,7 @@ mod tests {
             None,
         ));
 
-        let long_species =
-            standard_lca_ratio_lower_bounds("species", Some(EvidenceMode::Long)).unwrap();
+        let long_species = standard_lca_ratio_lower_bounds("species", EvidenceMode::Long).unwrap();
         assert_eq!(long_species, (0.70, 0.70));
         assert!(ratio_filter_passes_with_defaults(
             0.70,
@@ -7483,8 +7342,7 @@ mod tests {
             "phylum",
             "superkingdom",
         ] {
-            let defaults =
-                standard_lca_ratio_lower_bounds(rank, Some(EvidenceMode::Single)).unwrap();
+            let defaults = standard_lca_ratio_lower_bounds(rank, EvidenceMode::Single).unwrap();
             assert_eq!(defaults, (0.65, 0.65));
             assert!(ratio_filter_passes_with_defaults(
                 0.65, 1.0, 0.65, 1.0, defaults, None, None,
@@ -7492,16 +7350,14 @@ mod tests {
         }
 
         assert_eq!(
-            standard_lca_ratio_lower_bounds("no rank", Some(EvidenceMode::Long)),
+            standard_lca_ratio_lower_bounds("no rank", EvidenceMode::Long),
             None
         );
-        assert_eq!(standard_lca_ratio_lower_bounds("genus", None), None);
     }
 
     #[test]
     fn majority_lca_ratio_defaults_still_honor_cli_overrides_and_upper_bound() {
-        let defaults =
-            standard_lca_ratio_lower_bounds("family", Some(EvidenceMode::Paired)).unwrap();
+        let defaults = standard_lca_ratio_lower_bounds("family", EvidenceMode::Paired).unwrap();
         assert!(!ratio_filter_passes_with_defaults(
             0.79,
             1.0,
@@ -7579,10 +7435,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // process_batch precedence & fallback thresholds
+    // Batch assignment: species precedence & genus fallback thresholds
     // ------------------------------------------------------------------
 
-    /// Helper: run `process_batch` on a single read and return the
+    /// Helper: run the batch assignment on a single read and return the
     /// resulting `ReadAssignment` (if any). Uses an empty
     /// species-normalization map (no sub-species remapping).
     fn run_single(
@@ -7615,9 +7471,9 @@ mod tests {
         read_name: &str,
         alns: Vec<RawAln>,
     ) -> Option<ReadAssignment> {
-        // Pre-parse each synthetic alignment exactly like the SAM
-        // worker would — rejects are filtered out, mirroring the real
-        // pipeline where unparsable records never reach `process_batch`.
+        // Pre-parse each synthetic alignment as the mapping loader would —
+        // rejects are filtered out, mirroring the real pipeline where
+        // unparsable records never reach the batch assignment.
         let alignments: Vec<AlignmentEntry> = alns
             .iter()
             .filter_map(|raw| build_aln(raw, asm_lengths, species_normalize))
@@ -7626,7 +7482,8 @@ mod tests {
             read_name: Arc::<str>::from(read_name),
             alignments,
         };
-        let mut result = process_batch(&[bundle], cfg, fallback_mode, s2g);
+        let policy = EvidencePolicy::from_config(cfg).expect("read input");
+        let mut result = process_evidence_batch(&[bundle], cfg, policy, fallback_mode, s2g, None);
         result.read_assignments.pop()
     }
 
@@ -7898,7 +7755,7 @@ mod tests {
         let cfg = make_cfg(Sequencer::Illumina, None);
         let asm = mk_asm_map();
         let s2g = mk_genus_map();
-        // CIGAR with fraction = 50/100 = 0.5 (<0.60) but identity 1.0 and
+        // Fraction = 50/100 = 0.5 (<0.60) but identity 1.0 and
         // mapped_len above species threshold. Note this actually qualifies
         // for species (identity >= cfg.identity=0.95, mapped_len >= 50) *except*
         // fraction < cfg.fraction => species disqualified. Then fallback:

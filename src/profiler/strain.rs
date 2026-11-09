@@ -131,7 +131,7 @@ struct ReferenceMetadata {
     /// Stable numeric assembly identifier used by compact coverage keys.
     assembly_id: u32,
 
-    /// Reference sequence length from SAM header
+    /// Reference sequence length
     length: usize,
 
     /// Primary taxonomy ID (strain-level if available)
@@ -171,12 +171,10 @@ struct AlignmentRecord {
     /// Number of aligned bases
     mapped_len: usize,
 
-    /// Alignment identity. For SAM input this is derived from CIGAR; for
-    /// Metam input this is read directly from the Metam TSV.
+    /// Alignment identity, as the mapping records it.
     identity: f64,
 
-    /// Aligned fraction of the read. For SAM input this is derived from CIGAR;
-    /// for Metam input this is mapped_bases / read_len.
+    /// Aligned fraction of the read: mapped_bases / read_len.
     fraction: f64,
 
     /// Stable reference and assembly identifiers for coordinate evidence.
@@ -186,8 +184,8 @@ struct AlignmentRecord {
     /// Reference coordinate span, using 1-based start and exclusive end.
     span: (usize, usize),
 
-    /// Explicit native paired-placement metadata. Legacy SAM records use
-    /// `pair_id = 0` and retain their established first-mate behavior.
+    /// Paired-placement metadata; `pair_id` is 0 for a read that is not part
+    /// of a pair.
     mate_number: u8,
     pair_id: u32,
     /// Taxonomic candidate levels that may be incomplete.
@@ -202,7 +200,7 @@ struct AlignmentRecord {
 
 /// Mapping-quality thresholds used by both strain coverage and assignment.
 /// Keeping this as a small Copy value avoids sharing the full profiler config
-/// with SAM workers and prevents the two phases from drifting semantically.
+/// with the workers and prevents the two phases from drifting semantically.
 #[derive(Clone, Copy, Debug)]
 struct AssignmentQualityThresholds {
     min_identity: f64,
@@ -1320,7 +1318,7 @@ fn resolve_taxon_info(
 ///
 /// # Pipeline
 ///
-/// 1. Load SAM and extract per-assembly coverage metrics
+/// 1. Load mappings and extract per-assembly coverage metrics
 /// 2. Assign reads to strains (or species as fallback)
 /// 3. Resolve ambiguous reads using EM algorithm
 /// 4. Apply LCA for reads mapping to undetected strains
