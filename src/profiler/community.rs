@@ -1266,119 +1266,322 @@ impl CommunityProfiler {
         Ok(final_result)
     }
 
-    /// Write profiling results to output files.
+    /// Write the profile and, when requested, the raw profile and the read
+    /// classifications; returns the number of reads (fragments) assigned to
+    /// retained taxa. In order: coverage of each taxon's reads, presence from
+    /// the coordinate evidence, reads grouped by the candidates they keep,
+    /// shared groups folded, genus rows for reads of removed species, the
+    /// shared-read EM, profile rows, row filters and guards, output.
     ///
-    /// This is a large function that:
-    /// 1. Computes final coverage metrics per terminal taxon
-    /// 2. Performs EM algorithm for ambiguous read redistribution
-    /// 3. Calculates abundance estimates and statistical p-values
-    /// 4. Filters taxa based on coverage criteria
-    /// 5. Writes profile.txt and, when requested, classify.txt output files
-    ///
-    /// # Output Files
-    ///
-    /// - `<prefix>.profile.txt`: Filtered abundance profile with statistics
-    /// - `<prefix>.rprofile.txt`: Post-EM profile before taxon-level evidence
-    ///   and reporting filters (if keep_raw=true)
-    /// - `<prefix>.classify.txt`: Optional per-read assignments
-    ///   (`--save-classification`)
-    ///
-    /// # EM Algorithm
-    ///
-    /// For multi-mapping reads, the EM algorithm iteratively:
-    /// 1. E-step: Redistribute reads based on current abundance estimates
-    /// 2. M-step: Recalculate abundances from redistributed reads
-    /// 3. Converge when relative change < 1e-5
-    ///
-    /// # Returns
-    ///
-    /// Number of taxonomically classified reads
+    /// Output files: `<prefix>.profile.txt`; `<prefix>.rprofile.txt` (raw
+    /// profile, with `--save-raw-profile`), before the taxon-level evidence and
+    /// reporting filters; `<prefix>.classify.txt` (`--save-classification`).
     fn write_outputs(
         &self,
-        mapping_data: MappingData,
+        data: MappingData,
         mut assignment: AssignmentResult,
         evidence_policy: EvidencePolicy,
     ) -> Result<usize> {
-        let MappingData {
-            asm_lengths,
-            min_breadth,
-            min_chunk_breadth,
-            safeguard_min_chunk_breadth,
-            has_scaled_genomes,
-            terminal_ranks,
-            marker_model,
-            genus_rollup,
-            total_reads,
-            unclassified_species,
-            assembly_names,
-            ..
-        } = mapping_data;
         let verbose_logging = self.cfg.verbose || self.cfg.very_verbose;
+        let taxon_coverage = measure_taxon_coverage(&assignment, &data.asm_lengths);
+        let presence = self.resolve_presence(&data, evidence_policy, &mut assignment)?;
+
+        // Preserve only compact coordinate measurements for the optional raw
+        // profile. Its separate EM runs later, after every production value is
+        // finalized, so diagnostic work cannot influence production
+        // aggregation or filtering. The large coordinate stores are never
+        // cloned.
+        let raw_profile_coverage = self.cfg.keep_raw.then(|| taxon_coverage.clone());
+
+        let classification_path = self.classification_path(&data);
+        let mut groups = self.group_reads(
+            &data,
+            &assignment,
+            &taxon_coverage,
+            &presence,
+            classification_path.is_some(),
+        );
         // Majority-LCA rows are evaluated later than native coordinate
         // witnesses. Resolve the same platform mode here so their default
         // ratio bounds come from the standard evidence policy rather than the
         // older output-only genus/species defaults.
-        let lca_ratio_mode = evidence_policy.mode;
-
-        let mut taxon_coverage: HashMap<u32, TaxonCoverage> = HashMap::new();
-        let mut coverage_keys = assignment.acc_intervals.keys().collect::<Vec<_>>();
-        coverage_keys.sort_unstable();
-        for key in coverage_keys {
-            let intervals = &assignment.acc_intervals[key];
-            let merged = merge_intervals(intervals);
-            let merged_fixed = merge_intervals(
-                assignment
-                    .acc_fixed_chunk_intervals
-                    .get(key)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]),
+        let mut reported = self.fold_shared_groups(
+            &mut groups,
+            &presence,
+            &taxon_coverage,
+            evidence_policy.mode,
+        );
+        if let Some(orphans) = groups.orphans.take() {
+            reported.rollup_metrics = self.add_genus_rows(
+                orphans.into_genus_rows(&presence.decisions, &presence.selected_taxa),
+                &mut groups.unambiguous,
+                &mut groups.classifications,
             );
-            let merged_flex = merge_intervals(
-                assignment
-                    .acc_flex_chunk_intervals
-                    .get(key)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]),
-            );
-            let asm_len = asm_lengths
-                .get(key.asm.as_ref())
-                .copied()
-                .unwrap_or(1.0)
-                .max(1.0);
-            let total_span: usize = merged.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
-            let total_fixed: usize = merged_fixed.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
-            let total_flex: usize = merged_flex.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
-            let coverage = taxon_coverage.entry(key.taxid).or_default();
-            coverage.breadth += total_span as f64 / asm_len;
-            coverage.fixed_chunk += total_fixed as f64 / asm_len;
-            coverage.flex_chunk += total_flex as f64 / asm_len;
         }
+        let rolled_up_genera: HashSet<u32> = reported.rollup_metrics.keys().copied().collect();
 
-        let resolved = resolve_coordinate_evidence(
+        let mut em_groups = groups.ambiguous_counts.iter().collect::<Vec<_>>();
+        em_groups.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        let em = shared_read_em(
+            &groups.unambiguous,
+            &em_groups,
+            self.cfg.max_em_iterations,
+            "Community",
+            verbose_logging,
+        );
+        let mut ambiguous_fraction = group_shares(&em_groups, &em.previous);
+        let species_count_depth = em.totals;
+
+        let pathogen_map = if self.cfg.host.is_some() {
+            self.cfg
+                .pathogen_host
+                .as_deref()
+                .map(load_pathogen_table)
+                .transpose()?
+        } else {
+            None
+        };
+        let mut normalized = self.build_profile_rows(
+            &data,
+            &species_count_depth,
+            &presence,
+            &reported,
+            &taxon_coverage,
+            pathogen_map.as_ref(),
+        );
+        normalized.retain(|row| {
+            community_profile_row_passes(
+                row,
+                &self.cfg,
+                data.min_chunk_breadth,
+                &presence.selected_taxa,
+                &rolled_up_genera,
+                &reported.lca_ratio_lower_bounds,
+            )
+        });
+        self.apply_relative_identity_guard(&mut normalized, &assignment);
+        // Before species move to their genus, while marker species still
+        // carry their own scale.
+        let unclassified = self.estimate_unclassified(&data, &normalized, &assignment);
+        if let Some(margin) = self.cfg.identity_margin {
+            let moved = self.report_low_identity_species_at_genus(
+                &mut normalized,
+                &assignment.best_placements,
+                margin,
+                self.host_taxid(),
+                pathogen_map.as_ref(),
+            );
+            groups.classifications.relabel(&moved);
+            relabel_ambiguous_fractions(&mut ambiguous_fraction, &moved);
+        }
+        let total_abundance = normalized.iter().map(|row| row.abundance).sum::<f64>();
+        for row in &mut normalized {
+            row.normalize_abundance(total_abundance);
+        }
+        let retained_taxa = normalized
+            .iter()
+            .map(|row| row.taxid)
+            .collect::<HashSet<_>>();
+        let final_classified_reads = write_community_classifications(
+            classification_path.as_deref(),
+            &groups.classifications,
+            &groups.ambiguous_counts,
+            &groups.ambiguous_reads,
+            &ambiguous_fraction,
+            &retained_taxa,
+            &data.terminal_ranks,
+            &self.taxonomy,
+        )?;
+
+        // Production assignment, EM, report filtering, and abundance
+        // normalization are complete. Release their grouped working sets
+        // before the opt-in shadow EM to avoid overlapping the two memory
+        // peaks. Keep only per-read candidate vectors needed by raw EM, then
+        // release the remaining coordinate-heavy AssignmentResult fields.
+        drop(groups);
+        drop(ambiguous_fraction);
+        drop(species_count_depth);
+        let raw_assignments = raw_profile_coverage
+            .as_ref()
+            .map(|_| std::mem::take(&mut assignment.read_assignments));
+        drop(assignment);
+
+        let raw_taxa_list = match (raw_profile_coverage, raw_assignments) {
+            (Some(coverage), Some(assignments)) => self.build_raw_profile(
+                &data,
+                &presence,
+                coverage,
+                &assignments,
+                pathogen_map.as_ref(),
+            )?,
+            _ => Vec::new(),
+        };
+
+        self.write_profile_files(&normalized, unclassified, raw_taxa_list)?;
+
+        Ok(final_classified_reads)
+    }
+
+    /// Drop species that a stronger relative explains (`--relative-identity-gap`).
+    fn apply_relative_identity_guard(
+        &self,
+        rows: &mut Vec<ProfileRow>,
+        assignment: &AssignmentResult,
+    ) {
+        if let Some(gap) = self.cfg.relative_identity_gap {
+            let removed = remove_species_explained_by_relatives(
+                rows,
+                &self.taxonomy,
+                &assignment.taxon_evidence,
+                gap,
+            );
+            log::info!(
+                target: "PROFILER",
+                "Relative identity guard removed {} species.",
+                removed.len()
+            );
+            if self.cfg.verbose || self.cfg.very_verbose {
+                for (taxid, relative) in removed {
+                    log::info!(
+                        target: "PROFILER",
+                        "  {taxid} is explained by {relative}, which has more depth and more identical reads."
+                    );
+                }
+            }
+        }
+    }
+
+    /// The unclassified share (`--estimate-unclassified`): `None` when not
+    /// requested, `Some(None)` when it cannot be estimated.
+    fn estimate_unclassified(
+        &self,
+        data: &MappingData,
+        rows: &[ProfileRow],
+        assignment: &AssignmentResult,
+    ) -> Option<Option<unclassified::UnclassifiedEstimate>> {
+        data.unclassified_species.as_ref().map(|species| {
+            // Long reads differ in length and in the genes each covers, so
+            // their scales come from the reads themselves.
+            let scales = unclassified::marker_scales(
+                species,
+                data.marker_model.as_deref(),
+                &assignment.marker_genome_reads,
+                self.cfg.coverage_gate_is_or(),
+            );
+            let estimate = unclassified::estimate(rows, &scales, data.total_reads);
+            match estimate {
+                Ok(estimate) => log::info!(
+                    target: "PROFILER",
+                    "Unclassified estimate: {:.2}% of {} input {} are not explained by the profile.",
+                    estimate.share * 100.0,
+                    data.total_reads,
+                    if self.cfg.is_paired { "fragments" } else { "reads" }
+                ),
+                Err(taxid) => log::warn!(
+                    target: "PROFILER",
+                    "Unclassified estimate unavailable: species {taxid} is represented by marker genes that declare no genome size, cannot hold a read of this length, or have no resolved long read."
+                ),
+            }
+            estimate.ok()
+        })
+    }
+
+    /// The raw profile (`--save-raw-profile`): its own EM over every candidate
+    /// of the reads, before the taxon-level checks.
+    fn build_raw_profile(
+        &self,
+        data: &MappingData,
+        presence: &CoordinateEvidenceResult,
+        mut coverage: HashMap<u32, TaxonCoverage>,
+        assignments: &[ReadAssignment],
+        pathogen_map: Option<&HashMap<u32, PathogenEntry>>,
+    ) -> Result<Vec<ProfileRow>> {
+        let totals = estimate_unfiltered_taxon_totals(
+            assignments,
+            &self.taxonomy,
+            &mut coverage,
+            self.cfg.max_em_iterations,
+            self.cfg.verbose || self.cfg.very_verbose,
+        )?;
+        Ok(self.build_raw_profile_rows(
+            &RawProfileEstimate { totals, coverage },
+            &presence.decisions,
+            &data.terminal_ranks,
+            self.host_taxid(),
+            pathogen_map,
+        ))
+    }
+
+    /// Write the profile and, with `--save-raw-profile`, the raw profile.
+    fn write_profile_files(
+        &self,
+        rows: &[ProfileRow],
+        unclassified: Option<Option<unclassified::UnclassifiedEstimate>>,
+        raw_rows: Vec<ProfileRow>,
+    ) -> Result<()> {
+        let out_prefix = if self.cfg.host.is_some() {
+            format!("{}.pathogen", self.cfg.outprefix)
+        } else {
+            self.cfg.outprefix.clone()
+        };
+        let profile_path = format!("{}.profile.txt", out_prefix);
+        let mut profile_writer = WriterBuilder::new()
+            .has_headers(false)
+            .delimiter(b'\t')
+            .from_writer(File::create(&profile_path)?);
+        for row in rows {
+            row.write(&mut profile_writer)?;
+        }
+        if let Some(estimate) = unclassified {
+            unclassified::write_row(&mut profile_writer, estimate)?;
+        }
+        profile_writer.flush()?;
+
+        if self.cfg.keep_raw {
+            let raw_path = format!("{}.rprofile.txt", out_prefix);
+            let mut raw_writer = WriterBuilder::new()
+                .has_headers(false)
+                .delimiter(b'\t')
+                .from_writer(File::create(&raw_path)?);
+            for row in raw_rows {
+                row.write(&mut raw_writer)?;
+            }
+            raw_writer.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Decide which taxa are present from the coordinate evidence, rescale
+    /// the reads' depths to each present taxon's best-fit genome, and add the
+    /// species reported for even coverage of their genome.
+    fn resolve_presence(
+        &self,
+        data: &MappingData,
+        policy: EvidencePolicy,
+        assignment: &mut AssignmentResult,
+    ) -> Result<CoordinateEvidenceResult> {
+        let mut presence = resolve_coordinate_evidence(
             &self.cfg,
-            evidence_policy,
-            &mut assignment,
-            min_breadth,
-            min_chunk_breadth,
-            safeguard_min_chunk_breadth,
+            policy,
+            assignment,
+            data.min_breadth,
+            data.min_chunk_breadth,
+            data.safeguard_min_chunk_breadth,
             CoverageModel {
-                markers: marker_model.as_deref(),
-                layout: genus_rollup.as_deref().map(|rollup| &rollup.layout),
+                markers: data.marker_model.as_deref(),
+                layout: data.genus_rollup.as_deref().map(|rollup| &rollup.layout),
             },
         )?;
         rescale_to_best_fit(
             &mut assignment.read_assignments,
-            &resolved.best_fit,
-            marker_model.as_deref(),
+            &presence.best_fit,
+            data.marker_model.as_deref(),
         );
-        let best_fit = resolved.best_fit;
-        let mut evidence_decisions = resolved.decisions;
-        let mut evidence_selected_taxa = resolved.selected_taxa;
-        if let Some(rollup) = genus_rollup.as_deref() {
+        if let Some(rollup) = data.genus_rollup.as_deref() {
             let even = rollup.even_coverage_species(
-                &evidence_decisions,
-                |taxid| terminal_ranks.get(&taxid).copied(),
-                min_chunk_breadth,
+                &presence.decisions,
+                |taxid| data.terminal_ranks.get(&taxid).copied(),
+                data.min_chunk_breadth,
             );
             log::info!(
                 target: "PROFILER",
@@ -1386,10 +1589,10 @@ impl CommunityProfiler {
                 even.len()
             );
             for taxid in even {
-                if let Some(decision) = evidence_decisions.get_mut(&taxid) {
+                if let Some(decision) = presence.decisions.get_mut(&taxid) {
                     decision.rescues.even_coverage = true;
                 }
-                evidence_selected_taxa.insert(taxid);
+                presence.selected_taxa.insert(taxid);
                 if self.cfg.verbose || self.cfg.very_verbose {
                     log::info!(
                         target: "PROFILER",
@@ -1400,23 +1603,19 @@ impl CommunityProfiler {
                 }
             }
         }
+        Ok(presence)
+    }
 
-        // Preserve only compact coordinate measurements for the optional raw
-        // profile. Its separate EM runs later, after every production value is
-        // finalized, so diagnostic work cannot influence production
-        // aggregation or filtering. The large coordinate stores are never
-        // cloned.
-        let raw_profile_coverage = self.cfg.keep_raw.then(|| taxon_coverage.clone());
-
+    /// Path of the per-read classifications, when they are requested and can
+    /// be written for this database.
+    fn classification_path(&self, data: &MappingData) -> Option<String> {
         let classification_path = format!("{}.classify.txt", self.cfg.outprefix);
         let database_is_fractional = self
             .cfg
             .db_metadata
             .as_ref()
             .map(|metadata| metadata.is_fractional)
-            .unwrap_or(has_scaled_genomes);
-        let write_classifications = self.cfg.save_classifications && !database_is_fractional;
-        let mut resolved_classifications = ResolvedClassifications::new(write_classifications);
+            .unwrap_or(data.has_scaled_genomes);
         if self.cfg.save_classifications {
             if database_is_fractional {
                 log::warn!(
@@ -1431,11 +1630,28 @@ impl CommunityProfiler {
                 );
             }
         }
+        (self.cfg.save_classifications && !database_is_fractional).then_some(classification_path)
+    }
 
+    /// Group the reads by the candidates they keep: a candidate is kept when
+    /// the coverage evidence selected it (or, for genus-fallback reads, when
+    /// its pooled breadth reaches the minimum). Reads with one candidate count
+    /// for it alone, reads with several form shared groups, and reads without
+    /// any go to the genus roll-up.
+    fn group_reads<'a>(
+        &self,
+        data: &'a MappingData,
+        assignment: &AssignmentResult,
+        taxon_coverage: &HashMap<u32, TaxonCoverage>,
+        presence: &CoordinateEvidenceResult,
+        write_classifications: bool,
+    ) -> ReadGroups<'a> {
+        let mut resolved_classifications = ResolvedClassifications::new(write_classifications);
         let mut unambiguous: HashMap<u32, TaxonTotals> = HashMap::new();
         let mut ambiguous_counts: HashMap<Vec<u32>, AmbiguousTotals> = HashMap::new();
         let mut ambiguous_reads: HashMap<Vec<u32>, Vec<String>> = HashMap::new();
-        let mut orphans = genus_rollup
+        let mut orphans = data
+            .genus_rollup
             .as_deref()
             .map(|rollup| OrphanedFragments::new(rollup, write_classifications));
 
@@ -1453,9 +1669,9 @@ impl CommunityProfiler {
             {
                 let coverage = taxon_coverage.get(taxid).cloned().unwrap_or_default();
                 let evidence_selected =
-                    assignment.requires_terminal_evidence && evidence_selected_taxa.contains(taxid);
+                    assignment.requires_terminal_evidence && presence.selected_taxa.contains(taxid);
                 let legacy_selected = !assignment.requires_terminal_evidence;
-                if evidence_selected || (legacy_selected && coverage.breadth >= min_breadth) {
+                if evidence_selected || (legacy_selected && coverage.breadth >= data.min_breadth) {
                     final_taxids.push(*taxid);
                     final_depths.push(*depth);
                     final_maplens.push(*maplen);
@@ -1513,7 +1729,33 @@ impl CommunityProfiler {
                 }
             }
         }
+        ReadGroups {
+            unambiguous,
+            ambiguous_counts,
+            ambiguous_reads,
+            classifications: resolved_classifications,
+            orphans,
+        }
+    }
 
+    /// Hand each shared group to its members that have reads of their own,
+    /// or, when none has, to the group's majority LCA. Returns the coverage
+    /// that rows without their own evidence decision report.
+    fn fold_shared_groups(
+        &self,
+        groups: &mut ReadGroups,
+        evidence: &CoordinateEvidenceResult,
+        taxon_coverage: &HashMap<u32, TaxonCoverage>,
+        lca_ratio_mode: EvidenceMode,
+    ) -> ReportedCoverage {
+        let verbose_logging = self.cfg.verbose || self.cfg.very_verbose;
+        let ReadGroups {
+            unambiguous,
+            ambiguous_counts,
+            ambiguous_reads,
+            classifications: resolved_classifications,
+            ..
+        } = groups;
         let direct_taxa_before_lca: HashSet<u32> = unambiguous.keys().copied().collect();
         let mut taxids_with_lca: Vec<Vec<u32>> = Vec::new();
         let mut lca_ratio_lower_bounds: HashMap<u32, (f64, f64)> = HashMap::new();
@@ -1609,7 +1851,7 @@ impl CommunityProfiler {
                     // against another population's expectation. Choosing one
                     // witness keeps observed, expected and both p-values on the
                     // same coordinate system.
-                    let coherent_witness = coherent_lca_witness(taxids, &evidence_decisions);
+                    let coherent_witness = coherent_lca_witness(taxids, &evidence.decisions);
                     if let Some(witness) = coherent_witness {
                         retain_coherent_lca_witness(
                             &mut coherent_lca_witnesses,
@@ -1691,31 +1933,29 @@ impl CommunityProfiler {
                 })
                 .or_insert(values);
         }
+        ReportedCoverage {
+            direct_taxa_before_lca,
+            lca_ratio_lower_bounds,
+            lca_metrics,
+            legacy_lca_coverage,
+            rollup_metrics: HashMap::new(),
+        }
+    }
 
-        let rollup_metrics = match orphans {
-            Some(orphans) => self.add_genus_rows(
-                orphans.into_genus_rows(&evidence_decisions, &evidence_selected_taxa),
-                &mut unambiguous,
-                &mut resolved_classifications,
-            ),
-            None => HashMap::new(),
-        };
-        let rolled_up_genera: HashSet<u32> = rollup_metrics.keys().copied().collect();
-
-        let mut em_groups = ambiguous_counts.iter().collect::<Vec<_>>();
-        em_groups.sort_unstable_by(|left, right| left.0.cmp(right.0));
-        let mut em_taxids = unambiguous.keys().copied().collect::<Vec<_>>();
+    /// One profile row for every taxon with reads after the EM, before the
+    /// row filters. Abundance is depth over the summed depth of all taxa.
+    fn build_profile_rows(
+        &self,
+        data: &MappingData,
+        species_count_depth: &HashMap<u32, TaxonTotals>,
+        presence: &CoordinateEvidenceResult,
+        reported: &ReportedCoverage,
+        taxon_coverage: &HashMap<u32, TaxonCoverage>,
+        pathogen_map: Option<&HashMap<u32, PathogenEntry>>,
+    ) -> Vec<ProfileRow> {
+        let verbose_logging = self.cfg.verbose || self.cfg.very_verbose;
+        let mut em_taxids = species_count_depth.keys().copied().collect::<Vec<_>>();
         em_taxids.sort_unstable();
-        let em = shared_read_em(
-            &unambiguous,
-            &em_groups,
-            self.cfg.max_em_iterations,
-            "Community",
-            verbose_logging,
-        );
-        let mut ambiguous_fraction = group_shares(&em_groups, &em.previous);
-        let species_count_depth = em.totals;
-
         let norm_factor: f64 = 0.01
             * em_taxids
                 .iter()
@@ -1731,16 +1971,6 @@ impl CommunityProfiler {
         }
 
         let mut out_taxa_list = Vec::new();
-        let host_taxid = self.cfg.host.as_deref().and_then(|h| h.parse::<u32>().ok());
-        let pathogen_map = if self.cfg.host.is_some() {
-            self.cfg
-                .pathogen_host
-                .as_deref()
-                .map(load_pathogen_table)
-                .transpose()?
-        } else {
-            None
-        };
         let mut entries: Vec<(u32, TaxonTotals)> = species_count_depth
             .iter()
             .map(|(taxid, totals)| (*taxid, *totals))
@@ -1766,7 +1996,8 @@ impl CommunityProfiler {
             } else {
                 depth / norm_factor
             };
-            let rank = terminal_ranks
+            let rank = data
+                .terminal_ranks
                 .get(&taxid)
                 .copied()
                 .map(ProfileRank::as_str)
@@ -1780,8 +2011,9 @@ impl CommunityProfiler {
             if taxname == "Taxonomy deprecated" {
                 continue;
             }
-            let evidence_metrics = if evidence_selected_taxa.contains(&taxid) {
-                evidence_decisions
+            let evidence_metrics = if presence.selected_taxa.contains(&taxid) {
+                presence
+                    .decisions
                     .get(&taxid)
                     .map(|decision| decision.metrics)
             } else {
@@ -1790,9 +2022,10 @@ impl CommunityProfiler {
                 // an expectation rebuilt from pooled depth and count. Report
                 // filtering still applies to LCA rows; only the numbers change.
                 // A roll-up genus row reports its strongest donor likewise.
-                lca_metrics
+                reported
+                    .lca_metrics
                     .get(&taxid)
-                    .or_else(|| rollup_metrics.get(&taxid))
+                    .or_else(|| reported.rollup_metrics.get(&taxid))
                     .copied()
             };
             let (
@@ -1820,9 +2053,9 @@ impl CommunityProfiler {
             } else {
                 let coverage = legacy_output_coverage(
                     taxid,
-                    &direct_taxa_before_lca,
-                    &taxon_coverage,
-                    &legacy_lca_coverage,
+                    &reported.direct_taxa_before_lca,
+                    taxon_coverage,
+                    &reported.legacy_lca_coverage,
                 );
                 let breadth = coverage.breadth.min(1.0);
                 let fixed_chunk = coverage.fixed_chunk.min(1.0);
@@ -1859,19 +2092,20 @@ impl CommunityProfiler {
                     chunkcov_prob,
                 )
             };
-            let Some(annotations) = self.row_annotations(taxid, host_taxid, pathogen_map.as_ref())
+            let Some(annotations) = self.row_annotations(taxid, self.host_taxid(), pathogen_map)
             else {
                 continue;
             };
             // A taxon kept by the coverage evidence also reports its best-fit
             // genome and the depth of that evidence there before abundance.
-            let best_fit_report = best_fit
+            let best_fit_report = presence
+                .best_fit
                 .get(&taxid)
-                .filter(|_| evidence_selected_taxa.contains(&taxid))
+                .filter(|_| presence.selected_taxa.contains(&taxid))
                 .zip(evidence_metrics)
                 .and_then(|(genome, metrics)| {
                     Some(BestFitReport {
-                        genome: Arc::clone(assembly_names.get(genome.assembly_id as usize)?),
+                        genome: Arc::clone(data.assembly_names.get(genome.assembly_id as usize)?),
                         evidence_depth: metrics.depth,
                     })
                 });
@@ -1893,165 +2127,11 @@ impl CommunityProfiler {
                 annotations,
             });
         }
+        out_taxa_list
+    }
 
-        let mut normalized: Vec<ProfileRow> = out_taxa_list
-            .into_iter()
-            .filter(|row| {
-                community_profile_row_passes(
-                    row,
-                    &self.cfg,
-                    min_chunk_breadth,
-                    &evidence_selected_taxa,
-                    &rolled_up_genera,
-                    &lca_ratio_lower_bounds,
-                )
-            })
-            .collect();
-        if let Some(gap) = self.cfg.relative_identity_gap {
-            let removed = remove_species_explained_by_relatives(
-                &mut normalized,
-                &self.taxonomy,
-                &assignment.taxon_evidence,
-                gap,
-            );
-            log::info!(
-                target: "PROFILER",
-                "Relative identity guard removed {} species.",
-                removed.len()
-            );
-            if verbose_logging {
-                for (taxid, relative) in removed {
-                    log::info!(
-                        target: "PROFILER",
-                        "  {taxid} is explained by {relative}, which has more depth and more identical reads."
-                    );
-                }
-            }
-        }
-        // Before species move to their genus, while marker species still
-        // carry their own scale.
-        let unclassified = unclassified_species.as_ref().map(|species| {
-            // Long reads differ in length and in the genes each covers, so
-            // their scales come from the reads themselves.
-            let scales = unclassified::marker_scales(
-                species,
-                marker_model.as_deref(),
-                &assignment.marker_genome_reads,
-                self.cfg.coverage_gate_is_or(),
-            );
-            let estimate = unclassified::estimate(&normalized, &scales, total_reads);
-            match estimate {
-                Ok(estimate) => log::info!(
-                    target: "PROFILER",
-                    "Unclassified estimate: {:.2}% of {} input {} are not explained by the profile.",
-                    estimate.share * 100.0,
-                    total_reads,
-                    if self.cfg.is_paired { "fragments" } else { "reads" }
-                ),
-                Err(taxid) => log::warn!(
-                    target: "PROFILER",
-                    "Unclassified estimate unavailable: species {taxid} is represented by marker genes that declare no genome size, cannot hold a read of this length, or have no resolved long read."
-                ),
-            }
-            estimate.ok()
-        });
-        if let Some(margin) = self.cfg.identity_margin {
-            let moved = self.report_low_identity_species_at_genus(
-                &mut normalized,
-                &assignment.best_placements,
-                margin,
-                host_taxid,
-                pathogen_map.as_ref(),
-            );
-            resolved_classifications.relabel(&moved);
-            relabel_ambiguous_fractions(&mut ambiguous_fraction, &moved);
-        }
-        let total_abundance = normalized.iter().map(|row| row.abundance).sum::<f64>();
-        for row in &mut normalized {
-            row.normalize_abundance(total_abundance);
-        }
-        let retained_taxa = normalized
-            .iter()
-            .map(|row| row.taxid)
-            .collect::<HashSet<_>>();
-        let final_classified_reads = write_community_classifications(
-            write_classifications.then_some(classification_path.as_str()),
-            &resolved_classifications,
-            &ambiguous_counts,
-            &ambiguous_reads,
-            &ambiguous_fraction,
-            &retained_taxa,
-            &terminal_ranks,
-            &self.taxonomy,
-        )?;
-
-        // Production assignment, EM, report filtering, and abundance
-        // normalization are complete. Release their grouped working sets
-        // before the opt-in shadow EM to avoid overlapping the two memory
-        // peaks. Keep only per-read candidate vectors needed by raw EM, then
-        // release the remaining coordinate-heavy AssignmentResult fields.
-        drop(ambiguous_counts);
-        drop(ambiguous_reads);
-        drop(ambiguous_fraction);
-        drop(unambiguous);
-        drop(species_count_depth);
-        let raw_assignments = raw_profile_coverage
-            .as_ref()
-            .map(|_| std::mem::take(&mut assignment.read_assignments));
-        drop(assignment);
-
-        let raw_taxa_list = if let (Some(mut coverage), Some(assignments)) =
-            (raw_profile_coverage, raw_assignments)
-        {
-            let totals = estimate_unfiltered_taxon_totals(
-                &assignments,
-                &self.taxonomy,
-                &mut coverage,
-                self.cfg.max_em_iterations,
-                verbose_logging,
-            )?;
-            self.build_raw_profile_rows(
-                &RawProfileEstimate { totals, coverage },
-                &evidence_decisions,
-                &terminal_ranks,
-                host_taxid,
-                pathogen_map.as_ref(),
-            )
-        } else {
-            Vec::new()
-        };
-
-        let out_prefix = if self.cfg.host.is_some() {
-            format!("{}.pathogen", self.cfg.outprefix)
-        } else {
-            self.cfg.outprefix.clone()
-        };
-        let profile_path = format!("{}.profile.txt", out_prefix);
-        let mut profile_writer = WriterBuilder::new()
-            .has_headers(false)
-            .delimiter(b'\t')
-            .from_writer(File::create(&profile_path)?);
-        for row in &normalized {
-            row.write(&mut profile_writer)?;
-        }
-        if let Some(estimate) = unclassified {
-            unclassified::write_row(&mut profile_writer, estimate)?;
-        }
-        profile_writer.flush()?;
-
-        if self.cfg.keep_raw {
-            let raw_path = format!("{}.rprofile.txt", out_prefix);
-            let mut raw_writer = WriterBuilder::new()
-                .has_headers(false)
-                .delimiter(b'\t')
-                .from_writer(File::create(&raw_path)?);
-            for row in raw_taxa_list {
-                row.write(&mut raw_writer)?;
-            }
-            raw_writer.flush()?;
-        }
-
-        Ok(final_classified_reads)
+    fn host_taxid(&self) -> Option<u32> {
+        self.cfg.host.as_deref().and_then(|h| h.parse::<u32>().ok())
     }
 
     /// Add the genus rows of the roll-up to the unambiguous totals
@@ -2486,6 +2566,76 @@ struct BestFitGenome {
 /// genome's length, with that genome's sampling scale, whichever of the
 /// taxon's genomes the fragment placed best on. Depths on marker genomes keep
 /// their gene model.
+/// Reads grouped by the candidates they keep (see
+/// [`CommunityProfiler::group_reads`]).
+struct ReadGroups<'a> {
+    /// Totals of reads that kept one candidate, by taxon.
+    unambiguous: HashMap<u32, TaxonTotals>,
+    /// Shared groups: candidates and their summed values.
+    ambiguous_counts: HashMap<Vec<u32>, AmbiguousTotals>,
+    /// Read names of each shared group, when classifications are written.
+    ambiguous_reads: HashMap<Vec<u32>, Vec<String>>,
+    classifications: ResolvedClassifications,
+    /// Reads of removed species for the genus roll-up.
+    orphans: Option<OrphanedFragments<'a>>,
+}
+
+/// Coverage that rows without their own evidence decision report, and the
+/// default ratio bounds of majority-LCA rows.
+struct ReportedCoverage {
+    /// Taxa with reads of their own before majority-LCA folding.
+    direct_taxa_before_lca: HashSet<u32>,
+    lca_ratio_lower_bounds: HashMap<u32, (f64, f64)>,
+    /// The coherent descendant witness of each majority-LCA row.
+    lca_metrics: HashMap<u32, EvidenceCoverage>,
+    /// Pooled coverage of LCA rows of genus-fallback groups.
+    legacy_lca_coverage: HashMap<u32, TaxonCoverage>,
+    /// The strongest donor of each roll-up genus row.
+    rollup_metrics: HashMap<u32, EvidenceCoverage>,
+}
+
+/// Breadth, fixed-chunk and flexible-chunk coverage of each taxon's reads,
+/// summed over the assemblies its reads cover.
+fn measure_taxon_coverage(
+    assignment: &AssignmentResult,
+    asm_lengths: &HashMap<String, f64>,
+) -> HashMap<u32, TaxonCoverage> {
+    let mut taxon_coverage: HashMap<u32, TaxonCoverage> = HashMap::new();
+    let mut coverage_keys = assignment.acc_intervals.keys().collect::<Vec<_>>();
+    coverage_keys.sort_unstable();
+    for key in coverage_keys {
+        let intervals = &assignment.acc_intervals[key];
+        let merged = merge_intervals(intervals);
+        let merged_fixed = merge_intervals(
+            assignment
+                .acc_fixed_chunk_intervals
+                .get(key)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+        );
+        let merged_flex = merge_intervals(
+            assignment
+                .acc_flex_chunk_intervals
+                .get(key)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+        );
+        let asm_len = asm_lengths
+            .get(key.asm.as_ref())
+            .copied()
+            .unwrap_or(1.0)
+            .max(1.0);
+        let total_span: usize = merged.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+        let total_fixed: usize = merged_fixed.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+        let total_flex: usize = merged_flex.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+        let coverage = taxon_coverage.entry(key.taxid).or_default();
+        coverage.breadth += total_span as f64 / asm_len;
+        coverage.fixed_chunk += total_fixed as f64 / asm_len;
+        coverage.flex_chunk += total_flex as f64 / asm_len;
+    }
+    taxon_coverage
+}
+
 fn rescale_to_best_fit(
     assignments: &mut [ReadAssignment],
     best_fit: &HashMap<u32, BestFitGenome>,
