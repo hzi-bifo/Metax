@@ -837,7 +837,8 @@ fn push_nonempty_range(ranges: &mut Vec<std::ops::Range<usize>>, range: std::ops
 }
 
 pub struct MappedReference<'a> {
-    id: &'a str,
+    /// The name's bytes, checked to be UTF-8 when the cache is opened.
+    id: &'a [u8],
     len: u64,
     packed_bases: &'a [u8],
     mask: MappedMask<'a>,
@@ -1097,7 +1098,8 @@ impl ReferenceView<'_> {
     pub fn id(&self) -> &str {
         match self {
             Self::Owned(reference) => &reference.id,
-            Self::Mapped(reference) => reference.id,
+            Self::Mapped(reference) => std::str::from_utf8(reference.id)
+                .expect("reference names are checked when the cache is opened"),
         }
     }
 
@@ -3300,7 +3302,7 @@ impl MappedIndex {
         let meta = &self.references[ref_id as usize];
         let bytes = self.mmap.as_slice();
         MappedReference {
-            id: self.reference_name(meta),
+            id: &bytes[meta.id.clone()],
             len: meta.len,
             packed_bases: &bytes[meta.packed.clone()],
             mask: MappedMask {
@@ -4564,7 +4566,7 @@ mod tests {
         assert_eq!(mapped.header.reference_count, index.header.reference_count);
         for (ref_id, expected) in index.references.iter().enumerate() {
             let found = mapped.reference(ref_id as u32);
-            assert_eq!(found.id, expected.id);
+            assert_eq!(found.id, expected.id.as_bytes());
             assert_eq!(found.len, expected.len);
             for pos in 0..expected.len() {
                 assert_eq!(found.base_at(pos), expected.base_at(pos));
