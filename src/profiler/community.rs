@@ -3546,32 +3546,12 @@ fn process_evidence_batch(
     let mut indexed_candidates: Vec<usize> = Vec::new();
     let mut best_identities: Vec<(u32, f32)> = Vec::new();
     let mut best_placements = BestPlacementScratch::default();
-
     // Genus fallback remains a separate, lower-rank path and runs only when
     // no terminal candidate survives the native policy.
-    let genus_fb_mapped_min = genus_fallback_min_mapped_len(cfg);
-    let mut genus_best: BestMap = HashMap::new();
-    let mut genus_order: Vec<u32> = Vec::new();
-    let mut genus_intervals: IntervalMap = HashMap::new();
-
+    let mut genus_fallback = GenusFallbackScratch::new(cfg, species_to_genus);
     for read in chunk {
         if policy.collect_identities {
-            // Best mapping identity of the fragment to each taxon, before any gate.
-            best_identities.clear();
-            for row in &read.alignments {
-                match best_identities
-                    .iter_mut()
-                    .find(|(taxid, _)| *taxid == row.profile_taxid)
-                {
-                    Some((_, best)) => *best = best.max(row.identity),
-                    None => best_identities.push((row.profile_taxid, row.identity)),
-                }
-            }
-            for &(taxid, identity) in &best_identities {
-                let evidence = result.taxon_evidence.entry(taxid).or_default();
-                evidence.mapped_fragments = evidence.mapped_fragments.saturating_add(1);
-                evidence.identity_sum += f64::from(identity);
-            }
+            credit_identities(read, &mut best_identities, &mut result.taxon_evidence);
         }
         if policy.collect_best_placements {
             best_placements.credit(&read.alignments, &mut result.best_placements);
@@ -3582,171 +3562,241 @@ fn process_evidence_batch(
             .filter_stats
             .evaluated
             .saturating_add(read.alignments.len());
-
         if !candidates.is_empty() {
-            let resolved_index = resolved_candidate_index(candidates, policy.mode);
-            let profile_boundary_incomplete = candidates
-                .iter()
-                .any(|candidate| candidate.candidate_boundary.profile_incomplete());
-            if profile_boundary_incomplete {
-                result.boundary_ambiguous_fragments =
-                    result.boundary_ambiguous_fragments.saturating_add(1);
-            }
-            result.filter_stats.passed =
-                result.filter_stats.passed.saturating_add(candidates.len());
-            for candidate in candidates {
-                let evidence = result.taxon_evidence.entry(candidate.taxid).or_default();
-                evidence.candidate_fragments = evidence.candidate_fragments.saturating_add(1);
-                if resolved_index.is_some() {
-                    evidence.resolved_candidate_fragments =
-                        evidence.resolved_candidate_fragments.saturating_add(1);
-                }
-            }
-            if candidates.len() == 1 && !profile_boundary_incomplete {
-                result.uniquely_supported_taxa.insert(candidates[0].taxid);
-            }
+            assign_candidates(
+                &mut result,
+                read,
+                candidates,
+                &mut indexed_candidates,
+                cfg,
+                policy,
+                markers,
+            );
+        } else if fallback_mode {
+            genus_fallback.assign(&mut result, read);
+        }
+    }
+    result
+}
 
-            // Stable taxid order canonicalizes ambiguous EM keys independent
-            // of mapping row order and candidate score ties.
-            indexed_candidates.clear();
-            indexed_candidates.extend(0..candidates.len());
-            indexed_candidates.sort_unstable_by_key(|&index| {
-                (candidates[index].taxid, candidates[index].profile_rank)
-            });
-            let mut taxids = Vec::with_capacity(candidates.len());
-            let mut depths = Vec::with_capacity(candidates.len());
-            let mut mapped_lens = Vec::with_capacity(candidates.len());
-            let mut sampling_scales = Vec::with_capacity(candidates.len());
-            // Candidates arrive best placement first.
-            let best = indexed_candidates
-                .iter()
-                .position(|&index| index == 0)
-                .unwrap_or(0) as u32;
-            for &index in &indexed_candidates {
-                let candidate = &candidates[index];
-                let placement = candidate.best;
-                let mapped = match policy.mode {
-                    EvidenceMode::Paired | EvidenceMode::Single => placement.r1_mapped,
-                    EvidenceMode::Long => placement.both_mapped,
-                };
-                taxids.push(candidate.taxid);
-                depths.push(fragment_depth(placement, mapped, markers));
-                mapped_lens.push(f64::from(mapped));
-                sampling_scales.push(placement.sampling_scale);
-            }
-            result.read_assignments.push(ReadAssignment {
-                read: Arc::clone(&read.read_name),
-                rank: homogeneous_candidate_rank(candidates),
-                requires_terminal_evidence: true,
-                taxids,
-                depths,
-                mapped_lens,
-                sampling_scales,
-                best,
-            });
+/// Credit each taxon with the fragment's best mapping identity to it, before
+/// any gate.
+fn credit_identities(
+    read: &ReadBundle,
+    best_identities: &mut Vec<(u32, f32)>,
+    taxon_evidence: &mut HashMap<u32, TaxonEvidence>,
+) {
+    // Best mapping identity of the fragment to each taxon, before any gate.
+    best_identities.clear();
+    for row in &read.alignments {
+        match best_identities
+            .iter_mut()
+            .find(|(taxid, _)| *taxid == row.profile_taxid)
+        {
+            Some((_, best)) => *best = best.max(row.identity),
+            None => best_identities.push((row.profile_taxid, row.identity)),
+        }
+    }
+    for &(taxid, identity) in best_identities.iter() {
+        let evidence = taxon_evidence.entry(taxid).or_default();
+        evidence.mapped_fragments = evidence.mapped_fragments.saturating_add(1);
+        evidence.identity_sum += f64::from(identity);
+    }
+}
 
-            if policy.collect_exact_ties
-                && candidates
-                    .iter()
-                    .all(|candidate| candidate.profile_rank.is_species())
-            {
-                result.exact_ties.record(candidates);
-            }
+/// Record a fragment that has terminal candidates: their support, its
+/// assignment for the EM and, for a clear winner, its coordinate evidence.
+fn assign_candidates(
+    result: &mut AssignmentResult,
+    read: &ReadBundle,
+    candidates: &[super::evidence::TerminalCandidate],
+    indexed_candidates: &mut Vec<usize>,
+    cfg: &ProfilerConfig,
+    policy: EvidencePolicy,
+    markers: Option<&MarkerModel>,
+) {
+    let resolved_index = resolved_candidate_index(candidates, policy.mode);
+    let profile_boundary_incomplete = candidates
+        .iter()
+        .any(|candidate| candidate.candidate_boundary.profile_incomplete());
+    if profile_boundary_incomplete {
+        result.boundary_ambiguous_fragments = result.boundary_ambiguous_fragments.saturating_add(1);
+    }
+    result.filter_stats.passed = result.filter_stats.passed.saturating_add(candidates.len());
+    for candidate in candidates {
+        let evidence = result.taxon_evidence.entry(candidate.taxid).or_default();
+        evidence.candidate_fragments = evidence.candidate_fragments.saturating_add(1);
+        if resolved_index.is_some() {
+            evidence.resolved_candidate_fragments =
+                evidence.resolved_candidate_fragments.saturating_add(1);
+        }
+    }
+    if candidates.len() == 1 && !profile_boundary_incomplete {
+        result.uniquely_supported_taxa.insert(candidates[0].taxid);
+    }
 
-            if let Some(index) = resolved_index {
-                // Direct unique or margin-resolved winners count as both
-                // resolved-best and clear-best support. An unresolved tie
-                // counts for neither taxon; guarded MAP may later add only its
-                // successfully resolved winner to `best_fragments`.
-                let evidence = result
-                    .taxon_evidence
-                    .entry(candidates[index].taxid)
-                    .or_default();
-                evidence.best_fragments = evidence.best_fragments.saturating_add(1);
-                evidence.clear_best_fragments = evidence.clear_best_fragments.saturating_add(1);
-                let best_assembly = candidates[index].best.assembly_id;
-                for placement in &candidates[index].placements {
-                    let key = PresenceKey {
-                        taxid: placement.taxid,
-                        profile_rank: placement.profile_rank,
-                        assembly_id: placement.assembly_id,
-                    };
-                    let presence = result.presence.entry(key).or_default();
-                    if presence.asm_len <= 0.0 {
-                        presence.asm_len = placement.asm_len;
-                        presence.sampling_scale = placement.sampling_scale;
-                    }
-                    presence.count = presence.count.saturating_add(1);
-                    presence.fits += u64::from(placement.assembly_id == best_assembly);
-                    presence.other_gene_hits = presence
+    // Stable taxid order canonicalizes ambiguous EM keys independent
+    // of mapping row order and candidate score ties.
+    indexed_candidates.clear();
+    indexed_candidates.extend(0..candidates.len());
+    indexed_candidates
+        .sort_unstable_by_key(|&index| (candidates[index].taxid, candidates[index].profile_rank));
+    let mut taxids = Vec::with_capacity(candidates.len());
+    let mut depths = Vec::with_capacity(candidates.len());
+    let mut mapped_lens = Vec::with_capacity(candidates.len());
+    let mut sampling_scales = Vec::with_capacity(candidates.len());
+    // Candidates arrive best placement first.
+    let best = indexed_candidates
+        .iter()
+        .position(|&index| index == 0)
+        .unwrap_or(0) as u32;
+    for &index in indexed_candidates.iter() {
+        let candidate = &candidates[index];
+        let placement = candidate.best;
+        let mapped = match policy.mode {
+            EvidenceMode::Paired | EvidenceMode::Single => placement.r1_mapped,
+            EvidenceMode::Long => placement.both_mapped,
+        };
+        taxids.push(candidate.taxid);
+        depths.push(fragment_depth(placement, mapped, markers));
+        mapped_lens.push(f64::from(mapped));
+        sampling_scales.push(placement.sampling_scale);
+    }
+    result.read_assignments.push(ReadAssignment {
+        read: Arc::clone(&read.read_name),
+        rank: homogeneous_candidate_rank(candidates),
+        requires_terminal_evidence: true,
+        taxids,
+        depths,
+        mapped_lens,
+        sampling_scales,
+        best,
+    });
+
+    if policy.collect_exact_ties
+        && candidates
+            .iter()
+            .all(|candidate| candidate.profile_rank.is_species())
+    {
+        result.exact_ties.record(candidates);
+    }
+
+    if let Some(index) = resolved_index {
+        record_resolved_winner(result, &candidates[index], cfg, markers);
+    }
+}
+
+/// Credit a fragment's resolved winner: resolved-best and clear-best support,
+/// and its placements as coordinate evidence.
+fn record_resolved_winner(
+    result: &mut AssignmentResult,
+    winner: &super::evidence::TerminalCandidate,
+    cfg: &ProfilerConfig,
+    markers: Option<&MarkerModel>,
+) {
+    // Direct unique or margin-resolved winners count as both
+    // resolved-best and clear-best support. An unresolved tie
+    // counts for neither taxon; guarded MAP may later add only its
+    // successfully resolved winner to `best_fragments`.
+    let evidence = result.taxon_evidence.entry(winner.taxid).or_default();
+    evidence.best_fragments = evidence.best_fragments.saturating_add(1);
+    evidence.clear_best_fragments = evidence.clear_best_fragments.saturating_add(1);
+    let best_assembly = winner.best.assembly_id;
+    for placement in &winner.placements {
+        let key = PresenceKey {
+            taxid: placement.taxid,
+            profile_rank: placement.profile_rank,
+            assembly_id: placement.assembly_id,
+        };
+        let presence = result.presence.entry(key).or_default();
+        if presence.asm_len <= 0.0 {
+            presence.asm_len = placement.asm_len;
+            presence.sampling_scale = placement.sampling_scale;
+        }
+        presence.count = presence.count.saturating_add(1);
+        presence.fits += u64::from(placement.assembly_id == best_assembly);
+        presence.other_gene_hits = presence
+            .other_gene_hits
+            .saturating_add(u64::from(placement.other_genes));
+        presence.reference_span_bases = presence
+            .reference_span_bases
+            .saturating_add(u64::from(placement.span.1.saturating_sub(placement.span.0)));
+        presence.intervals.push(PresenceInterval {
+            reference_id: placement.reference_id,
+            span: placement.span,
+            mate_span: placement.mate_span,
+            fixed_chunk: placement.fixed_chunk,
+            flex_chunk: placement.flex_chunk,
+        });
+        if cfg.estimate_unclassified {
+            if cfg.coverage_gate_is_or() {
+                let genes = std::iter::once(placement.reference_id).chain(
+                    winner
                         .other_gene_hits
-                        .saturating_add(u64::from(placement.other_genes));
-                    presence.reference_span_bases = presence.reference_span_bases.saturating_add(
-                        u64::from(placement.span.1.saturating_sub(placement.span.0)),
-                    );
-                    presence.intervals.push(PresenceInterval {
-                        reference_id: placement.reference_id,
-                        span: placement.span,
-                        mate_span: placement.mate_span,
-                        fixed_chunk: placement.fixed_chunk,
-                        flex_chunk: placement.flex_chunk,
-                    });
-                    if cfg.estimate_unclassified {
-                        if cfg.coverage_gate_is_or() {
-                            let genes = std::iter::once(placement.reference_id).chain(
-                                candidates[index]
-                                    .other_gene_hits
-                                    .iter()
-                                    .filter(|hit| hit.assembly_id == placement.assembly_id)
-                                    .map(|hit| hit.interval.reference_id),
-                            );
-                            if let Some((hits, per_hit)) = markers.and_then(|model| {
-                                model.whole_genome_reads(
-                                    placement.assembly_id,
-                                    placement.read_len,
-                                    genes,
-                                )
-                            }) {
-                                result
-                                    .marker_genome_reads
-                                    .entry(placement.assembly_id)
-                                    .or_default()
-                                    .add(hits, per_hit);
-                            }
-                        } else if markers
-                            .is_some_and(|model| model.is_marker_genome(placement.assembly_id))
-                        {
-                            result
-                                .marker_genome_reads
-                                .entry(placement.assembly_id)
-                                .or_default()
-                                .add_fragment(1 + placement.other_genes);
-                        }
-                    }
+                        .iter()
+                        .filter(|hit| hit.assembly_id == placement.assembly_id)
+                        .map(|hit| hit.interval.reference_id),
+                );
+                if let Some((hits, per_hit)) = markers.and_then(|model| {
+                    model.whole_genome_reads(placement.assembly_id, placement.read_len, genes)
+                }) {
+                    result
+                        .marker_genome_reads
+                        .entry(placement.assembly_id)
+                        .or_default()
+                        .add(hits, per_hit);
                 }
-                let resolved = &candidates[index];
-                for hit in &resolved.other_gene_hits {
-                    let key = PresenceKey {
-                        taxid: resolved.taxid,
-                        profile_rank: resolved.profile_rank,
-                        assembly_id: hit.assembly_id,
-                    };
-                    let presence = result.presence.entry(key).or_default();
-                    presence.reference_span_bases = presence.reference_span_bases.saturating_add(
-                        u64::from(hit.interval.span.1.saturating_sub(hit.interval.span.0)),
-                    );
-                    presence.intervals.push(hit.interval);
-                }
+            } else if markers.is_some_and(|model| model.is_marker_genome(placement.assembly_id)) {
+                result
+                    .marker_genome_reads
+                    .entry(placement.assembly_id)
+                    .or_default()
+                    .add_fragment(1 + placement.other_genes);
             }
-            continue;
         }
+    }
+    for hit in &winner.other_gene_hits {
+        let key = PresenceKey {
+            taxid: winner.taxid,
+            profile_rank: winner.profile_rank,
+            assembly_id: hit.assembly_id,
+        };
+        let presence = result.presence.entry(key).or_default();
+        presence.reference_span_bases = presence.reference_span_bases.saturating_add(u64::from(
+            hit.interval.span.1.saturating_sub(hit.interval.span.0),
+        ));
+        presence.intervals.push(hit.interval);
+    }
+}
 
-        if !fallback_mode {
-            continue;
+/// Genus fallback of one batch: the best placement in each genus of a
+/// fragment without any terminal candidate. The buffers are reused across
+/// fragments.
+struct GenusFallbackScratch<'a> {
+    cfg: &'a ProfilerConfig,
+    species_to_genus: &'a HashMap<u32, u32>,
+    mapped_min: usize,
+    best: BestMap,
+    order: Vec<u32>,
+    intervals: IntervalMap,
+}
+
+impl<'a> GenusFallbackScratch<'a> {
+    fn new(cfg: &'a ProfilerConfig, species_to_genus: &'a HashMap<u32, u32>) -> Self {
+        Self {
+            cfg,
+            species_to_genus,
+            mapped_min: genus_fallback_min_mapped_len(cfg),
+            best: HashMap::new(),
+            order: Vec::new(),
+            intervals: HashMap::new(),
         }
-        genus_best.clear();
-        genus_order.clear();
-        genus_intervals.clear();
+    }
+
+    fn assign(&mut self, result: &mut AssignmentResult, read: &ReadBundle) {
+        self.best.clear();
+        self.order.clear();
+        self.intervals.clear();
         for aln in &read.alignments {
             // One row per fragment: the first mate of a pair, a lone mate whose
             // mate lies beyond its reference end, or a single-end/long read.
@@ -3758,38 +3808,37 @@ fn process_evidence_batch(
             }
             let identity = f64::from(aln.identity);
             let fraction = f64::from(aln.fraction);
-            let length_ok = aln.mapped_len as usize >= genus_fb_mapped_min;
+            let length_ok = aln.mapped_len as usize >= self.mapped_min;
             let fraction_ok = fraction >= GENUS_FALLBACK_MIN_FRACTION;
-            if identity < cfg.genus_identity
-                || !coverage_passes(length_ok, fraction_ok, cfg.coverage_gate_is_or())
+            if identity < self.cfg.genus_identity
+                || !coverage_passes(length_ok, fraction_ok, self.cfg.coverage_gate_is_or())
             {
                 continue;
             }
-            let Some(genus_taxid) = species_to_genus.get(&aln.profile_taxid).copied() else {
+            let Some(genus_taxid) = self.species_to_genus.get(&aln.profile_taxid).copied() else {
                 continue;
             };
             update_best(
-                &mut genus_best,
-                &mut genus_order,
-                &mut genus_intervals,
+                &mut self.best,
+                &mut self.order,
+                &mut self.intervals,
                 genus_taxid,
                 identity,
                 aln.mapped_len as f64 / aln.asm_len,
                 aln,
             );
         }
-        if !genus_order.is_empty() {
+        if !self.order.is_empty() {
             commit_assignment(
-                &mut result,
+                result,
                 &read.read_name,
                 AssignRank::Genus,
-                &genus_order,
-                &genus_best,
-                &mut genus_intervals,
+                &self.order,
+                &self.best,
+                &mut self.intervals,
             );
         }
     }
-    result
 }
 
 fn homogeneous_candidate_rank(candidates: &[super::evidence::TerminalCandidate]) -> AssignRank {
