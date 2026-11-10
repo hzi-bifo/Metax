@@ -3073,7 +3073,67 @@ impl MappedIndex {
         };
         index.validate()?;
         index.prefetch_seed_lookup_metadata();
+        #[cfg(unix)]
+        index.read_ahead_in_background(path);
         Ok(index)
+    }
+
+    /// Read the whole cache once in the background, in large chunks on
+    /// several threads, so that mapping finds its pages in the page cache.
+    /// Through the memory map a cold cache is read in small pieces as
+    /// lookups touch it, which on a network file system is many times slower
+    /// than reading it sequentially. Seed occurrences and fingerprints come
+    /// first. The data goes to a scratch buffer: its pages land in the shared
+    /// page cache, not in this process's memory. Best effort: an error ends
+    /// the read-ahead and mapping reads the pages as before.
+    #[cfg(unix)]
+    fn read_ahead_in_background(&self, path: &str) {
+        use std::os::unix::fs::FileExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        const CHUNK: usize = 64 << 20;
+        const BUFFER: usize = 4 << 20;
+        // Parallel streams are what makes a network file system fast; more
+        // than a few gain little.
+        const THREADS: usize = 8;
+        let len = self.mmap.len;
+        let first = [
+            self.seed_table.occurrences.clone(),
+            self.seed_table.fingerprints.clone(),
+        ];
+        let mut chunks = (0..len)
+            .step_by(CHUNK)
+            .map(|start| start..(start + CHUNK).min(len))
+            .collect::<Vec<_>>();
+        chunks.sort_by_key(|chunk| {
+            !first
+                .iter()
+                .any(|range| range.start < chunk.end && chunk.start < range.end)
+        });
+        let chunks = Arc::new(chunks);
+        let next = Arc::new(AtomicUsize::new(0));
+        for _ in 0..THREADS {
+            let (chunks, next, path) = (Arc::clone(&chunks), Arc::clone(&next), path.to_owned());
+            let _ = std::thread::Builder::new()
+                .name("index-read-ahead".to_owned())
+                .spawn(move || {
+                    let Ok(file) = File::open(&path) else {
+                        return;
+                    };
+                    let mut buffer = vec![0u8; BUFFER];
+                    while let Some(chunk) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        let mut offset = chunk.start;
+                        while offset < chunk.end {
+                            let want = (chunk.end - offset).min(BUFFER);
+                            match file.read_at(&mut buffer[..want], offset as u64) {
+                                Ok(read) if read > 0 => offset += read,
+                                _ => return,
+                            }
+                        }
+                    }
+                });
+        }
     }
 
     fn prefetch_seed_lookup_metadata(&self) {
