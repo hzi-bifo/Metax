@@ -556,7 +556,7 @@ fn resolve_db_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn load_db_tsv(path: &Path) -> Result<DatabaseMetadata> {
-    let reader = open_metadata_reader(path)?;
+    let mut reader = open_metadata_reader(path)?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     // Columns after the genome columns: none (version 2), reference_type
     // (version 3), reference_type and declared_genome_size (version 4).
@@ -566,13 +566,48 @@ fn load_db_tsv(path: &Path) -> Result<DatabaseMetadata> {
     let mut is_fractional = false;
     let mut references = Vec::new();
 
-    for (line_no, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("failed reading {}", path.display()))?;
+    // One line buffer for the whole file: a database of marker genes has tens
+    // of millions of rows.
+    let mut line = String::new();
+    let mut next_line_no = 0usize;
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .with_context(|| format!("failed reading {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        // Drop the line ending, as `BufRead::lines` does.
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
+        let line_no = next_line_no;
+        next_line_no += 1;
         if line.trim().is_empty() {
             continue;
         }
-        let fields: Vec<&str> = line.split('\t').collect();
-        match fields.as_slice() {
+        // A row has at most nine fields; a longer line is split into a vector
+        // so that it is matched and reported as before.
+        let mut short = [""; 10];
+        let mut count = 0usize;
+        for field in line.split('\t') {
+            if let Some(slot) = short.get_mut(count) {
+                *slot = field;
+            }
+            count += 1;
+        }
+        let long: Vec<&str>;
+        let fields: &[&str] = if count <= short.len() {
+            &short[..count]
+        } else {
+            long = line.split('\t').collect();
+            &long
+        };
+        match fields {
             ["#metax_db_version", version] => {
                 extra_columns = Some(match *version {
                     DB_VERSION_GENOMES => 0,
@@ -2445,6 +2480,38 @@ mod tests {
             hasher.update(row.as_bytes());
         }
         assert_eq!(loaded.fingerprint(), hasher.digest128());
+    }
+
+    #[test]
+    fn metadata_lines_end_and_split_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [
+            "#metax_db_version\t2".to_string(),
+            "#mapping_index\tmetax_db.mxi".to_string(),
+            "#fractional\tfalse".to_string(),
+            format!("#columns\t{}", column_names(0)),
+            "r1\t100\t300\t300\tG1\tc1\ts:562".to_string(),
+            String::new(),
+            "r2\t200\t300\t300\tG1\tc2\ts:562".to_string(),
+        ];
+        let load = |name: &str, text: String| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            load_db_tsv(&path)
+        };
+        let unix = load("unix.tsv", rows.join("\n") + "\n").unwrap();
+        let windows = load("windows.tsv", rows.join("\r\n") + "\r\n").unwrap();
+        assert_eq!(unix.fingerprint(), windows.fingerprint());
+        assert_eq!(windows.references.len(), 2);
+        assert_eq!(windows.references[1].taxonomy_field, "s:562");
+
+        let mut long = rows.to_vec();
+        long.push("r3\t1\t2\t3\t4\t5\t6\t7\t8\t9\t10".to_string());
+        let error = load("long.tsv", long.join("\n")).unwrap_err().to_string();
+        assert!(
+            error.contains("malformed database metadata line 8"),
+            "{error}"
+        );
     }
 
     #[test]
