@@ -3579,11 +3579,11 @@ mod tests {
         let reference = |name: &str, reference_type| crate::db::ReferenceMetadata {
             name: name.to_string(),
             length: 1_000,
-            genome: name.to_string(),
+            genome: name.into(),
             contig: name.to_string(),
             full_genome_size: 1_000,
             effective_indexed_size: 1_000,
-            taxonomy_field: "s:8".to_string(),
+            taxonomy_field: "s:8".into(),
             reference_type,
             declared_genome_size: None,
         };

@@ -73,7 +73,7 @@ fn print_metadata_summary(metadata: &DatabaseMetadata) {
     for reference in &metadata.references {
         reference_bases += reference.length as u64;
         // Genome sizes repeat on every row of a genome; count each genome once.
-        if genomes.insert(reference.genome.as_str()) {
+        if genomes.insert(&*reference.genome) {
             full_genome_bases += reference.full_genome_size as u64;
             effective_indexed_bases += reference.effective_indexed_size as u64;
             marker_genomes += usize::from(reference.reference_type == ReferenceType::Markers);

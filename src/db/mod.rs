@@ -11,6 +11,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::progress::{self, ProgressOptions};
@@ -196,9 +197,9 @@ impl DatabaseMetadata {
                 push_decimal(&mut row, value);
             }
             for text in [
-                &reference.genome,
-                &reference.contig,
-                &reference.taxonomy_field,
+                &*reference.genome,
+                reference.contig.as_str(),
+                &*reference.taxonomy_field,
             ] {
                 row.push(b'\t');
                 row.extend_from_slice(text.as_bytes());
@@ -237,11 +238,13 @@ fn push_decimal(out: &mut Vec<u8>, mut value: usize) {
 pub struct ReferenceMetadata {
     pub name: String,
     pub length: usize,
-    pub genome: String,
+    /// Shared by the references of one genome.
+    pub genome: Arc<str>,
     pub contig: String,
     pub full_genome_size: usize,
     pub effective_indexed_size: usize,
-    pub taxonomy_field: String,
+    /// Shared by consecutive references with the same taxonomy.
+    pub taxonomy_field: Arc<str>,
     pub reference_type: ReferenceType,
     /// Size of the whole genome as declared in the reference FASTA, kept for
     /// marker genomes only, whose `full_genome_size` is their summed marker
@@ -564,7 +567,7 @@ fn load_db_tsv(path: &Path) -> Result<DatabaseMetadata> {
     let mut declared_type: Option<String> = None;
     let mut metam_index: Option<PathBuf> = None;
     let mut is_fractional = false;
-    let mut references = Vec::new();
+    let mut references: Vec<ReferenceMetadata> = Vec::new();
 
     // One line buffer for the whole file: a database of marker genes has tens
     // of millions of rows.
@@ -661,12 +664,26 @@ fn load_db_tsv(path: &Path) -> Result<DatabaseMetadata> {
                         })?,
                     ),
                 };
+                // The references of a genome are consecutive and share its name
+                // and usually its taxonomy, so a row keeps the previous row's
+                // strings when they are equal.
+                let previous = references.last();
+                let genome = match previous {
+                    Some(previous) if &*previous.genome == *genome => Arc::clone(&previous.genome),
+                    _ => Arc::from(*genome),
+                };
+                let taxonomy_field = match previous {
+                    Some(previous) if &*previous.taxonomy_field == *taxonomy => {
+                        Arc::clone(&previous.taxonomy_field)
+                    }
+                    _ => Arc::from(*taxonomy),
+                };
                 references.push(ReferenceMetadata {
                     name: (*name).to_string(),
                     length: parse_positive_usize(length, "reference length").with_context(
                         || format!("invalid reference length on line {}", line_no + 1),
                     )?,
-                    genome: (*genome).to_string(),
+                    genome,
                     contig: (*contig).to_string(),
                     full_genome_size: parse_positive_usize(full, "full genome size").with_context(
                         || format!("invalid full genome size on line {}", line_no + 1),
@@ -678,7 +695,7 @@ fn load_db_tsv(path: &Path) -> Result<DatabaseMetadata> {
                     .with_context(|| {
                         format!("invalid effective indexed size on line {}", line_no + 1)
                     })?,
-                    taxonomy_field: (*taxonomy).to_string(),
+                    taxonomy_field,
                     reference_type,
                     declared_genome_size,
                 });
@@ -1575,11 +1592,11 @@ fn build_direct_reference_metadata(records: Vec<SelectedRecord>) -> Result<Vec<R
         references.push(ReferenceMetadata {
             name: record.source_name,
             length,
-            genome: record.genome,
+            genome: record.genome.into(),
             contig: record.contig,
             full_genome_size: record.full_genome_size,
             effective_indexed_size: record.effective_indexed_size,
-            taxonomy_field: record.taxonomy.raw,
+            taxonomy_field: record.taxonomy.raw.into(),
             reference_type: record.reference_type,
             declared_genome_size: record.declared_genome_size,
         });
@@ -1735,11 +1752,11 @@ fn flush_selected_source_record(
         references.push(ReferenceMetadata {
             name: prepared.name,
             length,
-            genome: record.genome,
+            genome: record.genome.into(),
             contig: record.contig,
             full_genome_size: record.full_genome_size,
             effective_indexed_size: record.effective_indexed_size,
-            taxonomy_field: record.taxonomy.raw,
+            taxonomy_field: record.taxonomy.raw.into(),
             reference_type: record.reference_type,
             declared_genome_size: record.declared_genome_size,
         });
@@ -2345,11 +2362,7 @@ mod tests {
         let loaded = DatabaseMetadata::load(&output).unwrap();
         let names: Vec<String> = loaded.references.iter().map(|r| r.name.clone()).collect();
         assert_eq!(index_reference_ids(&output), names);
-        let genomes: Vec<&str> = loaded
-            .references
-            .iter()
-            .map(|r| r.genome.as_str())
-            .collect();
+        let genomes: Vec<&str> = loaded.references.iter().map(|r| &*r.genome).collect();
         assert_eq!(genomes, ["G1", "G2", "G1"]);
         loaded
     }
@@ -2503,7 +2516,7 @@ mod tests {
         let windows = load("windows.tsv", rows.join("\r\n") + "\r\n").unwrap();
         assert_eq!(unix.fingerprint(), windows.fingerprint());
         assert_eq!(windows.references.len(), 2);
-        assert_eq!(windows.references[1].taxonomy_field, "s:562");
+        assert_eq!(&*windows.references[1].taxonomy_field, "s:562");
 
         let mut long = rows.to_vec();
         long.push("r3\t1\t2\t3\t4\t5\t6\t7\t8\t9\t10".to_string());
@@ -2521,11 +2534,11 @@ mod tests {
             |name: &str, length, reference_type, declared_genome_size| ReferenceMetadata {
                 name: name.to_string(),
                 length,
-                genome: "G1".to_string(),
+                genome: "G1".into(),
                 contig: format!("{name}_contig"),
                 full_genome_size: 1_000_000_007,
                 effective_indexed_size: 10,
-                taxonomy_field: "t:436646856;s:2056026598".to_string(),
+                taxonomy_field: "t:436646856;s:2056026598".into(),
                 reference_type,
                 declared_genome_size,
             };
@@ -2589,13 +2602,13 @@ mod tests {
         assert!(text.contains("\n#reference_type\tmixed\n"));
         assert_eq!(loaded.reference_type_label(), "mixed");
         for r in &loaded.references {
-            let expected = if r.genome == "G1" {
+            let expected = if &*r.genome == "G1" {
                 ReferenceType::Markers
             } else {
                 ReferenceType::Genome
             };
             assert_eq!(r.reference_type, expected);
-            if r.genome == "G1" {
+            if &*r.genome == "G1" {
                 assert_eq!((r.full_genome_size, r.effective_indexed_size), (1200, 1200));
                 assert_eq!(r.declared_genome_size, Some(5000));
             } else {

@@ -607,7 +607,7 @@ impl CommunityProfiler {
         let mut previous_taxonomy: Option<(&str, ReferenceTaxonomy)> = None;
         for reference in &db.references {
             let declared_taxonomy = match previous_taxonomy {
-                Some((field, taxonomy)) if field == reference.taxonomy_field => taxonomy,
+                Some((field, taxonomy)) if field == &*reference.taxonomy_field => taxonomy,
                 _ => {
                     let taxonomy = parse_reference_taxonomy(&reference.taxonomy_field)
                         .with_context(|| {
@@ -616,7 +616,7 @@ impl CommunityProfiler {
                                 reference.name
                             )
                         })?;
-                    previous_taxonomy = Some((reference.taxonomy_field.as_str(), taxonomy));
+                    previous_taxonomy = Some((&*reference.taxonomy_field, taxonomy));
                     taxonomy
                 }
             };
@@ -626,10 +626,10 @@ impl CommunityProfiler {
                 declared_taxonomy,
                 taxonomy,
             );
-            match asm_lengths_raw.get_mut(reference.genome.as_str()) {
+            match asm_lengths_raw.get_mut(&*reference.genome) {
                 Some(length) => *length += reference.length as f64,
                 None => {
-                    asm_lengths_raw.insert(reference.genome.clone(), reference.length as f64);
+                    asm_lengths_raw.insert(reference.genome.to_string(), reference.length as f64);
                 }
             }
             profile_taxids.insert(taxonomy.profile_taxid);
@@ -700,20 +700,19 @@ impl CommunityProfiler {
         let mut assembly_ids: HashMap<&str, u32> = HashMap::new();
         let mut assembly_names: Vec<Arc<str>> = Vec::new();
         for reference in &db.references {
-            if !assembly_ids.contains_key(reference.genome.as_str()) {
+            if !assembly_ids.contains_key(&*reference.genome) {
                 let next = u32::try_from(assembly_ids.len())
                     .context("database contains more than 2^32 assemblies")?;
-                assembly_ids.insert(reference.genome.as_str(), next);
-                assembly_names.push(Arc::from(reference.genome.as_str()));
+                assembly_ids.insert(&*reference.genome, next);
+                assembly_names.push(Arc::clone(&reference.genome));
             }
         }
         let genus_rollup = rollup_genus_of.map(|genus_of| {
-            let layout = GenomeLayout::new(db.references.iter().map(|reference| {
-                (
-                    assembly_ids[reference.genome.as_str()],
-                    reference.length as u64,
-                )
-            }));
+            let layout = GenomeLayout::new(
+                db.references
+                    .iter()
+                    .map(|reference| (assembly_ids[&*reference.genome], reference.length as u64)),
+            );
             Arc::new(GenusRollup {
                 genus_of,
                 marker_only: marker_only_species,
@@ -741,7 +740,7 @@ impl CommunityProfiler {
         for (reference_index, (reference, taxonomy)) in
             db.references.iter().zip(&reference_taxonomies).enumerate()
         {
-            let assembly_id = assembly_ids[reference.genome.as_str()];
+            let assembly_id = assembly_ids[&*reference.genome];
             let has_length = metam_refs.assemblies[assembly_id as usize].asm_len > 0.0;
             if !has_length {
                 metam_refs.entries.push(None);
@@ -847,7 +846,7 @@ impl CommunityProfiler {
                     let taxid = taxonomy.profile_taxid;
                     ReferenceKind {
                         taxid: species_normalize.get(&taxid).copied().unwrap_or(taxid),
-                        assembly_id: assembly_ids[reference.genome.as_str()],
+                        assembly_id: assembly_ids[&*reference.genome],
                         reference_type: reference.reference_type,
                         declared_genome_size: reference.declared_genome_size,
                     }

@@ -288,7 +288,7 @@ fn distinct_genomes(database: &DatabaseMetadata) -> usize {
     let mut genomes = HashSet::new();
     let mut previous: Option<&str> = None;
     for reference in &database.references {
-        let genome = reference.genome.as_str();
+        let genome = &*reference.genome;
         if previous != Some(genome) {
             genomes.insert(genome);
             previous = Some(genome);
@@ -942,11 +942,11 @@ mod tests {
             references: vec![ReferenceMetadata {
                 name: "G|ctg|s:8|100".to_string(),
                 length: 100,
-                genome: "G".to_string(),
+                genome: "G".into(),
                 contig: "ctg".to_string(),
                 full_genome_size: 100,
                 effective_indexed_size: if fractional { 60 } else { 100 },
-                taxonomy_field: "s:8".to_string(),
+                taxonomy_field: "s:8".into(),
                 reference_type: Default::default(),
                 declared_genome_size: None,
             }],
