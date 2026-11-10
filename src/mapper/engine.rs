@@ -997,6 +997,9 @@ fn build_reference_candidate_groups(
     }
 
     let mut groups = Vec::with_capacity(database.references.len());
+    // The references of a genome share its taxonomy field, so a field equal to
+    // the previous one is not parsed again.
+    let mut previous: Option<(&str, ReferenceCandidateGroups)> = None;
     for (reference_index, reference) in database.references.iter().enumerate() {
         let index_name = index.reference_id(reference_index as u32);
         if index_name != reference.name {
@@ -1007,16 +1010,25 @@ fn build_reference_candidate_groups(
                 reference.name
             );
         }
-        let taxonomy = parse_reference_taxonomy(&reference.taxonomy_field).with_context(|| {
-            format!(
-                "invalid taxonomy metadata for reference '{}' while preparing mapper candidates",
-                reference.name
-            )
-        })?;
-        groups.push(ReferenceCandidateGroups::new(
-            taxonomy.profile_taxid,
-            taxonomy.primary_taxid.unwrap_or(taxonomy.profile_taxid),
-        ));
+        let group = match previous {
+            Some((field, group)) if field == &*reference.taxonomy_field => group,
+            _ => {
+                let taxonomy =
+                    parse_reference_taxonomy(&reference.taxonomy_field).with_context(|| {
+                        format!(
+                            "invalid taxonomy metadata for reference '{}' while preparing mapper candidates",
+                            reference.name
+                        )
+                    })?;
+                let group = ReferenceCandidateGroups::new(
+                    taxonomy.profile_taxid,
+                    taxonomy.primary_taxid.unwrap_or(taxonomy.profile_taxid),
+                );
+                previous = Some((&*reference.taxonomy_field, group));
+                group
+            }
+        };
+        groups.push(group);
     }
     Ok(groups)
 }
