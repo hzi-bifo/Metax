@@ -356,6 +356,7 @@ struct RescueSeedHit {
 #[derive(Default)]
 struct MateRescueWorkspace {
     reverse_complement: Vec<u8>,
+    coded: CodedRead,
     forward_hits: Vec<RescueSeedHit>,
     reverse_hits: Vec<RescueSeedHit>,
 }
@@ -612,25 +613,26 @@ pub fn map_read_with_workspace(
         return Vec::new();
     }
 
-    let (rc, candidates) = collect_candidates(read, index, params, profile, |_| true);
+    let candidates = collect_candidates(read, index, params, profile, |_| true);
 
     profile.candidates_before_filtering += candidates.len() as u64;
     if candidates.is_empty() {
         return Vec::new();
     }
+    let coded = CodedRead::new(read);
     let mut mappings = match marker_gene_read_parts(&candidates, read.len(), index, params) {
         Some(parts) => {
             let mut mappings = Vec::new();
             for part in parts {
                 mappings.extend(select_mappings(
-                    read_id, read, &rc, part, index, params, profile, workspace,
+                    read_id, &coded, part, index, params, profile, workspace,
                 ));
             }
             mappings.sort_unstable_by(mapping_order);
             mappings
         }
         None => select_mappings(
-            read_id, read, &rc, candidates, index, params, profile, workspace,
+            read_id, &coded, candidates, index, params, profile, workspace,
         ),
     };
     profile.candidates_after_filtering += mappings.len() as u64;
@@ -716,8 +718,7 @@ fn marker_gene_read_parts(
 #[allow(clippy::too_many_arguments)]
 fn select_mappings(
     read_id: &str,
-    read: &[u8],
-    rc: &[u8],
+    read: &CodedRead,
     mut candidates: Vec<Candidate>,
     index: &RuntimeIndex,
     params: MapParams,
@@ -750,7 +751,6 @@ fn select_mappings(
         if let Some(mapping) = evaluate_candidate(
             read_id,
             read,
-            rc,
             &candidates[index_in_candidates],
             index,
             params,
@@ -778,7 +778,6 @@ fn select_mappings(
             if let Some(mapping) = evaluate_candidate(
                 read_id,
                 read,
-                rc,
                 candidate,
                 index,
                 params,
@@ -819,15 +818,7 @@ fn select_mappings(
         &mut workspace.candidate_selection,
     ));
     if params.long_read_extension == LongReadExtension::Retained {
-        extend_retained_long_read_mappings(
-            read,
-            rc,
-            index,
-            params,
-            profile,
-            &mut mappings,
-            workspace,
-        );
+        extend_retained_long_read_mappings(read, index, params, profile, &mut mappings, workspace);
         dedup_mappings_preserve_order(&mut mappings);
         // Extension re-scores each mapping in place, so the pre-extension
         // ordering may no longer be best-first. Re-sort so the reported
@@ -889,8 +880,7 @@ fn interval_query_span(interval: Interval) -> usize {
 #[allow(clippy::too_many_arguments)]
 fn evaluate_candidate(
     read_id: &str,
-    read: &[u8],
-    rc: &[u8],
+    read: &CodedRead,
     candidate: &Candidate,
     index: &RuntimeIndex,
     params: MapParams,
@@ -899,7 +889,7 @@ fn evaluate_candidate(
     edit_distance: &mut EditDistanceWorkspace,
 ) -> Option<Mapping> {
     let reference = index.reference(candidate.ref_id);
-    let query = if candidate.strand == 1 { read } else { rc };
+    let query = read.strand(candidate.strand);
     let interval = if params.long_read_chaining {
         chain_interval(query.len(), reference.len(), candidate, false)
     } else {
@@ -937,7 +927,7 @@ fn evaluate_candidate(
 #[allow(clippy::too_many_arguments)]
 fn evaluate_candidate_interval(
     read_id: &str,
-    read: &[u8],
+    read: &CodedRead,
     query: &[u8],
     reference: &ReferenceView<'_>,
     candidate: &Candidate,
@@ -1053,8 +1043,7 @@ fn evaluate_candidate_interval(
 }
 
 fn extend_retained_long_read_mappings(
-    read: &[u8],
-    rc: &[u8],
+    read: &CodedRead,
     index: &RuntimeIndex,
     params: MapParams,
     profile: &mut MapProfile,
@@ -1067,7 +1056,7 @@ fn extend_retained_long_read_mappings(
     for mapping in mappings {
         let ref_id = mapping.ref_index;
         let reference = index.reference(ref_id);
-        let query = if mapping.strand == 1 { read } else { rc };
+        let query = read.strand(mapping.strand);
         let interval = (
             mapping.query_start,
             mapping.query_end,
@@ -1136,7 +1125,7 @@ fn extend_retained_long_read_mappings(
 }
 
 fn evaluate_interval_identity(
-    read: &[u8],
+    read: &CodedRead,
     query: &[u8],
     reference: &ReferenceView<'_>,
     interval: (usize, usize, usize, usize),
@@ -1261,7 +1250,7 @@ fn extend_long_read_interval(
     let left_q = bound(qs, rs);
     let left_r = rs.min(left_q.saturating_add(extension_slack(left_q)));
     if left_q > 0 && left_r > 0 {
-        let query_left = query_codes(query[qs - left_q..qs].iter().rev().copied());
+        let query_left: Vec<u8> = query[qs - left_q..qs].iter().rev().copied().collect();
         let reference_left = reference_codes(reference, rs - left_r, rs, true);
         let (q_ext, r_ext) = banded_xdrop_extend(
             &query_left,
@@ -1277,10 +1266,9 @@ fn extend_long_read_interval(
     let right_q = bound(query.len().saturating_sub(qe), reference_right);
     let right_r = reference_right.min(right_q.saturating_add(extension_slack(right_q)));
     if right_q > 0 && right_r > 0 {
-        let query_right = query_codes(query[qe..qe + right_q].iter().copied());
         let reference_right = reference_codes(reference, re, re + right_r, false);
         let (q_ext, r_ext) = banded_xdrop_extend(
-            &query_right,
+            &query[qe..qe + right_q],
             &reference_right,
             ignore_n,
             LONG_READ_EXTEND_XDROP,
@@ -1538,14 +1526,60 @@ fn extension_slack(query_bases: usize) -> usize {
     query_bases / 5 + 128
 }
 
-/// Code of a base that is not A, C, G or T in an extension.
+/// Code of a base that is not A, C, G or T.
 const OTHER_BASE: u8 = 4;
 
-/// Base codes of read bases, for [`banded_xdrop_extend`].
-fn query_codes(bases: impl Iterator<Item = u8>) -> Vec<u8> {
-    bases
-        .map(|base| base_code(base).unwrap_or(OTHER_BASE))
-        .collect()
+/// A read as base codes on both strands, [`OTHER_BASE`] where a base is not
+/// A, C, G or T. A read is coded once; every comparison with a reference
+/// reads these codes.
+#[derive(Default)]
+struct CodedRead {
+    forward: Vec<u8>,
+    reverse: Vec<u8>,
+}
+
+impl CodedRead {
+    fn new(read: &[u8]) -> Self {
+        let mut coded = Self::default();
+        coded.fill(read);
+        coded
+    }
+
+    /// Code `read` into this storage.
+    fn fill(&mut self, read: &[u8]) {
+        self.forward.clear();
+        self.forward.extend(
+            read.iter()
+                .map(|&base| base_code(base).unwrap_or(OTHER_BASE)),
+        );
+        self.reverse.clear();
+        self.reverse.extend(self.forward.iter().rev().map(|&code| {
+            if code == OTHER_BASE {
+                OTHER_BASE
+            } else {
+                3 - code
+            }
+        }));
+    }
+
+    fn len(&self) -> usize {
+        self.forward.len()
+    }
+
+    /// The codes of the read on `strand`: 1 forward, -1 reverse complement.
+    fn strand(&self, strand: i8) -> &[u8] {
+        if strand == 1 {
+            &self.forward
+        } else {
+            &self.reverse
+        }
+    }
+}
+
+/// A read base code as an option, `None` for [`OTHER_BASE`].
+#[inline]
+fn known_code(code: u8) -> Option<u8> {
+    (code != OTHER_BASE).then_some(code)
 }
 
 /// Base codes of `start..end` of a reference, backwards when `reverse`, for
@@ -1868,7 +1902,7 @@ fn collect_candidates<F>(
     params: MapParams,
     profile: &mut MapProfile,
     mut accept: F,
-) -> (Vec<u8>, Vec<Candidate>)
+) -> Vec<Candidate>
 where
     F: FnMut(SeedOccurrence) -> bool,
 {
@@ -1917,11 +1951,10 @@ where
         profile.total_query_seeds += used_query_seeds;
     }
     profile.candidate_groups += groups.len() as u64;
-    let candidates = groups
+    groups
         .into_iter()
         .filter_map(|(key, acc)| acc.into_candidate(key, k, params.min_seeds))
-        .collect();
-    (rc, candidates)
+        .collect()
 }
 
 fn collect_chained_candidates<F>(
@@ -1930,7 +1963,7 @@ fn collect_chained_candidates<F>(
     params: MapParams,
     profile: &mut MapProfile,
     mut accept: F,
-) -> (Vec<u8>, Vec<Candidate>)
+) -> Vec<Candidate>
 where
     F: FnMut(SeedOccurrence) -> bool,
 {
@@ -1973,14 +2006,13 @@ where
         }
         profile.total_query_seeds += used_query_seeds;
     }
-    let candidates = chain_hit_groups(
+    chain_hit_groups(
         &mut hits,
         index.header().k,
         read.len(),
         |ref_id| index.chain_min_seeds(ref_id, params.min_seeds),
         profile,
-    );
-    (rc, candidates)
+    )
 }
 
 fn prepare_mate_rescue_hits(
@@ -1993,6 +2025,7 @@ fn prepare_mate_rescue_hits(
     workspace.forward_hits.clear();
     workspace.reverse_hits.clear();
     revcomp_into(read, &mut workspace.reverse_complement);
+    workspace.coded.fill(read);
 
     collect_rescue_seed_hits(read, index, params, profile, &mut workspace.forward_hits);
     collect_rescue_seed_hits(
@@ -2397,14 +2430,14 @@ fn trim_right_run(
     }
 }
 
-/// Whether a query base matches a reference position.
+/// Whether a read base code matches a reference position.
 ///
 /// Takes the reference side as an already-decoded code so the caller can read
 /// it straight out of the packed reference. Ambiguity on either side is never
-/// a match.
+/// a match: a reference code is never [`OTHER_BASE`].
 #[inline]
 fn matches_reference(q: u8, r: Option<u8>) -> bool {
-    matches!((base_code(q), r), (Some(a), Some(b)) if a == b)
+    r == Some(q)
 }
 
 fn identity(
@@ -2485,7 +2518,7 @@ fn ungapped_identity(
     let mut compared = 0usize;
     let mut denom = 0usize;
     for (i, &q) in query.iter().take(ref_end - ref_start).enumerate() {
-        let qb = base_code(q);
+        let qb = known_code(q);
         let rb = reference.code_at(ref_start + i);
         if ignore_n && (qb.is_none() || rb.is_none()) {
             continue;
@@ -2555,7 +2588,7 @@ fn alignment_table_last_row(
     }
     let mut curr = vec![DpCell::default(); m + 1];
     for &q in query {
-        let qb = base_code(q);
+        let qb = known_code(q);
         curr[0] = query_gap(prev[0], qb, ignore_n);
         for j in 1..=m {
             let rb = reference.code_at(ref_start + j - 1);
@@ -2594,7 +2627,7 @@ fn banded_gapped_identity(
 
     let mut curr = vec![impossible; m + 1];
     for i in 1..=n {
-        let qb = base_code(query[i - 1]);
+        let qb = known_code(query[i - 1]);
         let j_start = i.saturating_sub(band);
         let j_end = (i + band).min(m);
         // Clearing all m+1 cells made this banded DP cost O(n*m), defeating the
@@ -2660,7 +2693,7 @@ fn banded_gapped_identity_full_row_clear(
     let mut curr = vec![impossible; m + 1];
     for i in 1..=n {
         curr.fill(impossible);
-        let qb = base_code(query[i - 1]);
+        let qb = known_code(query[i - 1]);
         let j_start = i.saturating_sub(band);
         let j_end = (i + band).min(m);
         if j_start == 0 && prev[0].score > impossible.score {
@@ -2754,8 +2787,8 @@ fn edit_identity(query_len: usize, reference_len: usize, edit_distance: usize) -
 }
 
 /// Exact global Levenshtein distance using the arbitrary-width form of the
-/// Myers bit-vector recurrence. `reference_codes` must yield A/C/G/T as 0..=3
-/// and ambiguous bases as 4. Ambiguous symbols deliberately have no equality
+/// Myers bit-vector recurrence. `query` and `reference_codes` hold A/C/G/T as
+/// 0..=3 and ambiguous bases as 4. Ambiguous symbols deliberately have no equality
 /// mask, so N-vs-N is a mismatch just as it is in the scalar gapped identity
 /// path when `--ignore-n` is not active.
 fn exact_bitvector_edit_distance<I>(
@@ -2774,8 +2807,8 @@ where
         masks.resize(word_count, 0);
         masks.fill(0);
     }
-    for (position, &base) in query.iter().enumerate() {
-        if let Some(code) = base_code(base) {
+    for (position, &code) in query.iter().enumerate() {
+        if let Some(code) = known_code(code) {
             workspace.peq[usize::from(code)][position / WORD_BITS] |=
                 1u64 << (position % WORD_BITS);
         }
@@ -2886,7 +2919,7 @@ fn scalar_banded_edit_identity(
     for i in 1..=n {
         let start = i.saturating_sub(band);
         let end = i.saturating_add(band).min(m);
-        let query_code = base_code(query[i - 1]);
+        let query_code = known_code(query[i - 1]);
         curr.clear();
         curr.resize(end - start + 1, inf);
         for j in start..=end {
@@ -3485,8 +3518,7 @@ fn rescue_beside_mate(
         }
         let Some(mut mapping) = evaluate_candidate(
             read_id,
-            read,
-            &workspace.mate_rescue.reverse_complement,
+            &workspace.mate_rescue.coded,
             &candidate,
             index,
             params,
@@ -3509,8 +3541,7 @@ fn rescue_beside_mate(
     if best.is_none() && window_end.saturating_sub(window_start) <= 256 {
         *best = brute_force_rescue(
             read_id,
-            read,
-            &workspace.mate_rescue.reverse_complement,
+            &workspace.mate_rescue.coded,
             &reference,
             ref_id,
             mate,
@@ -3534,8 +3565,7 @@ fn rescue_beside_mate(
 #[allow(clippy::too_many_arguments)]
 fn brute_force_rescue(
     read_id: &str,
-    read: &[u8],
-    rc: &[u8],
+    read: &CodedRead,
     reference: &ReferenceView<'_>,
     ref_id: u32,
     mate: &Mapping,
@@ -3550,7 +3580,8 @@ fn brute_force_rescue(
 ) -> Option<Mapping> {
     let mut best = None;
     let window_len = window_end.saturating_sub(window_start);
-    for (query, strand) in [(read, 1i8), (rc, -1i8)] {
+    for strand in [1i8, -1i8] {
+        let query = read.strand(strand);
         let min_len = query.len().saturating_sub(8).max(1);
         let max_len = query.len().saturating_add(8).min(reference.len());
         if window_len < min_len || max_len < min_len {
@@ -3752,7 +3783,7 @@ mod tests {
         for case in 0..240usize {
             let query_len = 1 + (case * 7 % 300);
             let ref_len = 1 + (case * 13 % 400);
-            let query = deterministic_bases(&mut state, query_len);
+            let query = codes(&deterministic_bases(&mut state, query_len));
             let reference_sequence = deterministic_bases(&mut state, ref_len);
             let reference = owned_reference("band", &reference_sequence);
             let reference = ReferenceView::Owned(&reference);
@@ -3776,6 +3807,20 @@ mod tests {
             }
         }
         assert_eq!(compared, 480);
+    }
+
+    /// Base codes of `bases`, as the mapper compares them.
+    fn codes(bases: &[u8]) -> Vec<u8> {
+        CodedRead::new(bases).forward
+    }
+
+    #[test]
+    fn coded_reverse_strand_is_the_coded_reverse_complement() {
+        let read = b"ACGTNacgtuURYx";
+        let coded = CodedRead::new(read);
+        assert_eq!(coded.strand(1), codes(read).as_slice());
+        assert_eq!(coded.strand(-1), codes(&revcomp(read)).as_slice());
+        assert_eq!(coded.len(), read.len());
     }
 
     fn deterministic_bases(state: &mut u64, len: usize) -> Vec<u8> {
@@ -3850,7 +3895,7 @@ mod tests {
 
             for (window_start, window_end) in [(0usize, 20usize), (4, 16)] {
                 let mut expected_profile = MapProfile::default();
-                let (_, expected) =
+                let expected =
                     collect_candidates(read, &index, params, &mut expected_profile, |occurrence| {
                         occurrence.ref_id == 0
                             && (window_start..window_end).contains(&(occurrence.pos as usize))
@@ -3953,7 +3998,7 @@ mod tests {
                     let reference = sequence(reference_len);
                     let expected = full_edit_distance(&query, &reference);
                     let observed = exact_bitvector_edit_distance(
-                        &query,
+                        &codes(&query),
                         reference.iter().map(|base| base_code(*base).unwrap_or(4)),
                         &mut workspace,
                     );
@@ -3972,7 +4017,7 @@ mod tests {
         let large_query = deterministic_read(513);
         let large_reference = mutate_every(&large_query, 17);
         let large = exact_bitvector_edit_distance(
-            &large_query,
+            &codes(&large_query),
             large_reference
                 .iter()
                 .map(|base| base_code(*base).unwrap_or(4)),
@@ -3983,7 +4028,7 @@ mod tests {
         let query = b"ACGTNAC";
         let reference = b"AGGTNTC";
         let observed = exact_bitvector_edit_distance(
-            query,
+            &codes(query),
             reference.iter().map(|base| base_code(*base).unwrap_or(4)),
             &mut workspace,
         );
@@ -4017,7 +4062,7 @@ mod tests {
         let expected = full_edit_distance(&query, &reference);
         let mut workspace = EditDistanceWorkspace::default();
         let observed = exact_bitvector_edit_distance(
-            &query,
+            &codes(&query),
             reference.iter().map(|base| base_code(*base).unwrap_or(4)),
             &mut workspace,
         );
@@ -4071,6 +4116,7 @@ mod tests {
 
             let reference = owned_reference("property", &reference_sequence);
             let reference = ReferenceView::Owned(&reference);
+            let query = codes(&query);
             let legacy = scalar_banded_edit_identity(&query, &reference, 0, reference.len(), false);
             let exact = fast_edit_identity(
                 &query,
@@ -4110,6 +4156,7 @@ mod tests {
 
         let reference = owned_reference("drift", &reference_sequence);
         let reference = ReferenceView::Owned(&reference);
+        let query = codes(&query);
         let legacy = scalar_banded_edit_identity(&query, &reference, 0, reference.len(), false);
         let mut workspace = EditDistanceWorkspace::default();
         let exact = fast_edit_identity(
@@ -4685,6 +4732,7 @@ mod tests {
         long[300] = substituted(long[300]);
         let mut workspace = EditDistanceWorkspace::default();
 
+        let (short, long) = (codes(&short), codes(&long));
         for query in [&short, &long] {
             for (ignore_n, identity_mode, fast_long_read_identity) in [
                 (false, IdentityMode::Gapped, false),
@@ -5375,10 +5423,11 @@ mod tests {
         window_end: usize,
     ) -> Option<Mapping> {
         let reference = index.reference(0);
-        let rc = revcomp(read);
+        let coded = CodedRead::new(read);
         let mut workspace = EditDistanceWorkspace::default();
         let mut best = None;
-        for (query, strand) in [(read, 1i8), (rc.as_slice(), -1i8)] {
+        for strand in [1i8, -1i8] {
+            let query = coded.strand(strand);
             let min_len = query.len().saturating_sub(8).max(1);
             let max_len = query.len().saturating_add(8).min(reference.len());
             for ref_len in min_len..=max_len {
@@ -5466,14 +5515,12 @@ mod tests {
             let params = short_test_params();
             let window_end = reference.len();
 
-            let rc = revcomp(&read);
             let mut profile = MapProfile::default();
             let expected =
                 brute_force_by_position(&read, &index, &mate, params, 0, 1_000, 0, window_end);
             let actual = brute_force_rescue(
                 "pair",
-                &read,
-                &rc,
+                &CodedRead::new(&read),
                 &index.reference(0),
                 0,
                 &mate,
@@ -5527,6 +5574,7 @@ mod tests {
         let reference = owned_reference("ambiguous", &query);
         let reference = ReferenceView::Owned(&reference);
         let mut workspace = EditDistanceWorkspace::default();
+        let query = codes(&query);
         let counted = fast_edit_identity(&query, &reference, 0, query.len(), false, &mut workspace);
         assert_eq!(counted.matches, 512);
         assert_eq!(counted.denom, 513);
