@@ -968,6 +968,7 @@ mod tests {
         Mapping {
             read_id: "r1".to_string(),
             ref_id: "ref".to_string(),
+            ref_index: 0,
             ref_start: 0,
             ref_end: 100,
             identity,

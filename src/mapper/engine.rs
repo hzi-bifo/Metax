@@ -3548,6 +3548,7 @@ mod tests {
         Mapping {
             read_id: read_id.to_string(),
             ref_id: ref_id.to_string(),
+            ref_index: 0,
             ref_start: 1,
             ref_end: 101,
             identity: 0.99,

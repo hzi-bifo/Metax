@@ -16,7 +16,6 @@ use crate::{
 
 pub struct RuntimeIndex {
     index: LoadedIndex,
-    ref_lookup: HashMap<String, usize>,
     lookup_mode: SeedLookupMode,
     reference_candidate_groups: Option<Box<[ReferenceCandidateGroups]>>,
     reference_kinds: Option<Box<[ReferenceKind]>>,
@@ -49,9 +48,6 @@ impl RuntimeIndex {
     }
 
     pub fn from_loaded_with_options(index: LoadedIndex, options: RuntimeIndexOptions) -> Self {
-        let ref_lookup = (0..index.reference_count())
-            .map(|i| (index.reference_id(i as u32).to_string(), i))
-            .collect();
         let lookup_mode = if options.allow_single_strobe_matches {
             SeedLookupMode::IgnoreRandstrobeFingerprint
         } else {
@@ -59,7 +55,6 @@ impl RuntimeIndex {
         };
         Self {
             index,
-            ref_lookup,
             lookup_mode,
             reference_candidate_groups: None,
             reference_kinds: None,
@@ -120,10 +115,6 @@ impl RuntimeIndex {
 
     fn reference_id(&self, ref_id: u32) -> &str {
         self.index.reference_id(ref_id)
-    }
-
-    fn reference_index_by_id(&self, ref_id: &str) -> Option<u32> {
-        self.ref_lookup.get(ref_id).map(|i| *i as u32)
     }
 
     #[inline]
@@ -238,6 +229,8 @@ impl CandidateBoundary {
 pub struct Mapping {
     pub read_id: String,
     pub ref_id: String,
+    /// Position of `ref_id` among the index's reference sequences.
+    pub ref_index: u32,
     pub ref_start: u32,
     pub ref_end: u32,
     pub identity: f64,
@@ -1032,6 +1025,7 @@ fn evaluate_candidate_interval(
     Some(Mapping {
         read_id: read_id.to_string(),
         ref_id: index.reference_id(candidate.ref_id).to_string(),
+        ref_index: candidate.ref_id,
         ref_start: rs as u32,
         ref_end: re as u32,
         identity: ident.value,
@@ -1071,9 +1065,7 @@ fn extend_retained_long_read_mappings(
         return;
     }
     for mapping in mappings {
-        let Some(ref_id) = index.reference_index_by_id(&mapping.ref_id) else {
-            continue;
-        };
+        let ref_id = mapping.ref_index;
         let reference = index.reference(ref_id);
         let query = if mapping.strand == 1 { read } else { rc };
         let interval = (
@@ -3297,9 +3289,7 @@ pub fn mark_mates_beyond_reference_end(
         .iter_mut()
         .filter(|read| !read.mate_ref_status.is_same())
     {
-        let Some(ref_id) = index.reference_index_by_id(&read.ref_id) else {
-            continue;
-        };
+        let ref_id = read.ref_index;
         if !index.is_open_ended(ref_id) {
             continue;
         }
@@ -3462,9 +3452,7 @@ fn rescue_beside_mate(
     workspace: &mut MappingWorkspace,
     best: &mut Option<Mapping>,
 ) {
-    let Some(ref_id) = index.reference_index_by_id(&mate.ref_id) else {
-        return;
-    };
+    let ref_id = mate.ref_index;
     let reference = index.reference(ref_id);
     if reference.is_empty() {
         return;
@@ -3594,6 +3582,7 @@ fn brute_force_rescue(
                 let mapping = Mapping {
                     read_id: read_id.to_string(),
                     ref_id: index.reference_id(ref_id).to_string(),
+                    ref_index: ref_id,
                     ref_start: pos as u32,
                     ref_end: (pos + ref_len) as u32,
                     identity: ident.value,
@@ -4801,11 +4790,20 @@ mod tests {
 
     /// The placements of a 300-base fragment's mates on `ref_id`: R1 forward on
     /// the first 100 bases, R2 reverse on the last 100.
-    fn fragment_placements(ref_id: &str, taxon: u32) -> (Mapping, Mapping) {
-        let r1 = test_mapping("pair", ref_id, 0, 100, 100, 1.0, 100);
-        let mut r2 = test_mapping("pair", ref_id, 200, 300, 100, 1.0, 100);
+    fn fragment_placements(index: &RuntimeIndex, ref_id: &str, taxon: u32) -> (Mapping, Mapping) {
+        let r1 = indexed(index, test_mapping("pair", ref_id, 0, 100, 100, 1.0, 100));
+        let mut r2 = indexed(index, test_mapping("pair", ref_id, 200, 300, 100, 1.0, 100));
         r2.strand = -1;
         (with_groups(r1, taxon, taxon), with_groups(r2, taxon, taxon))
+    }
+
+    /// `mapping` with the index position of its reference, as the mapper
+    /// sets it.
+    fn indexed(index: &RuntimeIndex, mut mapping: Mapping) -> Mapping {
+        mapping.ref_index = (0..index.index.reference_count() as u32)
+            .find(|&id| index.reference_id(id) == mapping.ref_id)
+            .expect("reference of the test index");
+        mapping
     }
 
     fn rescue_competing(
@@ -4837,8 +4835,8 @@ mod tests {
         let fragment = deterministic_read(300);
         let index = rescue_runtime_index(&[("a", &fragment), ("b", &fragment)]);
         let read2 = revcomp(&fragment[200..]);
-        let (a1, a2) = fragment_placements("a", 0);
-        let (b1, _) = fragment_placements("b", 1);
+        let (a1, a2) = fragment_placements(&index, "a", 0);
+        let (b1, _) = fragment_placements(&index, "b", 1);
         let mates = [a1, b1];
         let own = [a2];
         let mut profile = MapProfile::default();
@@ -4885,8 +4883,8 @@ mod tests {
         }
         let index = rescue_runtime_index(&[("a", &fragment), ("b", &diverged)]);
         let read2 = revcomp(&fragment[200..]);
-        let (a1, mut a2) = fragment_placements("a", 0);
-        let (b1, _) = fragment_placements("b", 1);
+        let (a1, mut a2) = fragment_placements(&index, "a", 0);
+        let (b1, _) = fragment_placements(&index, "b", 1);
         let mates = [a1, b1];
         let mut profile = MapProfile::default();
 
@@ -4908,9 +4906,9 @@ mod tests {
         let fragment = deterministic_read(300);
         let index = rescue_runtime_index(&[("a", &fragment), ("b", &fragment), ("c", &fragment)]);
         let read2 = revcomp(&fragment[200..]);
-        let (a1, a2) = fragment_placements("a", 0);
-        let (mut b1, _) = fragment_placements("b", 1);
-        let (c1, _) = fragment_placements("c", 2);
+        let (a1, a2) = fragment_placements(&index, "a", 0);
+        let (mut b1, _) = fragment_placements(&index, "b", 1);
+        let (c1, _) = fragment_placements(&index, "c", 2);
         // The seeded pair matches 200 bases. With 99 matched bases on "b", a
         // perfect 100-base mate would still leave that pair one base short.
         b1.matched_bases = 99;
@@ -5196,7 +5194,10 @@ mod tests {
             .unwrap();
         // Both placements end 100 bases before their reference does.
         let mut reads = ["gene", "genome"].map(|reference| {
-            let mut mapping = test_mapping("pair", reference, 1_800, 1_900, 100, 1.0, 100);
+            let mut mapping = indexed(
+                &index,
+                test_mapping("pair", reference, 1_800, 1_900, 100, 1.0, 100),
+            );
             mapping.mate_ref_status = MateRefStatus::Unmapped;
             mapping
         });
@@ -5210,7 +5211,7 @@ mod tests {
         let fragment = deterministic_read(300);
         let index = rescue_runtime_index(&[("a", &fragment)]);
         let read2 = read2_with_unaligned_end(&fragment, 15);
-        let (a1, _) = fragment_placements("a", 0);
+        let (a1, _) = fragment_placements(&index, "a", 0);
 
         // Without gaps as well: the aligned part of the read is compared, not
         // its first bases.
@@ -5241,7 +5242,7 @@ mod tests {
         let mut target = fragment[200..].to_vec();
         target.remove(50);
         let read2 = revcomp(&target);
-        let (a1, _) = fragment_placements("a", 0);
+        let (a1, _) = fragment_placements(&index, "a", 0);
         let params = MapParams {
             long_read_chaining: true,
             ..short_test_params()
@@ -5261,7 +5262,7 @@ mod tests {
     fn rescue_accepts_what_seeding_accepts() {
         let fragment = deterministic_read(300);
         let index = rescue_runtime_index(&[("a", &fragment)]);
-        let (a1, _) = fragment_placements("a", 0);
+        let (a1, _) = fragment_placements(&index, "a", 0);
 
         // 70 of 100 bases align: above the mapped-fraction cutoff of 0.5.
         let rescued = rescue_beside(
@@ -5302,7 +5303,7 @@ mod tests {
         }
         let reference = [&fragment[..200], &whole, &fragment[..50], &partial].concat();
         let index = rescue_runtime_index(&[("a", &reference)]);
-        let (a1, _) = fragment_placements("a", 0);
+        let (a1, _) = fragment_placements(&index, "a", 0);
 
         let rescued = rescue_beside(&revcomp(target), &index, &a1, short_test_params());
         assert_eq!(rescued.len(), 1, "{rescued:?}");
@@ -5319,8 +5320,8 @@ mod tests {
         let index = rescue_runtime_index(&[("a", &fragment), ("b", &fragment)]);
         let read2 = revcomp(&fragment[200..]);
         // Both references belong to one taxon, which pairs properly on "a".
-        let (a1, a2) = fragment_placements("a", 7);
-        let (b1, _) = fragment_placements("b", 7);
+        let (a1, a2) = fragment_placements(&index, "a", 7);
+        let (b1, _) = fragment_placements(&index, "b", 7);
         let mut profile = MapProfile::default();
 
         let rescued = rescue_competing(&read2, &index, &[b1, a1], &[a2], 8, &mut profile);
@@ -5333,9 +5334,9 @@ mod tests {
         let fragment = deterministic_read(300);
         let index = rescue_runtime_index(&[("a", &fragment), ("b", &fragment), ("c", &fragment)]);
         let read2 = revcomp(&fragment[200..]);
-        let (a1, a2) = fragment_placements("a", 0);
-        let (b1, _) = fragment_placements("b", 1);
-        let (c1, _) = fragment_placements("c", 2);
+        let (a1, a2) = fragment_placements(&index, "a", 0);
+        let (b1, _) = fragment_placements(&index, "b", 1);
+        let (c1, _) = fragment_placements(&index, "c", 2);
         let mates = [a1, b1, c1];
         let own = [a2];
         let refs = |rescued: &[Mapping]| {
@@ -5699,6 +5700,7 @@ mod tests {
         Mapping {
             read_id: read_id.to_string(),
             ref_id: ref_id.to_string(),
+            ref_index: 0,
             ref_start,
             ref_end,
             identity,
