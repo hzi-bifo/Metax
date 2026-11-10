@@ -37,6 +37,7 @@
 //! - `TaxonCoverage`: Coverage metrics aggregated at the terminal taxon
 //! - `ReadAssignment`: Final taxonomic assignment for a read
 
+use std::cell::OnceCell;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::fs::File;
@@ -85,7 +86,7 @@ use super::{
     log_resolved_profiler_parameters, parse_reference_taxonomy, push_string_keyed_value,
     record_genome_sampling_scale, record_reference_taxonomy_adjustment, sampling_scale_from_sizes,
     scale_automatic_chunk_breadth, strip_pair_suffix, ProfileMode, ProfileRank, ProfilerConfig,
-    ReadSupport, ReferenceTaxonomyAdjustments, ReferenceTaxonomyResolver,
+    ReadSupport, ReferenceTaxonomy, ReferenceTaxonomyAdjustments, ReferenceTaxonomyResolver,
     ResolvedProfilerParameters, StableReadMap,
 };
 
@@ -189,18 +190,44 @@ struct AccKey {
 /// avoidable allocator and hash-table work. This cache moves that work to DB
 /// load time, where each reference is parsed once.
 #[derive(Clone, Debug)]
-struct MetamReferenceEntry {
+/// A database reference as the mapping loader needs it; values shared by its
+/// genome are in [`MetamAssembly`].
+struct MetamReferenceEntry<'a> {
     ref_len: usize,
-    asm: Arc<str>,
-    acc: Arc<str>,
+    contig: &'a str,
+    /// The contig name that this reference's alignments share, made when a
+    /// mapping first lands on the reference: in a large database most
+    /// references never receive one.
+    acc: OnceCell<Arc<str>>,
     profile_taxid: u32,
     profile_rank: ProfileRank,
-    reference_id: u32,
     assembly_id: u32,
-    sampling_scale: f32,
+    is_marker: bool,
+}
+
+/// Values of a genome that every mapping record on it needs.
+struct MetamAssembly {
+    asm: Arc<str>,
     asm_len: f64,
     flex_len: usize,
-    is_marker: bool,
+    sampling_scale: f32,
+}
+
+/// The references that mapping records name, found by name and indexed by
+/// reference id. A reference whose genome has no length has no entry, and
+/// records on it are skipped.
+struct MetamReferences<'a> {
+    ids: HashMap<&'a str, u32>,
+    entries: Vec<Option<MetamReferenceEntry<'a>>>,
+    assemblies: Vec<MetamAssembly>,
+}
+
+impl<'a> MetamReferences<'a> {
+    fn get(&self, name: &str) -> Option<(u32, &MetamReferenceEntry<'a>, &MetamAssembly)> {
+        let id = *self.ids.get(name)?;
+        let entry = self.entries[id as usize].as_ref()?;
+        Some((id, entry, &self.assemblies[entry.assembly_id as usize]))
+    }
 }
 
 /// Statistics about alignment filtering.
@@ -575,22 +602,36 @@ impl CommunityProfiler {
         let mut taxonomy_resolver = ReferenceTaxonomyResolver::new(&self.taxonomy);
         let has_marker_genomes = db.uniform_reference_type() != Some(ReferenceType::Genome);
         let mut taxids_with_genomes: HashSet<u32> = HashSet::new();
+        // The references of a genome share its taxonomy field, so a field
+        // equal to the previous one is not parsed again.
+        let mut previous_taxonomy: Option<(&str, ReferenceTaxonomy)> = None;
         for reference in &db.references {
-            let declared_taxonomy = parse_reference_taxonomy(&reference.taxonomy_field)
-                .with_context(|| {
-                    format!(
-                        "invalid taxonomy metadata for reference '{}'",
-                        reference.name
-                    )
-                })?;
+            let declared_taxonomy = match previous_taxonomy {
+                Some((field, taxonomy)) if field == reference.taxonomy_field => taxonomy,
+                _ => {
+                    let taxonomy = parse_reference_taxonomy(&reference.taxonomy_field)
+                        .with_context(|| {
+                            format!(
+                                "invalid taxonomy metadata for reference '{}'",
+                                reference.name
+                            )
+                        })?;
+                    previous_taxonomy = Some((reference.taxonomy_field.as_str(), taxonomy));
+                    taxonomy
+                }
+            };
             let taxonomy = taxonomy_resolver.resolve(declared_taxonomy, &reference.name)?;
             record_reference_taxonomy_adjustment(
                 &mut taxonomy_adjustments,
                 declared_taxonomy,
                 taxonomy,
             );
-            let asm = reference.genome.clone();
-            *asm_lengths_raw.entry(asm).or_insert(0.0) += reference.length as f64;
+            match asm_lengths_raw.get_mut(reference.genome.as_str()) {
+                Some(length) => *length += reference.length as f64,
+                None => {
+                    asm_lengths_raw.insert(reference.genome.clone(), reference.length as f64);
+                }
+            }
             profile_taxids.insert(taxonomy.profile_taxid);
             if reference.reference_type == ReferenceType::Genome {
                 taxids_with_genomes.insert(taxonomy.profile_taxid);
@@ -680,52 +721,57 @@ impl CommunityProfiler {
                 fractional: db_is_subsampled,
             })
         });
-        let mut metam_refs: HashMap<String, MetamReferenceEntry> =
-            HashMap::with_capacity(db.references.len());
+        let assemblies = assembly_names
+            .iter()
+            .map(|asm| MetamAssembly {
+                asm: Arc::clone(asm),
+                asm_len: asm_lengths_raw.get(&**asm).copied().unwrap_or(0.0),
+                flex_len: asm_flex_lengths
+                    .get(&**asm)
+                    .copied()
+                    .unwrap_or(fixed_flank_len),
+                sampling_scale: genome_sampling_scales.get(&**asm).copied().unwrap_or(1.0) as f32,
+            })
+            .collect::<Vec<_>>();
+        let mut metam_refs = MetamReferences {
+            ids: HashMap::with_capacity(db.references.len()),
+            entries: Vec::with_capacity(db.references.len()),
+            assemblies,
+        };
         for (reference_index, (reference, taxonomy)) in
             db.references.iter().zip(&reference_taxonomies).enumerate()
         {
-            let asm = reference.genome.as_str();
+            let assembly_id = assembly_ids[reference.genome.as_str()];
+            let has_length = metam_refs.assemblies[assembly_id as usize].asm_len > 0.0;
+            if !has_length {
+                metam_refs.entries.push(None);
+                continue;
+            }
             let raw_profile_taxid = taxonomy.profile_taxid;
-            let acc = reference.contig.as_str();
-            let asm_len = match asm_lengths_raw.get(asm).copied() {
-                Some(value) if value > 0.0 => value,
-                _ => continue,
-            };
             let profile_taxid = species_normalize
                 .get(&raw_profile_taxid)
                 .copied()
                 .unwrap_or(raw_profile_taxid);
-            let flex_len = asm_flex_lengths
-                .get(asm)
-                .copied()
-                .unwrap_or(fixed_flank_len);
-            let sampling_scale = genome_sampling_scales.get(asm).copied().unwrap_or(1.0) as f32;
             let reference_id = u32::try_from(reference_index)
                 .context("database contains more than 2^32 references")?;
-            let assembly_id = assembly_ids[asm];
-            if metam_refs.contains_key(&reference.name) {
-                bail!(
+            match metam_refs.ids.entry(reference.name.as_str()) {
+                Entry::Occupied(_) => bail!(
                     "database metadata contains duplicate reference name '{}'",
                     reference.name
-                );
+                ),
+                Entry::Vacant(slot) => {
+                    slot.insert(reference_id);
+                }
             }
-            metam_refs.insert(
-                reference.name.clone(),
-                MetamReferenceEntry {
-                    ref_len: reference.length,
-                    asm: Arc::<str>::from(asm),
-                    acc: Arc::<str>::from(acc),
-                    profile_taxid,
-                    profile_rank: taxonomy.profile_rank,
-                    reference_id,
-                    assembly_id,
-                    sampling_scale,
-                    asm_len,
-                    flex_len,
-                    is_marker: reference.reference_type == ReferenceType::Markers,
-                },
-            );
+            metam_refs.entries.push(Some(MetamReferenceEntry {
+                ref_len: reference.length,
+                contig: reference.contig.as_str(),
+                acc: OnceCell::new(),
+                profile_taxid,
+                profile_rank: taxonomy.profile_rank,
+                assembly_id,
+                is_marker: reference.reference_type == ReferenceType::Markers,
+            }));
         }
 
         let mut read_map: StableReadMap<AlignmentEntry> = StableReadMap::default();
@@ -911,13 +957,13 @@ impl CommunityProfiler {
     fn entry_from_metam_mapping<'a>(
         &self,
         mapping: MetamMappingRecord<'a>,
-        metam_refs: &HashMap<String, MetamReferenceEntry>,
+        metam_refs: &MetamReferences,
         fixed_flank_len: usize,
     ) -> Option<(&'a str, AlignmentEntry)> {
         if self.cfg.is_paired && !mapping.is_paired_evidence() {
             return None;
         }
-        let reference = metam_refs.get(mapping.ref_id)?;
+        let (reference_id, reference, assembly) = metam_refs.get(mapping.ref_id)?;
         if reference.ref_len == 0 || mapping.read_len == 0 || mapping.mapped_bases == 0 {
             return None;
         }
@@ -929,9 +975,9 @@ impl CommunityProfiler {
         let fixed_chunk_end = end
             .saturating_add(fixed_flank_len)
             .min(reference.ref_len.saturating_add(1));
-        let flex_chunk_start = midpoint.saturating_sub(reference.flex_len).max(1);
+        let flex_chunk_start = midpoint.saturating_sub(assembly.flex_len).max(1);
         let flex_chunk_end = midpoint
-            .saturating_add(reference.flex_len)
+            .saturating_add(assembly.flex_len)
             .min(reference.ref_len.saturating_add(1));
         let fraction = (mapping.mapped_bases as f64 / mapping.read_len as f64).min(1.0);
         let read_name: &'a str = if self.cfg.is_paired {
@@ -942,11 +988,11 @@ impl CommunityProfiler {
         Some((
             read_name,
             AlignmentEntry {
-                asm: Arc::clone(&reference.asm),
-                acc: Arc::clone(&reference.acc),
+                asm: Arc::clone(&assembly.asm),
+                acc: Arc::clone(reference.acc.get_or_init(|| Arc::from(reference.contig))),
                 profile_taxid: reference.profile_taxid,
                 profile_rank: reference.profile_rank,
-                reference_id: reference.reference_id,
+                reference_id,
                 assembly_id: reference.assembly_id,
                 role: if self.cfg.is_paired {
                     match mapping.mate_number {
@@ -959,8 +1005,8 @@ impl CommunityProfiler {
                 },
                 pair_id: mapping.pair_id,
                 candidate_boundary: mapping.candidate_boundary,
-                sampling_scale: reference.sampling_scale,
-                asm_len: reference.asm_len,
+                sampling_scale: assembly.sampling_scale,
+                asm_len: assembly.asm_len,
                 identity: mapping.identity as f32,
                 fraction: fraction as f32,
                 mapped_len: clamp_u32(mapping.mapped_bases),
