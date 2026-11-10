@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
-    io::{copy, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{copy, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process,
     time::{SystemTime, UNIX_EPOCH},
@@ -1839,8 +1839,8 @@ fn read_partition(path: &Path) -> Result<Vec<RawSeed>> {
 
 pub fn read_index(path: &str) -> Result<Index> {
     let file = File::open(path).with_context(|| format!("failed to open index {path}"))?;
-    let reader = BufReader::new(file);
-    let mut decoder = zstd::stream::Decoder::new(reader)
+    let compressed = BufReader::with_capacity(INDEX_CACHE_IO_BUFFER_BYTES, file);
+    let mut decoder = buffered_index_decoder(compressed)
         .with_context(|| format!("invalid or unsupported index compression in {path}"))?;
     let index =
         read_index_payload(&mut decoder).with_context(|| format!("invalid index {path}"))?;
@@ -1885,6 +1885,19 @@ where
         }
     }
     read_index(path).map(LoadedIndex::Owned)
+}
+
+/// The decompressed index stream, buffered: the payload is read largely as
+/// varints, one byte at a time, and each unbuffered read is a call into the
+/// zstd decoder.
+fn buffered_index_decoder<R: BufRead>(
+    compressed: R,
+) -> Result<BufReader<zstd::stream::Decoder<'static, R>>> {
+    let decoder = zstd::stream::Decoder::with_buffer(compressed)?;
+    Ok(BufReader::with_capacity(
+        INDEX_CACHE_IO_BUFFER_BYTES,
+        decoder,
+    ))
 }
 
 fn index_source_fingerprint(path: &str) -> Result<IndexSourceFingerprint> {
@@ -1938,7 +1951,7 @@ where
             on_progress: &mut on_progress,
         };
         let source_reader = BufReader::with_capacity(INDEX_CACHE_IO_BUFFER_BYTES, source_reader);
-        let mut decoder = zstd::stream::Decoder::new(source_reader)
+        let mut decoder = buffered_index_decoder(source_reader)
             .with_context(|| format!("invalid or unsupported index compression in {index_path}"))?;
         let cache_file = OpenOptions::new()
             .create(true)
