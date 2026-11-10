@@ -2454,6 +2454,10 @@ fn identity(
         IdentityMode::Gapped => {
             if fast_long_read_identity && query.len().max(ref_end - ref_start) > 512 {
                 fast_edit_identity(query, reference, ref_start, ref_end, ignore_n, workspace)
+            } else if fast_long_read_identity {
+                // A long read's interval of equal length on both sides may
+                // still hold an insertion and a deletion that cancel.
+                gapped_alignment_identity(query, reference, ref_start, ref_end, ignore_n)
             } else {
                 gapped_identity(query, reference, ref_start, ref_end, ignore_n)
             }
@@ -2553,6 +2557,20 @@ fn gapped_identity(
     if n == m && n <= 512 {
         return ungapped_identity(query, reference, ref_start, ref_end, ignore_n);
     }
+    gapped_alignment_identity(query, reference, ref_start, ref_end, ignore_n)
+}
+
+/// Identity of the best gapped alignment of the whole `query` with
+/// `reference[ref_start..ref_end]`.
+fn gapped_alignment_identity(
+    query: &[u8],
+    reference: &ReferenceView<'_>,
+    ref_start: usize,
+    ref_end: usize,
+    ignore_n: bool,
+) -> Identity {
+    let n = query.len();
+    let m = ref_end - ref_start;
     if n == 0 || m == 0 {
         return Identity {
             matches: 0,
@@ -4713,6 +4731,37 @@ mod tests {
         } else {
             b'A'
         }
+    }
+
+    #[test]
+    fn long_reads_align_equal_length_intervals_with_gaps() {
+        let sequence = deterministic_read(300);
+        let owned = owned_reference("gene", &sequence);
+        let reference = ReferenceView::Owned(&owned);
+        // One deletion and, 100 bases later, one insertion: the read spans as
+        // many bases as the reference interval, with 100 bases out of frame.
+        let mut read = sequence[0..300].to_vec();
+        read.remove(100);
+        read.insert(199, b'T');
+        assert_eq!(read.len(), 300);
+        let read = codes(&read);
+        let mut workspace = EditDistanceWorkspace::default();
+        let mut score = |fast_long_read_identity| {
+            identity(
+                &read,
+                &reference,
+                0,
+                300,
+                false,
+                IdentityMode::Gapped,
+                fast_long_read_identity,
+                &mut workspace,
+            )
+            .value
+        };
+        assert!(score(true) > 0.99, "{}", score(true));
+        // Short reads keep the ungapped comparison.
+        assert!(score(false) < 0.8, "{}", score(false));
     }
 
     #[test]
