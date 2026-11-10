@@ -821,7 +821,9 @@ impl SeedLookupMode {
 
 #[derive(Clone, Debug)]
 struct MappedReferenceMeta {
-    id: String,
+    /// Byte range of the reference name in the cache, checked to be UTF-8 when
+    /// the cache is opened.
+    id: std::ops::Range<usize>,
     len: u64,
     packed: std::ops::Range<usize>,
     mask_entries: std::ops::Range<usize>,
@@ -1063,7 +1065,7 @@ impl LoadedIndex {
     pub fn reference_id(&self, ref_id: u32) -> &str {
         match self {
             Self::Owned(index) => &index.references[ref_id as usize].id,
-            Self::Mapped(index) => &index.references[ref_id as usize].id,
+            Self::Mapped(index) => index.reference_name(&index.references[ref_id as usize]),
         }
     }
 
@@ -2946,7 +2948,8 @@ impl MappedIndex {
         let mut found_total_reference_bases = 0u64;
         let mut longest_reference = 0u64;
         for _ in 0..ref_count {
-            let id = reference_metadata.read_string()?;
+            let id = reference_metadata.read_str_range()?;
+            let id = reference_metadata_offset + id.start..reference_metadata_offset + id.end;
             let len = reference_metadata.read_u64()?;
             longest_reference = longest_reference.max(len);
             let packed_len = reference_metadata.read_u64()?;
@@ -3288,11 +3291,16 @@ impl MappedIndex {
         Ok(())
     }
 
+    fn reference_name(&self, meta: &MappedReferenceMeta) -> &str {
+        std::str::from_utf8(&self.mmap.as_slice()[meta.id.clone()])
+            .expect("reference names are checked when the cache is opened")
+    }
+
     fn reference(&self, ref_id: u32) -> MappedReference<'_> {
         let meta = &self.references[ref_id as usize];
         let bytes = self.mmap.as_slice();
         MappedReference {
-            id: &meta.id,
+            id: self.reference_name(meta),
             len: meta.len,
             packed_bases: &bytes[meta.packed.clone()],
             mask: MappedMask {
@@ -3529,6 +3537,14 @@ impl<'a> CacheCursor<'a> {
 
     fn read_string(&mut self) -> Result<String> {
         Ok(String::from_utf8(self.read_bytes()?.to_vec())?)
+    }
+
+    /// The position of a length-prefixed string, checked to be UTF-8 but not
+    /// copied.
+    fn read_str_range(&mut self) -> Result<std::ops::Range<usize>> {
+        let bytes = self.read_bytes()?;
+        std::str::from_utf8(bytes)?;
+        Ok(self.pos - bytes.len()..self.pos)
     }
 
     fn read_bytes(&mut self) -> Result<&'a [u8]> {
