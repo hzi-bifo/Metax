@@ -174,7 +174,6 @@ impl DatabaseMetadata {
     /// rows hash as before reference types existed, so databases of genomes
     /// keep their fingerprint.
     pub fn fingerprint(&self) -> u128 {
-        use std::fmt::Write as _;
         use xxhash_rust::xxh3::Xxh3;
 
         let mut hasher = Xxh3::new();
@@ -183,32 +182,55 @@ impl DatabaseMetadata {
         } else {
             b"absolute\n"
         });
-        let mut row = String::new();
+        let mut row = Vec::new();
         for reference in &self.references {
             row.clear();
             // Tab-delimited canonical identity, mirroring metax_db.tsv.gz columns.
-            let _ = write!(
-                row,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                reference.name,
+            row.extend_from_slice(reference.name.as_bytes());
+            for value in [
                 reference.length,
                 reference.full_genome_size,
                 reference.effective_indexed_size,
-                reference.genome,
-                reference.contig,
-                reference.taxonomy_field,
-            );
+            ] {
+                row.push(b'\t');
+                push_decimal(&mut row, value);
+            }
+            for text in [
+                &reference.genome,
+                &reference.contig,
+                &reference.taxonomy_field,
+            ] {
+                row.push(b'\t');
+                row.extend_from_slice(text.as_bytes());
+            }
             if reference.reference_type != ReferenceType::Genome {
-                let _ = write!(row, "\t{}", reference.reference_type);
+                row.push(b'\t');
+                row.extend_from_slice(reference.reference_type.as_str().as_bytes());
             }
             if let Some(size) = reference.declared_genome_size {
-                let _ = write!(row, "\t{size}");
+                row.push(b'\t');
+                push_decimal(&mut row, size);
             }
-            row.push('\n');
-            hasher.update(row.as_bytes());
+            row.push(b'\n');
+            hasher.update(&row);
         }
         hasher.digest128()
     }
+}
+
+/// Append `value` in decimal, as `Display` writes it.
+fn push_decimal(out: &mut Vec<u8>, mut value: usize) {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[start..]);
 }
 
 #[derive(Clone, Debug)]
@@ -2423,6 +2445,65 @@ mod tests {
             hasher.update(row.as_bytes());
         }
         assert_eq!(loaded.fingerprint(), hasher.digest128());
+    }
+
+    #[test]
+    fn fingerprint_hashes_the_formatted_rows() {
+        use std::fmt::Write as _;
+        let reference =
+            |name: &str, length, reference_type, declared_genome_size| ReferenceMetadata {
+                name: name.to_string(),
+                length,
+                genome: "G1".to_string(),
+                contig: format!("{name}_contig"),
+                full_genome_size: 1_000_000_007,
+                effective_indexed_size: 10,
+                taxonomy_field: "t:436646856;s:2056026598".to_string(),
+                reference_type,
+                declared_genome_size,
+            };
+        for is_fractional in [false, true] {
+            let database = DatabaseMetadata {
+                metam_index: PathBuf::from("index.mxi"),
+                references: vec![
+                    reference("a", 1, ReferenceType::Genome, None),
+                    reference("b", 987_654_321, ReferenceType::Markers, Some(2_540_361)),
+                    reference("c", 9, ReferenceType::Markers, None),
+                    reference("d", usize::MAX, ReferenceType::Genome, None),
+                ],
+                is_fractional,
+            };
+            let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+            hasher.update(if is_fractional {
+                b"fractional\n"
+            } else {
+                b"absolute\n"
+            });
+            for r in &database.references {
+                let mut row = String::new();
+                write!(
+                    row,
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    r.name,
+                    r.length,
+                    r.full_genome_size,
+                    r.effective_indexed_size,
+                    r.genome,
+                    r.contig,
+                    r.taxonomy_field
+                )
+                .unwrap();
+                if r.reference_type != ReferenceType::Genome {
+                    write!(row, "\t{}", r.reference_type).unwrap();
+                }
+                if let Some(size) = r.declared_genome_size {
+                    write!(row, "\t{size}").unwrap();
+                }
+                row.push('\n');
+                hasher.update(row.as_bytes());
+            }
+            assert_eq!(database.fingerprint(), hasher.digest128());
+        }
     }
 
     #[test]

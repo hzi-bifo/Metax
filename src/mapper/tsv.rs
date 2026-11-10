@@ -281,17 +281,28 @@ pub struct MappingDatabaseSummary {
     pub fingerprint: u128,
 }
 
+/// Number of distinct genomes. The references of a genome are usually
+/// consecutive, so a row naming the previous row's genome is skipped before
+/// the set is consulted.
+fn distinct_genomes(database: &DatabaseMetadata) -> usize {
+    let mut genomes = HashSet::new();
+    let mut previous: Option<&str> = None;
+    for reference in &database.references {
+        let genome = reference.genome.as_str();
+        if previous != Some(genome) {
+            genomes.insert(genome);
+            previous = Some(genome);
+        }
+    }
+    genomes.len()
+}
+
 impl MappingDatabaseSummary {
     pub fn from_database(database: &DatabaseMetadata) -> Self {
         Self {
             is_fractional: database.is_fractional,
             sequences: database.references.len(),
-            genomes: database
-                .references
-                .iter()
-                .map(|reference| reference.genome.as_str())
-                .collect::<HashSet<_>>()
-                .len(),
+            genomes: distinct_genomes(database),
             fingerprint: database.fingerprint(),
         }
     }
