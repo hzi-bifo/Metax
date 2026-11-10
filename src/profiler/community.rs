@@ -3189,19 +3189,27 @@ fn resolve_coordinate_evidence(
             (*key, genome)
         })
         .collect();
-    let baseline_best_fit = report_best_fit(
+    let best_fit = report_best_fit(
         &mut baseline_decisions,
         baseline_evaluations.iter().copied(),
         &support,
     );
+    // The result without guarded MAP, and the reference that MAP may only add to.
+    let baseline = CoordinateEvidenceResult {
+        decisions: baseline_decisions,
+        selected_taxa: baseline_selected,
+        best_fit,
+    };
 
     if !policy.collect_exact_ties {
         if cfg.verbose || cfg.very_verbose {
-            let standard = baseline_decisions
+            let standard = baseline
+                .decisions
                 .values()
                 .filter(|decision| decision.standard)
                 .count();
-            let rescued = baseline_decisions
+            let rescued = baseline
+                .decisions
                 .values()
                 .filter(|decision| decision.rescued())
                 .count();
@@ -3209,17 +3217,13 @@ fn resolve_coordinate_evidence(
                 target: "PROFILER",
                 "Resolved coordinate evidence ({}) selected {} terminal taxa ({} standard, {} rescue) from {} assembly-coherent witnesses.",
                 policy.mode.label(),
-                baseline_selected.len(),
+                baseline.selected_taxa.len(),
                 standard,
                 rescued,
                 baseline_witness_count,
             );
         }
-        return Ok(CoordinateEvidenceResult {
-            decisions: baseline_decisions,
-            selected_taxa: baseline_selected,
-            best_fit: baseline_best_fit,
-        });
+        return Ok(baseline);
     }
 
     // This is also checked by the CLI, but library callers receive a safe
@@ -3229,21 +3233,13 @@ fn resolve_coordinate_evidence(
             target: "PROFILER",
             "Guarded short-read MAP requires native Illumina evidence and a positive active chunk-breadth cutoff; exact ties remain ambiguous."
         );
-        return Ok(CoordinateEvidenceResult {
-            decisions: baseline_decisions,
-            selected_taxa: baseline_selected,
-            best_fit: baseline_best_fit,
-        });
+        return Ok(baseline);
     }
 
     let exact_ties = std::mem::take(&mut assignment.exact_ties);
     let exact_tie_count = exact_ties.fragment_count();
     if exact_tie_count == 0 {
-        return Ok(CoordinateEvidenceResult {
-            decisions: baseline_decisions,
-            selected_taxa: baseline_selected,
-            best_fit: baseline_best_fit,
-        });
+        return Ok(baseline);
     }
     // Guarded MAP is a calibrated species-only policy. Higher-rank terminal
     // endpoints remain in abundance EM but must never seed or receive MAP
@@ -3262,11 +3258,7 @@ fn resolve_coordinate_evidence(
         cfg.max_em_iterations,
     );
     if priors.is_empty() {
-        return Ok(CoordinateEvidenceResult {
-            decisions: baseline_decisions,
-            selected_taxa: baseline_selected,
-            best_fit: baseline_best_fit,
-        });
+        return Ok(baseline);
     }
     let baseline_by_key = baseline_evaluations
         .iter()
@@ -3346,9 +3338,9 @@ fn resolve_coordinate_evidence(
             .collect::<Vec<_>>()
     });
     let mut post_decisions = strongest_witnesses(&post_evaluations);
-    let mut selected_taxa = baseline_selected.clone();
+    let mut selected_taxa = baseline.selected_taxa.clone();
     let additions = guarded_map_additions(
-        &baseline_selected,
+        &baseline.selected_taxa,
         &baseline_by_key,
         &post_evaluations,
         safeguard_min_chunk_breadth,
@@ -3367,13 +3359,13 @@ fn resolve_coordinate_evidence(
     }
     // MAP is monotonic. If added conserved intervals make an upper-ratio or
     // p-value statistic fail, retain the baseline witness and its metrics.
-    for &taxid in &baseline_selected {
+    for &taxid in &baseline.selected_taxa {
         let post_still_passes = post_decisions
             .get(&taxid)
             .is_some_and(|decision| decision.accepted());
         if !post_still_passes {
-            if let Some(&baseline) = baseline_decisions.get(&taxid) {
-                post_decisions.insert(taxid, baseline);
+            if let Some(&decision) = baseline.decisions.get(&taxid) {
+                post_decisions.insert(taxid, decision);
             }
         }
     }
@@ -3389,17 +3381,17 @@ fn resolve_coordinate_evidence(
         .iter()
         .copied()
         .filter(|&(key, post)| {
-            baseline_selected.contains(&key.taxid)
+            baseline.selected_taxa.contains(&key.taxid)
                 || map_addition_qualifies(
                     key,
                     post,
-                    &baseline_selected,
+                    &baseline.selected_taxa,
                     &baseline_by_key,
                     safeguard_min_chunk_breadth,
                 )
         })
         .chain(baseline_evaluations.iter().copied().filter(|(key, _)| {
-            baseline_selected.contains(&key.taxid) && !passes_after_map.contains(&key.taxid)
+            baseline.selected_taxa.contains(&key.taxid) && !passes_after_map.contains(&key.taxid)
         }));
     let best_fit = report_best_fit(&mut post_decisions, deciding, &support);
 
@@ -3428,7 +3420,7 @@ fn resolve_coordinate_evidence(
             exact_tie_count,
             resolved_ties,
             posterior_mean,
-            baseline_selected.len(),
+            baseline.selected_taxa.len(),
             guarded_additions,
             low_abundance_additions,
             selected_taxa.len(),
