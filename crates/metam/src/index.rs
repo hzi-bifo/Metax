@@ -1475,6 +1475,7 @@ where
         &seed_store_path,
         exact_randstrobe_match.then_some(fingerprint_store_path.as_path()),
         out_path,
+        threads,
     )?;
     std::fs::remove_dir_all(&temp_dir).with_context(|| {
         format!(
@@ -1497,7 +1498,7 @@ where
 }
 
 pub fn write_index(index: &Index, path: &str) -> Result<()> {
-    write_compressed_index_atomic(Path::new(path), |encoder| {
+    write_compressed_index_atomic(Path::new(path), 1, |encoder| {
         write_index_payload(encoder, index)
     })
 }
@@ -3904,8 +3905,9 @@ fn write_streamed_index_payload(
     seed_store_path: &Path,
     fingerprint_store_path: Option<&Path>,
     out_path: &str,
+    threads: usize,
 ) -> Result<()> {
-    write_compressed_index_atomic(Path::new(out_path), |encoder| {
+    write_compressed_index_atomic(Path::new(out_path), threads, |encoder| {
         write_index_metadata(encoder, header)?;
         write_varint(encoder, header.reference_count as u64)?;
         let mut ref_store = BufReader::new(File::open(ref_store_path)?);
@@ -3922,7 +3924,10 @@ fn write_streamed_index_payload(
     })
 }
 
-fn write_compressed_index_atomic<F>(path: &Path, write_payload: F) -> Result<()>
+/// Write an index through zstd into a sibling file, then rename it over
+/// `path`. With more than one thread, zstd compresses parts of the payload
+/// in parallel; the decompressed payload is the same.
+fn write_compressed_index_atomic<F>(path: &Path, threads: usize, write_payload: F) -> Result<()>
 where
     F: FnOnce(&mut zstd::stream::write::Encoder<'static, BufWriter<File>>) -> Result<()>,
 {
@@ -3946,6 +3951,16 @@ where
             path.display()
         )
     })?;
+    if threads > 1 {
+        encoder
+            .multithread(u32::try_from(threads).unwrap_or(u32::MAX))
+            .with_context(|| {
+                format!(
+                    "failed to start {threads} zstd threads for index {}",
+                    path.display()
+                )
+            })?;
+    }
     write_payload(&mut encoder)?;
     let mut writer = encoder
         .finish()
@@ -4943,12 +4958,36 @@ mod tests {
     }
 
     #[test]
+    fn threaded_index_compression_keeps_the_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let payload = (0..3 << 20)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                b"ACGT"[(state >> 62) as usize]
+            })
+            .collect::<Vec<_>>();
+        for threads in [1, 4] {
+            let path = directory.path().join(format!("index-{threads}.mxi"));
+            write_compressed_index_atomic(&path, threads, |encoder| {
+                encoder.write_all(&payload)?;
+                Ok(())
+            })
+            .unwrap();
+            let decoded = zstd::stream::decode_all(File::open(&path).unwrap()).unwrap();
+            assert!(decoded == payload, "{threads} threads");
+        }
+    }
+
+    #[test]
     fn failed_atomic_index_write_preserves_existing_index() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("index.mxi");
         std::fs::write(&path, b"existing-index").unwrap();
 
-        let error = write_compressed_index_atomic(&path, |encoder| {
+        let error = write_compressed_index_atomic(&path, 1, |encoder| {
             encoder.write_all(b"incomplete replacement")?;
             bail!("injected payload failure")
         })
