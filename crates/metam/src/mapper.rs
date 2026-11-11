@@ -469,7 +469,7 @@ struct CandidateAccumulator {
     last_q: Option<u32>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct Candidate {
     ref_id: u32,
     strand: i8,
@@ -707,7 +707,7 @@ fn marker_gene_read_parts(
         if part == next {
             parts.push(Vec::new());
         }
-        parts[part].push(candidate.clone());
+        parts[part].push(*candidate);
     }
     (parts.len() > 1).then_some(parts)
 }
@@ -733,10 +733,16 @@ fn select_mappings(
     });
     let best_score = candidates[0].score.max(1) as f64;
     let second_score = candidates.get(1).map(|c| c.score).unwrap_or(0);
+    let primary_limit = candidate_eval_limit(params);
+    order_tied_candidates_by_taxon(
+        &mut candidates,
+        primary_limit,
+        index,
+        &mut workspace.candidate_selection.profile_groups,
+    );
 
     let mut mappings = Vec::new();
     let mut evaluated = vec![false; candidates.len()];
-    let primary_limit = candidate_eval_limit(params);
     let primary_indices =
         select_score_ranked_candidates(&candidates, best_score, params.score_ratio, primary_limit);
     let mut candidate_evaluation_limited = score_ranked_candidate_limit_reached(
@@ -831,6 +837,42 @@ fn select_mappings(
         }
     }
     mappings
+}
+
+/// Order the candidates that tie in seed score at the evaluation limit so
+/// that the limit admits taxa not yet among the higher-scored candidates
+/// first: one candidate for each such taxon, then the rest, each in the
+/// given order. `candidates` are sorted by descending score.
+fn order_tied_candidates_by_taxon(
+    candidates: &mut [Candidate],
+    limit: usize,
+    index: &RuntimeIndex,
+    seen: &mut FastU32Set,
+) {
+    let (Some(last), Some(next)) = (
+        limit.checked_sub(1).and_then(|last| candidates.get(last)),
+        candidates.get(limit),
+    ) else {
+        return;
+    };
+    if last.score != next.score {
+        return;
+    }
+    let score = last.score;
+    let start = candidates.partition_point(|candidate| candidate.score > score);
+    let end = candidates.partition_point(|candidate| candidate.score >= score);
+    let taxon = |candidate: &Candidate| {
+        index
+            .reference_candidate_groups(candidate.ref_id)
+            .profile_taxon
+    };
+    seen.clear();
+    seen.extend(candidates[..start].iter().map(taxon));
+    let (mut leading, mut rest): (Vec<Candidate>, Vec<Candidate>) = candidates[start..end]
+        .iter()
+        .partition(|candidate| seen.insert(taxon(candidate)));
+    leading.append(&mut rest);
+    candidates[start..end].copy_from_slice(&leading);
 }
 
 fn dedup_mappings_preserve_order(mappings: &mut Vec<Mapping>) {
@@ -5774,6 +5816,63 @@ mod tests {
                 .map(|mapping| (mapping.ref_id.as_str(), mapping.rank))
                 .collect::<Vec<_>>(),
             [("more-bases", 1), ("fewer-bases", 2)]
+        );
+    }
+
+    #[test]
+    fn tied_candidates_at_the_evaluation_limit_lead_with_new_taxa() {
+        let sequence = deterministic_read(200);
+        let index = rescue_runtime_index(&[("a", &sequence), ("b", &sequence), ("c", &sequence)]);
+        let candidate = |ref_id, score, diag| Candidate {
+            ref_id,
+            strand: 1,
+            diag,
+            seed_count: 1,
+            score,
+            query_seed_start: 0,
+            query_seed_end: 10,
+            ref_seed_start: 0,
+            ref_seed_end: 10,
+        };
+        let mut seen = FastU32Set::default();
+        let mut candidates = vec![
+            candidate(0, 10, 0),
+            candidate(0, 5, 0),
+            candidate(0, 5, 2),
+            candidate(1, 5, 0),
+            candidate(2, 5, 0),
+            candidate(2, 5, 4),
+            candidate(1, 3, 0),
+        ];
+        order_tied_candidates_by_taxon(&mut candidates, 2, &index, &mut seen);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| (candidate.ref_id, candidate.score, candidate.diag))
+                .collect::<Vec<_>>(),
+            [
+                (0, 10, 0),
+                (1, 5, 0),
+                (2, 5, 0),
+                (0, 5, 0),
+                (0, 5, 2),
+                (2, 5, 4),
+                (1, 3, 0)
+            ]
+        );
+
+        // No tie at the limit: the order stays.
+        let before = candidates.clone();
+        order_tied_candidates_by_taxon(&mut candidates, 6, &index, &mut seen);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| (c.ref_id, c.diag))
+                .collect::<Vec<_>>(),
+            before
+                .iter()
+                .map(|c| (c.ref_id, c.diag))
+                .collect::<Vec<_>>()
         );
     }
 
