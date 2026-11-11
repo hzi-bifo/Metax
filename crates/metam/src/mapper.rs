@@ -3039,8 +3039,13 @@ pub fn apply_pair_awareness(
     score_against_mates(r1, r2, min_insert, max_insert, enabled);
     score_against_mates(r2, r1, min_insert, max_insert, enabled);
     if enabled {
-        r1.sort_unstable_by(|a, b| b.adjusted_score.cmp(&a.adjusted_score));
-        r2.sort_unstable_by(|a, b| b.adjusted_score.cmp(&a.adjusted_score));
+        let pair_order = |a: &Mapping, b: &Mapping| {
+            b.adjusted_score
+                .cmp(&a.adjusted_score)
+                .then_with(|| mapping_order(a, b))
+        };
+        r1.sort_by(pair_order);
+        r2.sort_by(pair_order);
         set_ranks(r1);
         set_ranks(r2);
     }
@@ -5752,6 +5757,24 @@ mod tests {
         limit_mappings(&mut mappings, 1);
         assert_eq!(mappings.len(), 1);
         assert!(mappings[0].candidate_boundary.is_complete());
+    }
+
+    #[test]
+    fn pair_awareness_orders_equal_adjusted_scores_by_mapping_quality() {
+        // Equal adjusted scores: the mapping with more mapped bases comes
+        // first, whatever the input order.
+        let mut r1 = vec![
+            test_mapping("read", "fewer-bases", 0, 90, 90, 1.0, 100),
+            test_mapping("read", "more-bases", 0, 100, 100, 1.0, 100),
+        ];
+        let mut r2 = Vec::new();
+        apply_pair_awareness(&mut r1, &mut r2, 0, 1_000, true);
+        assert_eq!(
+            r1.iter()
+                .map(|mapping| (mapping.ref_id.as_str(), mapping.rank))
+                .collect::<Vec<_>>(),
+            [("more-bases", 1), ("fewer-bases", 2)]
+        );
     }
 
     #[test]
