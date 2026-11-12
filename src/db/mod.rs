@@ -16,8 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::progress::{self, ProgressOptions};
 use crate::taxonomy::{
-    pack_dump, TaxonomyRecord, TaxonomySource, DATABASE_TAXDMP_ARCHIVE, DATABASE_TAXDMP_DIR,
-    TAXONOMY_RECORD_FILE,
+    pack_dump, DumpProvenance, TaxonomyRecord, TaxonomySource, DATABASE_TAXDMP_ARCHIVE,
+    DATABASE_TAXDMP_DIR, TAXONOMY_RECORD_FILE,
 };
 use metam::{
     index::{
@@ -386,9 +386,11 @@ pub fn build_database(
 
     let staging_path = create_database_staging_directory(outdir_path)?;
     let mut cleanup_staging = RemoveDirOnDrop::new(staging_path.clone());
-    if let Some((source, record)) = &taxonomy {
-        pack_dump(source.path(), &staging_path.join(DATABASE_TAXDMP_ARCHIVE))?;
-        record.write(&staging_path.join(TAXONOMY_RECORD_FILE))?;
+    if let Some((source, record)) = taxonomy {
+        let files = pack_dump(source.path(), &staging_path.join(DATABASE_TAXDMP_ARCHIVE))?;
+        record
+            .with_provenance(Some(DumpProvenance::now(files)))
+            .write(&staging_path.join(TAXONOMY_RECORD_FILE))?;
     }
     let force_sampled_field =
         requires_effective_size_reference_names(&selected, subsample.is_some());
@@ -512,8 +514,10 @@ pub fn attach_taxonomy(database: &Path, source: &TaxonomySource) -> Result<()> {
                 directory.display()
             )
         })?;
-    pack_dump(source.path(), &staging.path().join(DATABASE_TAXDMP_ARCHIVE))?;
-    record.write(&staging.path().join(TAXONOMY_RECORD_FILE))?;
+    let files = pack_dump(source.path(), &staging.path().join(DATABASE_TAXDMP_ARCHIVE))?;
+    record
+        .with_provenance(Some(DumpProvenance::now(files)))
+        .write(&staging.path().join(TAXONOMY_RECORD_FILE))?;
     let dump = directory.join(DATABASE_TAXDMP_ARCHIVE);
     fs::rename(staging.path().join(DATABASE_TAXDMP_ARCHIVE), &dump)
         .with_context(|| format!("failed to create {}", dump.display()))?;
@@ -2483,8 +2487,21 @@ mod tests {
         let stored_taxonomy = crate::taxonomy::Taxonomy::from_archive(&stored).unwrap();
         assert_eq!(stored_taxonomy.get_name(11), Some("Genus twenty A"));
         let record = TaxonomyRecord::load(&output.join(TAXONOMY_RECORD_FILE)).unwrap();
+        let provenance = record.provenance().unwrap();
+        assert_eq!(provenance.metax_version, env!("CARGO_PKG_VERSION"));
+        let nodes = std::fs::read(dump.join("nodes.dmp")).unwrap();
+        let nodes_sha256: String = ring::digest::digest(&ring::digest::SHA256, &nodes)
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         assert_eq!(
-            record,
+            provenance.files[0],
+            ("nodes.dmp".to_string(), nodes.len() as u64, nodes_sha256)
+        );
+        assert_eq!(provenance.files.len(), 4);
+        assert_eq!(
+            record.with_provenance(None),
             TaxonomyRecord::build(&stored_taxonomy, &BTreeSet::from([11, 20, 30])).unwrap()
         );
     }
@@ -2516,7 +2533,9 @@ mod tests {
         let stored =
             crate::taxonomy::Taxonomy::from_archive(&output.join(DATABASE_TAXDMP_ARCHIVE)).unwrap();
         assert_eq!(
-            TaxonomyRecord::load(&output.join(TAXONOMY_RECORD_FILE)).unwrap(),
+            TaxonomyRecord::load(&output.join(TAXONOMY_RECORD_FILE))
+                .unwrap()
+                .with_provenance(None),
             TaxonomyRecord::build(&stored, &BTreeSet::from([11, 20, 30])).unwrap()
         );
         let names = std::fs::read_dir(&output)

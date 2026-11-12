@@ -197,7 +197,8 @@ impl TaxonomySource {
 
 /// Pack the dump files in `source` into the new `.tar.gz` archive `target`,
 /// each under its own name and in the form it has there (plain or gzipped).
-pub(crate) fn pack_dump(source: &Path, target: &Path) -> Result<()> {
+/// Returns the name, size and SHA-256 of each packed file.
+pub(crate) fn pack_dump(source: &Path, target: &Path) -> Result<Vec<(String, u64, String)>> {
     let output = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -208,6 +209,7 @@ pub(crate) fn pack_dump(source: &Path, target: &Path) -> Result<()> {
         Compression::default(),
     );
     let mut archive = tar::Builder::new(encoder);
+    let mut packed = Vec::with_capacity(REQUIRED_DUMP_FILES.len());
     for name in REQUIRED_DUMP_FILES {
         let from = dump_file_path(source, name);
         let file =
@@ -224,12 +226,12 @@ pub(crate) fn pack_dump(source: &Path, target: &Path) -> Result<()> {
                 .map_or(0, |age| age.as_secs()),
         );
         let entry = from.file_name().expect("a dump file path ends in its name");
+        let mut reader = Sha256Reader {
+            inner: BufReader::with_capacity(IO_BUFFER_BYTES, file),
+            digest: ring::digest::Context::new(&ring::digest::SHA256),
+        };
         archive
-            .append_data(
-                &mut header,
-                entry,
-                BufReader::with_capacity(IO_BUFFER_BYTES, file),
-            )
+            .append_data(&mut header, entry, &mut reader)
             .with_context(|| {
                 format!(
                     "failed to pack {} into {}",
@@ -237,12 +239,35 @@ pub(crate) fn pack_dump(source: &Path, target: &Path) -> Result<()> {
                     target.display()
                 )
             })?;
+        let sha256 = reader
+            .digest
+            .finish()
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        packed.push((entry.to_string_lossy().into_owned(), metadata.len(), sha256));
     }
     archive
         .into_inner()
         .and_then(|encoder| encoder.finish())
         .and_then(|mut writer| writer.flush())
-        .with_context(|| format!("failed to finish {}", target.display()))
+        .with_context(|| format!("failed to finish {}", target.display()))?;
+    Ok(packed)
+}
+
+/// A reader that hashes what it reads.
+struct Sha256Reader<R> {
+    inner: R,
+    digest: ring::digest::Context,
+}
+
+impl<R: Read> Read for Sha256Reader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.digest.update(&buffer[..read]);
+        Ok(read)
+    }
 }
 
 fn dump_files_look_complete(directory: &Path) -> bool {

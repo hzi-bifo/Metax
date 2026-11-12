@@ -187,6 +187,8 @@ grep -q '^metadata_reference_count	1$' "$WORK/info.tsv"
 grep -q '^index_present	true$' "$WORK/info.tsv"
 grep -q '^taxonomy_dump	taxdmp.tar.gz$' "$WORK/info.tsv"
 grep -q '^taxonomy_record_taxa	2$' "$WORK/info.tsv"
+grep -q '^taxonomy_record_metax_version	' "$WORK/info.tsv"
+[[ "$(grep -c '^taxonomy_dump_file	' "$WORK/info.tsv")" == 4 ]]
 
 if run_metax index "$WORK/bad.fa" -o "$WORK/db_bad" "${COMMON_INDEX_ARGS[@]}" 2>"$WORK/bad.err"; then
   echo "malformed header unexpectedly succeeded" >&2

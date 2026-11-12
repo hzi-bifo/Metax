@@ -42,5 +42,7 @@ tempfile = "3.20"
 tar = { version = "0.4", default-features = false }
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
 rand = "0.8"
+# Already built for HTTPS downloads; used for SHA-256 checksums of stored dumps.
+ring = { version = "0.17", default-features = false }
 zstd = "0.13"
 metam = { path = "crates/metam" }

@@ -591,6 +591,7 @@ dependencies = [
  "metam",
  "rand",
  "rayon",
+ "ring",
  "statrs",
  "tar",
  "tempfile",

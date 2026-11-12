@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 pub use dump::TaxonomySource;
 pub(crate) use dump::{pack_dump, DATABASE_TAXDMP_ARCHIVE, DATABASE_TAXDMP_DIR};
-pub use record::{TaxonomyRecord, TAXONOMY_RECORD_FILE};
+pub use record::{DumpProvenance, TaxonomyRecord, TAXONOMY_RECORD_FILE};
 
 #[derive(Clone, Debug)]
 pub struct Taxonomy {

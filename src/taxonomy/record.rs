@@ -23,6 +23,29 @@ const LISTED_TAXIDS: usize = 10;
 pub struct TaxonomyRecord {
     /// (taxid, lineage hash), sorted by taxid.
     lineages: Vec<(u32, u64)>,
+    provenance: Option<DumpProvenance>,
+}
+
+/// Where a record's dump came from: the dump files stored with the database
+/// and the Metax version and time that recorded them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DumpProvenance {
+    pub metax_version: String,
+    /// UTC time, as `YYYY-MM-DDThh:mm:ssZ`.
+    pub created: String,
+    /// (file name, bytes, SHA-256) of each stored dump file.
+    pub files: Vec<(String, u64, String)>,
+}
+
+impl DumpProvenance {
+    /// Provenance of `files` recorded now by this Metax version.
+    pub fn now(files: Vec<(String, u64, String)>) -> Self {
+        Self {
+            metax_version: env!("CARGO_PKG_VERSION").to_string(),
+            created: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            files,
+        }
+    }
 }
 
 impl TaxonomyRecord {
@@ -44,7 +67,18 @@ impl TaxonomyRecord {
                 list_taxids(&missing)
             );
         }
-        Ok(Self { lineages })
+        Ok(Self {
+            lineages,
+            provenance: None,
+        })
+    }
+
+    pub fn with_provenance(self, provenance: Option<DumpProvenance>) -> Self {
+        Self { provenance, ..self }
+    }
+
+    pub fn provenance(&self) -> Option<&DumpProvenance> {
+        self.provenance.as_ref()
     }
 
     /// Number of recorded taxa.
@@ -61,6 +95,13 @@ impl TaxonomyRecord {
             File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
         let mut writer = GzEncoder::new(BufWriter::new(file), Compression::default());
         writeln!(writer, "#metax_taxonomy_version\t{RECORD_VERSION}")?;
+        if let Some(provenance) = &self.provenance {
+            writeln!(writer, "#metax_version\t{}", provenance.metax_version)?;
+            writeln!(writer, "#created\t{}", provenance.created)?;
+            for (name, bytes, sha256) in &provenance.files {
+                writeln!(writer, "#dump_file\t{name}\t{bytes}\t{sha256}")?;
+            }
+        }
         writeln!(writer, "#columns\t{COLUMNS}")?;
         for (taxid, hash) in &self.lineages {
             writeln!(writer, "{taxid}\t{hash:016x}")?;
@@ -97,9 +138,13 @@ impl TaxonomyRecord {
         if changed.is_empty() && missing.is_empty() {
             log::info!(
                 target: "TAXONOMY",
-                "The taxonomy dump in {} matches the database ({} taxa).",
+                "The taxonomy dump in {} matches the database ({} taxa{}).",
                 dump.display(),
-                self.len()
+                self.len(),
+                self.provenance.as_ref().map_or(String::new(), |provenance| format!(
+                    "; recorded by Metax {} on {}",
+                    provenance.metax_version, provenance.created
+                ))
             );
             return Ok(());
         }
@@ -142,6 +187,9 @@ impl TaxonomyRecord {
         let reader = BufReader::new(MultiGzDecoder::new(file));
         let mut version = None;
         let mut lineages: Vec<(u32, u64)> = Vec::new();
+        let mut metax_version = None;
+        let mut created = None;
+        let mut files = Vec::new();
         for (index, line) in reader.lines().enumerate() {
             let line = line.with_context(|| format!("failed to read {}", path.display()))?;
             let parsed = match line.split_once('\t') {
@@ -151,6 +199,27 @@ impl TaxonomyRecord {
                     }
                     version = Some(value.to_string());
                     Ok(())
+                }
+                Some(("#metax_version", value)) if version.is_some() => {
+                    metax_version = Some(value.to_string());
+                    Ok(())
+                }
+                Some(("#created", value)) if version.is_some() => {
+                    created = Some(value.to_string());
+                    Ok(())
+                }
+                Some(("#dump_file", value)) if version.is_some() => {
+                    match value.split('\t').collect::<Vec<_>>()[..] {
+                        [name, bytes, sha256] if bytes.parse::<u64>().is_ok() => {
+                            files.push((
+                                name.to_string(),
+                                bytes.parse().expect("checked"),
+                                sha256.to_string(),
+                            ));
+                            Ok(())
+                        }
+                        _ => Err(anyhow!("malformed dump file line")),
+                    }
                 }
                 Some(("#columns", value)) if value == COLUMNS => Ok(()),
                 Some((taxid, hash)) if version.is_some() && !taxid.starts_with('#') => {
@@ -173,7 +242,19 @@ impl TaxonomyRecord {
         if version.is_none() {
             bail!("{} is not a Metax taxonomy record", path.display());
         }
-        Ok(Self { lineages })
+        let provenance = match (metax_version, created) {
+            (Some(metax_version), Some(created)) => Some(DumpProvenance {
+                metax_version,
+                created,
+                files,
+            }),
+            (None, None) if files.is_empty() => None,
+            _ => bail!("{} has incomplete provenance lines", path.display()),
+        };
+        Ok(Self {
+            lineages,
+            provenance,
+        })
     }
 }
 
@@ -239,6 +320,15 @@ mod tests {
         let path = temp.path().join(TAXONOMY_RECORD_FILE);
         record.write(&path).unwrap();
         assert_eq!(TaxonomyRecord::load(&path).unwrap(), record);
+        let with_provenance = record
+            .clone()
+            .with_provenance(Some(DumpProvenance::now(vec![(
+                "nodes.dmp".to_string(),
+                12,
+                "ab".repeat(32),
+            )])));
+        with_provenance.write(&path).unwrap();
+        assert_eq!(TaxonomyRecord::load(&path).unwrap(), with_provenance);
 
         let renamed = TaxonomyRecord::build(&taxonomy("Species renamed"), &taxids).unwrap();
         assert_ne!(renamed, record);

@@ -104,11 +104,19 @@ fn print_taxonomy_summary(database: &Path) -> Result<()> {
         .find(|name| database.join(name).exists())
         .unwrap_or("none");
     print_kv("taxonomy_dump", stored);
-    let record = database.join(TAXONOMY_RECORD_FILE);
-    if record.exists() {
-        print_kv("taxonomy_record_taxa", TaxonomyRecord::load(&record)?.len());
-    } else {
+    let path = database.join(TAXONOMY_RECORD_FILE);
+    if !path.exists() {
         print_kv("taxonomy_record_taxa", "NA");
+        return Ok(());
+    }
+    let record = TaxonomyRecord::load(&path)?;
+    print_kv("taxonomy_record_taxa", record.len());
+    if let Some(provenance) = record.provenance() {
+        print_kv("taxonomy_record_metax_version", &provenance.metax_version);
+        print_kv("taxonomy_record_created", &provenance.created);
+        for (name, bytes, sha256) in &provenance.files {
+            print_kv("taxonomy_dump_file", format!("{name}\t{bytes}\t{sha256}"));
+        }
     }
     Ok(())
 }
