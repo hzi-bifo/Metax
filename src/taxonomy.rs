@@ -1,11 +1,12 @@
 mod dump;
 
 use anyhow::{bail, Context, Result};
+use flate2::read::MultiGzDecoder;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(crate) use dump::TaxonomySource;
 
@@ -27,10 +28,10 @@ impl Taxonomy {
     }
 
     pub(super) fn from_dir(dir: &Path) -> Result<Self> {
-        let nodes = dir.join("nodes.dmp");
-        let names = dir.join("names.dmp");
-        let merged = dir.join("merged.dmp");
-        let delnodes = dir.join("delnodes.dmp");
+        let nodes = dump_file_path(dir, "nodes.dmp");
+        let names = dump_file_path(dir, "names.dmp");
+        let merged = dump_file_path(dir, "merged.dmp");
+        let delnodes = dump_file_path(dir, "delnodes.dmp");
         Self::from_files(&nodes, &names, &merged, Some(&delnodes))
     }
 
@@ -223,10 +224,31 @@ impl Taxonomy {
     }
 }
 
+/// Path of the dump file `name` in `dir`: the plain file, or its gzipped
+/// form `name.gz` when only that exists.
+pub(crate) fn dump_file_path(dir: &Path, name: &str) -> PathBuf {
+    let plain = dir.join(name);
+    if !plain.exists() {
+        let gzipped = dir.join(format!("{name}.gz"));
+        if gzipped.exists() {
+            return gzipped;
+        }
+    }
+    plain
+}
+
+fn open_dump_file(path: &Path) -> Result<Box<dyn BufRead>> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    if path.extension().is_some_and(|extension| extension == "gz") {
+        Ok(Box::new(BufReader::new(MultiGzDecoder::new(file))))
+    } else {
+        Ok(Box::new(BufReader::new(file)))
+    }
+}
+
 fn load_nodes(path: &Path) -> Result<HashMap<u32, (u32, String)>> {
     // nodes.dmp: tax_id | parent_tax_id | rank
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let reader = BufReader::new(file);
+    let reader = open_dump_file(path)?;
     let mut nodes = HashMap::new();
     for (line_index, line) in reader.lines().enumerate() {
         let line_number = line_index + 1;
@@ -274,8 +296,7 @@ fn load_nodes(path: &Path) -> Result<HashMap<u32, (u32, String)>> {
 
 fn load_names(path: &Path) -> Result<HashMap<u32, String>> {
     // names.dmp: tax_id | name | ... | name_class (keep scientific name only)
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let reader = BufReader::new(file);
+    let reader = open_dump_file(path)?;
     let mut names = HashMap::new();
     for (line_index, line) in reader.lines().enumerate() {
         let line_number = line_index + 1;
@@ -318,8 +339,7 @@ fn load_names(path: &Path) -> Result<HashMap<u32, String>> {
 
 fn load_merged(path: &Path) -> Result<HashMap<u32, u32>> {
     // merged.dmp: old_tax_id | new_tax_id
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let reader = BufReader::new(file);
+    let reader = open_dump_file(path)?;
     let mut merged = HashMap::new();
     for (line_index, line) in reader.lines().enumerate() {
         let line_number = line_index + 1;
@@ -357,8 +377,7 @@ fn load_merged(path: &Path) -> Result<HashMap<u32, u32>> {
 
 fn load_delnodes(path: &Path) -> Result<HashSet<u32>> {
     // delnodes.dmp: list of deleted tax_ids
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let reader = BufReader::new(file);
+    let reader = open_dump_file(path)?;
     let mut delnodes = HashSet::new();
     for (line_index, line) in reader.lines().enumerate() {
         let line_number = line_index + 1;
@@ -388,7 +407,10 @@ fn load_delnodes(path: &Path) -> Result<HashSet<u32>> {
 #[cfg(test)]
 mod tests {
     use super::Taxonomy;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::collections::{HashMap, HashSet};
+    use std::io::Write;
 
     fn taxonomy(merged: HashMap<u32, u32>, deleted: HashSet<u32>) -> Taxonomy {
         Taxonomy::from_parts(
@@ -435,5 +457,30 @@ mod tests {
         assert_eq!(taxonomy.resolve_current_taxid(50), None);
         assert_eq!(taxonomy.resolve_current_taxid(999), None);
         assert!(taxonomy.get_parents(40).is_empty());
+    }
+
+    #[test]
+    fn loads_gzipped_and_plain_dump_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let gzip = |name: &str, contents: &str| {
+            let file = std::fs::File::create(temp.path().join(name)).unwrap();
+            let mut encoder = GzEncoder::new(file, Compression::fast());
+            encoder.write_all(contents.as_bytes()).unwrap();
+            encoder.finish().unwrap();
+        };
+        gzip(
+            "nodes.dmp.gz",
+            "1\t|\t1\t|\tno rank\t|\n2\t|\t1\t|\tspecies\t|\n",
+        );
+        gzip(
+            "names.dmp.gz",
+            "1\t|\troot\t|\t\t|\tscientific name\t|\n2\t|\tSpecies two\t|\t\t|\tscientific name\t|\n",
+        );
+        gzip("merged.dmp.gz", "3\t|\t2\t|\n");
+        std::fs::write(temp.path().join("delnodes.dmp"), "4\t|\n").unwrap();
+
+        let taxonomy = Taxonomy::from_dir(temp.path()).unwrap();
+        assert_eq!(taxonomy.get_name(3), Some("Species two"));
+        assert_eq!(taxonomy.resolve_current_taxid(4), None);
     }
 }

@@ -61,7 +61,7 @@ tar -xzf taxdump.tar.gz -C taxonomy
 metax profile --dmp-dir taxonomy ...
 ```
 
-An explicit directory is never downloaded, repaired, or modified by Metax. Use it for offline installations, pinned taxonomy snapshots, or alternative taxonomies (e.g. GTDB or ICTV) converted to the same dump-file format. The directory must contain at least `nodes.dmp`, `names.dmp`, and `merged.dmp`.
+An explicit directory is never downloaded, repaired, or modified by Metax. Use it for offline installations, pinned taxonomy snapshots, or alternative taxonomies (e.g. GTDB or ICTV) converted to the same dump-file format. The directory must contain `nodes.dmp`, `names.dmp`, `merged.dmp`, and `delnodes.dmp`; each may also be gzipped (`nodes.dmp.gz` and so on).
 
 ## 3. Reference Databases
 
