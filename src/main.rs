@@ -138,7 +138,7 @@ enum Commands {
     #[command(
         name = "attach-taxonomy",
         display_order = 4,
-        long_about = "Check every reference taxid of an existing database against a taxonomy dump, then copy the dump into the database (DB/taxdmp) and record the reference taxa (DB/metax_taxonomy.tsv.gz), as 'metax index' does for a new database. Files already in the database are never replaced.",
+        long_about = "Check every reference taxid of an existing database against a taxonomy dump, then store the dump in the database (DB/taxdmp.tar.gz) and record the reference taxa (DB/metax_taxonomy.tsv.gz), as 'metax index' does for a new database. Files already in the database are never replaced.",
         after_help = "Example:\n  metax attach-taxonomy -d DB --dmp-dir taxonomy"
     )]
     AttachTaxonomy(AttachTaxonomyArgs),
@@ -722,7 +722,7 @@ struct IndexArgs {
         long = "dmp-dir",
         value_name = "DIR",
         help_heading = "Input and output",
-        help = "Directory with the taxonomy dump of the reference taxids (nodes.dmp, names.dmp, merged.dmp, delnodes.dmp; plain or gzipped). Every reference taxid must be in it. The dump is stored gzipped in the database (DB/taxdmp) with a record of the reference taxa. If omitted, Metax uses ~/.metax/taxdmp and downloads a validated NCBI dump there when needed."
+        help = "Directory with the taxonomy dump of the reference taxids (nodes.dmp, names.dmp, merged.dmp, delnodes.dmp; plain or gzipped). Every reference taxid must be in it. The dump is stored in the database as DB/taxdmp.tar.gz, with a record of the reference taxa. If omitted, Metax uses ~/.metax/taxdmp and downloads a validated NCBI dump there when needed."
     )]
     dmp_dir: Option<String>,
 

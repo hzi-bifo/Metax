@@ -169,10 +169,8 @@ assert_not_exists "$WORK/db_one/metax_db.tsv"
 assert_not_exists "$WORK/db_one/metax_db.mmi"
 assert_not_exists "$WORK/db_one/metax_reference.fasta"
 assert_not_exists "$WORK/db_one/metax_reference.fasta.gz"
-assert_exists "$WORK/db_one/taxdmp/nodes.dmp"
-assert_exists "$WORK/db_one/taxdmp/names.dmp"
-assert_exists "$WORK/db_one/taxdmp/merged.dmp"
-assert_exists "$WORK/db_one/taxdmp/delnodes.dmp"
+assert_exists "$WORK/db_one/taxdmp.tar.gz"
+assert_not_exists "$WORK/db_one/taxdmp"
 assert_exists "$WORK/db_one/metax_taxonomy.tsv.gz"
 
 run_metax index "$WORK/multicontig.fa" -o "$WORK/db_multi" "${COMMON_INDEX_ARGS[@]}"
@@ -187,7 +185,7 @@ run_metax info --db "$WORK/db_one" > "$WORK/info.tsv"
 grep -q '^info_type	metax_database$' "$WORK/info.tsv"
 grep -q '^metadata_reference_count	1$' "$WORK/info.tsv"
 grep -q '^index_present	true$' "$WORK/info.tsv"
-grep -q '^taxonomy_dump_stored	true$' "$WORK/info.tsv"
+grep -q '^taxonomy_dump	taxdmp.tar.gz$' "$WORK/info.tsv"
 grep -q '^taxonomy_record_taxa	2$' "$WORK/info.tsv"
 
 if run_metax index "$WORK/bad.fa" -o "$WORK/db_bad" "${COMMON_INDEX_ARGS[@]}" 2>"$WORK/bad.err"; then
@@ -229,10 +227,10 @@ run_metax profile \
   --min-mapped-fraction 0.50
 assert_single_species_profile "$WORK/se_stored_taxonomy.profile.txt"
 
-# A shipped database carries its dump as taxdmp.tar.gz, read without unpacking.
+# The stored archive unpacked by hand into taxdmp/ is used as well.
 cp -r "$WORK/db_one" "$WORK/db_packed"
-tar -czf "$WORK/db_packed/taxdmp.tar.gz" -C "$WORK/db_packed/taxdmp" nodes.dmp names.dmp merged.dmp delnodes.dmp
-rm -r "$WORK/db_packed/taxdmp"
+mkdir "$WORK/db_packed/taxdmp"
+tar -xzf "$WORK/db_packed/taxdmp.tar.gz" -C "$WORK/db_packed/taxdmp"
 run_metax profile \
   --db "$WORK/db_packed" \
   -i "$WORK/se.fq" \
@@ -243,14 +241,12 @@ run_metax profile \
   --mapped-len 50 \
   --min-mapped-fraction 0.50
 assert_single_species_profile "$WORK/se_packed_taxonomy.profile.txt"
-assert_exists "$WORK/db_packed/taxdmp.tar.gz"
-assert_not_exists "$WORK/db_packed/taxdmp"
 
 # A database built without a dump can be given one.
 mkdir "$WORK/db_attach"
 cp "$WORK/db_one/metax_db.mxi" "$WORK/db_one/metax_db.tsv.gz" "$WORK/db_attach/"
 run_metax attach-taxonomy -d "$WORK/db_attach" --dmp-dir "$WORK/tax"
-assert_exists "$WORK/db_attach/taxdmp/nodes.dmp"
+assert_exists "$WORK/db_attach/taxdmp.tar.gz"
 assert_exists "$WORK/db_attach/metax_taxonomy.tsv.gz"
 if run_metax attach-taxonomy -d "$WORK/db_attach" --dmp-dir "$WORK/tax" 2>"$WORK/attach.err"; then
   echo "a second attach-taxonomy unexpectedly succeeded" >&2

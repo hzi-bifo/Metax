@@ -49,8 +49,8 @@ smoke_tests/run_smoke_tests.sh
 Metax needs NCBI-style taxonomy dump files. `metax profile` takes the first of:
 
 1. the directory given with `--dmp-dir`;
-2. `taxdmp/` in the database directory, the dump that `metax index` stored with the database (§4.1). If this folder exists but lacks a dump file or cannot be read, Metax stops rather than use another taxonomy;
-3. `taxdmp.tar.gz` in the database directory, the form in which a shipped database carries its dump (§4.1). Metax reads the dump files from the archive on every run without unpacking it, so nothing is written for the taxonomy; this takes up to a second longer than reading plain files. If the archive is damaged, Metax stops;
+2. `taxdmp/` in the database directory, if present: a folder of dump files, for example the archive below unpacked by hand. If this folder lacks a dump file or cannot be read, Metax stops rather than use another taxonomy;
+3. `taxdmp.tar.gz` in the database directory, the dump that `metax index` stores with the database (§4.1). Metax reads it on every run without unpacking it, so nothing is written for the taxonomy. If the archive is damaged, Metax stops;
 4. the managed NCBI dump in `~/.metax/taxdmp` (section 2.1).
 
 A database built by `metax index` (or given its dump with `metax attach-taxonomy`, §4.6) records the scientific name, rank and lineage of every reference taxid in the dump it was built with (`metax_taxonomy.tsv.gz`, §4.1). `metax profile` compares the dump it uses with this record: a dump that gives a database taxid another name, rank or lineage, or lacks it, stops the run and lists the differing taxids. Such a dump would label the profile with names the database was not built for, for example an NCBI dump with a GTDB database. A dump other than the database's own is compared before mapping starts. Pass `--allow-taxonomy-mismatch` to profile with a different dump anyway, for example a newer NCBI dump for a database built with an older one; the differences are then reported as a warning. Databases built without a record are not checked.
@@ -160,20 +160,13 @@ Gzip-compressed input is accepted. The output directory contains:
 - `metax_db.tsv.gz`: compressed reference, genome, taxonomy, and size metadata;
 - `metax_db.mxi`: the mapping index;
 - `metax_reference.fasta.gz`: only for fractional indexes, the exact sampled FASTA used to build the index (not required for profiling);
-- `taxdmp/`: a copy of the taxonomy dump the database was built with, from `--dmp-dir` or, without it, from the managed NCBI dump (§2.1). `metax profile` uses it when `--dmp-dir` is omitted;
+- `taxdmp.tar.gz`: the taxonomy dump the database was built with, from `--dmp-dir` or, without it, from the managed NCBI dump (§2.1), as one archive. `metax profile` uses it when `--dmp-dir` is omitted;
 - `metax_taxonomy.tsv.gz`: a hash of the scientific name, rank and lineage of every reference taxid in that dump, against which `metax profile` checks the dump it uses (§2).
 
 Every reference taxid must be in the taxonomy dump. `metax index` checks them before it builds the index and stops with the missing taxids otherwise, so index with the dump the FASTA headers were written for, for example a GTDB dump for GTDB taxids:
 
 ```bash
 metax index gtdb_genomes.fa -o db_gtdb --dmp-dir gtdb_taxdump -t 20
-```
-
-To ship a database, pack its dump into one archive, which `metax profile` reads without unpacking (§2):
-
-```bash
-tar -czf db/taxdmp.tar.gz -C db/taxdmp nodes.dmp names.dmp merged.dmp delnodes.dmp
-rm -r db/taxdmp
 ```
 
 `metax index` refuses to overwrite an existing output path. The completed database is published by a same-filesystem rename, so an interrupted build never leaves a partial database in place.
@@ -269,7 +262,7 @@ A database built without a taxonomy dump, for example by an earlier release, can
 metax attach-taxonomy -d db --dmp-dir taxonomy
 ```
 
-Pass the dump the database was built with. Metax checks every reference taxid against it, as `metax index` does, and then adds `taxdmp/` and `metax_taxonomy.tsv.gz` to the database (§4.1). Nothing is added when a taxid is missing, and files already in the database are never replaced.
+Pass the dump the database was built with. Metax checks every reference taxid against it, as `metax index` does, and then adds `taxdmp.tar.gz` and `metax_taxonomy.tsv.gz` to the database (§4.1). Nothing is added when a taxid is missing, and files already in the database are never replaced.
 
 ## 5. Run Profiling
 

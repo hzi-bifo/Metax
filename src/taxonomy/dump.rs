@@ -2,13 +2,13 @@
 
 use super::{dump_file_path, Taxonomy};
 use anyhow::{anyhow, bail, Context, Result};
-use flate2::read::MultiGzDecoder;
+use flate2::{read::MultiGzDecoder, write::GzEncoder, Compression};
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::fs::{self, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tempfile::Builder;
 
 const NCBI_TAXDUMP_URL: &str = "https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz";
@@ -195,17 +195,54 @@ impl TaxonomySource {
     }
 }
 
-/// Copy the dump files in `source` into the new directory `target`, each
-/// in the form it has there (plain or gzipped).
-pub(crate) fn store_dump(source: &Path, target: &Path) -> Result<()> {
-    fs::create_dir(target).with_context(|| format!("failed to create {}", target.display()))?;
+/// Pack the dump files in `source` into the new `.tar.gz` archive `target`,
+/// each under its own name and in the form it has there (plain or gzipped).
+pub(crate) fn pack_dump(source: &Path, target: &Path) -> Result<()> {
+    let output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .with_context(|| format!("failed to create {}", target.display()))?;
+    let encoder = GzEncoder::new(
+        BufWriter::with_capacity(IO_BUFFER_BYTES, output),
+        Compression::default(),
+    );
+    let mut archive = tar::Builder::new(encoder);
     for name in REQUIRED_DUMP_FILES {
         let from = dump_file_path(source, name);
-        let to = target.join(from.file_name().expect("a dump file path ends in its name"));
-        fs::copy(&from, &to)
-            .with_context(|| format!("failed to copy {} to {}", from.display(), to.display()))?;
+        let file =
+            File::open(&from).with_context(|| format!("failed to open {}", from.display()))?;
+        let metadata = file.metadata()?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(metadata.len());
+        header.set_mode(0o644);
+        header.set_mtime(
+            metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |age| age.as_secs()),
+        );
+        let entry = from.file_name().expect("a dump file path ends in its name");
+        archive
+            .append_data(
+                &mut header,
+                entry,
+                BufReader::with_capacity(IO_BUFFER_BYTES, file),
+            )
+            .with_context(|| {
+                format!(
+                    "failed to pack {} into {}",
+                    from.display(),
+                    target.display()
+                )
+            })?;
     }
-    Ok(())
+    archive
+        .into_inner()
+        .and_then(|encoder| encoder.finish())
+        .and_then(|mut writer| writer.flush())
+        .with_context(|| format!("failed to finish {}", target.display()))
 }
 
 fn dump_files_look_complete(directory: &Path) -> bool {

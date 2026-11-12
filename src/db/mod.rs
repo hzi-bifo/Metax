@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::progress::{self, ProgressOptions};
 use crate::taxonomy::{
-    store_dump, TaxonomyRecord, TaxonomySource, DATABASE_TAXDMP_ARCHIVE, DATABASE_TAXDMP_DIR,
+    pack_dump, TaxonomyRecord, TaxonomySource, DATABASE_TAXDMP_ARCHIVE, DATABASE_TAXDMP_DIR,
     TAXONOMY_RECORD_FILE,
 };
 use metam::{
@@ -387,7 +387,7 @@ pub fn build_database(
     let staging_path = create_database_staging_directory(outdir_path)?;
     let mut cleanup_staging = RemoveDirOnDrop::new(staging_path.clone());
     if let Some((source, record)) = &taxonomy {
-        store_dump(source.path(), &staging_path.join(DATABASE_TAXDMP_DIR))?;
+        pack_dump(source.path(), &staging_path.join(DATABASE_TAXDMP_ARCHIVE))?;
         record.write(&staging_path.join(TAXONOMY_RECORD_FILE))?;
     }
     let force_sampled_field =
@@ -512,14 +512,14 @@ pub fn attach_taxonomy(database: &Path, source: &TaxonomySource) -> Result<()> {
                 directory.display()
             )
         })?;
-    store_dump(source.path(), &staging.path().join(DATABASE_TAXDMP_DIR))?;
+    pack_dump(source.path(), &staging.path().join(DATABASE_TAXDMP_ARCHIVE))?;
     record.write(&staging.path().join(TAXONOMY_RECORD_FILE))?;
-    let dump = directory.join(DATABASE_TAXDMP_DIR);
-    fs::rename(staging.path().join(DATABASE_TAXDMP_DIR), &dump)
+    let dump = directory.join(DATABASE_TAXDMP_ARCHIVE);
+    fs::rename(staging.path().join(DATABASE_TAXDMP_ARCHIVE), &dump)
         .with_context(|| format!("failed to create {}", dump.display()))?;
     let record_path = directory.join(TAXONOMY_RECORD_FILE);
     if let Err(error) = fs::rename(staging.path().join(TAXONOMY_RECORD_FILE), &record_path) {
-        let _ = fs::remove_dir_all(&dump);
+        let _ = fs::remove_file(&dump);
         return Err(error).with_context(|| format!("failed to create {}", record_path.display()));
     }
     Ok(())
@@ -2467,17 +2467,20 @@ mod tests {
         )
         .unwrap();
 
-        let stored = output.join(DATABASE_TAXDMP_DIR);
-        let mut names = std::fs::read_dir(&stored)
+        assert!(!output.join(DATABASE_TAXDMP_DIR).exists());
+        let stored = output.join(DATABASE_TAXDMP_ARCHIVE);
+        let mut archive = tar::Archive::new(MultiGzDecoder::new(File::open(&stored).unwrap()));
+        let mut names = archive
+            .entries()
             .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .map(|entry| entry.unwrap().path().unwrap().display().to_string())
             .collect::<Vec<_>>();
         names.sort();
         assert_eq!(
             names,
             ["delnodes.dmp", "merged.dmp", "names.dmp", "nodes.dmp"]
         );
-        let stored_taxonomy = crate::taxonomy::Taxonomy::from_dir(&stored).unwrap();
+        let stored_taxonomy = crate::taxonomy::Taxonomy::from_archive(&stored).unwrap();
         assert_eq!(stored_taxonomy.get_name(11), Some("Genus twenty A"));
         let record = TaxonomyRecord::load(&output.join(TAXONOMY_RECORD_FILE)).unwrap();
         assert_eq!(
@@ -2505,13 +2508,13 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(!output.join(DATABASE_TAXDMP_DIR).exists());
+        assert!(!output.join(DATABASE_TAXDMP_ARCHIVE).exists());
         let source = TaxonomySource::prepare(dump.to_str(), None).unwrap();
 
         attach_taxonomy(&output, &source).unwrap();
 
         let stored =
-            crate::taxonomy::Taxonomy::from_dir(&output.join(DATABASE_TAXDMP_DIR)).unwrap();
+            crate::taxonomy::Taxonomy::from_archive(&output.join(DATABASE_TAXDMP_ARCHIVE)).unwrap();
         assert_eq!(
             TaxonomyRecord::load(&output.join(TAXONOMY_RECORD_FILE)).unwrap(),
             TaxonomyRecord::build(&stored, &BTreeSet::from([11, 20, 30])).unwrap()
