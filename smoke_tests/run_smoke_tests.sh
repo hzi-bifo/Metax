@@ -229,6 +229,23 @@ run_metax profile \
   --min-mapped-fraction 0.50
 assert_single_species_profile "$WORK/se_stored_taxonomy.profile.txt"
 
+# A shipped database carries its dump as taxdmp.tar.gz; the first run unpacks it.
+cp -r "$WORK/db_one" "$WORK/db_packed"
+tar -czf "$WORK/db_packed/taxdmp.tar.gz" -C "$WORK/db_packed/taxdmp" nodes.dmp names.dmp merged.dmp delnodes.dmp
+rm -r "$WORK/db_packed/taxdmp"
+run_metax profile \
+  --db "$WORK/db_packed" \
+  -i "$WORK/se.fq" \
+  -o "$WORK/se_packed_taxonomy" \
+  -t 2 \
+  --temp-dir "$WORK/stage" \
+  --min-identity 0.90 \
+  --mapped-len 50 \
+  --min-mapped-fraction 0.50
+assert_single_species_profile "$WORK/se_packed_taxonomy.profile.txt"
+assert_exists "$WORK/db_packed/taxdmp/nodes.dmp"
+assert_not_exists "$WORK/db_packed/taxdmp.tar.gz"
+
 run_metax profile \
   --db "$WORK/db_genus" \
   --dmp-dir "$WORK/tax" \

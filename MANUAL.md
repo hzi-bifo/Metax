@@ -50,7 +50,8 @@ Metax needs NCBI-style taxonomy dump files. `metax profile` takes the first of:
 
 1. the directory given with `--dmp-dir`;
 2. `taxdmp/` in the database directory, the dump that `metax index` stored with the database (§4.1). If this folder exists but lacks a dump file or cannot be read, Metax stops rather than use another taxonomy;
-3. the managed NCBI dump in `~/.metax/taxdmp` (section 2.1).
+3. `taxdmp.tar.gz` in the database directory, the form in which a shipped database carries its dump (§4.1). The first run unpacks it into `taxdmp/`, checks it and removes the archive; runs started at the same time wait for it. If the archive cannot be unpacked, for example because the database directory is not writable, Metax stops; unpack it into `taxdmp/` yourself or pass `--dmp-dir`;
+4. the managed NCBI dump in `~/.metax/taxdmp` (section 2.1).
 
 ### 2.1 Managed taxonomy
 
@@ -164,6 +165,13 @@ Every reference taxid must be in the taxonomy dump. `metax index` checks them be
 
 ```bash
 metax index gtdb_genomes.fa -o db_gtdb --dmp-dir gtdb_taxdump -t 20
+```
+
+To ship a database, pack its dump into one archive; the first `metax profile` run unpacks it (§2):
+
+```bash
+tar -czf db/taxdmp.tar.gz -C db/taxdmp nodes.dmp names.dmp merged.dmp delnodes.dmp
+rm -r db/taxdmp
 ```
 
 `metax index` refuses to overwrite an existing output path. The completed database is published by a same-filesystem rename, so an interrupted build never leaves a partial database in place.

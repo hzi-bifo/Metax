@@ -60,7 +60,7 @@ smoke_tests/run_smoke_tests.sh
 
 Metax uses NCBI-style taxonomy dump files (`nodes.dmp`, `names.dmp`, `merged.dmp`, `delnodes.dmp`).
 
-- If `--dmp-dir` is omitted, Metax uses the dump stored in the database directory (`taxdmp/`). Without one, it downloads the official NCBI [taxdump](https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz) to `~/.metax/taxdmp` on first use and reuses it afterwards.
+- If `--dmp-dir` is omitted, Metax uses the dump stored in the database directory (`taxdmp/`, unpacked from `taxdmp.tar.gz` on first use). Without one, it downloads the official NCBI [taxdump](https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz) to `~/.metax/taxdmp` on first use and reuses it afterwards.
 - Pass `--dmp-dir <dir>` to use an offline installation, a pinned taxonomy snapshot, or an alternative taxonomy (e.g. GTDB or ICTV) converted to the same dump-file format. An explicit directory is never modified by Metax.
 
 ### Reference database
