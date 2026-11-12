@@ -703,7 +703,7 @@ struct IndexArgs {
         long = "dmp-dir",
         value_name = "DIR",
         help_heading = "Input and output",
-        help = "Directory with NCBI taxonomy dump files, used to report the genera of a mixed database that hold both genome-type and marker-type species."
+        help = "Directory with the taxonomy dump of the reference taxids (nodes.dmp, names.dmp, merged.dmp, delnodes.dmp; plain or gzipped). Every reference taxid must be in it. The dump is stored gzipped in the database (DB/taxdmp) with a record of the reference taxa. If omitted, Metax uses ~/.metax/taxdmp and downloads a validated NCBI dump there when needed."
     )]
     dmp_dir: Option<String>,
 
@@ -1213,12 +1213,10 @@ fn main() -> Result<()> {
                     no_progress: args.no_progress,
                     progress_interval: args.progress_interval,
                 },
+                args.dmp_dir.as_deref(),
             )?;
             if mixed_types_possible {
-                report_genera_with_both_types(
-                    Path::new(&args.outdir),
-                    args.dmp_dir.as_deref().map(Path::new),
-                )?;
+                report_genera_with_both_types(Path::new(&args.outdir))?;
             }
             Ok(())
         }

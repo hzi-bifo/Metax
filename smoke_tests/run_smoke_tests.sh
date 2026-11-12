@@ -157,6 +157,7 @@ COMMON_INDEX_ARGS=(
   --strobe-start-dist-min 20
   --strobe-start-dist-max 60
   --temp-dir "$WORK/stage"
+  --dmp-dir "$WORK/tax"
   -t 2
 )
 
@@ -168,6 +169,11 @@ assert_not_exists "$WORK/db_one/metax_db.tsv"
 assert_not_exists "$WORK/db_one/metax_db.mmi"
 assert_not_exists "$WORK/db_one/metax_reference.fasta"
 assert_not_exists "$WORK/db_one/metax_reference.fasta.gz"
+assert_exists "$WORK/db_one/taxdmp/nodes.dmp"
+assert_exists "$WORK/db_one/taxdmp/names.dmp"
+assert_exists "$WORK/db_one/taxdmp/merged.dmp"
+assert_exists "$WORK/db_one/taxdmp/delnodes.dmp"
+assert_exists "$WORK/db_one/metax_taxonomy.tsv.gz"
 
 run_metax index "$WORK/multicontig.fa" -o "$WORK/db_multi" "${COMMON_INDEX_ARGS[@]}"
 run_metax index "$WORK/genus.fa" -o "$WORK/db_genus" "${COMMON_INDEX_ARGS[@]}"
@@ -181,6 +187,8 @@ run_metax info --db "$WORK/db_one" > "$WORK/info.tsv"
 grep -q '^info_type	metax_database$' "$WORK/info.tsv"
 grep -q '^metadata_reference_count	1$' "$WORK/info.tsv"
 grep -q '^index_present	true$' "$WORK/info.tsv"
+grep -q '^taxonomy_dump_stored	true$' "$WORK/info.tsv"
+grep -q '^taxonomy_record_taxa	2$' "$WORK/info.tsv"
 
 if run_metax index "$WORK/bad.fa" -o "$WORK/db_bad" "${COMMON_INDEX_ARGS[@]}" 2>"$WORK/bad.err"; then
   echo "malformed header unexpectedly succeeded" >&2
@@ -208,6 +216,18 @@ if find "$WORK/stage" -mindepth 1 -print -quit | grep -q .; then
   echo "temporary staged mapping output was not cleaned up" >&2
   exit 1
 fi
+
+# Without --dmp-dir, the dump stored with the database is used.
+run_metax profile \
+  --db "$WORK/db_one" \
+  -i "$WORK/se.fq" \
+  -o "$WORK/se_stored_taxonomy" \
+  -t 2 \
+  --temp-dir "$WORK/stage" \
+  --min-identity 0.90 \
+  --mapped-len 50 \
+  --min-mapped-fraction 0.50
+assert_single_species_profile "$WORK/se_stored_taxonomy.profile.txt"
 
 run_metax profile \
   --db "$WORK/db_genus" \

@@ -5,7 +5,8 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::db::{DatabaseMetadata, ReferenceType};
+use crate::db::{database_directory, DatabaseMetadata, ReferenceType};
+use crate::taxonomy::{TaxonomyRecord, DATABASE_TAXDMP_DIR, TAXONOMY_RECORD_FILE};
 
 #[derive(Debug)]
 struct IndexInfo {
@@ -45,6 +46,7 @@ fn run_db_info(path: &Path) -> Result<()> {
     print_kv("mapping_index", metadata.metam_index.display());
     print_kv("fractional", metadata.is_fractional);
     print_metadata_summary(&metadata);
+    print_taxonomy_summary(&database_directory(path)?)?;
     if metadata.metam_index.exists() {
         print_index_summary(&metadata.metam_index)?;
     } else {
@@ -90,6 +92,22 @@ fn print_metadata_summary(metadata: &DatabaseMetadata) {
     print_kv("metadata_reference_bases", reference_bases);
     print_kv("metadata_full_genome_bases", full_genome_bases);
     print_kv("metadata_effective_indexed_bases", effective_indexed_bases);
+}
+
+/// Whether the database stores its taxonomy dump, and how many taxa its
+/// taxonomy record holds.
+fn print_taxonomy_summary(database: &Path) -> Result<()> {
+    print_kv(
+        "taxonomy_dump_stored",
+        database.join(DATABASE_TAXDMP_DIR).is_dir(),
+    );
+    let record = database.join(TAXONOMY_RECORD_FILE);
+    if record.exists() {
+        print_kv("taxonomy_record_taxa", TaxonomyRecord::load(&record)?.len());
+    } else {
+        print_kv("taxonomy_record_taxa", "NA");
+    }
+    Ok(())
 }
 
 fn print_index_summary(path: &Path) -> Result<()> {

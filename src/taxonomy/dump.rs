@@ -42,7 +42,7 @@ enum DumpLocation {
 /// explicit and database locations are read exactly as found and never
 /// modified.
 #[derive(Clone, Debug)]
-pub(crate) struct TaxonomySource {
+pub struct TaxonomySource {
     directory: PathBuf,
     location: DumpLocation,
 }
@@ -118,6 +118,10 @@ impl TaxonomySource {
         })
     }
 
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+
     pub(crate) fn load(&self) -> Result<Taxonomy> {
         self.load_with_repair(|target| install_managed_taxdump(target, true))
     }
@@ -156,6 +160,19 @@ impl TaxonomySource {
             }
         }
     }
+}
+
+/// Copy the dump files in `source` into the new directory `target`, each
+/// in the form it has there (plain or gzipped).
+pub(crate) fn store_dump(source: &Path, target: &Path) -> Result<()> {
+    fs::create_dir(target).with_context(|| format!("failed to create {}", target.display()))?;
+    for name in REQUIRED_DUMP_FILES {
+        let from = dump_file_path(source, name);
+        let to = target.join(from.file_name().expect("a dump file path ends in its name"));
+        fs::copy(&from, &to)
+            .with_context(|| format!("failed to copy {} to {}", from.display(), to.display()))?;
+    }
+    Ok(())
 }
 
 fn dump_files_look_complete(directory: &Path) -> bool {

@@ -6,7 +6,7 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::progress::{self, ProgressOptions};
+use crate::taxonomy::{
+    store_dump, TaxonomyRecord, TaxonomySource, DATABASE_TAXDMP_DIR, TAXONOMY_RECORD_FILE,
+};
 use metam::{
     index::{
         build_index_file_with_progress, BuildProgress, ReferenceOrderDigest,
@@ -325,6 +328,7 @@ impl DatabaseMetadata {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_database(
     fasta: &str,
     outdir: &str,
@@ -333,6 +337,7 @@ pub fn build_database(
     _compress_reference: bool,
     types: &ReferenceTypes,
     options: &MetamIndexOptions,
+    taxonomy: Option<&TaxonomySource>,
 ) -> Result<PathBuf> {
     let outdir_path = Path::new(outdir);
     match fs::symlink_metadata(outdir_path) {
@@ -365,9 +370,20 @@ pub fn build_database(
     if selected.is_empty() {
         bail!("reference FASTA produced no indexable records");
     }
+    // Check the reference taxids against the taxonomy before the index build;
+    // the taxonomy is freed before the build starts.
+    let taxonomy = taxonomy
+        .map(|source| {
+            record_reference_taxa(source, &selected, options.quiet).map(|record| (source, record))
+        })
+        .transpose()?;
 
     let staging_path = create_database_staging_directory(outdir_path)?;
     let mut cleanup_staging = RemoveDirOnDrop::new(staging_path.clone());
+    if let Some((source, record)) = &taxonomy {
+        store_dump(source.directory(), &staging_path.join(DATABASE_TAXDMP_DIR))?;
+        record.write(&staging_path.join(TAXONOMY_RECORD_FILE))?;
+    }
     let force_sampled_field =
         requires_effective_size_reference_names(&selected, subsample.is_some());
     let index_path = staging_path.join(METAM_INDEX_FILE);
@@ -418,6 +434,38 @@ pub fn build_database(
     })?;
     cleanup_staging.disarm();
     Ok(outdir_path.join(DB_TSV_FILE))
+}
+
+/// Record the taxa that the selected references name in the taxonomy dump
+/// of `source`; fails when the dump lacks any of them.
+fn record_reference_taxa(
+    source: &TaxonomySource,
+    records: &[SelectedRecord],
+    quiet: bool,
+) -> Result<TaxonomyRecord> {
+    let mut taxids = BTreeSet::new();
+    let mut previous = None;
+    for record in records {
+        let taxonomy = &record.taxonomy;
+        if previous != Some(taxonomy) {
+            taxids.insert(taxonomy.profile_taxid);
+            taxids.extend(taxonomy.primary_taxid);
+            previous = Some(taxonomy);
+        }
+    }
+    let dump = source.directory().display();
+    let record = TaxonomyRecord::build(&source.load()?, &taxids).with_context(|| {
+        format!(
+            "the reference taxids do not match the taxonomy dump in {dump}; index with the dump they come from (--dmp-dir)"
+        )
+    })?;
+    if !quiet {
+        log_message(
+            "index",
+            format_args!("taxonomy dump={dump} reference_taxa={}", record.len()),
+        );
+    }
+    Ok(record)
 }
 
 fn create_database_staging_directory(target: &Path) -> Result<PathBuf> {
@@ -2235,6 +2283,7 @@ mod tests {
             false,
             &ReferenceTypes::default(),
             &options,
+            None,
         )
         .unwrap_err();
 
@@ -2268,6 +2317,7 @@ mod tests {
             false,
             &ReferenceTypes::default(),
             &options,
+            None,
         )
         .unwrap_err();
 
@@ -2298,6 +2348,7 @@ mod tests {
             false,
             &ReferenceTypes::default(),
             &options,
+            None,
         )
         .unwrap();
 
@@ -2318,6 +2369,94 @@ mod tests {
         );
         let loaded = DatabaseMetadata::load(&output).unwrap();
         assert_eq!(loaded.references.len(), 1);
+    }
+
+    /// A dump with genus 10, its species 20 and 30, and strain 11 of 20.
+    fn write_test_dump(directory: &Path) {
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::write(
+            directory.join("nodes.dmp"),
+            "1\t|\t1\t|\tno rank\t|\n10\t|\t1\t|\tgenus\t|\n20\t|\t10\t|\tspecies\t|\n30\t|\t10\t|\tspecies\t|\n11\t|\t20\t|\tstrain\t|\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("names.dmp"),
+            "1\t|\troot\t|\t\t|\tscientific name\t|\n10\t|\tGenus\t|\t\t|\tscientific name\t|\n20\t|\tGenus twenty\t|\t\t|\tscientific name\t|\n30\t|\tGenus thirty\t|\t\t|\tscientific name\t|\n11\t|\tGenus twenty A\t|\t\t|\tscientific name\t|\n",
+        )
+        .unwrap();
+        std::fs::write(directory.join("merged.dmp"), "").unwrap();
+        std::fs::write(directory.join("delnodes.dmp"), "").unwrap();
+    }
+
+    #[test]
+    fn database_stores_its_taxonomy_dump_and_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let fasta = directory.path().join("reference.fa");
+        let output = directory.path().join("database");
+        let dump = directory.path().join("taxonomy");
+        write_interleaved_fasta(&fasta, "");
+        write_test_dump(&dump);
+        let source = TaxonomySource::prepare(dump.to_str(), None).unwrap();
+
+        build_database(
+            fasta.to_str().unwrap(),
+            output.to_str().unwrap(),
+            None,
+            Some(2),
+            false,
+            &ReferenceTypes::default(),
+            &test_index_options(None),
+            Some(&source),
+        )
+        .unwrap();
+
+        let stored = output.join(DATABASE_TAXDMP_DIR);
+        let mut names = std::fs::read_dir(&stored)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            ["delnodes.dmp", "merged.dmp", "names.dmp", "nodes.dmp"]
+        );
+        let stored_taxonomy = crate::taxonomy::Taxonomy::from_dir(&stored).unwrap();
+        assert_eq!(stored_taxonomy.get_name(11), Some("Genus twenty A"));
+        let record = TaxonomyRecord::load(&output.join(TAXONOMY_RECORD_FILE)).unwrap();
+        assert_eq!(
+            record,
+            TaxonomyRecord::build(&stored_taxonomy, &BTreeSet::from([11, 20, 30])).unwrap()
+        );
+    }
+
+    #[test]
+    fn reference_taxids_missing_from_the_dump_stop_the_build() {
+        let directory = tempfile::tempdir().unwrap();
+        let fasta = directory.path().join("reference.fa");
+        let output = directory.path().join("database");
+        let dump = directory.path().join("taxonomy");
+        std::fs::write(
+            &fasta,
+            format!(">G1|contig1|s:40\n{}\n", test_sequence(1, 500)),
+        )
+        .unwrap();
+        write_test_dump(&dump);
+        let source = TaxonomySource::prepare(dump.to_str(), None).unwrap();
+
+        let error = build_database(
+            fasta.to_str().unwrap(),
+            output.to_str().unwrap(),
+            None,
+            Some(1),
+            false,
+            &ReferenceTypes::default(),
+            &test_index_options(Some(directory.path().to_path_buf())),
+            Some(&source),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("1 of 1 reference taxids"));
+        assert!(!output.exists());
     }
 
     /// Deterministic pseudo-random DNA, so every record yields seeds.
@@ -2367,6 +2506,7 @@ mod tests {
             false,
             &ReferenceTypes::default(),
             &test_index_options(None),
+            None,
         )
         .unwrap();
         let loaded = DatabaseMetadata::load(&output).unwrap();
@@ -2467,6 +2607,7 @@ mod tests {
             false,
             &ReferenceTypes::new(ReferenceType::Genome, Some(&table)).unwrap(),
             &test_index_options(None),
+            None,
         )
         .unwrap();
         let mut text = String::new();

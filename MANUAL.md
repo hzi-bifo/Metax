@@ -49,7 +49,7 @@ smoke_tests/run_smoke_tests.sh
 Metax needs NCBI-style taxonomy dump files. `metax profile` takes the first of:
 
 1. the directory given with `--dmp-dir`;
-2. `taxdmp/` in the database directory, the dump stored with the database. If this folder exists but lacks a dump file or cannot be read, Metax stops rather than use another taxonomy;
+2. `taxdmp/` in the database directory, the dump that `metax index` stored with the database (§4.1). If this folder exists but lacks a dump file or cannot be read, Metax stops rather than use another taxonomy;
 3. the managed NCBI dump in `~/.metax/taxdmp` (section 2.1).
 
 ### 2.1 Managed taxonomy
@@ -156,7 +156,15 @@ Gzip-compressed input is accepted. The output directory contains:
 
 - `metax_db.tsv.gz`: compressed reference, genome, taxonomy, and size metadata;
 - `metax_db.mxi`: the mapping index;
-- `metax_reference.fasta.gz`: only for fractional indexes, the exact sampled FASTA used to build the index (not required for profiling).
+- `metax_reference.fasta.gz`: only for fractional indexes, the exact sampled FASTA used to build the index (not required for profiling);
+- `taxdmp/`: a copy of the taxonomy dump the database was built with, from `--dmp-dir` or, without it, from the managed NCBI dump (§2.1). `metax profile` uses it when `--dmp-dir` is omitted;
+- `metax_taxonomy.tsv.gz`: a hash of the scientific name, rank and lineage of every reference taxid in that dump.
+
+Every reference taxid must be in the taxonomy dump. `metax index` checks them before it builds the index and stops with the missing taxids otherwise, so index with the dump the FASTA headers were written for, for example a GTDB dump for GTDB taxids:
+
+```bash
+metax index gtdb_genomes.fa -o db_gtdb --dmp-dir gtdb_taxdump -t 20
+```
 
 `metax index` refuses to overwrite an existing output path. The completed database is published by a same-filesystem rename, so an interrupted build never leaves a partial database in place.
 
@@ -206,7 +214,7 @@ Marker genomes:
 
 A read counts on a marker gene only when enough of it lies inside the gene; a long read also counts on a gene shorter than that when it aligns to more than half of the gene (§7.4).
 
-In a mixed database, reads from the part of a marker-only genome that is not indexed can map to the genomes of related species of type `genome`. With `--dmp-dir`, `metax index` lists the genera that hold species of both types; give the species of one genus the same type where possible.
+In a mixed database, reads from the part of a marker-only genome that is not indexed can map to the genomes of related species of type `genome`. `metax index` lists the genera that hold species of both types; give the species of one genus the same type where possible.
 
 Databases with marker genomes write metadata version 3, which adds a `reference_type` column and a `#reference_type genome|markers|mixed` line; earlier Metax releases cannot read it. Databases of genomes keep metadata version 2.
 
@@ -241,7 +249,7 @@ metax info -d db
 metax info -i db/metax_db.mxi
 ```
 
-`info -d` summarizes the database metadata, including its reference type and number of marker genomes, and, when the `.mxi` file is present, the mapping-index header. `info -i` inspects an index directly. Neither command loads the full index into memory.
+`info -d` summarizes the database metadata, including its reference type, number of marker genomes, whether it stores its taxonomy dump and how many taxa its taxonomy record holds, and, when the `.mxi` file is present, the mapping-index header. `info -i` inspects an index directly. Neither command loads the full index into memory.
 
 ## 5. Run Profiling
 

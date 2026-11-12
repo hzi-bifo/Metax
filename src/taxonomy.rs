@@ -1,4 +1,5 @@
 mod dump;
+mod record;
 
 use anyhow::{bail, Context, Result};
 use flate2::read::MultiGzDecoder;
@@ -8,7 +9,9 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-pub(crate) use dump::TaxonomySource;
+pub use dump::TaxonomySource;
+pub(crate) use dump::{store_dump, DATABASE_TAXDMP_DIR};
+pub use record::{TaxonomyRecord, TAXONOMY_RECORD_FILE};
 
 #[derive(Clone, Debug)]
 pub struct Taxonomy {

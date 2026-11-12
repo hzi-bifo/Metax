@@ -1000,7 +1000,11 @@ pub fn build_index(
     compress_subsampled: bool,
     reference_types: ReferenceTypes,
     metam_options: MetamIndexOptions,
+    dmp_dir: Option<&str>,
 ) -> Result<()> {
+    // The explicit dump, else the managed NCBI dump, is stored with the
+    // database.
+    let taxonomy = taxonomy::TaxonomySource::prepare(dmp_dir, None)?;
     let params = subsample.map(|fraction| crate::db::SubsampleParams {
         fraction,
         seed,
@@ -1015,6 +1019,7 @@ pub fn build_index(
         compress_subsampled,
         &reference_types,
         &metam_options,
+        Some(&taxonomy),
     )?;
     Ok(())
 }
@@ -1022,18 +1027,13 @@ pub fn build_index(
 /// In a mixed database, list the genera that hold both genome-type and
 /// marker-type species: reads from the unindexed part of a marker-only genome
 /// can land on the genomes of its relatives there.
-pub fn report_genera_with_both_types(database: &Path, dmp_dir: Option<&Path>) -> Result<()> {
+pub fn report_genera_with_both_types(database: &Path) -> Result<()> {
     let metadata = DatabaseMetadata::load(database)?;
     if metadata.uniform_reference_type().is_some() {
         return Ok(());
     }
-    let Some(dmp_dir) = dmp_dir else {
-        eprintln!(
-            "[index] note: the database mixes genomes and marker genes; pass --dmp-dir to list the genera that hold both"
-        );
-        return Ok(());
-    };
-    let taxonomy = crate::taxonomy::Taxonomy::from_dir(dmp_dir)?;
+    let directory = crate::db::database_directory(database)?;
+    let taxonomy = taxonomy::TaxonomySource::prepare(None, Some(&directory))?.load()?;
     let species = metadata
         .references
         .iter()
