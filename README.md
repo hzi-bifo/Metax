@@ -24,7 +24,7 @@ By unifying coverage-informed presence probability estimation with EM-based abun
 - **Rank-aware reference labels.** References may be labelled at strain, species, genus, or any higher rank, and Metax reports each genome at the lowest rank its label supports.
 - **Lower peak memory.** Mapping and profiling run as separate stages, so the mapping index is released before the profiler starts.
 - **Reusable mapping output.** Save compressed coordinate mappings once and re-profile them with different thresholds without remapping.
-- **Managed taxonomy.** The NCBI taxonomy dump is downloaded and cached automatically when no `--dmp-dir` is given.
+- **Managed taxonomy.** A database can carry its own taxonomy dump; otherwise the NCBI taxonomy dump is downloaded and cached automatically when no `--dmp-dir` is given.
 - **More platforms.** Conda packages are published for Linux x86-64, Linux ARM64, and macOS Apple Silicon.
 
 Databases built for Metax 0.9 use a different index format and must be rebuilt with `metax index` (see [Reference database](#reference-database)).
@@ -60,7 +60,7 @@ smoke_tests/run_smoke_tests.sh
 
 Metax uses NCBI-style taxonomy dump files (`nodes.dmp`, `names.dmp`, `merged.dmp`, `delnodes.dmp`).
 
-- If `--dmp-dir` is omitted, Metax downloads the official NCBI [taxdump](https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz) to `~/.metax/taxdmp` on first use and reuses it afterwards.
+- If `--dmp-dir` is omitted, Metax uses the dump stored in the database directory (`taxdmp/`). Without one, it downloads the official NCBI [taxdump](https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz) to `~/.metax/taxdmp` on first use and reuses it afterwards.
 - Pass `--dmp-dir <dir>` to use an offline installation, a pinned taxonomy snapshot, or an alternative taxonomy (e.g. GTDB or ICTV) converted to the same dump-file format. An explicit directory is never modified by Metax.
 
 ### Reference database

@@ -23,8 +23,13 @@ pub struct Taxonomy {
 }
 
 impl Taxonomy {
-    pub(crate) fn prepare_dmp(dmp_dir: Option<&str>) -> Result<TaxonomySource> {
-        TaxonomySource::prepare(dmp_dir)
+    /// Locate the taxonomy dump: `dmp_dir` when given, else the dump stored
+    /// in the `database` directory, else the managed NCBI dump.
+    pub(crate) fn prepare_dmp(
+        dmp_dir: Option<&str>,
+        database: Option<&Path>,
+    ) -> Result<TaxonomySource> {
+        TaxonomySource::prepare(dmp_dir, database)
     }
 
     pub(super) fn from_dir(dir: &Path) -> Result<Self> {

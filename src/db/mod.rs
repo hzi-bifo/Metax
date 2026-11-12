@@ -540,6 +540,16 @@ impl Drop for RemoveFileOnDrop {
     }
 }
 
+/// Directory of the database given as a directory or as its metadata file.
+pub fn database_directory(path: &Path) -> Result<PathBuf> {
+    let metadata = resolve_db_path(path)?;
+    Ok(metadata
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf())
+}
+
 fn resolve_db_path(path: &Path) -> Result<PathBuf> {
     if path.is_dir() {
         let gz = path.join(DB_TSV_FILE);

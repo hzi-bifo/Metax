@@ -215,7 +215,14 @@ impl MetaxApp {
         // Resolve or install the taxonomy dump before starting an expensive
         // mapping run. The taxonomy itself is loaded only after mapping so it
         // does not increase mapper peak memory.
-        let taxonomy_source = Taxonomy::prepare_dmp(self.config.dmp_dir.as_deref())?;
+        let database = self
+            .config
+            .db
+            .as_deref()
+            .map(|db| crate::db::database_directory(Path::new(db)))
+            .transpose()?;
+        let taxonomy_source =
+            Taxonomy::prepare_dmp(self.config.dmp_dir.as_deref(), database.as_deref())?;
         // Resolve read-level profiler gates before mapping so saved mapping
         // metadata records the exact values used by this run. Resume/reuse
         // loads those values first, making profiling reproducible without the

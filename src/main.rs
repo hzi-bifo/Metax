@@ -167,7 +167,7 @@ struct ProfileArgs {
         alias = "taxonomy-dir",
         value_name = "DIR",
         help_heading = "Input and output",
-        help = "Directory containing NCBI taxonomy dump files. If omitted, Metax uses ~/.metax/taxdmp and downloads a validated dump there when needed."
+        help = "Directory containing the taxonomy dump files (nodes.dmp, names.dmp, merged.dmp, delnodes.dmp; plain or gzipped). If omitted, Metax uses the dump stored with the database (DB/taxdmp), and otherwise ~/.metax/taxdmp, where it downloads a validated NCBI dump when needed."
     )]
     dmp_dir: Option<String>,
 
@@ -2036,7 +2036,8 @@ mod tests {
         assert!(!help.contains("--keep-mapping-output"));
         assert!(!help.contains("Mapping-stage acceptance:"));
         assert!(help.contains("~/.metax/taxdmp"));
-        assert!(help.contains("downloads a validated dump"));
+        assert!(help.contains("stored with the database (DB/taxdmp)"));
+        assert!(help.contains("downloads a validated NCBI dump"));
         assert!(help.contains("does not discard lower-identity mapper output"));
         assert!(help.contains("independent of --min-identity"));
         assert!(help.contains("Advanced mapper candidate generation:"));

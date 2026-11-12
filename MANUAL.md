@@ -46,11 +46,15 @@ smoke_tests/run_smoke_tests.sh
 
 ## 2. Taxonomy Files
 
-Metax needs NCBI-style taxonomy dump files.
+Metax needs NCBI-style taxonomy dump files. `metax profile` takes the first of:
 
-### 2.1 Managed taxonomy (default)
+1. the directory given with `--dmp-dir`;
+2. `taxdmp/` in the database directory, the dump stored with the database. If this folder exists but lacks a dump file or cannot be read, Metax stops rather than use another taxonomy;
+3. the managed NCBI dump in `~/.metax/taxdmp` (section 2.1).
 
-When `--dmp-dir` is omitted, Metax uses `~/.metax/taxdmp`. On the first run, or when that copy is missing or invalid, Metax downloads the official NCBI `taxdump.tar.gz`, validates it, and keeps `nodes.dmp`, `names.dmp`, `merged.dmp`, and `delnodes.dmp`. Concurrent Metax processes share an installation lock, so a partially written dump is never used.
+### 2.1 Managed taxonomy
+
+When neither `--dmp-dir` nor a dump stored with the database is available, Metax uses `~/.metax/taxdmp`. On the first run, or when that copy is missing or invalid, Metax downloads the official NCBI `taxdump.tar.gz`, validates it, and keeps `nodes.dmp`, `names.dmp`, `merged.dmp`, and `delnodes.dmp`. Concurrent Metax processes share an installation lock, so a partially written dump is never used.
 
 ### 2.2 Explicit taxonomy directory
 
@@ -61,7 +65,7 @@ tar -xzf taxdump.tar.gz -C taxonomy
 metax profile --dmp-dir taxonomy ...
 ```
 
-An explicit directory is never downloaded, repaired, or modified by Metax. Use it for offline installations, pinned taxonomy snapshots, or alternative taxonomies (e.g. GTDB or ICTV) converted to the same dump-file format. The directory must contain `nodes.dmp`, `names.dmp`, `merged.dmp`, and `delnodes.dmp`; each may also be gzipped (`nodes.dmp.gz` and so on).
+An explicit directory, like a dump stored with a database, is never downloaded, repaired, or modified by Metax. Use it for offline installations, pinned taxonomy snapshots, or alternative taxonomies (e.g. GTDB or ICTV) converted to the same dump-file format. The directory must contain `nodes.dmp`, `names.dmp`, `merged.dmp`, and `delnodes.dmp`; each may also be gzipped (`nodes.dmp.gz` and so on).
 
 ## 3. Reference Databases
 

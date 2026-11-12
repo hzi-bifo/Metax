@@ -1,6 +1,6 @@
 //! Discovery and managed installation of the NCBI taxonomy dump.
 
-use super::Taxonomy;
+use super::{dump_file_path, Taxonomy};
 use anyhow::{anyhow, bail, Context, Result};
 use flate2::read::MultiGzDecoder;
 use std::collections::HashSet;
@@ -24,28 +24,80 @@ const DOWNLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNLOAD_BODY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const BACKUP_DIRECTORY_NAME: &str = ".taxdmp-backup";
 const STAGING_DIRECTORY_PREFIX: &str = ".taxdmp-download-";
+/// Folder of a database directory that holds the database's taxonomy dump.
+pub(crate) const DATABASE_TAXDMP_DIR: &str = "taxdmp";
+
+/// Where a taxonomy dump was found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DumpLocation {
+    /// Given with --dmp-dir.
+    Explicit,
+    /// Stored in the database directory.
+    Database,
+    /// The managed NCBI dump in the user's home directory.
+    Managed,
+}
 
 /// A resolved taxonomy location. Managed locations may be repaired on load;
-/// explicit user locations are read exactly as supplied and never modified.
+/// explicit and database locations are read exactly as found and never
+/// modified.
 #[derive(Clone, Debug)]
 pub(crate) struct TaxonomySource {
     directory: PathBuf,
-    managed: bool,
+    location: DumpLocation,
 }
 
 impl TaxonomySource {
-    pub(crate) fn prepare(dmp_dir: Option<&str>) -> Result<Self> {
-        if let Some(directory) = dmp_dir {
-            return Ok(Self {
-                directory: PathBuf::from(directory),
-                managed: false,
-            });
+    /// Use `dmp_dir` when given, else the dump stored in `database`, else
+    /// the managed NCBI dump, which is downloaded when missing.
+    pub(crate) fn prepare(dmp_dir: Option<&str>, database: Option<&Path>) -> Result<Self> {
+        if let Some(source) = Self::locate(dmp_dir, database)? {
+            return Ok(source);
         }
-
         let home = dirs::home_dir()
             .context("failed to determine the user home directory; specify --dmp-dir explicitly")?;
         let directory = home.join(".metax").join("taxdmp");
         Self::prepare_managed_with(directory, |target| install_managed_taxdump(target, false))
+    }
+
+    /// The explicit or database dump, or `None` when the managed dump is
+    /// needed. A database dump that is present but incomplete is an error, so
+    /// a damaged database never falls back to another taxonomy.
+    fn locate(dmp_dir: Option<&str>, database: Option<&Path>) -> Result<Option<Self>> {
+        if let Some(directory) = dmp_dir {
+            return Ok(Some(Self {
+                directory: PathBuf::from(directory),
+                location: DumpLocation::Explicit,
+            }));
+        }
+        let Some(database) = database else {
+            return Ok(None);
+        };
+        let directory = database.join(DATABASE_TAXDMP_DIR);
+        if fs::symlink_metadata(&directory).is_err() {
+            return Ok(None);
+        }
+        let missing = REQUIRED_DUMP_FILES
+            .iter()
+            .filter(|name| !dump_file_path(&directory, name).is_file())
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!(
+                "the taxonomy dump stored with the database in {} lacks {}; restore it or pass --dmp-dir",
+                directory.display(),
+                missing.join(", ")
+            );
+        }
+        log::info!(
+            target: "TAXONOMY",
+            "Using the taxonomy dump stored with the database in {}.",
+            directory.display()
+        );
+        Ok(Some(Self {
+            directory,
+            location: DumpLocation::Database,
+        }))
     }
 
     fn prepare_managed_with<F>(directory: PathBuf, installer: F) -> Result<Self>
@@ -62,7 +114,7 @@ impl TaxonomySource {
         }
         Ok(Self {
             directory,
-            managed: true,
+            location: DumpLocation::Managed,
         })
     }
 
@@ -76,9 +128,9 @@ impl TaxonomySource {
     {
         match Taxonomy::from_dir(&self.directory) {
             Ok(taxonomy) => Ok(taxonomy),
-            Err(error) if !self.managed => Err(error).with_context(|| {
+            Err(error) if self.location != DumpLocation::Managed => Err(error).with_context(|| {
                 format!(
-                    "failed to load the NCBI taxonomy dump from {}",
+                    "failed to load the taxonomy dump from {}",
                     self.directory.display()
                 )
             }),
@@ -530,7 +582,7 @@ mod tests {
         }
         let managed = TaxonomySource {
             directory: directory.clone(),
-            managed: true,
+            location: DumpLocation::Managed,
         };
         let repaired = managed
             .load_with_repair(|target| {
@@ -545,7 +597,7 @@ mod tests {
         }
         let explicit = TaxonomySource {
             directory,
-            managed: false,
+            location: DumpLocation::Explicit,
         };
         assert!(explicit
             .load_with_repair(|_| panic!("explicit dumps must not be repaired"))
@@ -595,5 +647,61 @@ mod tests {
         );
         assert!(!backup.exists());
         assert!(!stale_staging.exists());
+    }
+
+    #[test]
+    fn database_dump_is_used_unless_a_directory_is_given() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("db");
+        let stored = database.join(DATABASE_TAXDMP_DIR);
+        write_dump(&stored);
+        let explicit = temp.path().join("explicit");
+        write_dump(&explicit);
+
+        let source = TaxonomySource::locate(None, Some(&database))
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.location, DumpLocation::Database);
+        assert_eq!(source.directory, stored);
+        assert_eq!(source.load().unwrap().get_name(2), Some("Species two"));
+
+        let source = TaxonomySource::locate(explicit.to_str(), Some(&database))
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.location, DumpLocation::Explicit);
+        assert_eq!(source.directory, explicit);
+    }
+
+    #[test]
+    fn database_without_a_dump_needs_the_managed_dump() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(TaxonomySource::locate(None, Some(temp.path()))
+            .unwrap()
+            .is_none());
+        assert!(TaxonomySource::locate(None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn incomplete_database_dump_is_an_error_not_a_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let stored = temp.path().join(DATABASE_TAXDMP_DIR);
+        write_dump(&stored);
+        fs::remove_file(stored.join("merged.dmp")).unwrap();
+        let error = TaxonomySource::locate(None, Some(temp.path())).unwrap_err();
+        assert!(format!("{error:#}").contains("merged.dmp"));
+    }
+
+    #[test]
+    fn damaged_database_dump_is_not_repaired() {
+        let temp = tempfile::tempdir().unwrap();
+        let stored = temp.path().join(DATABASE_TAXDMP_DIR);
+        write_dump(&stored);
+        fs::write(stored.join("nodes.dmp"), "corrupt\n").unwrap();
+        let source = TaxonomySource::locate(None, Some(temp.path()))
+            .unwrap()
+            .unwrap();
+        assert!(source
+            .load_with_repair(|_| panic!("database dumps must not be repaired"))
+            .is_err());
     }
 }
