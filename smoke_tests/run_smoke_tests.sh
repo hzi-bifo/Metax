@@ -258,22 +258,26 @@ run_metax profile --db "$WORK/db_attach" -i "$WORK/se.fq" -o "$WORK/se_attach" -
   --temp-dir "$WORK/stage" --min-identity 0.90 --mapped-len 50 --min-mapped-fraction 0.50
 assert_single_species_profile "$WORK/se_attach.profile.txt"
 
-# A dump that names a database taxon differently stops the run unless allowed.
+# A dump that names a database taxon differently gives a warning; one that
+# lacks database taxa stops the run before mapping.
 cp -r "$WORK/tax" "$WORK/tax_renamed"
 sed -i 's/SpeciesA/SpeciesRenamed/' "$WORK/tax_renamed/names.dmp"
-if run_metax profile --db "$WORK/db_one" --dmp-dir "$WORK/tax_renamed" \
-  -i "$WORK/se.fq" -o "$WORK/se_renamed" -t 2 --temp-dir "$WORK/stage" \
-  2>"$WORK/renamed.err"; then
-  echo "profiling with a different taxonomy dump unexpectedly succeeded" >&2
-  exit 1
-fi
-grep -q "is not the one the database was built with" "$WORK/renamed.err"
-assert_not_exists "$WORK/se_renamed.profile.txt"
 run_metax profile --db "$WORK/db_one" --dmp-dir "$WORK/tax_renamed" \
-  --allow-taxonomy-mismatch \
   -i "$WORK/se.fq" -o "$WORK/se_renamed" -t 2 --temp-dir "$WORK/stage" \
   --min-identity 0.90 --mapped-len 50 --min-mapped-fraction 0.50
 grep -q "SpeciesRenamed" "$WORK/se_renamed.profile.txt"
+grep -q "differs from the one the database was built with" "$WORK/se_renamed.log"
+cp -r "$WORK/tax" "$WORK/tax_missing"
+sed -i '/^10[01]\t/d' "$WORK/tax_missing/nodes.dmp" "$WORK/tax_missing/names.dmp"
+if run_metax profile --db "$WORK/db_one" --dmp-dir "$WORK/tax_missing" \
+  -i "$WORK/se.fq" -o "$WORK/se_missing" -t 2 --temp-dir "$WORK/stage" \
+  2>"$WORK/missing.err"; then
+  echo "profiling with a dump that lacks database taxa unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q "2 are not in it" "$WORK/missing.err"
+grep -q -- "--allow-taxonomy-mismatch" "$WORK/missing.err"
+assert_not_exists "$WORK/se_missing.profile.txt"
 
 run_metax profile \
   --db "$WORK/db_genus" \

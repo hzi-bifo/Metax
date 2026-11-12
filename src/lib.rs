@@ -78,7 +78,7 @@ pub struct AppConfig {
     // Input database and taxonomy locations.
     pub db: Option<String>,
     pub dmp_dir: Option<String>,
-    /// Profile with a taxonomy dump that differs from the database's record.
+    /// Profile with a taxonomy dump that lacks database taxids.
     pub allow_taxonomy_mismatch: bool,
     // Input reads (comma-separated for paired-end).
     pub input_sequences: Option<String>,

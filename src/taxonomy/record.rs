@@ -122,20 +122,34 @@ impl TaxonomyRecord {
         Self::load(&path).map(Some)
     }
 
-    /// Compare `taxonomy`, loaded from `dump`, with the record. A database
-    /// taxid whose lineage differs, or that the dump lacks, stops the run
-    /// unless `allow_mismatch`, which reports the differences as a warning.
-    pub fn check(&self, taxonomy: &Taxonomy, dump: &Path, allow_mismatch: bool) -> Result<()> {
-        let mut changed = Vec::new();
-        let mut missing = Vec::new();
+    /// The recorded taxa whose lineage differs in `taxonomy`, split into
+    /// those it merges into another taxid and the others, and the recorded
+    /// taxa it lacks.
+    fn compare(&self, taxonomy: &Taxonomy) -> Comparison {
+        let mut comparison = Comparison::default();
         for &(taxid, hash) in &self.lineages {
             match lineage_hash(taxonomy, taxid) {
                 Some(current) if current == hash => {}
-                Some(_) => changed.push(taxid),
-                None => missing.push(taxid),
+                Some(_) if taxonomy.resolve_current_taxid(taxid) != Some(taxid) => {
+                    comparison.merged.push(taxid)
+                }
+                Some(_) => comparison.changed.push(taxid),
+                None => comparison.missing.push(taxid),
             }
         }
-        if changed.is_empty() && missing.is_empty() {
+        comparison
+    }
+
+    /// Compare `taxonomy`, loaded from `dump`, with the record. Merged or
+    /// otherwise changed taxa are reported as a warning; taxa the dump lacks
+    /// stop the run unless `allow_missing`.
+    pub fn check(&self, taxonomy: &Taxonomy, dump: &Path, allow_missing: bool) -> Result<()> {
+        let Comparison {
+            merged,
+            changed,
+            missing,
+        } = self.compare(taxonomy);
+        if merged.is_empty() && changed.is_empty() && missing.is_empty() {
             log::info!(
                 target: "TAXONOMY",
                 "The taxonomy dump in {} matches the database ({} taxa{}).",
@@ -149,34 +163,29 @@ impl TaxonomyRecord {
             return Ok(());
         }
         let mut differences = Vec::new();
-        if !changed.is_empty() {
-            differences.push(format!(
-                "{} have a different name, rank or lineage ({})",
-                changed.len(),
-                list_taxids(&changed)
-            ));
+        for (taxids, what) in [
+            (&merged, "are merged into other taxids in it"),
+            (&changed, "have another name, rank or lineage"),
+            (&missing, "are not in it"),
+        ] {
+            if !taxids.is_empty() {
+                differences.push(format!("{} {what} ({})", taxids.len(), list_taxids(taxids)));
+            }
         }
-        if !missing.is_empty() {
-            differences.push(format!(
-                "{} are not in it ({})",
-                missing.len(),
-                list_taxids(&missing)
-            ));
-        }
-        let message = format!(
-            "taxonomy dump in {} is not the one the database was built with: of the {} database taxa, {}",
+        let detail = format!(
+            "taxonomy dump in {} differs from the one the database was built with: of the {} database taxa, {}",
             dump.display(),
             self.len(),
-            differences.join(" and ")
+            differences.join("; ")
         );
-        if !allow_mismatch {
+        if !missing.is_empty() && !allow_missing {
             bail!(
-                "the {message}. Use the dump the database was built with (its taxdmp folder, used when --dmp-dir is omitted), or pass --allow-taxonomy-mismatch to profile with this dump"
+                "the {detail}. Use the dump stored with the database (used when --dmp-dir is omitted), or pass --allow-taxonomy-mismatch to continue anyway"
             );
         }
         log::warn!(
             target: "TAXONOMY",
-            "The {message}. Continuing because --allow-taxonomy-mismatch was given."
+            "The {detail}. The profile uses the names and lineages of this dump."
         );
         Ok(())
     }
@@ -256,6 +265,14 @@ impl TaxonomyRecord {
             provenance,
         })
     }
+}
+
+/// Recorded taxa that another dump treats differently.
+#[derive(Debug, Default)]
+struct Comparison {
+    merged: Vec<u32>,
+    changed: Vec<u32>,
+    missing: Vec<u32>,
 }
 
 /// Hash of the scientific name and rank of `taxid` and of each of its
@@ -338,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn check_stops_on_a_different_dump_unless_allowed() {
+    fn changed_taxa_warn_and_missing_taxa_stop_unless_allowed() {
         let taxids = BTreeSet::from([20, 25, 30]);
         let record = TaxonomyRecord::build(&taxonomy("Species twenty"), &taxids).unwrap();
         let dump = Path::new("dump");
@@ -346,20 +363,26 @@ mod tests {
             .check(&taxonomy("Species twenty"), dump, false)
             .unwrap();
 
+        // Renaming species 20 changes taxid 20 and taxid 25, which the dump
+        // merges into 20.
         let renamed = taxonomy("Species renamed");
-        let message = record.check(&renamed, dump, false).unwrap_err().to_string();
-        assert!(message.contains("of the 3 database taxa, 2 have a different name"));
-        assert!(message.contains("taxid 20, 25"));
-        record.check(&renamed, dump, true).unwrap();
+        let comparison = record.compare(&renamed);
+        assert_eq!(comparison.merged, [25]);
+        assert_eq!(comparison.changed, [20]);
+        assert!(comparison.missing.is_empty());
+        record.check(&renamed, dump, false).unwrap();
 
         let mut without_thirty = taxonomy("Species twenty");
         without_thirty.nodes.remove(&30);
         without_thirty.names.remove(&30);
+        assert_eq!(record.compare(&without_thirty).missing, [30]);
         let message = record
             .check(&without_thirty, dump, false)
             .unwrap_err()
             .to_string();
-        assert!(message.contains("1 are not in it (taxid 30)"));
+        assert!(message.contains("of the 3 database taxa, 1 are not in it (taxid 30)"));
+        assert!(message.contains("--allow-taxonomy-mismatch"));
+        record.check(&without_thirty, dump, true).unwrap();
     }
 
     #[test]
