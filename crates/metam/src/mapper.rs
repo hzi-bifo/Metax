@@ -3415,6 +3415,10 @@ fn assign_mate_status(reads: &mut [Mapping], mates: &[Mapping], fallback: Option
     }
 }
 
+/// The best placement of `read` beside any of `mate_mappings`. With
+/// `seedless_identity`, the read's best ungapped position within that
+/// identity is also tried in a long window that holds no seeded candidate
+/// (see [`rescue_beside_mate`]).
 #[allow(clippy::too_many_arguments)]
 pub fn rescue_mate_with_workspace(
     read_id: &str,
@@ -3424,6 +3428,7 @@ pub fn rescue_mate_with_workspace(
     params: MapParams,
     min_insert: usize,
     max_insert: usize,
+    seedless_identity: Option<f64>,
     profile: &mut MapProfile,
     workspace: &mut MappingWorkspace,
 ) -> Vec<Mapping> {
@@ -3434,7 +3439,16 @@ pub fn rescue_mate_with_workspace(
     let mut best = None;
     for mate in mate_mappings {
         rescue_beside_mate(
-            read_id, read, index, mate, params, min_insert, max_insert, profile, workspace,
+            read_id,
+            read,
+            index,
+            mate,
+            params,
+            min_insert,
+            max_insert,
+            seedless_identity,
+            profile,
+            workspace,
             &mut best,
         );
     }
@@ -3514,6 +3528,7 @@ pub fn rescue_competing_mates_with_workspace(
             params,
             min_insert,
             max_insert,
+            None,
             profile,
             workspace,
             &mut candidate,
@@ -3532,9 +3547,10 @@ pub fn rescue_competing_mates_with_workspace(
 ///
 /// A candidate is judged exactly as seeding judges one, so a rescued
 /// placement carries the identity and mapped bases of its aligned interval.
-/// Only when no candidate is found on a reference of at most 256 bases is the
-/// read aligned as a whole at every position of the window
-/// (`brute_force_rescue`).
+/// In a longer window without seeded candidates, the read's best ungapped
+/// position within `seedless_identity` is judged as a candidate. When no
+/// candidate is found, the read is aligned as a whole at every position of a
+/// window of at most 256 bases (`brute_force_rescue`).
 ///
 /// The seed hits of `read` must already be prepared in `workspace`.
 #[allow(clippy::too_many_arguments)]
@@ -3546,6 +3562,7 @@ fn rescue_beside_mate(
     params: MapParams,
     min_insert: usize,
     max_insert: usize,
+    seedless_identity: Option<f64>,
     profile: &mut MapProfile,
     workspace: &mut MappingWorkspace,
     best: &mut Option<Mapping>,
@@ -3570,6 +3587,31 @@ fn rescue_beside_mate(
         profile,
         &mut workspace.mate_rescue,
     );
+    // A read without seed hits in a long window is tried at its best ungapped
+    // position within `seedless_identity`, judged as any candidate is.
+    if candidates.is_empty() && window_end.saturating_sub(window_start) > 256 {
+        if let Some((pos, strand)) = seedless_identity.and_then(|identity| {
+            best_ungapped_placement(
+                &workspace.mate_rescue.coded,
+                &reference,
+                window_start,
+                window_end,
+                identity,
+            )
+        }) {
+            candidates.push(Candidate {
+                ref_id,
+                strand,
+                diag: pos as i64,
+                seed_count: 0,
+                score: 0,
+                query_seed_start: 0,
+                query_seed_end: read.len(),
+                ref_seed_start: pos,
+                ref_seed_end: pos + read.len(),
+            });
+        }
+    }
     candidates.sort_unstable_by(|a, b| b.score.cmp(&a.score));
     for candidate in candidates.into_iter().take(params.top_n.max(4)) {
         // A short-read placement scores its candidate's score plus the match
@@ -3620,6 +3662,46 @@ fn rescue_beside_mate(
             &mut workspace.edit_distance,
         );
     }
+}
+
+/// Start and strand of the ungapped placement of the whole read in
+/// `start..end` with the fewest mismatches, if they stay within
+/// `1 - identity` of the read's length (ambiguous bases are mismatches);
+/// the first such placement on a tie.
+fn best_ungapped_placement(
+    read: &CodedRead,
+    reference: &ReferenceView<'_>,
+    start: usize,
+    end: usize,
+    identity: f64,
+) -> Option<(usize, i8)> {
+    let len = read.len();
+    if len == 0 || end < start + len {
+        return None;
+    }
+    let mut allowed = ((1.0 - identity) * len as f64).floor() as usize;
+    let mut best = None;
+    for strand in [1i8, -1i8] {
+        let query = read.strand(strand);
+        'position: for pos in start..=end - len {
+            let mut mismatches = 0usize;
+            for (offset, &code) in query.iter().enumerate() {
+                if reference.code_at(pos + offset) != Some(code) {
+                    mismatches += 1;
+                    if mismatches > allowed {
+                        continue 'position;
+                    }
+                }
+            }
+            if mismatches == 0 {
+                return Some((pos, strand));
+            }
+            best = Some((pos, strand));
+            // Later starts must match strictly better.
+            allowed = mismatches - 1;
+        }
+    }
+    best
 }
 
 /// Align the whole read (and its reverse complement) at every start in the
@@ -5006,6 +5088,7 @@ mod tests {
             short_test_params(),
             0,
             1_000,
+            None,
             &mut profile,
             &mut MappingWorkspace::default(),
         );
@@ -5098,9 +5181,101 @@ mod tests {
             params,
             0,
             1_000,
+            None,
             &mut MapProfile::default(),
             &mut MappingWorkspace::default(),
         )
+    }
+
+    #[test]
+    fn best_ungapped_placement_finds_the_closest_placement_within_the_identity() {
+        let sequence = deterministic_read(400);
+        let owned = owned_reference("long", &sequence);
+        let reference = ReferenceView::Owned(&owned);
+        let mut read = sequence[100..200].to_vec();
+        read[10] = substituted(read[10]);
+        read[60] = substituted(read[60]);
+        let coded = CodedRead::new(&read);
+        assert_eq!(
+            best_ungapped_placement(&coded, &reference, 0, 400, 0.97),
+            Some((100, 1))
+        );
+        // Two mismatches in 100 bases exceed one per cent.
+        assert_eq!(
+            best_ungapped_placement(&coded, &reference, 0, 400, 0.99),
+            None
+        );
+        // The window must hold the whole read.
+        assert_eq!(
+            best_ungapped_placement(&coded, &reference, 120, 400, 0.97),
+            None
+        );
+        // The reverse strand is searched too.
+        let reverse = CodedRead::new(&revcomp(&sequence[250..350]));
+        assert_eq!(
+            best_ungapped_placement(&reverse, &reference, 0, 400, 0.97),
+            Some((250, -1))
+        );
+    }
+
+    #[test]
+    fn long_rescue_window_without_seeds_is_searched_within_the_identity() {
+        let sequence = deterministic_read(3_000);
+        // No seeds at all: only the seedless search can place the mate.
+        let references = vec![owned_reference("genome", &sequence)];
+        let mut seed_table = SeedTable::default();
+        seed_table.rebuild_lookup_index();
+        let index = RuntimeIndex::new(Index {
+            header: IndexHeader {
+                magic: INDEX_MAGIC,
+                version: INDEX_VERSION,
+                metam_version: "test".to_string(),
+                k: 8,
+                w: 4,
+                seed_mode: SeedMode::Minimizer,
+                max_occ: 100,
+                hash_bits: 64,
+                exact_randstrobe_match: false,
+                strobe_start_dist: None,
+                reference_count: 1,
+                total_reference_bases: 3_000,
+                indexed_seed_hashes: 0,
+                indexed_seed_occurrences: 0,
+                filtered_seed_hashes: 0,
+                reference_storage_bytes: 0,
+                created_unix_seconds: 0,
+            },
+            references,
+            seed_table,
+        });
+        let mut mate = test_mapping("pair", "genome", 1_000, 1_100, 100, 1.0, 100);
+        mate.strand = 1;
+        let mut read = revcomp(&sequence[1_200..1_300]);
+        read[30] = substituted(read[30]);
+        let rescue = |identity| {
+            rescue_mate_with_workspace(
+                "pair",
+                &read,
+                &index,
+                std::slice::from_ref(&mate),
+                short_test_params(),
+                0,
+                1_000,
+                identity,
+                &mut MapProfile::default(),
+                &mut MappingWorkspace::default(),
+            )
+        };
+        assert!(rescue(None).is_empty());
+        let placed = rescue(Some(0.97));
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert_eq!(
+            (placed[0].ref_start, placed[0].ref_end, placed[0].strand),
+            (1_200, 1_300, -1)
+        );
+        assert_eq!(placed[0].matched_bases, 99);
+        // One mismatch in 100 bases exceeds a cutoff of 0.995.
+        assert!(rescue(Some(0.995)).is_empty());
     }
 
     /// What a rescued and a seeded placement must agree on.

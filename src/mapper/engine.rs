@@ -418,6 +418,9 @@ pub struct Mapper {
     outprefix: String,
     /// Long reads whose sampled base accuracy marks them as noisy.
     noisy_long_reads: bool,
+    /// The profiler's species identity cutoff for this sample; short-read
+    /// mate rescue scans a long window without seeds only within it.
+    species_identity: f64,
 }
 
 impl Mapper {
@@ -426,12 +429,14 @@ impl Mapper {
         sequences: Vec<String>,
         outprefix: String,
         noisy_long_reads: bool,
+        species_identity: f64,
     ) -> Self {
         Self {
             db,
             sequences,
             outprefix,
             noisy_long_reads,
+            species_identity,
         }
     }
 
@@ -607,6 +612,7 @@ impl Mapper {
             sequences: self.sequences.clone(),
             outprefix: self.outprefix.clone(),
             noisy_long_reads: self.noisy_long_reads,
+            species_identity: self.species_identity,
         };
         let extra_args = extra_args.to_vec();
         let profile_for_worker = profile.clone();
@@ -771,7 +777,7 @@ impl Mapper {
         let db = DatabaseMetadata::load(Path::new(&self.db))?;
         let inputs = self.input_sequences(sequencer, is_paired)?;
         let has_marker_genes = db.uniform_reference_type() != Some(ReferenceType::Genome);
-        let config = MappingConfig::resolve(
+        let mut config = MappingConfig::resolve(
             sequencer,
             is_paired,
             self.noisy_long_reads,
@@ -779,6 +785,9 @@ impl Mapper {
             mode,
             extra_args,
         )?;
+        if config.preset == MappingPreset::Illumina {
+            config.seedless_rescue_identity = Some(self.species_identity);
+        }
         if config.preset == MappingPreset::Ont && config.allow_single_strobe_matches {
             log::info!(
                 target: "MAPPER",
@@ -831,6 +840,7 @@ impl Mapper {
                  \tmin_insert                {}\n\
                  \tmax_insert                {}\n\
                  \tmate_rescue_taxa          {}\n\
+                 \tseedless_rescue_identity  {}\n\
                  \textra_mapper_args         {}",
                 index_path,
                 index_cache,
@@ -875,6 +885,10 @@ impl Mapper {
                 config.min_insert,
                 config.max_insert,
                 config.mate_rescue_taxa,
+                config
+                    .seedless_rescue_identity
+                    .map(|value| format!("{value:.4}"))
+                    .unwrap_or_else(|| "none".to_string()),
                 extra_args_display,
             );
         }
@@ -1068,6 +1082,9 @@ struct MappingConfig {
     min_insert: usize,
     max_insert: usize,
     mate_rescue_taxa: usize,
+    /// Identity within which mate rescue scans a long window that holds no
+    /// seeded candidate; set for short reads from the profiler's cutoff.
+    seedless_rescue_identity: Option<f64>,
     index_cache: Option<String>,
 }
 
@@ -1207,6 +1224,7 @@ impl MappingConfig {
             mate_rescue_taxa: overrides
                 .mate_rescue_taxa
                 .unwrap_or(DEFAULT_MATE_RESCUE_TAXA),
+            seedless_rescue_identity: None,
             index_cache: overrides
                 .index_cache
                 .unwrap_or_else(|| Some("auto".to_string())),
@@ -1843,11 +1861,11 @@ fn map_record_pair(
         // The mate whose rescue seed hits the workspace holds, if any.
         let mut prepared = None;
         if m1.is_empty() && !m2.is_empty() {
-            m1 = rescue.beside_any(r1, &m2);
+            m1 = rescue.beside_any(r1, &m2, true);
             prepared = Some(1);
         }
         if m2.is_empty() && !m1.is_empty() {
-            m2 = rescue.beside_any(r2, &m1);
+            m2 = rescue.beside_any(r2, &m1, true);
             prepared = Some(2);
         }
         if !m1.is_empty() && !m2.is_empty() {
@@ -1864,8 +1882,8 @@ fn map_record_pair(
                     competing2 = rescue.for_unpaired_taxa(r2, &m1, &m2, false);
                 }
             } else {
-                let mut rescued1 = rescue.beside_any(r1, &m2);
-                let mut rescued2 = rescue.beside_any(r2, &m1);
+                let mut rescued1 = rescue.beside_any(r1, &m2, false);
+                let mut rescued2 = rescue.beside_any(r2, &m1, false);
                 m1.append(&mut rescued1);
                 m2.append(&mut rescued2);
             }
@@ -1910,8 +1928,10 @@ struct MateRescue<'a> {
 }
 
 impl MateRescue<'_> {
-    /// The best placement of `read` beside any placement of its mate.
-    fn beside_any(&mut self, read: &Record, mates: &[Mapping]) -> Vec<Mapping> {
+    /// The best placement of `read` beside any placement of its mate. A read
+    /// that seeding did not place at all (`unplaced`) is also tried where it
+    /// has no seed hit.
+    fn beside_any(&mut self, read: &Record, mates: &[Mapping], unplaced: bool) -> Vec<Mapping> {
         rescue_mate_with_workspace(
             &read.id,
             &read.seq,
@@ -1920,6 +1940,7 @@ impl MateRescue<'_> {
             self.config.params,
             self.config.min_insert,
             self.config.max_insert,
+            self.config.seedless_rescue_identity.filter(|_| unplaced),
             self.profile,
             self.workspace,
         )

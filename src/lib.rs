@@ -415,6 +415,7 @@ impl MetaxApp {
             sequences,
             self.config.outprefix.clone(),
             noisy_long_reads,
+            profiler.identity,
         );
         if self.config.verbose || self.config.very_verbose {
             log::info!(
