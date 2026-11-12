@@ -246,6 +246,20 @@ assert_single_species_profile "$WORK/se_packed_taxonomy.profile.txt"
 assert_exists "$WORK/db_packed/taxdmp/nodes.dmp"
 assert_not_exists "$WORK/db_packed/taxdmp.tar.gz"
 
+# A database built without a dump can be given one.
+mkdir "$WORK/db_attach"
+cp "$WORK/db_one/metax_db.mxi" "$WORK/db_one/metax_db.tsv.gz" "$WORK/db_attach/"
+run_metax attach-taxonomy -d "$WORK/db_attach" --dmp-dir "$WORK/tax"
+assert_exists "$WORK/db_attach/taxdmp/nodes.dmp"
+assert_exists "$WORK/db_attach/metax_taxonomy.tsv.gz"
+if run_metax attach-taxonomy -d "$WORK/db_attach" --dmp-dir "$WORK/tax" 2>"$WORK/attach.err"; then
+  echo "a second attach-taxonomy unexpectedly succeeded" >&2
+  exit 1
+fi
+run_metax profile --db "$WORK/db_attach" -i "$WORK/se.fq" -o "$WORK/se_attach" -t 2 \
+  --temp-dir "$WORK/stage" --min-identity 0.90 --mapped-len 50 --min-mapped-fraction 0.50
+assert_single_species_profile "$WORK/se_attach.profile.txt"
+
 # A dump that names a database taxon differently stops the run unless allowed.
 cp -r "$WORK/tax" "$WORK/tax_renamed"
 sed -i 's/SpeciesA/SpeciesRenamed/' "$WORK/tax_renamed/names.dmp"

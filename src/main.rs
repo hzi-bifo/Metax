@@ -80,7 +80,10 @@ use metax::mapper::mapper_options_help;
 use metax::mapper::tsv::load_mapping_run_metadata;
 use metax::profiler::{ExactTiePolicy, ProfileMode};
 use metax::sequencer::Sequencer;
-use metax::{build_index, info::run_info, report_genera_with_both_types, AppConfig, MetaxApp};
+use metax::{
+    attach_taxonomy, build_index, info::run_info, report_genera_with_both_types, AppConfig,
+    MetaxApp,
+};
 
 /// Main command-line interface structure parsed by clap.
 /// Uses derive macros for automatic argument parsing and help generation.
@@ -130,6 +133,15 @@ enum Commands {
         after_help = "Examples:\n  metax info -d DB\n  metax info -i DB/metax_db.mxi"
     )]
     Info(InfoArgs),
+
+    /// Store a taxonomy dump with a database built without one.
+    #[command(
+        name = "attach-taxonomy",
+        display_order = 4,
+        long_about = "Check every reference taxid of an existing database against a taxonomy dump, then copy the dump into the database (DB/taxdmp) and record the reference taxa (DB/metax_taxonomy.tsv.gz), as 'metax index' does for a new database. Files already in the database are never replaced.",
+        after_help = "Example:\n  metax attach-taxonomy -d DB --dmp-dir taxonomy"
+    )]
+    AttachTaxonomy(AttachTaxonomyArgs),
 }
 
 /// Command-line arguments for the `profile` subcommand.
@@ -905,6 +917,25 @@ struct IndexArgs {
     progress_interval: u64,
 }
 
+/// Command-line arguments for the `attach-taxonomy` subcommand.
+#[derive(Args, Debug)]
+struct AttachTaxonomyArgs {
+    #[arg(
+        short = 'd',
+        long,
+        value_name = "DB",
+        help = "Database directory (or its metax_db.tsv.gz metadata file)."
+    )]
+    db: String,
+
+    #[arg(
+        long = "dmp-dir",
+        value_name = "DIR",
+        help = "Taxonomy dump the database was built with (nodes.dmp, names.dmp, merged.dmp, delnodes.dmp; plain or gzipped)."
+    )]
+    dmp_dir: String,
+}
+
 /// Command-line arguments for the `info` subcommand.
 #[derive(Args, Debug)]
 struct InfoArgs {
@@ -1229,6 +1260,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::Info(args) => run_info(args.db.as_deref(), args.index.as_deref()),
+        Commands::AttachTaxonomy(args) => attach_taxonomy(Path::new(&args.db), &args.dmp_dir),
     }
 }
 

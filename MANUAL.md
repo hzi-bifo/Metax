@@ -53,7 +53,7 @@ Metax needs NCBI-style taxonomy dump files. `metax profile` takes the first of:
 3. `taxdmp.tar.gz` in the database directory, the form in which a shipped database carries its dump (§4.1). The first run unpacks it into `taxdmp/`, checks it and removes the archive; runs started at the same time wait for it. If the archive cannot be unpacked, for example because the database directory is not writable, Metax stops; unpack it into `taxdmp/` yourself or pass `--dmp-dir`;
 4. the managed NCBI dump in `~/.metax/taxdmp` (section 2.1).
 
-A database built by `metax index` records the scientific name, rank and lineage of every reference taxid in the dump it was built with (`metax_taxonomy.tsv.gz`, §4.1). `metax profile` compares the dump it uses with this record: a dump that gives a database taxid another name, rank or lineage, or lacks it, stops the run and lists the differing taxids. Such a dump would label the profile with names the database was not built for, for example an NCBI dump with a GTDB database. A dump other than the database's own is compared before mapping starts. Pass `--allow-taxonomy-mismatch` to profile with a different dump anyway, for example a newer NCBI dump for a database built with an older one; the differences are then reported as a warning. Databases built without a record are not checked.
+A database built by `metax index` (or given its dump with `metax attach-taxonomy`, §4.6) records the scientific name, rank and lineage of every reference taxid in the dump it was built with (`metax_taxonomy.tsv.gz`, §4.1). `metax profile` compares the dump it uses with this record: a dump that gives a database taxid another name, rank or lineage, or lacks it, stops the run and lists the differing taxids. Such a dump would label the profile with names the database was not built for, for example an NCBI dump with a GTDB database. A dump other than the database's own is compared before mapping starts. Pass `--allow-taxonomy-mismatch` to profile with a different dump anyway, for example a newer NCBI dump for a database built with an older one; the differences are then reported as a warning. Databases built without a record are not checked.
 
 ### 2.1 Managed taxonomy
 
@@ -260,6 +260,16 @@ metax info -i db/metax_db.mxi
 ```
 
 `info -d` summarizes the database metadata, including its reference type, number of marker genomes, whether it stores its taxonomy dump and how many taxa its taxonomy record holds, and, when the `.mxi` file is present, the mapping-index header. `info -i` inspects an index directly. Neither command loads the full index into memory.
+
+### 4.6 Add the taxonomy dump to an existing database
+
+A database built without a taxonomy dump, for example by an earlier release, can be given one without rebuilding the index:
+
+```bash
+metax attach-taxonomy -d db --dmp-dir taxonomy
+```
+
+Pass the dump the database was built with. Metax checks every reference taxid against it, as `metax index` does, and then adds `taxdmp/` and `metax_taxonomy.tsv.gz` to the database (§4.1). Nothing is added when a taxid is missing, and files already in the database are never replaced.
 
 ## 5. Run Profiling
 

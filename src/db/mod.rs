@@ -16,7 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::progress::{self, ProgressOptions};
 use crate::taxonomy::{
-    store_dump, TaxonomyRecord, TaxonomySource, DATABASE_TAXDMP_DIR, TAXONOMY_RECORD_FILE,
+    store_dump, TaxonomyRecord, TaxonomySource, DATABASE_TAXDMP_ARCHIVE, DATABASE_TAXDMP_DIR,
+    TAXONOMY_RECORD_FILE,
 };
 use metam::{
     index::{
@@ -374,7 +375,12 @@ pub fn build_database(
     // the taxonomy is freed before the build starts.
     let taxonomy = taxonomy
         .map(|source| {
-            record_reference_taxa(source, &selected, options.quiet).map(|record| (source, record))
+            record_reference_taxa(
+                source,
+                selected.iter().map(|record| &record.taxonomy),
+                options.quiet,
+            )
+            .map(|record| (source, record))
         })
         .transpose()?;
 
@@ -438,15 +444,14 @@ pub fn build_database(
 
 /// Record the taxa that the selected references name in the taxonomy dump
 /// of `source`; fails when the dump lacks any of them.
-fn record_reference_taxa(
+fn record_reference_taxa<'a>(
     source: &TaxonomySource,
-    records: &[SelectedRecord],
+    references: impl IntoIterator<Item = &'a TaxonomySpec>,
     quiet: bool,
 ) -> Result<TaxonomyRecord> {
     let mut taxids = BTreeSet::new();
     let mut previous = None;
-    for record in records {
-        let taxonomy = &record.taxonomy;
+    for taxonomy in references {
         if previous != Some(taxonomy) {
             taxids.insert(taxonomy.profile_taxid);
             taxids.extend(taxonomy.primary_taxid);
@@ -456,16 +461,71 @@ fn record_reference_taxa(
     let dump = source.directory().display();
     let record = TaxonomyRecord::build(&source.load()?, &taxids).with_context(|| {
         format!(
-            "the reference taxids do not match the taxonomy dump in {dump}; index with the dump they come from (--dmp-dir)"
+            "the reference taxids do not match the taxonomy dump in {dump}; use the dump they come from (--dmp-dir)"
         )
     })?;
     if !quiet {
         log_message(
-            "index",
-            format_args!("taxonomy dump={dump} reference_taxa={}", record.len()),
+            "taxonomy",
+            format_args!("dump={dump} reference_taxa={}", record.len()),
         );
     }
     Ok(record)
+}
+
+/// Store the taxonomy dump of `source` with a database built without one,
+/// as `metax index` does for a new database, after checking every reference
+/// taxid against it. Files already in the database are never replaced.
+pub fn attach_taxonomy(database: &Path, source: &TaxonomySource) -> Result<()> {
+    let directory = database_directory(database)?;
+    for name in [
+        DATABASE_TAXDMP_DIR,
+        DATABASE_TAXDMP_ARCHIVE,
+        TAXONOMY_RECORD_FILE,
+    ] {
+        if fs::symlink_metadata(directory.join(name)).is_ok() {
+            bail!(
+                "{} already holds {name}; it is never replaced",
+                directory.display()
+            );
+        }
+    }
+    let metadata = DatabaseMetadata::load(&directory)?;
+    let mut references = Vec::new();
+    let mut previous: Option<&str> = None;
+    for reference in &metadata.references {
+        if previous != Some(&*reference.taxonomy_field) {
+            references.push(parse_taxonomy_field(&reference.taxonomy_field)?);
+            previous = Some(&reference.taxonomy_field);
+        }
+    }
+    let record = record_reference_taxa(source, &references, false)?;
+
+    // Stage both in the database directory, then move them in place; the
+    // staging folder is removed on any failure.
+    let staging = tempfile::Builder::new()
+        .prefix(".metax-taxonomy-")
+        .tempdir_in(&directory)
+        .with_context(|| {
+            format!(
+                "failed to create a staging folder in {}",
+                directory.display()
+            )
+        })?;
+    store_dump(
+        source.directory(),
+        &staging.path().join(DATABASE_TAXDMP_DIR),
+    )?;
+    record.write(&staging.path().join(TAXONOMY_RECORD_FILE))?;
+    let dump = directory.join(DATABASE_TAXDMP_DIR);
+    fs::rename(staging.path().join(DATABASE_TAXDMP_DIR), &dump)
+        .with_context(|| format!("failed to create {}", dump.display()))?;
+    let record_path = directory.join(TAXONOMY_RECORD_FILE);
+    if let Err(error) = fs::rename(staging.path().join(TAXONOMY_RECORD_FILE), &record_path) {
+        let _ = fs::remove_dir_all(&dump);
+        return Err(error).with_context(|| format!("failed to create {}", record_path.display()));
+    }
+    Ok(())
 }
 
 fn create_database_staging_directory(target: &Path) -> Result<PathBuf> {
@@ -2427,6 +2487,76 @@ mod tests {
             record,
             TaxonomyRecord::build(&stored_taxonomy, &BTreeSet::from([11, 20, 30])).unwrap()
         );
+    }
+
+    #[test]
+    fn taxonomy_is_attached_to_a_database_built_without_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let fasta = directory.path().join("reference.fa");
+        let output = directory.path().join("database");
+        let dump = directory.path().join("taxonomy");
+        write_interleaved_fasta(&fasta, "");
+        write_test_dump(&dump);
+        build_database(
+            fasta.to_str().unwrap(),
+            output.to_str().unwrap(),
+            None,
+            Some(2),
+            false,
+            &ReferenceTypes::default(),
+            &test_index_options(None),
+            None,
+        )
+        .unwrap();
+        assert!(!output.join(DATABASE_TAXDMP_DIR).exists());
+        let source = TaxonomySource::prepare(dump.to_str(), None).unwrap();
+
+        attach_taxonomy(&output, &source).unwrap();
+
+        let stored =
+            crate::taxonomy::Taxonomy::from_dir(&output.join(DATABASE_TAXDMP_DIR)).unwrap();
+        assert_eq!(
+            TaxonomyRecord::load(&output.join(TAXONOMY_RECORD_FILE)).unwrap(),
+            TaxonomyRecord::build(&stored, &BTreeSet::from([11, 20, 30])).unwrap()
+        );
+        let names = std::fs::read_dir(&output)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with('.'))
+            .collect::<Vec<_>>();
+        assert!(names.is_empty(), "staging left behind: {names:?}");
+        let error = attach_taxonomy(&output, &source).unwrap_err();
+        assert!(error.to_string().contains("never replaced"));
+    }
+
+    #[test]
+    fn attaching_a_dump_that_lacks_reference_taxids_changes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let fasta = directory.path().join("reference.fa");
+        let output = directory.path().join("database");
+        let dump = directory.path().join("taxonomy");
+        std::fs::write(
+            &fasta,
+            format!(">G1|contig1|s:40\n{}\n", test_sequence(1, 500)),
+        )
+        .unwrap();
+        write_test_dump(&dump);
+        build_database(
+            fasta.to_str().unwrap(),
+            output.to_str().unwrap(),
+            None,
+            Some(1),
+            false,
+            &ReferenceTypes::default(),
+            &test_index_options(None),
+            None,
+        )
+        .unwrap();
+        let before = std::fs::read_dir(&output).unwrap().count();
+        let source = TaxonomySource::prepare(dump.to_str(), None).unwrap();
+        let error = attach_taxonomy(&output, &source).unwrap_err();
+        assert!(format!("{error:#}").contains("1 of 1 reference taxids"));
+        assert_eq!(std::fs::read_dir(&output).unwrap().count(), before);
     }
 
     #[test]

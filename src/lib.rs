@@ -1055,6 +1055,12 @@ pub fn build_index(
     Ok(())
 }
 
+/// Store the taxonomy dump in `dmp_dir` with a database built without one.
+pub fn attach_taxonomy(database: &Path, dmp_dir: &str) -> Result<()> {
+    let source = taxonomy::TaxonomySource::prepare(Some(dmp_dir), None)?;
+    crate::db::attach_taxonomy(database, &source)
+}
+
 /// In a mixed database, list the genera that hold both genome-type and
 /// marker-type species: reads from the unindexed part of a marker-only genome
 /// can land on the genomes of its relatives there.
