@@ -71,6 +71,71 @@ impl TaxonomyRecord {
             .with_context(|| format!("failed to finish {}", path.display()))
     }
 
+    /// The record of the database in `database`, or `None` for a database
+    /// built without one.
+    pub fn load_from_database(database: &Path) -> Result<Option<Self>> {
+        let path = database.join(TAXONOMY_RECORD_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Self::load(&path).map(Some)
+    }
+
+    /// Compare `taxonomy`, loaded from `dump`, with the record. A database
+    /// taxid whose lineage differs, or that the dump lacks, stops the run
+    /// unless `allow_mismatch`, which reports the differences as a warning.
+    pub fn check(&self, taxonomy: &Taxonomy, dump: &Path, allow_mismatch: bool) -> Result<()> {
+        let mut changed = Vec::new();
+        let mut missing = Vec::new();
+        for &(taxid, hash) in &self.lineages {
+            match lineage_hash(taxonomy, taxid) {
+                Some(current) if current == hash => {}
+                Some(_) => changed.push(taxid),
+                None => missing.push(taxid),
+            }
+        }
+        if changed.is_empty() && missing.is_empty() {
+            log::info!(
+                target: "TAXONOMY",
+                "The taxonomy dump in {} matches the database ({} taxa).",
+                dump.display(),
+                self.len()
+            );
+            return Ok(());
+        }
+        let mut differences = Vec::new();
+        if !changed.is_empty() {
+            differences.push(format!(
+                "{} have a different name, rank or lineage ({})",
+                changed.len(),
+                list_taxids(&changed)
+            ));
+        }
+        if !missing.is_empty() {
+            differences.push(format!(
+                "{} are not in it ({})",
+                missing.len(),
+                list_taxids(&missing)
+            ));
+        }
+        let message = format!(
+            "taxonomy dump in {} is not the one the database was built with: of the {} database taxa, {}",
+            dump.display(),
+            self.len(),
+            differences.join(" and ")
+        );
+        if !allow_mismatch {
+            bail!(
+                "the {message}. Use the dump the database was built with (its taxdmp folder, used when --dmp-dir is omitted), or pass --allow-taxonomy-mismatch to profile with this dump"
+            );
+        }
+        log::warn!(
+            target: "TAXONOMY",
+            "The {message}. Continuing because --allow-taxonomy-mismatch was given."
+        );
+        Ok(())
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let file =
             File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -180,6 +245,31 @@ mod tests {
         assert_eq!(renamed.lineages[2], record.lineages[2]);
         // The merged taxid hashes the lineage of the taxid it was merged into.
         assert_eq!(record.lineages[0].1, record.lineages[1].1);
+    }
+
+    #[test]
+    fn check_stops_on_a_different_dump_unless_allowed() {
+        let taxids = BTreeSet::from([20, 25, 30]);
+        let record = TaxonomyRecord::build(&taxonomy("Species twenty"), &taxids).unwrap();
+        let dump = Path::new("dump");
+        record
+            .check(&taxonomy("Species twenty"), dump, false)
+            .unwrap();
+
+        let renamed = taxonomy("Species renamed");
+        let message = record.check(&renamed, dump, false).unwrap_err().to_string();
+        assert!(message.contains("of the 3 database taxa, 2 have a different name"));
+        assert!(message.contains("taxid 20, 25"));
+        record.check(&renamed, dump, true).unwrap();
+
+        let mut without_thirty = taxonomy("Species twenty");
+        without_thirty.nodes.remove(&30);
+        without_thirty.names.remove(&30);
+        let message = record
+            .check(&without_thirty, dump, false)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("1 are not in it (taxid 30)"));
     }
 
     #[test]

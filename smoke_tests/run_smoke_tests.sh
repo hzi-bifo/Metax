@@ -246,6 +246,23 @@ assert_single_species_profile "$WORK/se_packed_taxonomy.profile.txt"
 assert_exists "$WORK/db_packed/taxdmp/nodes.dmp"
 assert_not_exists "$WORK/db_packed/taxdmp.tar.gz"
 
+# A dump that names a database taxon differently stops the run unless allowed.
+cp -r "$WORK/tax" "$WORK/tax_renamed"
+sed -i 's/SpeciesA/SpeciesRenamed/' "$WORK/tax_renamed/names.dmp"
+if run_metax profile --db "$WORK/db_one" --dmp-dir "$WORK/tax_renamed" \
+  -i "$WORK/se.fq" -o "$WORK/se_renamed" -t 2 --temp-dir "$WORK/stage" \
+  2>"$WORK/renamed.err"; then
+  echo "profiling with a different taxonomy dump unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q "is not the one the database was built with" "$WORK/renamed.err"
+assert_not_exists "$WORK/se_renamed.profile.txt"
+run_metax profile --db "$WORK/db_one" --dmp-dir "$WORK/tax_renamed" \
+  --allow-taxonomy-mismatch \
+  -i "$WORK/se.fq" -o "$WORK/se_renamed" -t 2 --temp-dir "$WORK/stage" \
+  --min-identity 0.90 --mapped-len 50 --min-mapped-fraction 0.50
+grep -q "SpeciesRenamed" "$WORK/se_renamed.profile.txt"
+
 run_metax profile \
   --db "$WORK/db_genus" \
   --dmp-dir "$WORK/tax" \

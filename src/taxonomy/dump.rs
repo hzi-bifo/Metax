@@ -139,6 +139,11 @@ impl TaxonomySource {
         &self.directory
     }
 
+    /// Whether the dump is the one stored with the database.
+    pub(crate) fn is_database_dump(&self) -> bool {
+        self.location == DumpLocation::Database
+    }
+
     pub(crate) fn load(&self) -> Result<Taxonomy> {
         self.load_with_repair(|target| install_managed_taxdump(target, true))
     }

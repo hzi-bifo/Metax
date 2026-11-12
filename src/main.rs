@@ -172,6 +172,13 @@ struct ProfileArgs {
     dmp_dir: Option<String>,
 
     #[arg(
+        long = "allow-taxonomy-mismatch",
+        help_heading = "Input and output",
+        help = "Profile even when the taxonomy dump gives database taxa another name, rank or lineage than the dump the database was built with, or lacks some of them; the differences are reported as a warning. By default such a dump stops the run."
+    )]
+    allow_taxonomy_mismatch: bool,
+
+    #[arg(
         short = 'i',
         long = "reads",
         aliases = ["in-seq", "input"],
@@ -1086,6 +1093,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
         Ok(AppConfig {
             db: args.db,
             dmp_dir: args.dmp_dir,
+            allow_taxonomy_mismatch: args.allow_taxonomy_mismatch,
             input_sequences,
             outprefix,
             threads: args.threads,

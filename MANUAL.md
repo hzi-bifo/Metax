@@ -53,6 +53,8 @@ Metax needs NCBI-style taxonomy dump files. `metax profile` takes the first of:
 3. `taxdmp.tar.gz` in the database directory, the form in which a shipped database carries its dump (§4.1). The first run unpacks it into `taxdmp/`, checks it and removes the archive; runs started at the same time wait for it. If the archive cannot be unpacked, for example because the database directory is not writable, Metax stops; unpack it into `taxdmp/` yourself or pass `--dmp-dir`;
 4. the managed NCBI dump in `~/.metax/taxdmp` (section 2.1).
 
+A database built by `metax index` records the scientific name, rank and lineage of every reference taxid in the dump it was built with (`metax_taxonomy.tsv.gz`, §4.1). `metax profile` compares the dump it uses with this record: a dump that gives a database taxid another name, rank or lineage, or lacks it, stops the run and lists the differing taxids. Such a dump would label the profile with names the database was not built for, for example an NCBI dump with a GTDB database. A dump other than the database's own is compared before mapping starts. Pass `--allow-taxonomy-mismatch` to profile with a different dump anyway, for example a newer NCBI dump for a database built with an older one; the differences are then reported as a warning. Databases built without a record are not checked.
+
 ### 2.1 Managed taxonomy
 
 When neither `--dmp-dir` nor a dump stored with the database is available, Metax uses `~/.metax/taxdmp`. On the first run, or when that copy is missing or invalid, Metax downloads the official NCBI `taxdump.tar.gz`, validates it, and keeps `nodes.dmp`, `names.dmp`, `merged.dmp`, and `delnodes.dmp`. Concurrent Metax processes share an installation lock, so a partially written dump is never used.
@@ -159,7 +161,7 @@ Gzip-compressed input is accepted. The output directory contains:
 - `metax_db.mxi`: the mapping index;
 - `metax_reference.fasta.gz`: only for fractional indexes, the exact sampled FASTA used to build the index (not required for profiling);
 - `taxdmp/`: a copy of the taxonomy dump the database was built with, from `--dmp-dir` or, without it, from the managed NCBI dump (§2.1). `metax profile` uses it when `--dmp-dir` is omitted;
-- `metax_taxonomy.tsv.gz`: a hash of the scientific name, rank and lineage of every reference taxid in that dump.
+- `metax_taxonomy.tsv.gz`: a hash of the scientific name, rank and lineage of every reference taxid in that dump, against which `metax profile` checks the dump it uses (§2).
 
 Every reference taxid must be in the taxonomy dump. `metax index` checks them before it builds the index and stops with the missing taxids otherwise, so index with the dump the FASTA headers were written for, for example a GTDB dump for GTDB taxids:
 

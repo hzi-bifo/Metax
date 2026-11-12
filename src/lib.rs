@@ -16,7 +16,7 @@ use mapper::{
     StreamingStructuredMappingOutput,
 };
 use profiler::{ExactTiePolicy, Profiler, ProfilerConfig};
-use taxonomy::Taxonomy;
+use taxonomy::{Taxonomy, TaxonomyRecord};
 
 use crate::db::{
     build_database, genome_species_next_to_markers, DatabaseMetadata, MetamIndexOptions,
@@ -78,6 +78,8 @@ pub struct AppConfig {
     // Input database and taxonomy locations.
     pub db: Option<String>,
     pub dmp_dir: Option<String>,
+    /// Profile with a taxonomy dump that differs from the database's record.
+    pub allow_taxonomy_mismatch: bool,
     // Input reads (comma-separated for paired-end).
     pub input_sequences: Option<String>,
     pub outprefix: String,
@@ -223,6 +225,32 @@ impl MetaxApp {
             .transpose()?;
         let taxonomy_source =
             Taxonomy::prepare_dmp(self.config.dmp_dir.as_deref(), database.as_deref())?;
+        let taxonomy_record = database
+            .as_deref()
+            .map(TaxonomyRecord::load_from_database)
+            .transpose()?
+            .flatten();
+        let check_taxonomy = |taxonomy: &Taxonomy| {
+            taxonomy_record.as_ref().map_or(Ok(()), |record| {
+                record.check(
+                    taxonomy,
+                    taxonomy_source.directory(),
+                    self.config.allow_taxonomy_mismatch,
+                )
+            })
+        };
+        // Another dump than the database's own is checked now, so that a wrong
+        // one fails before mapping; the database's own dump is checked when it
+        // is loaded for profiling.
+        if !taxonomy_source.is_database_dump() {
+            check_taxonomy(&taxonomy_source.load()?)?;
+        }
+        if database.is_some() && taxonomy_record.is_none() {
+            log::info!(
+                target: "TAXONOMY",
+                "The database has no taxonomy record; the taxonomy dump is not checked against it."
+            );
+        }
         // Resolve read-level profiler gates before mapping so saved mapping
         // metadata records the exact values used by this run. Resume/reuse
         // loads those values first, making profiling reproducible without the
@@ -244,6 +272,9 @@ impl MetaxApp {
             );
         }
         let taxonomy = taxonomy_source.load()?;
+        if taxonomy_source.is_database_dump() {
+            check_taxonomy(&taxonomy)?;
+        }
         let profiler_config = self.build_profiler_config(&prepared_mapping, thresholds)?;
         let profiler = Profiler::new(profiler_config, taxonomy)?;
         match prepared_mapping {
@@ -1079,6 +1110,7 @@ mod tests {
         AppConfig {
             db: None,
             dmp_dir: None,
+            allow_taxonomy_mismatch: false,
             input_sequences: None,
             outprefix: "test".to_string(),
             threads: 1,
