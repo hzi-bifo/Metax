@@ -5,14 +5,15 @@ use anyhow::{anyhow, bail, Context, Result};
 use flate2::read::MultiGzDecoder;
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, OpenOptions, TryLockError};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tempfile::Builder;
 
 const NCBI_TAXDUMP_URL: &str = "https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz";
-const REQUIRED_DUMP_FILES: [&str; 4] = ["nodes.dmp", "names.dmp", "merged.dmp", "delnodes.dmp"];
+pub(super) const REQUIRED_DUMP_FILES: [&str; 4] =
+    ["nodes.dmp", "names.dmp", "merged.dmp", "delnodes.dmp"];
 const MAX_COMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DUMP_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_TOTAL_DUMP_BYTES: u64 = 6 * 1024 * 1024 * 1024;
@@ -26,8 +27,8 @@ const BACKUP_DIRECTORY_NAME: &str = ".taxdmp-backup";
 const STAGING_DIRECTORY_PREFIX: &str = ".taxdmp-download-";
 /// Folder of a database directory that holds the database's taxonomy dump.
 pub(crate) const DATABASE_TAXDMP_DIR: &str = "taxdmp";
-/// Archive of the dump files that a shipped database may hold instead of the
-/// folder; the first run unpacks it into the folder and removes it.
+/// Archive of the dump files in a database directory, read without
+/// unpacking; used when the database has no `taxdmp` folder.
 pub(crate) const DATABASE_TAXDMP_ARCHIVE: &str = "taxdmp.tar.gz";
 
 /// Where a taxonomy dump was found.
@@ -41,13 +42,14 @@ enum DumpLocation {
     Managed,
 }
 
-/// A resolved taxonomy location. Managed locations may be repaired on load;
-/// explicit and database locations are read exactly as found and never
-/// modified.
+/// A resolved taxonomy location: a folder of dump files or, for a database,
+/// an archive of them. Managed locations may be repaired on load; explicit
+/// and database locations are read exactly as found and never modified.
 #[derive(Clone, Debug)]
 pub struct TaxonomySource {
-    directory: PathBuf,
+    path: PathBuf,
     location: DumpLocation,
+    archive: bool,
 }
 
 impl TaxonomySource {
@@ -64,35 +66,36 @@ impl TaxonomySource {
     }
 
     /// The explicit or database dump, or `None` when the managed dump is
-    /// needed. A database archive is unpacked into the database folder first.
-    /// A database dump that is present but incomplete, or an archive that
-    /// cannot be unpacked, is an error, so a damaged database never falls back
-    /// to another taxonomy.
+    /// needed. A database's `taxdmp` folder comes before its archive. A
+    /// database dump that is present but incomplete or unreadable is an error,
+    /// so a damaged database never falls back to another taxonomy.
     fn locate(dmp_dir: Option<&str>, database: Option<&Path>) -> Result<Option<Self>> {
         if let Some(directory) = dmp_dir {
             return Ok(Some(Self {
-                directory: PathBuf::from(directory),
+                path: PathBuf::from(directory),
                 location: DumpLocation::Explicit,
+                archive: false,
             }));
         }
         let Some(database) = database else {
             return Ok(None);
         };
         let directory = database.join(DATABASE_TAXDMP_DIR);
-        let archive = database.join(DATABASE_TAXDMP_ARCHIVE);
-        // The folder appears before the archive is removed, so a run that
-        // finds neither has no database dump.
-        if fs::symlink_metadata(&directory).is_err() && archive.is_file() {
-            unpack_database_archive(&archive, &directory).with_context(|| {
-                format!(
-                    "failed to unpack the taxonomy archive {}; unpack it into {} or pass --dmp-dir",
-                    archive.display(),
-                    directory.display()
-                )
-            })?;
-        }
         if fs::symlink_metadata(&directory).is_err() {
-            return Ok(None);
+            let archive = database.join(DATABASE_TAXDMP_ARCHIVE);
+            if fs::symlink_metadata(&archive).is_err() {
+                return Ok(None);
+            }
+            log::info!(
+                target: "TAXONOMY",
+                "Using the taxonomy dump stored with the database in {}.",
+                archive.display()
+            );
+            return Ok(Some(Self {
+                path: archive,
+                location: DumpLocation::Database,
+                archive: true,
+            }));
         }
         let missing = REQUIRED_DUMP_FILES
             .iter()
@@ -112,8 +115,9 @@ impl TaxonomySource {
             directory.display()
         );
         Ok(Some(Self {
-            directory,
+            path: directory,
             location: DumpLocation::Database,
+            archive: false,
         }))
     }
 
@@ -130,13 +134,15 @@ impl TaxonomySource {
             })?;
         }
         Ok(Self {
-            directory,
+            path: directory,
             location: DumpLocation::Managed,
+            archive: false,
         })
     }
 
-    pub(crate) fn directory(&self) -> &Path {
-        &self.directory
+    /// The dump folder, or the database's dump archive.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Whether the dump is the one stored with the database.
@@ -152,31 +158,36 @@ impl TaxonomySource {
     where
         F: FnOnce(&Path) -> Result<()>,
     {
-        match Taxonomy::from_dir(&self.directory) {
+        let loaded = if self.archive {
+            Taxonomy::from_archive(&self.path)
+        } else {
+            Taxonomy::from_dir(&self.path)
+        };
+        match loaded {
             Ok(taxonomy) => Ok(taxonomy),
             Err(error) if self.location != DumpLocation::Managed => Err(error).with_context(|| {
                 format!(
                     "failed to load the taxonomy dump from {}",
-                    self.directory.display()
+                    self.path.display()
                 )
             }),
             Err(error) => {
                 log::warn!(
                     target: "TAXONOMY",
                     "Cached taxonomy dump at {} is invalid ({}); downloading a clean copy.",
-                    self.directory.display(),
+                    self.path.display(),
                     error
                 );
-                repair(&self.directory).with_context(|| {
+                repair(&self.path).with_context(|| {
                     format!(
                         "failed to replace the invalid taxonomy dump in {}",
-                        self.directory.display()
+                        self.path.display()
                     )
                 })?;
-                Taxonomy::from_dir(&self.directory).with_context(|| {
+                Taxonomy::from_dir(&self.path).with_context(|| {
                     format!(
                         "downloaded taxonomy dump in {} failed validation",
-                        self.directory.display()
+                        self.path.display()
                     )
                 })
             }
@@ -207,39 +218,12 @@ fn dump_files_look_complete(directory: &Path) -> bool {
     })
 }
 
-/// Unpack a database's dump archive into `target` and remove the archive.
-/// Concurrent runs wait for the first one, which does the work.
-fn unpack_database_archive(archive: &Path, target: &Path) -> Result<()> {
+fn install_managed_taxdump(target: &Path, force: bool) -> Result<()> {
     let parent = target
         .parent()
-        .context("taxonomy dump path has no parent")?;
-    let _lock = lock_install(parent)?;
-    cleanup_interrupted_install(parent, target)?;
-    if !target.exists() {
-        log::info!(
-            target: "TAXONOMY",
-            "Unpacking the taxonomy archive {} into {}.",
-            archive.display(),
-            target.display()
-        );
-        let file =
-            File::open(archive).with_context(|| format!("failed to open {}", archive.display()))?;
-        install_archive(target, file)?;
-    }
-    if let Err(error) = remove_path_if_present(archive) {
-        log::warn!(
-            target: "TAXONOMY",
-            "Unpacked the taxonomy archive but could not remove {}: {}",
-            archive.display(),
-            error
-        );
-    }
-    Ok(())
-}
+        .context("taxonomy cache path has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
 
-/// Take the install lock of the taxonomy folders in `parent`, waiting for
-/// another Metax process that holds it. The lock is released on drop.
-fn lock_install(parent: &Path) -> Result<File> {
     let lock_path = parent.join(".taxdmp.lock");
     let lock_file = OpenOptions::new()
         .create(true)
@@ -265,15 +249,6 @@ fn lock_install(parent: &Path) -> Result<File> {
             return Err(error).with_context(|| format!("failed to lock {}", lock_path.display()));
         }
     }
-    Ok(lock_file)
-}
-
-fn install_managed_taxdump(target: &Path, force: bool) -> Result<()> {
-    let parent = target
-        .parent()
-        .context("taxonomy cache path has no parent")?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let _lock = lock_install(parent)?;
     cleanup_interrupted_install(parent, target)?;
 
     // Another process may have completed the installation while this process
@@ -369,10 +344,8 @@ fn extract_archive<R: Read>(compressed: R, destination: &Path) -> Result<()> {
             bail!("taxonomy archive contains duplicate {expected_name}");
         }
 
-        // An empty merged.dmp or delnodes.dmp is valid; empty nodes or names
-        // fail the validation of the unpacked dump.
         let size = entry.size();
-        if size > MAX_DUMP_FILE_BYTES {
+        if size == 0 || size > MAX_DUMP_FILE_BYTES {
             bail!("invalid size for {expected_name} in taxonomy archive: {size} bytes");
         }
         total_size = total_size
@@ -658,8 +631,9 @@ mod tests {
             fs::write(directory.join(name), "corrupt\n").unwrap();
         }
         let managed = TaxonomySource {
-            directory: directory.clone(),
+            path: directory.clone(),
             location: DumpLocation::Managed,
+            archive: false,
         };
         let repaired = managed
             .load_with_repair(|target| {
@@ -673,8 +647,9 @@ mod tests {
             fs::write(directory.join(name), "corrupt\n").unwrap();
         }
         let explicit = TaxonomySource {
-            directory,
+            path: directory,
             location: DumpLocation::Explicit,
+            archive: false,
         };
         assert!(explicit
             .load_with_repair(|_| panic!("explicit dumps must not be repaired"))
@@ -739,14 +714,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(source.location, DumpLocation::Database);
-        assert_eq!(source.directory, stored);
+        assert_eq!(source.path, stored);
         assert_eq!(source.load().unwrap().get_name(2), Some("Species two"));
 
         let source = TaxonomySource::locate(explicit.to_str(), Some(&database))
             .unwrap()
             .unwrap();
         assert_eq!(source.location, DumpLocation::Explicit);
-        assert_eq!(source.directory, explicit);
+        assert_eq!(source.path, explicit);
     }
 
     #[test]
@@ -783,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn database_archive_is_unpacked_once_and_removed() {
+    fn database_archive_is_read_without_unpacking() {
         let temp = tempfile::tempdir().unwrap();
         let archive_path = temp.path().join(DATABASE_TAXDMP_ARCHIVE);
         fs::write(&archive_path, archive(true)).unwrap();
@@ -791,18 +766,11 @@ mod tests {
         let source = TaxonomySource::locate(None, Some(temp.path()))
             .unwrap()
             .unwrap();
-        let stored = temp.path().join(DATABASE_TAXDMP_DIR);
-        assert_eq!(source.location, DumpLocation::Database);
-        assert_eq!(source.directory, stored);
-        assert!(!archive_path.exists());
-        assert!(!stored.join("readme.txt").exists());
-        assert_eq!(source.load().unwrap().get_name(2), Some("Species two"));
-
-        // Later runs use the folder.
-        let again = TaxonomySource::locate(None, Some(temp.path()))
-            .unwrap()
-            .unwrap();
-        assert_eq!(again.directory, stored);
+        assert!(source.is_database_dump());
+        assert_eq!(source.path, archive_path);
+        assert_eq!(source.load().unwrap().get_name(3), Some("Species two"));
+        let names = fs::read_dir(temp.path()).unwrap().count();
+        assert_eq!(names, 1, "reading the archive must not write anything");
     }
 
     #[test]
@@ -810,23 +778,23 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let stored = temp.path().join(DATABASE_TAXDMP_DIR);
         write_dump(&stored);
-        let archive_path = temp.path().join(DATABASE_TAXDMP_ARCHIVE);
-        fs::write(&archive_path, b"not read").unwrap();
+        fs::write(temp.path().join(DATABASE_TAXDMP_ARCHIVE), b"not read").unwrap();
         let source = TaxonomySource::locate(None, Some(temp.path()))
             .unwrap()
             .unwrap();
-        assert_eq!(source.directory, stored);
-        assert!(archive_path.exists());
+        assert_eq!(source.path, stored);
     }
 
     #[test]
     fn damaged_database_archive_is_an_error_not_a_fallback() {
         let temp = tempfile::tempdir().unwrap();
-        let archive_path = temp.path().join(DATABASE_TAXDMP_ARCHIVE);
-        fs::write(&archive_path, archive(false)).unwrap();
-        let error = TaxonomySource::locate(None, Some(temp.path())).unwrap_err();
+        fs::write(temp.path().join(DATABASE_TAXDMP_ARCHIVE), archive(false)).unwrap();
+        let source = TaxonomySource::locate(None, Some(temp.path()))
+            .unwrap()
+            .unwrap();
+        let error = source
+            .load_with_repair(|_| panic!("database dumps must not be repaired"))
+            .unwrap_err();
         assert!(format!("{error:#}").contains("delnodes.dmp"));
-        assert!(archive_path.exists());
-        assert!(!temp.path().join(DATABASE_TAXDMP_DIR).exists());
     }
 }

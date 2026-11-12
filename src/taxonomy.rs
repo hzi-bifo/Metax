@@ -43,6 +43,77 @@ impl Taxonomy {
         Self::from_files(&nodes, &names, &merged, Some(&delnodes))
     }
 
+    /// Load the dump files from a `.tar.gz` archive without unpacking it.
+    /// Entries are matched by file name in any folder of the archive, and
+    /// may themselves be gzipped; other entries are skipped.
+    pub(crate) fn from_archive(path: &Path) -> Result<Self> {
+        let file =
+            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let mut archive = tar::Archive::new(MultiGzDecoder::new(BufReader::new(file)));
+        let mut nodes = None;
+        let mut names = None;
+        let mut merged = None;
+        let mut del_nodes = None;
+        for entry in archive
+            .entries()
+            .with_context(|| format!("failed to read {}", path.display()))?
+        {
+            let entry = entry.with_context(|| format!("failed to read {}", path.display()))?;
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            let entry_path = entry
+                .path()
+                .with_context(|| format!("invalid entry path in {}", path.display()))?
+                .into_owned();
+            let Some(file_name) = entry_path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let (name, gzipped) = match file_name.strip_suffix(".gz") {
+                Some(name) => (name, true),
+                None => (file_name, false),
+            };
+            if !dump::REQUIRED_DUMP_FILES.contains(&name) {
+                continue;
+            }
+            let source = format!("{}:{}", path.display(), entry_path.display());
+            let reader: Box<dyn BufRead> = if gzipped {
+                Box::new(BufReader::new(MultiGzDecoder::new(entry)))
+            } else {
+                Box::new(BufReader::new(entry))
+            };
+            let duplicate = match name {
+                "nodes.dmp" => nodes.replace(load_nodes(reader, &source)?).is_some(),
+                "names.dmp" => names.replace(load_names(reader, &source)?).is_some(),
+                "merged.dmp" => merged.replace(load_merged(reader, &source)?).is_some(),
+                _ => del_nodes.replace(load_delnodes(reader, &source)?).is_some(),
+            };
+            if duplicate {
+                bail!("{} holds {name} more than once", path.display());
+            }
+        }
+        let missing = [
+            ("nodes.dmp", nodes.is_none()),
+            ("names.dmp", names.is_none()),
+            ("merged.dmp", merged.is_none()),
+            ("delnodes.dmp", del_nodes.is_none()),
+        ]
+        .into_iter()
+        .filter_map(|(name, absent)| absent.then_some(name))
+        .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!("{} lacks {}", path.display(), missing.join(", "));
+        }
+        let taxonomy = Self {
+            nodes: nodes.expect("checked above"),
+            names: names.expect("checked above"),
+            merged: merged.expect("checked above"),
+            del_nodes: del_nodes.expect("checked above"),
+        };
+        taxonomy.validate()?;
+        Ok(taxonomy)
+    }
+
     pub fn from_files(
         nodes: &Path,
         names: &Path,
@@ -50,11 +121,12 @@ impl Taxonomy {
         delnodes: Option<&Path>,
     ) -> Result<Self> {
         // Load each taxonomy table into memory for fast lookups.
-        let nodes_iter = load_nodes(nodes)?;
-        let names_iter = load_names(names)?;
-        let merged_iter = load_merged(merged)?;
+        let label = |path: &Path| path.display().to_string();
+        let nodes_iter = load_nodes(open_dump_file(nodes)?, &label(nodes))?;
+        let names_iter = load_names(open_dump_file(names)?, &label(names))?;
+        let merged_iter = load_merged(open_dump_file(merged)?, &label(merged))?;
         let del_nodes = if let Some(path) = delnodes {
-            load_delnodes(path)?
+            load_delnodes(open_dump_file(path)?, &label(path))?
         } else {
             HashSet::new()
         };
@@ -254,14 +326,12 @@ fn open_dump_file(path: &Path) -> Result<Box<dyn BufRead>> {
     }
 }
 
-fn load_nodes(path: &Path) -> Result<HashMap<u32, (u32, String)>> {
+fn load_nodes(reader: impl BufRead, source: &str) -> Result<HashMap<u32, (u32, String)>> {
     // nodes.dmp: tax_id | parent_tax_id | rank
-    let reader = open_dump_file(path)?;
     let mut nodes = HashMap::new();
     for (line_index, line) in reader.lines().enumerate() {
         let line_number = line_index + 1;
-        let line =
-            line.with_context(|| format!("failed to read {} line {line_number}", path.display()))?;
+        let line = line.with_context(|| format!("failed to read {} line {line_number}", source))?;
         if line.trim().is_empty() {
             continue;
         }
@@ -269,47 +339,32 @@ fn load_nodes(path: &Path) -> Result<HashMap<u32, (u32, String)>> {
         let tax_id = fields
             .next()
             .filter(|value| !value.is_empty())
-            .with_context(|| format!("missing taxid in {} line {line_number}", path.display()))?
+            .with_context(|| format!("missing taxid in {} line {line_number}", source))?
             .parse::<u32>()
-            .with_context(|| format!("invalid taxid in {} line {line_number}", path.display()))?;
+            .with_context(|| format!("invalid taxid in {} line {line_number}", source))?;
         let parent_id = fields
             .next()
             .filter(|value| !value.is_empty())
-            .with_context(|| {
-                format!(
-                    "missing parent taxid in {} line {line_number}",
-                    path.display()
-                )
-            })?
+            .with_context(|| format!("missing parent taxid in {} line {line_number}", source))?
             .parse::<u32>()
-            .with_context(|| {
-                format!(
-                    "invalid parent taxid in {} line {line_number}",
-                    path.display()
-                )
-            })?;
+            .with_context(|| format!("invalid parent taxid in {} line {line_number}", source))?;
         let rank = fields
             .next()
-            .with_context(|| format!("missing rank in {} line {line_number}", path.display()))?
+            .with_context(|| format!("missing rank in {} line {line_number}", source))?
             .to_string();
         if nodes.insert(tax_id, (parent_id, rank)).is_some() {
-            bail!(
-                "duplicate taxid {tax_id} in {} line {line_number}",
-                path.display()
-            );
+            bail!("duplicate taxid {tax_id} in {} line {line_number}", source);
         }
     }
     Ok(nodes)
 }
 
-fn load_names(path: &Path) -> Result<HashMap<u32, String>> {
+fn load_names(reader: impl BufRead, source: &str) -> Result<HashMap<u32, String>> {
     // names.dmp: tax_id | name | ... | name_class (keep scientific name only)
-    let reader = open_dump_file(path)?;
     let mut names = HashMap::new();
     for (line_index, line) in reader.lines().enumerate() {
         let line_number = line_index + 1;
-        let line =
-            line.with_context(|| format!("failed to read {} line {line_number}", path.display()))?;
+        let line = line.with_context(|| format!("failed to read {} line {line_number}", source))?;
         if line.trim().is_empty() {
             continue;
         }
@@ -317,42 +372,34 @@ fn load_names(path: &Path) -> Result<HashMap<u32, String>> {
         let tax_id = fields
             .next()
             .filter(|value| !value.is_empty())
-            .with_context(|| format!("missing taxid in {} line {line_number}", path.display()))?
+            .with_context(|| format!("missing taxid in {} line {line_number}", source))?
             .parse::<u32>()
-            .with_context(|| format!("invalid taxid in {} line {line_number}", path.display()))?;
+            .with_context(|| format!("invalid taxid in {} line {line_number}", source))?;
         let name = fields
             .next()
-            .with_context(|| format!("missing name in {} line {line_number}", path.display()))?;
+            .with_context(|| format!("missing name in {} line {line_number}", source))?;
         let _unique_name = fields.next().with_context(|| {
-            format!(
-                "missing unique-name field in {} line {line_number}",
-                path.display()
-            )
+            format!("missing unique-name field in {} line {line_number}", source)
         })?;
-        let name_class = fields.next().with_context(|| {
-            format!(
-                "missing name class in {} line {line_number}",
-                path.display()
-            )
-        })?;
+        let name_class = fields
+            .next()
+            .with_context(|| format!("missing name class in {} line {line_number}", source))?;
         if name_class == "scientific name" && names.insert(tax_id, name.to_string()).is_some() {
             bail!(
                 "duplicate scientific name for taxid {tax_id} in {} line {line_number}",
-                path.display()
+                source
             );
         }
     }
     Ok(names)
 }
 
-fn load_merged(path: &Path) -> Result<HashMap<u32, u32>> {
+fn load_merged(reader: impl BufRead, source: &str) -> Result<HashMap<u32, u32>> {
     // merged.dmp: old_tax_id | new_tax_id
-    let reader = open_dump_file(path)?;
     let mut merged = HashMap::new();
     for (line_index, line) in reader.lines().enumerate() {
         let line_number = line_index + 1;
-        let line =
-            line.with_context(|| format!("failed to read {} line {line_number}", path.display()))?;
+        let line = line.with_context(|| format!("failed to read {} line {line_number}", source))?;
         if line.trim().is_empty() {
             continue;
         }
@@ -360,37 +407,31 @@ fn load_merged(path: &Path) -> Result<HashMap<u32, u32>> {
         let old_tax_id = fields
             .next()
             .filter(|value| !value.is_empty())
-            .with_context(|| format!("missing old taxid in {} line {line_number}", path.display()))?
+            .with_context(|| format!("missing old taxid in {} line {line_number}", source))?
             .parse::<u32>()
-            .with_context(|| {
-                format!("invalid old taxid in {} line {line_number}", path.display())
-            })?;
+            .with_context(|| format!("invalid old taxid in {} line {line_number}", source))?;
         let new_tax_id = fields
             .next()
             .filter(|value| !value.is_empty())
-            .with_context(|| format!("missing new taxid in {} line {line_number}", path.display()))?
+            .with_context(|| format!("missing new taxid in {} line {line_number}", source))?
             .parse::<u32>()
-            .with_context(|| {
-                format!("invalid new taxid in {} line {line_number}", path.display())
-            })?;
+            .with_context(|| format!("invalid new taxid in {} line {line_number}", source))?;
         if merged.insert(old_tax_id, new_tax_id).is_some() {
             bail!(
                 "duplicate merged taxid {old_tax_id} in {} line {line_number}",
-                path.display()
+                source
             );
         }
     }
     Ok(merged)
 }
 
-fn load_delnodes(path: &Path) -> Result<HashSet<u32>> {
+fn load_delnodes(reader: impl BufRead, source: &str) -> Result<HashSet<u32>> {
     // delnodes.dmp: list of deleted tax_ids
-    let reader = open_dump_file(path)?;
     let mut delnodes = HashSet::new();
     for (line_index, line) in reader.lines().enumerate() {
         let line_number = line_index + 1;
-        let line =
-            line.with_context(|| format!("failed to read {} line {line_number}", path.display()))?;
+        let line = line.with_context(|| format!("failed to read {} line {line_number}", source))?;
         if line.trim().is_empty() {
             continue;
         }
@@ -399,13 +440,13 @@ fn load_delnodes(path: &Path) -> Result<HashSet<u32>> {
             .next()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .with_context(|| format!("missing taxid in {} line {line_number}", path.display()))?
+            .with_context(|| format!("missing taxid in {} line {line_number}", source))?
             .parse::<u32>()
-            .with_context(|| format!("invalid taxid in {} line {line_number}", path.display()))?;
+            .with_context(|| format!("invalid taxid in {} line {line_number}", source))?;
         if !delnodes.insert(tax_id) {
             bail!(
                 "duplicate deleted taxid {tax_id} in {} line {line_number}",
-                path.display()
+                source
             );
         }
     }

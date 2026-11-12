@@ -50,7 +50,7 @@ Metax needs NCBI-style taxonomy dump files. `metax profile` takes the first of:
 
 1. the directory given with `--dmp-dir`;
 2. `taxdmp/` in the database directory, the dump that `metax index` stored with the database (§4.1). If this folder exists but lacks a dump file or cannot be read, Metax stops rather than use another taxonomy;
-3. `taxdmp.tar.gz` in the database directory, the form in which a shipped database carries its dump (§4.1). The first run unpacks it into `taxdmp/`, checks it and removes the archive; runs started at the same time wait for it. If the archive cannot be unpacked, for example because the database directory is not writable, Metax stops; unpack it into `taxdmp/` yourself or pass `--dmp-dir`;
+3. `taxdmp.tar.gz` in the database directory, the form in which a shipped database carries its dump (§4.1). Metax reads the dump files from the archive on every run without unpacking it, so nothing is written for the taxonomy; this takes up to a second longer than reading plain files. If the archive is damaged, Metax stops;
 4. the managed NCBI dump in `~/.metax/taxdmp` (section 2.1).
 
 A database built by `metax index` (or given its dump with `metax attach-taxonomy`, §4.6) records the scientific name, rank and lineage of every reference taxid in the dump it was built with (`metax_taxonomy.tsv.gz`, §4.1). `metax profile` compares the dump it uses with this record: a dump that gives a database taxid another name, rank or lineage, or lacks it, stops the run and lists the differing taxids. Such a dump would label the profile with names the database was not built for, for example an NCBI dump with a GTDB database. A dump other than the database's own is compared before mapping starts. Pass `--allow-taxonomy-mismatch` to profile with a different dump anyway, for example a newer NCBI dump for a database built with an older one; the differences are then reported as a warning. Databases built without a record are not checked.
@@ -169,7 +169,7 @@ Every reference taxid must be in the taxonomy dump. `metax index` checks them be
 metax index gtdb_genomes.fa -o db_gtdb --dmp-dir gtdb_taxdump -t 20
 ```
 
-To ship a database, pack its dump into one archive; the first `metax profile` run unpacks it (§2):
+To ship a database, pack its dump into one archive, which `metax profile` reads without unpacking (§2):
 
 ```bash
 tar -czf db/taxdmp.tar.gz -C db/taxdmp nodes.dmp names.dmp merged.dmp delnodes.dmp

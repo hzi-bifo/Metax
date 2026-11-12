@@ -234,7 +234,7 @@ impl MetaxApp {
             taxonomy_record.as_ref().map_or(Ok(()), |record| {
                 record.check(
                     taxonomy,
-                    taxonomy_source.directory(),
+                    taxonomy_source.path(),
                     self.config.allow_taxonomy_mismatch,
                 )
             })

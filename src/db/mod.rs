@@ -387,7 +387,7 @@ pub fn build_database(
     let staging_path = create_database_staging_directory(outdir_path)?;
     let mut cleanup_staging = RemoveDirOnDrop::new(staging_path.clone());
     if let Some((source, record)) = &taxonomy {
-        store_dump(source.directory(), &staging_path.join(DATABASE_TAXDMP_DIR))?;
+        store_dump(source.path(), &staging_path.join(DATABASE_TAXDMP_DIR))?;
         record.write(&staging_path.join(TAXONOMY_RECORD_FILE))?;
     }
     let force_sampled_field =
@@ -458,7 +458,7 @@ fn record_reference_taxa<'a>(
             previous = Some(taxonomy);
         }
     }
-    let dump = source.directory().display();
+    let dump = source.path().display();
     let record = TaxonomyRecord::build(&source.load()?, &taxids).with_context(|| {
         format!(
             "the reference taxids do not match the taxonomy dump in {dump}; use the dump they come from (--dmp-dir)"
@@ -512,10 +512,7 @@ pub fn attach_taxonomy(database: &Path, source: &TaxonomySource) -> Result<()> {
                 directory.display()
             )
         })?;
-    store_dump(
-        source.directory(),
-        &staging.path().join(DATABASE_TAXDMP_DIR),
-    )?;
+    store_dump(source.path(), &staging.path().join(DATABASE_TAXDMP_DIR))?;
     record.write(&staging.path().join(TAXONOMY_RECORD_FILE))?;
     let dump = directory.join(DATABASE_TAXDMP_DIR);
     fs::rename(staging.path().join(DATABASE_TAXDMP_DIR), &dump)
