@@ -186,7 +186,7 @@ struct ProfileArgs {
     #[arg(
         long = "allow-taxonomy-mismatch",
         help_heading = "Input and output",
-        help = "Profile even when database taxids are missing from the taxonomy dump. By default such a dump stops the run before mapping. Database taxa that the dump merged or gave another name, rank or lineage, as in a newer NCBI dump, only give a warning."
+        help = "Profile even when database taxids are missing from the taxonomy dump, ignoring the references whose taxonomy it cannot resolve: reads that map only to them stay unassigned. By default such a dump stops the run before mapping. Database taxa that the dump merged or gave another name, rank or lineage, as in a newer NCBI dump, only give a warning."
     )]
     allow_taxonomy_mismatch: bool,
 

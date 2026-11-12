@@ -180,7 +180,7 @@ impl TaxonomyRecord {
         );
         if !missing.is_empty() && !allow_missing {
             bail!(
-                "the {detail}. Use the dump stored with the database (used when --dmp-dir is omitted), or pass --allow-taxonomy-mismatch to continue anyway"
+                "the {detail}. Use the dump stored with the database (used when --dmp-dir is omitted), or pass --allow-taxonomy-mismatch to continue without the references of these taxa"
             );
         }
         log::warn!(

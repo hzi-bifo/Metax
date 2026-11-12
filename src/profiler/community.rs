@@ -87,7 +87,7 @@ use super::{
     record_genome_sampling_scale, record_reference_taxonomy_adjustment, sampling_scale_from_sizes,
     scale_automatic_chunk_breadth, strip_pair_suffix, ProfileMode, ProfileRank, ProfilerConfig,
     ReadSupport, ReferenceTaxonomy, ReferenceTaxonomyAdjustments, ReferenceTaxonomyResolver,
-    ResolvedProfilerParameters, StableReadMap,
+    ResolvedProfilerParameters, StableReadMap, UnresolvedReferences,
 };
 
 /// Fixed coordinate radius around each accepted read span for fixed-chunk
@@ -600,6 +600,7 @@ impl CommunityProfiler {
         let mut reference_taxonomies = Vec::with_capacity(db.references.len());
         let mut taxonomy_adjustments = ReferenceTaxonomyAdjustments::new();
         let mut taxonomy_resolver = ReferenceTaxonomyResolver::new(&self.taxonomy);
+        let mut unresolved = UnresolvedReferences::default();
         let has_marker_genomes = db.uniform_reference_type() != Some(ReferenceType::Genome);
         let mut taxids_with_genomes: HashSet<u32> = HashSet::new();
         // The references of a genome share its taxonomy field, so a field
@@ -620,7 +621,18 @@ impl CommunityProfiler {
                     taxonomy
                 }
             };
-            let taxonomy = taxonomy_resolver.resolve(declared_taxonomy, &reference.name)?;
+            let taxonomy = match taxonomy_resolver.resolve(declared_taxonomy, &reference.name) {
+                Ok(taxonomy) => taxonomy,
+                Err(error) => {
+                    unresolved.skip(
+                        &reference.genome,
+                        error,
+                        self.cfg.ignore_unresolved_references,
+                    )?;
+                    reference_taxonomies.push(None);
+                    continue;
+                }
+            };
             record_reference_taxonomy_adjustment(
                 &mut taxonomy_adjustments,
                 declared_taxonomy,
@@ -647,8 +659,9 @@ impl CommunityProfiler {
                 reference.effective_indexed_size,
             );
             record_genome_sampling_scale(&mut genome_sampling_scales, &reference.genome, scale)?;
-            reference_taxonomies.push(taxonomy);
+            reference_taxonomies.push(Some(taxonomy));
         }
+        unresolved.log();
         log_reference_taxonomy_adjustments(
             &taxonomy_adjustments,
             self.cfg.verbose || self.cfg.very_verbose,
@@ -742,10 +755,12 @@ impl CommunityProfiler {
         {
             let assembly_id = assembly_ids[&*reference.genome];
             let has_length = metam_refs.assemblies[assembly_id as usize].asm_len > 0.0;
-            if !has_length {
+            // A reference without a resolvable taxonomy, or of a genome without
+            // length, takes no mapping records.
+            let Some(taxonomy) = (*taxonomy).filter(|_| has_length) else {
                 metam_refs.entries.push(None);
                 continue;
-            }
+            };
             let raw_profile_taxid = taxonomy.profile_taxid;
             let profile_taxid = species_normalize
                 .get(&raw_profile_taxid)
@@ -841,17 +856,19 @@ impl CommunityProfiler {
             None
         };
         let unclassified_species = self.cfg.estimate_unclassified.then(|| {
-            unclassified::marker_species(db.references.iter().zip(&reference_taxonomies).map(
-                |(reference, taxonomy)| {
-                    let taxid = taxonomy.profile_taxid;
-                    ReferenceKind {
-                        taxid: species_normalize.get(&taxid).copied().unwrap_or(taxid),
-                        assembly_id: assembly_ids[&*reference.genome],
-                        reference_type: reference.reference_type,
-                        declared_genome_size: reference.declared_genome_size,
-                    }
-                },
-            ))
+            unclassified::marker_species(
+                db.references.iter().zip(&reference_taxonomies).filter_map(
+                    |(reference, taxonomy)| {
+                        let taxid = taxonomy.as_ref()?.profile_taxid;
+                        Some(ReferenceKind {
+                            taxid: species_normalize.get(&taxid).copied().unwrap_or(taxid),
+                            assembly_id: assembly_ids[&*reference.genome],
+                            reference_type: reference.reference_type,
+                            declared_genome_size: reference.declared_genome_size,
+                        })
+                    },
+                ),
+            )
         });
 
         let mapping_rate = if total_reads == 0 {
@@ -5327,6 +5344,7 @@ mod tests {
             outprefix: "test".to_string(),
             mode: ProfileMode::Default,
             dmp_dir: None,
+            ignore_unresolved_references: false,
             strain: false,
         }
     }

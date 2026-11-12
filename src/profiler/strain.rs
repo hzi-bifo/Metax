@@ -56,7 +56,7 @@ use super::{
     record_genome_sampling_scale, record_reference_taxonomy_adjustment, sampling_scale_from_sizes,
     scale_automatic_chunk_breadth, strip_pair_suffix, ProfilerConfig, ReadSupport,
     ReferenceTaxonomyAdjustments, ReferenceTaxonomyResolver, ResolvedProfilerParameters,
-    StableReadMap,
+    StableReadMap, UnresolvedReferences,
 };
 use crate::db::DatabaseMetadata;
 use crate::mapper::tsv::{
@@ -1530,6 +1530,7 @@ impl StrainProfiler {
         let mut genome_sampling_scales: HashMap<String, f64> = HashMap::new();
         let mut taxonomy_adjustments = ReferenceTaxonomyAdjustments::new();
         let mut taxonomy_resolver = ReferenceTaxonomyResolver::new(&self.taxonomy);
+        let mut unresolved = UnresolvedReferences::default();
 
         for (reference_index, reference) in db.references.iter().enumerate() {
             let declared_taxonomy = parse_reference_taxonomy(&reference.taxonomy_field)
@@ -1539,12 +1540,7 @@ impl StrainProfiler {
                         reference.name
                     )
                 })?;
-            let taxonomy = taxonomy_resolver.resolve(declared_taxonomy, &reference.name)?;
-            record_reference_taxonomy_adjustment(
-                &mut taxonomy_adjustments,
-                declared_taxonomy,
-                taxonomy,
-            );
+            let resolved = taxonomy_resolver.resolve(declared_taxonomy, &reference.name);
             let asm_name = reference.genome.clone();
             let assembly_id = intern_assembly(
                 &asm_name,
@@ -1554,6 +1550,31 @@ impl StrainProfiler {
             )?;
             let reference_id = u32::try_from(reference_index)
                 .context("database contains more than 2^32 reference sequences")?;
+            let taxonomy = match resolved {
+                Ok(taxonomy) => taxonomy,
+                Err(error) => {
+                    unresolved.skip(
+                        &reference.genome,
+                        error,
+                        self.cfg.ignore_unresolved_references,
+                    )?;
+                    // Kept in place so reference ids stay positions; without
+                    // an entry by name its mapping records are skipped.
+                    references.push(ReferenceMetadata {
+                        reference_id,
+                        assembly_id,
+                        length: reference.length,
+                        taxid: None,
+                        fallback_taxid: None,
+                    });
+                    continue;
+                }
+            };
+            record_reference_taxonomy_adjustment(
+                &mut taxonomy_adjustments,
+                declared_taxonomy,
+                taxonomy,
+            );
             let taxid = Some(taxonomy.primary_taxid.unwrap_or(taxonomy.profile_taxid));
             let fallback_taxid = Some(taxonomy.profile_taxid);
             let sampling_scale = sampling_scale_from_sizes(
@@ -1582,6 +1603,7 @@ impl StrainProfiler {
             stats.length += reference.length;
             stats.sampling_scale = sampling_scale;
         }
+        unresolved.log();
         log_reference_taxonomy_adjustments(
             &taxonomy_adjustments,
             self.cfg.verbose || self.cfg.very_verbose,
@@ -2526,6 +2548,7 @@ mod tests {
             outprefix: "test".to_string(),
             mode: ProfileMode::Default,
             dmp_dir: None,
+            ignore_unresolved_references: false,
             strain: true,
         }
     }

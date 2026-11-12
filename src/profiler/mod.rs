@@ -32,7 +32,7 @@
 //! - **Chunk breadth**: Coverage of fixed-size genome chunks (for QC)
 //! - **Flex chunk breadth**: Coverage of variable-size chunks (based on √genome_size)
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::BuildHasher;
 use std::sync::Arc;
 
@@ -384,6 +384,53 @@ fn taxonomy_adjustment_description(
         )
     };
     format!("{primary}; {terminal}")
+}
+
+/// References skipped because the taxonomy dump cannot resolve their
+/// taxids, which is allowed only with --allow-taxonomy-mismatch.
+#[derive(Default)]
+pub(crate) struct UnresolvedReferences {
+    references: usize,
+    genomes: BTreeSet<String>,
+}
+
+impl UnresolvedReferences {
+    /// Skip a reference of `genome` whose taxonomy failed to resolve with
+    /// `error`, or return the error when skipping is not allowed.
+    pub(crate) fn skip(&mut self, genome: &str, error: anyhow::Error, allowed: bool) -> Result<()> {
+        if !allowed {
+            return Err(error);
+        }
+        self.references += 1;
+        if !self.genomes.contains(genome) {
+            self.genomes.insert(genome.to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn log(&self) {
+        if self.references == 0 {
+            return;
+        }
+        const LISTED: usize = 5;
+        let mut listed = self
+            .genomes
+            .iter()
+            .take(LISTED)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if self.genomes.len() > LISTED {
+            listed.push_str(", ...");
+        }
+        log::warn!(
+            target: "PROFILER",
+            "Ignored {} reference sequence(s) of {} genome(s) whose taxids are not in the taxonomy dump ({}); reads that map only to them stay unassigned, and reads of these organisms may be assigned to relatives.",
+            self.references,
+            self.genomes.len(),
+            listed
+        );
+    }
 }
 
 pub(crate) fn log_reference_taxonomy_adjustments(
@@ -742,6 +789,10 @@ pub struct ProfilerConfig {
     /// Directory containing taxonomy dump files (optional)
     pub dmp_dir: Option<String>,
 
+    /// Skip references whose taxids the taxonomy dump cannot resolve instead
+    /// of failing (--allow-taxonomy-mismatch).
+    pub ignore_unresolved_references: bool,
+
     /// Enable strain-level profiling
     pub strain: bool,
 }
@@ -1034,7 +1085,7 @@ impl Profiler {
 mod reference_taxonomy_tests {
     use super::{
         parse_reference_taxonomy, taxonomy_adjustment_description, ProfileRank, ReferenceTaxonomy,
-        ReferenceTaxonomyResolver,
+        ReferenceTaxonomyResolver, UnresolvedReferences,
     };
     use crate::taxonomy::Taxonomy;
     use std::collections::{HashMap, HashSet};
@@ -1153,6 +1204,22 @@ mod reference_taxonomy_tests {
         assert_eq!(resolved.primary_taxid, None);
         assert_eq!(resolved.profile_taxid, 40);
         assert_eq!(resolved.profile_rank, ProfileRank::Genus);
+    }
+
+    #[test]
+    fn unresolved_references_are_skipped_only_when_allowed() {
+        let mut unresolved = UnresolvedReferences::default();
+        assert!(unresolved
+            .skip("G1", anyhow::anyhow!("cannot be resolved"), false)
+            .is_err());
+        assert_eq!(unresolved.references, 0);
+        for genome in ["G1", "G1", "G2"] {
+            unresolved
+                .skip(genome, anyhow::anyhow!("cannot be resolved"), true)
+                .unwrap();
+        }
+        assert_eq!(unresolved.references, 3);
+        assert_eq!(unresolved.genomes.len(), 2);
     }
 
     #[test]
@@ -1324,6 +1391,7 @@ mod chunk_basis_tests {
             outprefix: "t".to_string(),
             mode: ProfileMode::Default,
             dmp_dir: None,
+            ignore_unresolved_references: false,
             strain: false,
         }
     }

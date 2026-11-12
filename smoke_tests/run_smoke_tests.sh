@@ -278,6 +278,10 @@ fi
 grep -q "2 are not in it" "$WORK/missing.err"
 grep -q -- "--allow-taxonomy-mismatch" "$WORK/missing.err"
 assert_not_exists "$WORK/se_missing.profile.txt"
+run_metax profile --db "$WORK/db_one" --dmp-dir "$WORK/tax_missing" --allow-taxonomy-mismatch \
+  -i "$WORK/se.fq" -o "$WORK/se_missing" -t 2 --temp-dir "$WORK/stage" \
+  --min-identity 0.90 --mapped-len 50 --min-mapped-fraction 0.50
+grep -q "Ignored 1 reference sequence(s) of 1 genome(s)" "$WORK/se_missing.log"
 
 run_metax profile \
   --db "$WORK/db_genus" \

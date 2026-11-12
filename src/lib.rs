@@ -1005,6 +1005,7 @@ impl MetaxApp {
             outprefix: self.config.outprefix.clone(),
             mode: self.config.mode,
             dmp_dir: self.config.dmp_dir.clone(),
+            ignore_unresolved_references: self.config.allow_taxonomy_mismatch,
             strain: self.config.strain,
             progress: self.profile_progress_options(),
             suppress_mapping_load_progress,
