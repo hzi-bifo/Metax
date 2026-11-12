@@ -227,8 +227,8 @@ Databases with marker genomes write metadata version 3, which adds a `reference_
 
 Seed scheme:
 
-- `-k, --seed-length`: length of each syncmer component. Default `15`.
-- `-w, --seed-window`: seed density/window parameter; larger values produce fewer seeds and a smaller index. Default `15`.
+- `-k, --seed-length`: length of each syncmer component. Default `16`.
+- `-w, --seed-window`: seed density/window parameter; larger values produce fewer seeds and a smaller index. Default `37`.
 - `--max-occ`: discard seed keys occurring at more than N reference positions. Default `500` for an index of marker genes only (`--reference-type markers` without `--reference-type-table` or `--fraction`), where conserved genes share many seeds, and `100` otherwise.
 - `--seed-mode`: `randstrobe` (default) or `minimizer`.
 - `--hash-bits`: high hash bits stored as the lookup key (24–64). Default `32`.

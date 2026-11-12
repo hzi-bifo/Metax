@@ -757,7 +757,7 @@ struct IndexArgs {
         short = 'k',
         long = "seed-length",
         value_name = "BASES",
-        default_value_t = 15,
+        default_value_t = 16,
         help_heading = "Seed index configuration",
         help = "Length of each syncmer component used by the seed scheme."
     )]
@@ -767,7 +767,7 @@ struct IndexArgs {
         short = 'w',
         long = "seed-window",
         value_name = "N",
-        default_value_t = 15,
+        default_value_t = 37,
         help_heading = "Seed index configuration",
         help = "Seed density/window parameter; larger values generally produce fewer seeds and a smaller index."
     )]
@@ -2210,6 +2210,14 @@ mod tests {
         assert_eq!(args.temp_dir.as_deref(), Some("/local/scratch"));
         assert_eq!(args.k, 17);
         assert_eq!(args.w, 21);
+        let Commands::Index(defaults) =
+            Cli::try_parse_from(["metax", "index", "ref.fa", "-o", "db"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected index command");
+        };
+        assert_eq!((defaults.k, defaults.w), (16, 37));
         assert_eq!(args.fraction, Some(0.10));
         assert_eq!(args.seed, 7);
         assert_eq!(args.segment_length, 1000);
