@@ -244,6 +244,19 @@ run_metax profile \
   --min-mapped-fraction 0.50
 assert_single_species_profile "$WORK/se_packed_taxonomy.profile.txt"
 
+# A read-only database works when the index cache is placed elsewhere.
+mkdir "$WORK/db_readonly" "$WORK/cache"
+cp "$WORK/db_one/metax_db.mxi" "$WORK/db_one/metax_db.tsv.gz" "$WORK/db_one/metax_taxonomy.tsv.gz" \
+  "$WORK/db_one/taxdmp.tar.gz" "$WORK/db_readonly/"
+chmod a-w "$WORK/db_readonly"
+run_metax profile --db "$WORK/db_readonly" -i "$WORK/se.fq" -o "$WORK/se_readonly" -t 2 \
+  --temp-dir "$WORK/stage" --min-identity 0.90 --mapped-len 50 --min-mapped-fraction 0.50 \
+  -- --index-cache "$WORK/cache/db_readonly.metamcache"
+chmod u+w "$WORK/db_readonly"
+assert_single_species_profile "$WORK/se_readonly.profile.txt"
+assert_exists "$WORK/cache/db_readonly.metamcache"
+[[ "$(ls -A "$WORK/db_readonly" | wc -l)" == 4 ]]
+
 # A database built without a dump can be given one.
 mkdir "$WORK/db_attach"
 cp "$WORK/db_one/metax_db.mxi" "$WORK/db_one/metax_db.tsv.gz" "$WORK/db_attach/"

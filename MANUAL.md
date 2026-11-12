@@ -68,7 +68,7 @@ tar -xzf taxdump.tar.gz -C taxonomy
 metax profile --dmp-dir taxonomy ...
 ```
 
-An explicit directory, like a dump stored with a database, is never downloaded, repaired, or modified by Metax. Use it for offline installations, pinned taxonomy snapshots, or alternative taxonomies (e.g. GTDB or ICTV) converted to the same dump-file format. The directory must contain `nodes.dmp`, `names.dmp`, `merged.dmp`, and `delnodes.dmp`; each may also be gzipped (`nodes.dmp.gz` and so on).
+An explicit directory, like a dump stored with a database, is never downloaded, repaired, or modified by Metax. Use it for offline installations, pinned taxonomy snapshots, or alternative taxonomies (e.g. GTDB or ICTV) converted to the same dump-file format. For a database that stores its own dump, `--dmp-dir` replaces that dump and is checked against the database's record before mapping (§2). The directory must contain `nodes.dmp`, `names.dmp`, `merged.dmp`, and `delnodes.dmp`; each may also be gzipped (`nodes.dmp.gz` and so on).
 
 ## 3. Reference Databases
 
@@ -83,7 +83,7 @@ metax profile -d metax2_refseq_202607_k16w37 \
   -o sample_pe -t 32
 ```
 
-The archive holds `metax_db.mxi`, `metax_db.tsv.gz`, and `md5sums.txt` with the checksums of both. The first run writes an index cache of about 50 GiB into the unpacked folder, which must therefore be writable.
+The archive holds `metax_db.mxi`, `metax_db.tsv.gz`, and `md5sums.txt` with the checksums of both. It holds no taxonomy dump, so profiling uses `--dmp-dir` or the managed NCBI dump (§2) and does not check it against the database. The first run writes an index cache of about 50 GiB into the unpacked folder, which must therefore be writable; to keep the folder read-only, place the cache elsewhere with the mapper option `--index-cache PATH`, given after `--` (§5.6).
 
 Databases built for Metax 0.9 use a different index format and must be rebuilt with `metax index`.
 
@@ -168,6 +168,8 @@ Every reference taxid must be in the taxonomy dump. `metax index` checks them be
 ```bash
 metax index gtdb_genomes.fa -o db_gtdb --dmp-dir gtdb_taxdump -t 20
 ```
+
+A built database directory is complete: to publish it, share the directory as it is, without the index cache `metax_db.mxi.metamcache` that profiling writes beside the index on first use.
 
 `metax index` refuses to overwrite an existing output path. The completed database is published by a same-filesystem rename, so an interrupted build never leaves a partial database in place.
 
@@ -269,7 +271,7 @@ Pass the dump the database was built with. Metax checks every reference taxid ag
 ### 5.1 Illumina paired-end reads
 
 ```bash
-metax profile -d db --dmp-dir taxonomy \
+metax profile -d db \
   -i sample_R1.fastq.gz -I sample_R2.fastq.gz \
   -o sample_pe -t 32
 ```
@@ -279,19 +281,19 @@ Supplying `-I` enables paired-end mode. By default only concordant same-referenc
 ### 5.2 Illumina single-end reads
 
 ```bash
-metax profile -d db --dmp-dir taxonomy -i sample.fastq.gz -o sample_se -t 32
+metax profile -d db -i sample.fastq.gz -o sample_se -t 32
 ```
 
 ### 5.3 Nanopore reads
 
 ```bash
-metax profile -d db --dmp-dir taxonomy -i ont_reads.fastq.gz -s Nanopore -o sample_ont -t 32
+metax profile -d db -i ont_reads.fastq.gz -s Nanopore -o sample_ont -t 32
 ```
 
 ### 5.4 PacBio reads
 
 ```bash
-metax profile -d db --dmp-dir taxonomy -i pacbio_reads.fastq.gz -s PacBio -o sample_pacbio -t 32
+metax profile -d db -i pacbio_reads.fastq.gz -s PacBio -o sample_pacbio -t 32
 ```
 
 ### 5.5 Profiling modes and read-level thresholds
@@ -354,6 +356,8 @@ Faster paired-end mapping: `--top-n 10` retains at most ten placements per mate 
 metax profile ... -- --top-n 10
 ```
 
+Index cache: the first run against a database writes a memory-mapped cache of the index beside it (`metax_db.mxi.metamcache`), which later runs open directly. `--index-cache PATH` places the cache at `PATH` instead, for example when the database directory is shared or read-only.
+
 Note that `--min-identity` appears on both sides of `--` with different meanings: before it, the profiler's species/strain threshold; after it, the mapper's emission cutoff.
 
 Paired-end emission: `--paired-emission concordant-only` (default) emits same-reference pairs and, for a fragment without any pair, its mates whose mate may lie beyond the end of their reference (§7.1); `concordant-first` emits concordant pairs when present and otherwise discordant rows; `all` emits every mate mapping. The latter two are mainly useful together with `--save-mapping` for diagnostics. A pair is written once, also when mate rescue finds again a placement that a mate already has.
@@ -375,7 +379,7 @@ Writes `<prefix>.mapping.tsv.gz` (format in §6.4).
 **Re-profile saved mappings** with different profiler settings, without the reads and without remapping. The same database must be supplied:
 
 ```bash
-metax profile --reuse-mapping sample.mapping.tsv.gz -d db --dmp-dir taxonomy -o sample_reprofile -t 20
+metax profile --reuse-mapping sample.mapping.tsv.gz -d db -o sample_reprofile -t 20
 ```
 
 The file header supplies the platform, pairing state, mapper mode, and the original read-level gates, so `--sequencer`, `-I`, and mapper arguments must not be repeated. Profiler options such as `--mode`, `--strain`, evidence thresholds, coverage filters, genus fallback, and output controls remain available and override the recorded values. Changing `--mode` on reuse changes profiler thresholds only; the saved candidate set cannot be expanded.

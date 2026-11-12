@@ -24,7 +24,7 @@ By unifying coverage-informed presence probability estimation with EM-based abun
 - **Rank-aware reference labels.** References may be labelled at strain, species, genus, or any higher rank, and Metax reports each genome at the lowest rank its label supports.
 - **Lower peak memory.** Mapping and profiling run as separate stages, so the mapping index is released before the profiler starts.
 - **Reusable mapping output.** Save compressed coordinate mappings once and re-profile them with different thresholds without remapping.
-- **Managed taxonomy.** A database can carry its own taxonomy dump; otherwise the NCBI taxonomy dump is downloaded and cached automatically when no `--dmp-dir` is given.
+- **Taxonomy stored with the database.** `metax index` stores the taxonomy dump with the database, and profiling uses it by default; another dump given with `--dmp-dir` is checked against the database's taxa. Without a stored dump, the NCBI taxonomy dump is downloaded and cached automatically.
 - **More platforms.** Conda packages are published for Linux x86-64, Linux ARM64, and macOS Apple Silicon.
 
 Databases built for Metax 0.9 use a different index format and must be rebuilt with `metax index` (see [Reference database](#reference-database)).
@@ -60,8 +60,8 @@ smoke_tests/run_smoke_tests.sh
 
 Metax uses NCBI-style taxonomy dump files (`nodes.dmp`, `names.dmp`, `merged.dmp`, `delnodes.dmp`).
 
-- If `--dmp-dir` is omitted, Metax uses the dump stored in the database directory (`taxdmp/`, or `taxdmp.tar.gz` read without unpacking). Without one, it downloads the official NCBI [taxdump](https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz) to `~/.metax/taxdmp` on first use and reuses it afterwards.
-- Pass `--dmp-dir <dir>` to use an offline installation, a pinned taxonomy snapshot, or an alternative taxonomy (e.g. GTDB or ICTV) converted to the same dump-file format. An explicit directory is never modified by Metax.
+- A database built by `metax index` stores the dump it was built with as `taxdmp.tar.gz`, which `metax profile` reads without unpacking when `--dmp-dir` is omitted. Without a stored dump, Metax downloads the official NCBI [taxdump](https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz) to `~/.metax/taxdmp` on first use and reuses it afterwards.
+- Pass `--dmp-dir <dir>` to use an offline installation, a pinned taxonomy snapshot, or an alternative taxonomy (e.g. GTDB or ICTV) converted to the same dump-file format. An explicit directory is never modified by Metax. For a database with a stored dump, the given dump is checked against the database's taxa before mapping: taxa that are merged or renamed in it give a warning, and taxa missing from it stop the run unless `--allow-taxonomy-mismatch` is given.
 
 ### Reference database
 
@@ -74,7 +74,7 @@ Databases built for Metax 0.9 are not compatible with Metax 2 and must be rebuil
   metax profile -d metax2_refseq_202607_k16w37 -i <reads_1.fq.gz> -I <reads_2.fq.gz> -o <prefix> -t 20
   ```
 
-  The first run writes an index cache of about 50 GiB into the unpacked folder, which must therefore be writable.
+  This archive holds no taxonomy dump, so Metax uses `--dmp-dir` or the managed NCBI dump. The first run writes an index cache of about 50 GiB into the unpacked folder, which must therefore be writable (or place the cache elsewhere with `-- --index-cache <path>`; see the [manual](MANUAL.md#31-pre-built-database)).
 
 To build a custom database:
 
@@ -89,10 +89,10 @@ To build a custom database:
 2. Build the database:
 
    ```shell
-   metax index <fasta_file> -o <database_dir> -t 20
+   metax index <fasta_file> -o <database_dir> --dmp-dir <dump_dir> -t 20
    ```
 
-   Gzip-compressed input is accepted. For machines with limited RAM, `-f <fraction>` builds a **fractional index** from an evenly distributed fraction of each large genome; see the [manual](MANUAL.md#42-fractional-index).
+   Gzip-compressed input is accepted. Every reference taxid must be in the taxonomy dump (`--dmp-dir`, or the managed NCBI dump when omitted), which is stored in the database as `taxdmp.tar.gz`. A database built as a directory is complete; publish it without the index cache (`metax_db.mxi.metamcache`). A database built without a dump can be given one with `metax attach-taxonomy -d <database_dir> --dmp-dir <dump_dir>`. For machines with limited RAM, `-f <fraction>` builds a **fractional index** from an evenly distributed fraction of each large genome; see the [manual](MANUAL.md#42-fractional-index).
 
    For marker genes (one FASTA record per gene) add `--reference-type markers`, or list single genomes in `--reference-type-table` to mix genomes and marker genes; see the [manual](MANUAL.md#43-marker-gene-and-mixed-databases). The read counts of marker genomes are the reads mapped to their marker genes, because the size of the full genome is not used; depth and relative abundance remain comparable with genome taxa.
 
@@ -123,7 +123,7 @@ Nanopore or PacBio reads:
 metax profile -d <database_dir> -i <reads.fq.gz> -s Nanopore -o <output_prefix> -t 20
 ```
 
-Add `--dmp-dir <dump_dir>` to use a specific taxonomy directory. The first run against a database builds a memory-mapped index cache beside it; subsequent runs start faster.
+Add `--dmp-dir <dump_dir>` to use another taxonomy directory than the one stored with the database. The first run against a database builds a memory-mapped index cache beside it; subsequent runs start faster.
 
 ## Test datasets
 
