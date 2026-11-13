@@ -110,9 +110,13 @@ pub struct AppConfig {
     pub min_coebr: Option<f64>,
     pub min_marker_genes: usize,
     pub relative_identity_gap: Option<f64>,
+    /// `--no-relative-identity-gap`: no default gap either.
+    pub no_relative_identity_gap: bool,
     pub removed_to_genus: bool,
     pub estimate_unclassified: bool,
     pub identity_margin: Option<f64>,
+    /// `--no-identity-margin`: no default margin either.
+    pub no_identity_margin: bool,
     pub fraction: Option<f64>,
     pub lowbiomass: bool,
     pub keep_raw: bool,
@@ -166,6 +170,11 @@ const ADAPTIVE_IDENTITY_FLOOR: f64 = 0.84;
 /// qualities that are wrong or under-stated never let a species claim reads
 /// below the usual species boundary.
 const SHORT_READ_IDENTITY_FLOOR: f64 = 0.95;
+/// `--identity-margin` when it is on without a value or by default.
+pub const DEFAULT_IDENTITY_MARGIN: f64 = 0.025;
+/// `--relative-identity-gap` for single-end short reads on a fractional
+/// database.
+const FRACTIONAL_SINGLE_END_RELATIVE_IDENTITY_GAP: f64 = 0.01;
 
 /// Whether long reads with this sampled mean predicted base accuracy are
 /// noisy. Their identity cutoff self-calibrates, and the mapper also accepts
@@ -203,6 +212,29 @@ fn identity_below_accuracy(accuracy: f64, mode: ProfileMode) -> f64 {
         ProfileMode::Precision => 0.02,
     };
     (accuracy - margin).max(ADAPTIVE_IDENTITY_FLOOR)
+}
+
+impl AppConfig {
+    /// `--identity-margin` and `--relative-identity-gap` for this run. On a
+    /// fractional database the reads of a genome's unindexed part land on
+    /// indexed relatives; single-end short reads have no mate to tell them
+    /// apart, so both guards are on there unless given or switched off.
+    fn identity_guards(&self, fractional: bool) -> (Option<f64>, Option<f64>) {
+        let fractional_single_end =
+            fractional && self.sequencer.is_illumina() && !self.is_paired && !self.strain;
+        let margin = self.identity_margin.or_else(|| {
+            (fractional_single_end && !self.no_identity_margin).then_some(DEFAULT_IDENTITY_MARGIN)
+        });
+        let gap = self.relative_identity_gap.or_else(|| {
+            (fractional_single_end && !self.no_relative_identity_gap)
+                .then_some(FRACTIONAL_SINGLE_END_RELATIVE_IDENTITY_GAP)
+        });
+        (margin, gap)
+    }
+}
+
+fn display_guard(value: Option<f64>) -> String {
+    value.map_or_else(|| "off".to_string(), |value| value.to_string())
 }
 
 impl MetaxApp {
@@ -964,6 +996,18 @@ impl MetaxApp {
                 Some(Arc::new(DatabaseMetadata::load(Path::new(db))?)),
             ),
         };
+        let fractional = db_metadata.as_ref().is_some_and(|db| db.is_fractional);
+        let (identity_margin, relative_identity_gap) = self.config.identity_guards(fractional);
+        if identity_margin != self.config.identity_margin
+            || relative_identity_gap != self.config.relative_identity_gap
+        {
+            log::info!(
+                target: "PROFILER",
+                "Single-end reads on a fractional database: --identity-margin {} and --relative-identity-gap {} by default.",
+                display_guard(identity_margin),
+                display_guard(relative_identity_gap)
+            );
+        }
         Ok(ProfilerConfig {
             mapper_mappings,
             mapping_profile_memory,
@@ -984,10 +1028,10 @@ impl MetaxApp {
             min_oebr: self.config.min_oebr,
             min_coebr: self.config.min_coebr,
             min_marker_genes: self.config.min_marker_genes,
-            relative_identity_gap: self.config.relative_identity_gap,
+            relative_identity_gap,
             removed_to_genus: self.config.removed_to_genus,
             estimate_unclassified: self.config.estimate_unclassified,
-            identity_margin: self.config.identity_margin,
+            identity_margin,
             fraction,
             lowbiomass: self.config.lowbiomass,
             keep_raw: self.config.keep_raw,
@@ -1142,9 +1186,11 @@ mod tests {
             min_coebr: None,
             min_marker_genes: 3,
             relative_identity_gap: None,
+            no_relative_identity_gap: false,
             removed_to_genus: false,
             estimate_unclassified: false,
             identity_margin: None,
+            no_identity_margin: false,
             fraction: None,
             lowbiomass: false,
             keep_raw: false,
@@ -1166,6 +1212,36 @@ mod tests {
             progress_interval: 100_000,
             extra_args: Vec::new(),
         }
+    }
+
+    #[test]
+    fn identity_guards_are_on_for_single_end_reads_on_fractional_databases() {
+        let mut config = test_app_config();
+        config.sequencer = Sequencer::Illumina;
+        config.is_paired = false;
+        assert_eq!(config.identity_guards(false), (None, None));
+        assert_eq!(
+            config.identity_guards(true),
+            (Some(DEFAULT_IDENTITY_MARGIN), Some(0.01))
+        );
+        config.identity_margin = Some(0.04);
+        config.relative_identity_gap = Some(0.02);
+        assert_eq!(config.identity_guards(true), (Some(0.04), Some(0.02)));
+        config.identity_margin = None;
+        config.relative_identity_gap = None;
+        config.no_identity_margin = true;
+        config.no_relative_identity_gap = true;
+        assert_eq!(config.identity_guards(true), (None, None));
+        config.no_identity_margin = false;
+        config.no_relative_identity_gap = false;
+        config.strain = true;
+        assert_eq!(config.identity_guards(true), (None, None));
+        config.strain = false;
+        config.is_paired = true;
+        assert_eq!(config.identity_guards(true), (None, None));
+        config.is_paired = false;
+        config.sequencer = Sequencer::Nanopore;
+        assert_eq!(config.identity_guards(true), (None, None));
     }
 
     #[test]

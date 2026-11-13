@@ -31,9 +31,6 @@ use clap::{ArgAction, Args, Parser, Subcommand};
 /// Parser for a probability-valued CLI option. Rejects non-finite values
 /// and values outside `[0.0, 1.0]` at parse time so misuse is caught
 /// before any I/O work begins.
-/// Identity margin used when `--identity-margin` is on by default or given without a value.
-const DEFAULT_IDENTITY_MARGIN: f64 = 0.025;
-
 fn parse_probability(s: &str) -> Result<f64, String> {
     let value: f64 = s
         .parse()
@@ -82,7 +79,7 @@ use metax::profiler::{ExactTiePolicy, ProfileMode};
 use metax::sequencer::Sequencer;
 use metax::{
     attach_taxonomy, build_index, info::run_info, report_genera_with_both_types, AppConfig,
-    MetaxApp,
+    MetaxApp, DEFAULT_IDENTITY_MARGIN,
 };
 
 /// Main command-line interface structure parsed by clap.
@@ -352,7 +349,7 @@ struct ProfileArgs {
         value_parser = parse_probability,
         conflicts_with = "strain",
         help_heading = "Genus fallback and low-map behavior",
-        help = "Report a species at its genus when the reads placed best on it are, on average, more than FRACTION less identical than those of the sample's typical species (the median over the reported species, weighted by their fragments). Such a species is mostly a relative that receives the reads of an organism missing from the database. Needs at least 3 reported species. On by default with 0.025 for paired-end Illumina community profiling; other inputs use it only when it is given (without a value: 0.025)."
+        help = "Report a species at its genus when the reads placed best on it are, on average, more than FRACTION less identical than those of the sample's typical species (the median over the reported species, weighted by their fragments). Such a species is mostly a relative that receives the reads of an organism missing from the database. Needs at least 3 reported species. On by default with 0.025 for paired-end Illumina community profiling and for single-end Illumina reads on a fractional database; other inputs use it only when it is given (without a value: 0.025)."
     )]
     identity_margin: Option<f64>,
 
@@ -466,9 +463,18 @@ struct ProfileArgs {
         value_name = "FRACTION",
         value_parser = parse_probability,
         help_heading = "Coverage evidence and filters",
-        help = "Drop a species when a species of the same genus with more depth has a mean read identity at least FRACTION higher, so that its reads are better explained as reads of that relative. Removes relatives that only receive reads from genome parts missing from a fractional or marker index, but also a truly present species that is much less abundant than a close relative; use it when close relatives are not expected together. Off by default."
+        help = "Drop a species when a species of the same genus with more depth has a mean read identity at least FRACTION higher, so that its reads are better explained as reads of that relative. Removes relatives that only receive reads from genome parts missing from a fractional or marker index, but also a truly present species that is much less abundant than a close relative; use it when close relatives are not expected together. Off by default, except 0.01 for single-end Illumina reads on a fractional database."
     )]
     relative_identity_gap: Option<f64>,
+
+    #[arg(
+        long = "no-relative-identity-gap",
+        action = ArgAction::SetTrue,
+        conflicts_with = "relative_identity_gap",
+        help_heading = "Coverage evidence and filters",
+        help = "Do not drop species by --relative-identity-gap, also where it is on by default."
+    )]
+    no_relative_identity_gap: bool,
 
     #[arg(
         long = "strict",
@@ -1149,9 +1155,11 @@ impl TryFrom<ProfileArgs> for AppConfig {
             min_coebr: args.min_coebr,
             min_marker_genes: args.min_marker_genes,
             relative_identity_gap: args.relative_identity_gap,
+            no_relative_identity_gap: args.no_relative_identity_gap,
             removed_to_genus,
             estimate_unclassified: args.estimate_unclassified,
             identity_margin,
+            no_identity_margin: args.no_identity_margin,
             fraction: args.fraction,
             lowbiomass: args.lowbiomass,
             keep_raw: args.keep_raw,
@@ -1469,6 +1477,27 @@ mod tests {
             margin(&["--identity-margin", "-t", "4"]),
             Some(DEFAULT_IDENTITY_MARGIN)
         );
+    }
+
+    #[test]
+    fn relative_identity_gap_can_be_switched_off() {
+        let parse = |extra: &[&str]| {
+            let argv = ["metax", "profile", "-d", "db", "-i", "r1.fq", "-o", "out"];
+            Cli::try_parse_from(argv.iter().chain(extra))
+        };
+        let Commands::Profile(args) = parse(&["--no-relative-identity-gap"]).unwrap().command
+        else {
+            panic!("expected profile command");
+        };
+        let config = AppConfig::try_from(args).unwrap();
+        assert!(config.no_relative_identity_gap);
+        assert_eq!(config.relative_identity_gap, None);
+        assert!(parse(&[
+            "--no-relative-identity-gap",
+            "--relative-identity-gap",
+            "0.01"
+        ])
+        .is_err());
     }
 
     #[test]

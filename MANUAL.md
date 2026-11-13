@@ -658,7 +658,7 @@ Foreign contigs in a reference, a misassembled region, and DNA shared across gen
 
 When part of a genome is missing from the index, as in fractional indexes and for marker genomes, reads from the missing part land on related genomes at lower identity. Such a relative can pass every coverage test, because these reads spread over its sequence like its own reads. `--relative-identity-gap F` drops a reported species when a reported species of the same genus has more depth and a mean mapping identity at least `F` higher; the mean identity of a taxon is taken over every fragment mapped to it, using the fragment's best mapping, before the read-level identity gate. Species without a genus in the taxonomy are not checked. The number of removed species is logged; `--verbose` lists each with the relative that explains it.
 
-The guard is off by default, because it cannot tell such a relative from a species that is truly present but much less abundant than a close relative: the relative's reads land on that species too and lower its mean identity, so it is removed as well. Use the guard when close relatives are not expected in the same sample.
+The guard cannot tell such a relative from a species that is truly present but much less abundant than a close relative: the relative's reads land on that species too and lower its mean identity, so it is removed as well. It is therefore off by default, except for single-end Illumina reads on a fractional database, where it is on with `F = 0.01`: single reads carry no mate to place them, so many relatives would otherwise be reported, and the guard removes far more of them than true species. `--no-relative-identity-gap` turns it off there. Elsewhere, use the guard when close relatives are not expected in the same sample.
 
 ### 7.12 Identity relative to the sample
 
@@ -668,7 +668,7 @@ The reads of an organism that the database lacks land on its closest relatives, 
 - For every reported species the mean identity of its fragments is taken. The baseline is the median of these means over the reported species, weighted by their fragments.
 - A species whose mean lies more than `F` below the baseline is reported at its genus: its row joins the genus row, which adds up fragments, depth and abundance and shows the coverage columns of its largest part, and its classified reads follow.
 
-The rule is on by default with `F = 0.025` for paired-end Illumina community profiling; `--no-identity-margin` turns it off. For single-end and long-read profiling it applies only when `--identity-margin` is given (without a value, `F` is `0.025`); strain profiling does not use it. The rule needs at least 3 reported species with such fragments; a species without a genus in the taxonomy stays. With the relative identity guard (§7.11) it runs after the guard. The log reports the baseline and the number of species moved; `--verbose` lists each with its mean identity.
+The rule is on by default with `F = 0.025` for paired-end Illumina community profiling and for single-end Illumina reads on a fractional database (§7.11); `--no-identity-margin` turns it off. For other single-end and for long-read profiling it applies only when `--identity-margin` is given (without a value, `F` is `0.025`); strain profiling does not use it. The rule needs at least 3 reported species with such fragments; a species without a genus in the taxonomy stays. With the relative identity guard (§7.11) it runs after the guard. The log reports the baseline and the number of species moved; `--verbose` lists each with its mean identity.
 
 ### 7.13 Abundance estimation
 
@@ -740,7 +740,7 @@ metax profile -d db_markers -i R1.fastq.gz -I R2.fastq.gz -o sample_markers -t 3
 
 ### 8.8 Fractional index with the relative identity guard
 
-For samples in which close relatives are not expected together (§7.11):
+Single-end Illumina reads on a fractional index use the guard by default (§7.11). For paired-end reads, add it for samples in which close relatives are not expected together:
 
 ```bash
 metax profile -d db_frac_10 -i R1.fastq.gz -I R2.fastq.gz -o sample_frac -t 32 \
