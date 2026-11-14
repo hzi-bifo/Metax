@@ -611,6 +611,8 @@ Default bounds:
 
 `--min-oebr` and `--min-coebr` override the lower bounds; the upper bound stays `1.50`. `-b, --min-breadth` additionally requires a minimum observed breadth. Values given explicitly for `--min-breadth`, `--min-chunk-breadth`, `--min-oebr`, and `--min-coebr` apply to every reported taxon, including taxa admitted by a rescue tier (§7.8).
 
+Amplified libraries, such as those made with PCR-based kits, cover a genome unevenly: reads pile up at the same places and leave gaps, so the observed breadth of a species that is present can fall well below its expectation and fail the OEBR bound. For long reads from such libraries, `--min-oebr 0.6` keeps these species; expect a few more low-abundance species of related or commensal taxa as well.
+
 ### 7.7 P-values
 
 Species rows carry two p-values: one for the observed breadth against its expectation (column 9) and one for the flexible chunk breadth (column 13). Rows above species generally report `NA`.

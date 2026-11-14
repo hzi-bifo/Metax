@@ -436,7 +436,7 @@ struct ProfileArgs {
         value_name = "RATIO",
         value_parser = parse_nonnegative_float,
         help_heading = "Coverage evidence and filters",
-        help = "Minimum observed/expected genome-breadth ratio."
+        help = "Minimum observed/expected genome-breadth ratio (default 0.70 for species, 0.65 above species). Amplified libraries, such as those made with PCR-based kits, cover genomes unevenly; for long reads from such libraries, try 0.6."
     )]
     min_oebr: Option<f64>,
 
@@ -445,7 +445,7 @@ struct ProfileArgs {
         value_name = "RATIO",
         value_parser = parse_nonnegative_float,
         help_heading = "Coverage evidence and filters",
-        help = "Minimum observed/expected chunk-breadth ratio."
+        help = "Minimum observed/expected chunk-breadth ratio (default 0.75 for short-read species, 0.70 for long-read species, 0.65 above species)."
     )]
     min_coebr: Option<f64>,
 
