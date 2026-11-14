@@ -180,7 +180,7 @@ impl TaxonomyRecord {
         );
         if !missing.is_empty() && !allow_missing {
             bail!(
-                "the {detail}. Use the dump stored with the database (used when --dmp-dir is omitted), or pass --allow-taxonomy-mismatch to continue without the references of these taxa"
+                "the {detail}. Use the dump stored with the database (used when --dmp-dir is omitted), or pass --skip-missing-taxa to continue without the references of these taxa"
             );
         }
         log::warn!(
@@ -381,7 +381,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(message.contains("of the 3 database taxa, 1 are not in it (taxid 30)"));
-        assert!(message.contains("--allow-taxonomy-mismatch"));
+        assert!(message.contains("--skip-missing-taxa"));
         record.check(&without_thirty, dump, true).unwrap();
     }
 

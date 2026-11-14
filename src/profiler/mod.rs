@@ -387,7 +387,7 @@ fn taxonomy_adjustment_description(
 }
 
 /// References skipped because the taxonomy dump cannot resolve their
-/// taxids, which is allowed only with --allow-taxonomy-mismatch.
+/// taxids, which is allowed only with --skip-missing-taxa.
 #[derive(Default)]
 pub(crate) struct UnresolvedReferences {
     references: usize,
@@ -790,7 +790,7 @@ pub struct ProfilerConfig {
     pub dmp_dir: Option<String>,
 
     /// Skip references whose taxids the taxonomy dump cannot resolve instead
-    /// of failing (--allow-taxonomy-mismatch).
+    /// of failing (--skip-missing-taxa).
     pub ignore_unresolved_references: bool,
 
     /// Enable strain-level profiling

@@ -79,7 +79,7 @@ pub struct AppConfig {
     pub db: Option<String>,
     pub dmp_dir: Option<String>,
     /// Profile with a taxonomy dump that lacks database taxids.
-    pub allow_taxonomy_mismatch: bool,
+    pub skip_missing_taxa: bool,
     // Input reads (comma-separated for paired-end).
     pub input_sequences: Option<String>,
     pub outprefix: String,
@@ -267,7 +267,7 @@ impl MetaxApp {
                 record.check(
                     taxonomy,
                     taxonomy_source.path(),
-                    self.config.allow_taxonomy_mismatch,
+                    self.config.skip_missing_taxa,
                 )
             })
         };
@@ -1049,7 +1049,7 @@ impl MetaxApp {
             outprefix: self.config.outprefix.clone(),
             mode: self.config.mode,
             dmp_dir: self.config.dmp_dir.clone(),
-            ignore_unresolved_references: self.config.allow_taxonomy_mismatch,
+            ignore_unresolved_references: self.config.skip_missing_taxa,
             strain: self.config.strain,
             progress: self.profile_progress_options(),
             suppress_mapping_load_progress,
@@ -1161,7 +1161,7 @@ mod tests {
         AppConfig {
             db: None,
             dmp_dir: None,
-            allow_taxonomy_mismatch: false,
+            skip_missing_taxa: false,
             input_sequences: None,
             outprefix: "test".to_string(),
             threads: 1,
