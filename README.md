@@ -170,7 +170,7 @@ Add `--dmp-dir <dump_dir>` to use another taxonomy directory than the one stored
 Optional outputs:
 
 - `--save-raw-profile`: `<output_prefix>.rprofile.txt`, the post-EM profile before taxon-level filters.
-- `--save-classification`: `<output_prefix>.classify.txt`, per-read taxonomic assignments.
+- `--save-classification`: `<output_prefix>.classify.txt.gz`, per-read taxonomic assignments, gzip-compressed (not written for fractional databases; for species represented by marker genes, only the reads placed on those genes).
 - `--save-mapping`: `<output_prefix>.mapping.tsv.gz`, the coordinate mappings for `--reuse-mapping`.
 
 ## Manual

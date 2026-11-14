@@ -188,7 +188,7 @@ pub(crate) struct GenusRow {
     pub(crate) witness: EvidenceCoverage,
     /// Removed species whose fragments make up the row, by taxid.
     pub(crate) donors: Vec<u32>,
-    /// Read names, kept only for `classify.txt`.
+    /// Read names, kept only for `classify.txt.gz`.
     pub(crate) reads: Option<Vec<String>>,
 }
 

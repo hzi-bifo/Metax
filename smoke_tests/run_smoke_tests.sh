@@ -208,7 +208,7 @@ run_metax profile \
   --min-mapped-fraction 0.50
 assert_exists "$WORK/se.profile.txt"
 assert_single_species_profile "$WORK/se.profile.txt"
-assert_not_exists "$WORK/se.classify.txt"
+assert_not_exists "$WORK/se.classify.txt.gz"
 assert_not_exists "$WORK/se.mapping.tsv"
 assert_not_exists "$WORK/se.mapping.tsv.gz"
 assert_not_exists "$WORK/se.mapping.profile.json"
@@ -320,7 +320,7 @@ run_metax profile \
   --min-mapped-fraction 0.50
 assert_exists "$WORK/se_stream.profile.txt"
 assert_single_species_profile "$WORK/se_stream.profile.txt"
-assert_not_exists "$WORK/se_stream.classify.txt"
+assert_not_exists "$WORK/se_stream.classify.txt.gz"
 assert_not_exists "$WORK/se_stream.mapping.tsv.gz"
 cmp "$WORK/se.profile.txt" "$WORK/se_stream.profile.txt"
 
@@ -336,8 +336,8 @@ run_metax profile \
   --mapped-len 50 \
   --min-mapped-fraction 0.50
 assert_exists "$WORK/keep.mapping.tsv.gz"
-assert_exists "$WORK/keep.classify.txt"
-[[ -s "$WORK/keep.classify.txt" ]]
+assert_exists "$WORK/keep.classify.txt.gz"
+[[ -n "$(gzip -dc "$WORK/keep.classify.txt.gz")" ]]
 assert_single_species_profile "$WORK/keep.profile.txt"
 assert_not_exists "$WORK/keep.mapping.profile.json"
 if ! gzip -cd "$WORK/keep.mapping.tsv.gz" | awk -F '\t' '
@@ -366,7 +366,7 @@ run_metax profile \
   -t 2
 assert_exists "$WORK/reused.profile.txt"
 assert_single_species_profile "$WORK/reused.profile.txt"
-assert_not_exists "$WORK/reused.classify.txt"
+assert_not_exists "$WORK/reused.classify.txt.gz"
 cmp "$WORK/keep.profile.txt" "$WORK/reused.profile.txt"
 
 if find "$WORK" -maxdepth 1 -name '.metax-mapping-*.partial.tsv.gz' -print -quit | grep -q .; then
@@ -387,7 +387,7 @@ run_metax profile \
   --min-mapped-fraction 0.50
 assert_exists "$WORK/pe.profile.txt"
 assert_single_species_profile "$WORK/pe.profile.txt"
-assert_not_exists "$WORK/pe.classify.txt"
+assert_not_exists "$WORK/pe.classify.txt.gz"
 assert_exists "$WORK/pe.mapping.tsv.gz"
 if ! gzip -cd "$WORK/pe.mapping.tsv.gz" | awk -F '\t' '
   $1 == "#metax_mapping" && $2 == "version=5" && $4 == "paired=true" { file_meta = 1 }
@@ -427,7 +427,7 @@ assert_exists "$WORK/pe_strain.profile.txt"
 [[ ! -s "$WORK/pe_strain.profile.txt" ]]
 assert_exists "$WORK/pe_strain.rprofile.txt"
 assert_single_strain_raw_profile "$WORK/pe_strain.rprofile.txt"
-assert_not_exists "$WORK/pe_strain.classify.txt"
+assert_not_exists "$WORK/pe_strain.classify.txt.gz"
 
 run_metax profile \
   --db "$WORK/db_one" \
@@ -441,7 +441,7 @@ run_metax profile \
   --min-mapped-fraction 0.30
 assert_exists "$WORK/long.profile.txt"
 assert_single_species_profile "$WORK/long.profile.txt"
-assert_not_exists "$WORK/long.classify.txt"
+assert_not_exists "$WORK/long.classify.txt.gz"
 
 run_metax profile \
   --db "$WORK/db_one" \
@@ -485,7 +485,7 @@ run_metax profile \
   -o "$WORK/long_reused" \
   -t 2
 assert_exists "$WORK/long_reused.profile.txt"
-assert_not_exists "$WORK/long_reused.classify.txt"
+assert_not_exists "$WORK/long_reused.classify.txt.gz"
 cmp "$WORK/long_saved.profile.txt" "$WORK/long_reused.profile.txt"
 
 run_metax profile \
@@ -500,7 +500,7 @@ run_metax profile \
   --min-mapped-fraction 0.30
 assert_exists "$WORK/long_genus.profile.txt"
 assert_single_genus_profile "$WORK/long_genus.profile.txt"
-assert_not_exists "$WORK/long_genus.classify.txt"
+assert_not_exists "$WORK/long_genus.classify.txt.gz"
 
 run_metax profile \
   --db "$WORK/db_frac" \
@@ -515,7 +515,7 @@ run_metax profile \
   --min-mapped-fraction 0.50
 assert_exists "$WORK/frac.profile.txt"
 assert_exists "$WORK/frac.mapping.tsv.gz"
-assert_not_exists "$WORK/frac.classify.txt"
+assert_not_exists "$WORK/frac.classify.txt.gz"
 if ! gzip -cd "$WORK/frac.mapping.tsv.gz" | awk -F '\t' '
   $1 == "#metax_mapping_database" && $2 == "fractional=true" && $3 ~ /^sequences=[1-9][0-9]*$/ && $4 ~ /^genomes=[1-9][0-9]*$/ { db_meta = 1 }
   !/^#/ {
@@ -542,7 +542,7 @@ run_metax profile \
   --mapped-len 50 \
   --min-mapped-fraction 0.50
 assert_exists "$WORK/frac_reused.profile.txt"
-assert_not_exists "$WORK/frac_reused.classify.txt"
+assert_not_exists "$WORK/frac_reused.classify.txt.gz"
 cmp "$WORK/frac.profile.txt" "$WORK/frac_reused.profile.txt"
 
 echo "Metax smoke tests passed: $WORK"

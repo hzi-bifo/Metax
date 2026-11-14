@@ -40,7 +40,7 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
 
-use crate::db::DatabaseMetadata;
+use crate::db::{DatabaseMetadata, ReferenceType};
 use crate::mapper::tsv::{MetamMappingReceiver, SharedMetamProfile};
 use crate::progress::ProgressOptions;
 use crate::sequencer::Sequencer;
@@ -873,6 +873,38 @@ impl ProfilerConfig {
             num_reads
         }
     }
+
+    /// Whether `classify.txt.gz` is written: when requested, for any database
+    /// except a fractional one, whose scaled counts do not match single reads.
+    /// Warns when the database has marker-gene references, because the file
+    /// then lists only the reads placed on those genes for their species.
+    /// `has_scaled_genomes` stands in for the fractional flag when no database
+    /// metadata is loaded.
+    pub(crate) fn writes_classifications(&self, has_scaled_genomes: bool) -> bool {
+        if !self.save_classifications {
+            return false;
+        }
+        let database = self.db_metadata.as_deref();
+        if database.map_or(has_scaled_genomes, |database| database.is_fractional) {
+            log::warn!(
+                target: "PROFILER",
+                "Cannot write classify.txt.gz for a fractional database because per-read assignments cannot be expanded safely to full-index equivalents."
+            );
+            return false;
+        }
+        if database.is_some_and(|database| {
+            database
+                .references
+                .iter()
+                .any(|reference| reference.reference_type == ReferenceType::Markers)
+        }) {
+            log::warn!(
+                target: "PROFILER",
+                "The database has marker-gene references: for species represented by marker genes, classify.txt.gz lists only the reads placed on those genes, a small part of each genome, and not the reads from the rest of their genomes. Use profile.txt for abundances."
+            );
+        }
+        true
+    }
 }
 
 /// Apply a user-selected multiplier to an automatically estimated
@@ -1342,6 +1374,10 @@ mod subsample_scaling_tests {
 
 #[cfg(test)]
 mod chunk_basis_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use crate::db::{DatabaseMetadata, ReferenceMetadata, ReferenceType};
     use crate::progress::ProgressOptions;
     use crate::sequencer::Sequencer;
 
@@ -1461,5 +1497,43 @@ mod chunk_basis_tests {
         cfg.sequencer = Sequencer::Nanopore;
         cfg.host = Some("human".to_string());
         assert!(!cfg.is_low_map_run(0.10));
+    }
+
+    #[test]
+    fn classifications_are_written_for_every_database_except_fractional_ones() {
+        let reference = |reference_type| ReferenceMetadata {
+            name: "ref".to_string(),
+            length: 1_000,
+            genome: "genome".into(),
+            contig: "ref".to_string(),
+            full_genome_size: 1_000,
+            effective_indexed_size: 1_000,
+            taxonomy_field: "s:8".into(),
+            reference_type,
+            declared_genome_size: None,
+        };
+        let database = |types: &[ReferenceType], is_fractional| {
+            Some(Arc::new(DatabaseMetadata {
+                metam_index: PathBuf::from("metax_db.mxi"),
+                references: types.iter().copied().map(reference).collect(),
+                is_fractional,
+            }))
+        };
+        let mut cfg = minimal_cfg();
+        cfg.db_metadata = database(&[ReferenceType::Genome], false);
+        assert!(!cfg.writes_classifications(false));
+
+        cfg.save_classifications = true;
+        assert!(cfg.writes_classifications(false));
+        cfg.db_metadata = database(&[ReferenceType::Markers], false);
+        assert!(cfg.writes_classifications(false));
+        cfg.db_metadata = database(&[ReferenceType::Genome, ReferenceType::Markers], false);
+        assert!(cfg.writes_classifications(false));
+        cfg.db_metadata = database(&[ReferenceType::Genome], true);
+        assert!(!cfg.writes_classifications(false));
+
+        cfg.db_metadata = None;
+        assert!(cfg.writes_classifications(false));
+        assert!(!cfg.writes_classifications(true));
     }
 }

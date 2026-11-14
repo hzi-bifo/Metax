@@ -1,8 +1,12 @@
 use std::collections::HashMap;
-use std::io::Write;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::sync::Arc;
 
+use anyhow::{Context, Result};
 use csv::Writer;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 
 /// Optional host/pathogen annotation columns appended to a profile row.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,6 +77,27 @@ impl ResolvedClassificationGroup {
     }
 }
 
+/// Gzip writer of the per-read classifications, `<prefix>.classify.txt.gz`.
+pub(crate) type ClassificationWriter = BufWriter<GzEncoder<File>>;
+
+/// Create the per-read classification file at `path`. Gzip level 2: the
+/// backend's level 1 is a quick mode that compresses much less for little
+/// gain in speed.
+pub(crate) fn create_classification_writer(path: &str) -> Result<ClassificationWriter> {
+    let file = File::create(path).with_context(|| format!("failed to create {path}"))?;
+    Ok(BufWriter::new(GzEncoder::new(file, Compression::new(2))))
+}
+
+/// Write the gzip trailer. Dropping the writer would also close the stream,
+/// but would hide a failed write.
+pub(crate) fn finish_classification_writer(writer: ClassificationWriter) -> Result<()> {
+    writer
+        .into_inner()
+        .map_err(|error| error.into_error())?
+        .finish()?;
+    Ok(())
+}
+
 /// Grouped classifications retained until final taxon filtering.
 ///
 /// Read names are held only when classification output was explicitly
@@ -95,7 +120,7 @@ impl ResolvedClassifications {
     }
 
     /// Borrow classification groups in a stable output order. The temporary
-    /// vector contains pointers only and is allocated solely for `classify.txt`.
+    /// vector contains pointers only and is allocated solely for `classify.txt.gz`.
     pub(crate) fn sorted_groups(&self) -> Vec<&ResolvedClassificationGroup> {
         let mut groups = self.groups.iter().collect::<Vec<_>>();
         groups.sort_unstable_by(|left, right| left.key.cmp(&right.key));

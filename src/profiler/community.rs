@@ -41,7 +41,7 @@ use std::cell::OnceCell;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{BufRead, Write};
 use std::path::Path;
 use std::str;
 use std::sync::Arc;
@@ -75,7 +75,8 @@ use super::identity::{
 };
 use super::markers::{FragmentGeometry, FragmentLayout, LengthHistogram, MarkerModel};
 use super::output::{
-    BestFitReport, ClassificationSource, ProfileAnnotations, ProfileRow, ResolvedClassifications,
+    create_classification_writer, finish_classification_writer, BestFitReport,
+    ClassificationSource, ProfileAnnotations, ProfileRow, ResolvedClassifications,
 };
 use super::pathogen::{load_pathogen_table, PathogenEntry};
 use super::rollup::{GenomeLayout, GenusRollup, GenusRow, OrphanedFragments};
@@ -413,7 +414,7 @@ struct AmbiguousTotals {
 ///
 /// This is intentionally separate from the production EM state: enabling
 /// `--save-raw-profile` must not add candidates to `profile.txt` or
-/// `classify.txt`, or otherwise alter the established profiling policy.
+/// `classify.txt.gz`, or otherwise alter the established profiling policy.
 struct RawProfileEstimate {
     totals: HashMap<u32, TaxonTotals>,
     coverage: HashMap<u32, TaxonCoverage>,
@@ -1337,7 +1338,7 @@ impl CommunityProfiler {
     ///
     /// Output files: `<prefix>.profile.txt`; `<prefix>.rprofile.txt` (raw
     /// profile, with `--save-raw-profile`), before the taxon-level evidence and
-    /// reporting filters; `<prefix>.classify.txt` (`--save-classification`).
+    /// reporting filters; `<prefix>.classify.txt.gz` (`--save-classification`).
     fn write_outputs(
         &self,
         data: MappingData,
@@ -1671,28 +1672,17 @@ impl CommunityProfiler {
     /// Path of the per-read classifications, when they are requested and can
     /// be written for this database.
     fn classification_path(&self, data: &MappingData) -> Option<String> {
-        let classification_path = format!("{}.classify.txt", self.cfg.outprefix);
-        let database_is_fractional = self
-            .cfg
-            .db_metadata
-            .as_ref()
-            .map(|metadata| metadata.is_fractional)
-            .unwrap_or(data.has_scaled_genomes);
-        if self.cfg.save_classifications {
-            if database_is_fractional {
-                log::warn!(
-                    target: "PROFILER",
-                    "Cannot write classify.txt for a fractional database because per-read assignments cannot be expanded safely to full-index equivalents."
-                );
-            } else {
+        self.cfg
+            .writes_classifications(data.has_scaled_genomes)
+            .then(|| {
+                let classification_path = format!("{}.classify.txt.gz", self.cfg.outprefix);
                 log::info!(
                     target: "PROFILER",
                     "Writing per-read classifications to {}",
                     classification_path
                 );
-            }
-        }
-        (self.cfg.save_classifications && !database_is_fractional).then_some(classification_path)
+                classification_path
+            })
     }
 
     /// Group the reads by the candidates they keep: a candidate is kept when
@@ -5024,13 +5014,7 @@ fn write_community_classifications(
     terminal_ranks: &HashMap<u32, ProfileRank>,
     taxonomy: &Taxonomy,
 ) -> Result<usize> {
-    let mut writer = path
-        .map(|path| {
-            File::create(path)
-                .with_context(|| format!("failed to create {path}"))
-                .map(BufWriter::new)
-        })
-        .transpose()?;
+    let mut writer = path.map(create_classification_writer).transpose()?;
     let mut classified = 0usize;
 
     for group in &resolved.groups {
@@ -5133,8 +5117,8 @@ fn write_community_classifications(
         }
     }
 
-    if let Some(writer) = writer.as_mut() {
-        writer.flush()?;
+    if let Some(writer) = writer {
+        finish_classification_writer(writer)?;
     }
     Ok(classified)
 }
@@ -5672,15 +5656,10 @@ mod tests {
             std::fs::read(format!("{}.profile.txt", raw_prefix.to_string_lossy())).unwrap();
         assert_eq!(baseline_profile, raw_profile);
 
-        let baseline_classify = std::fs::read(format!(
-            "{}.classify.txt",
-            baseline_prefix.to_string_lossy()
-        ))
-        .unwrap();
-        let raw_classify =
-            std::fs::read(format!("{}.classify.txt", raw_prefix.to_string_lossy())).unwrap();
+        let baseline_classify = read_classifications(&baseline_prefix);
+        let raw_classify = read_classifications(&raw_prefix);
         assert_eq!(baseline_classify, raw_classify);
-        let classify_text = String::from_utf8(raw_classify).unwrap();
+        let classify_text = raw_classify;
         assert!(classify_text.contains("accepted-read\t101"));
         assert!(!classify_text.contains("rejected-read"));
 
@@ -5689,6 +5668,17 @@ mod tests {
                 .unwrap();
         assert!(raw_table.contains("Species one\t101\t"));
         assert!(raw_table.contains("Species two\t102\t"));
+    }
+
+    /// Decompressed `<prefix>.classify.txt.gz`.
+    fn read_classifications(prefix: &std::path::Path) -> String {
+        use std::io::Read;
+        let path = format!("{}.classify.txt.gz", prefix.to_string_lossy());
+        let mut text = String::new();
+        flate2::read::MultiGzDecoder::new(File::open(path).unwrap())
+            .read_to_string(&mut text)
+            .unwrap();
+        text
     }
 
     #[test]
@@ -5718,11 +5708,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(
-            std::fs::read(format!("{}.classify.txt", output.to_string_lossy()))
-                .unwrap()
-                .is_empty()
-        );
+        assert!(read_classifications(&output).is_empty());
     }
 
     #[test]

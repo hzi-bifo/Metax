@@ -27,7 +27,7 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{BufRead, Write};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicUsize, Ordering as AtomicOrdering},
@@ -46,7 +46,8 @@ use super::evidence::{
     EvidenceMode, LONG_RELATIVE_SCORE_MARGIN, PAIRED_ERROR_MARGIN, SINGLE_ERROR_MARGIN,
 };
 use super::output::{
-    ClassificationSource, ProfileAnnotations, ProfileRow, ResolvedClassifications,
+    create_classification_writer, finish_classification_writer, ClassificationSource,
+    ProfileAnnotations, ProfileRow, ResolvedClassifications,
 };
 use super::pathogen::load_pathogen_table;
 use super::statistics::{coverage_deviation_pvalue, round5};
@@ -1009,13 +1010,7 @@ fn write_strain_classifications(
     retained_taxa: &HashSet<u32>,
     taxonomy: &Taxonomy,
 ) -> Result<usize> {
-    let mut writer = path
-        .map(|path| {
-            File::create(path)
-                .with_context(|| format!("failed to create {path}"))
-                .map(BufWriter::new)
-        })
-        .transpose()?;
+    let mut writer = path.map(create_classification_writer).transpose()?;
     let mut classified = 0usize;
 
     for group in &resolved.groups {
@@ -1127,8 +1122,8 @@ fn write_strain_classifications(
         }
     }
 
-    if let Some(writer) = writer.as_mut() {
-        writer.flush()?;
+    if let Some(writer) = writer {
+        finish_classification_writer(writer)?;
     }
     Ok(classified)
 }
@@ -1441,13 +1436,7 @@ impl StrainProfiler {
             "Assigned taxonomy to {} reads",
             assigned_read_count
         );
-        let database_is_fractional = self
-            .cfg
-            .db_metadata
-            .as_ref()
-            .map(|metadata| metadata.is_fractional)
-            .unwrap_or(has_scaled_genomes);
-        let skip_classification = database_is_fractional || !self.cfg.save_classifications;
+        let skip_classification = !self.cfg.writes_classifications(has_scaled_genomes);
         if verbose_logging {
             log::info!(target: "PROFILER", "Profiling taxonomy abundance ...");
         }
@@ -1959,13 +1948,13 @@ impl StrainProfiler {
     /// 3. Run EM algorithm to redistribute remaining ambiguous reads
     /// 4. Calculate final abundances and p-values
     /// 5. Filter taxa by coverage criteria
-    /// 6. Write profile.txt and, when requested, classify.txt outputs
+    /// 6. Write profile.txt and, when requested, classify.txt.gz outputs
     ///
     /// # Arguments
     /// * `assignments` - Per-read taxonomic assignments
     /// * `taxid_coverage` - Coverage metrics per taxid
     /// * `min_chunk_breadth` - Minimum chunk breadth threshold
-    /// * `skip_classification` - Do not create the optional classify.txt output
+    /// * `skip_classification` - Do not create the optional classify.txt.gz output
     fn write_outputs(
         &self,
         assignments: Vec<ReadAssignment>,
@@ -1973,7 +1962,7 @@ impl StrainProfiler {
         min_chunk_breadth: f64,
         skip_classification: bool,
     ) -> Result<usize> {
-        let classification_path = format!("{}.classify.txt", self.cfg.outprefix);
+        let classification_path = format!("{}.classify.txt.gz", self.cfg.outprefix);
         let out_prefix = if self.cfg.host.is_some() {
             format!("{}.pathogen", self.cfg.outprefix)
         } else {
@@ -2006,12 +1995,7 @@ impl StrainProfiler {
         let mut ambiguous_counts: HashMap<Vec<u32>, StrainAmbiguousTotals> = HashMap::new();
         let mut ambiguous_read_counts: HashMap<Vec<u32>, usize> = HashMap::new();
         let mut ambiguous_reads: HashMap<Vec<u32>, Vec<String>> = HashMap::new();
-        if self.cfg.save_classifications && skip_classification {
-            log::warn!(
-                target: "PROFILER",
-                "Cannot write classify.txt for a fractional database because per-read assignments cannot be expanded safely to full-index equivalents."
-            );
-        } else if self.cfg.save_classifications {
+        if !skip_classification {
             log::info!(
                 target: "PROFILER",
                 "Writing per-read strain classifications to {}",

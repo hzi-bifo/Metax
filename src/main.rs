@@ -576,7 +576,7 @@ struct ProfileArgs {
         alias = "save-classifications",
         action = ArgAction::SetTrue,
         help_heading = "Saved and reused data",
-        help = "Write per-read taxonomic assignments to <PREFIX>.classify.txt. Disabled by default; fractional databases cannot produce this output safely."
+        help = "Write per-read taxonomic assignments to <PREFIX>.classify.txt.gz (gzip-compressed). Disabled by default; not written for fractional databases. For species represented by marker genes, only the reads placed on those genes are listed (a warning says so)."
     )]
     save_classifications: bool,
 

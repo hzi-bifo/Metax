@@ -394,7 +394,7 @@ SAM/BAM input from other mappers is no longer supported; `--reuse-sam` stops wit
 
 **Stream without temporary disk space.** `--stream-mappings` passes mappings directly to the profiler. It can increase peak memory and cannot be combined with `--save-mapping`.
 
-**Diagnostic outputs.** `--save-raw-profile` writes `<prefix>.rprofile.txt`; `--save-classification` writes `<prefix>.classify.txt` (§6).
+**Diagnostic outputs.** `--save-raw-profile` writes `<prefix>.rprofile.txt`; `--save-classification` writes `<prefix>.classify.txt.gz` (§6).
 
 ### 5.8 Pathogen-focused analysis
 
@@ -435,7 +435,7 @@ For an output prefix `sample`, Metax writes:
 - `sample.profile.txt`: final taxonomic profile;
 - `sample.log`: run log;
 - `sample.rprofile.txt`: post-EM profile before taxon-level filters, with `--save-raw-profile`;
-- `sample.classify.txt`: per-read assignments, with `--save-classification`;
+- `sample.classify.txt.gz`: per-read assignments, gzip-compressed, with `--save-classification`;
 - `sample.mapping.tsv.gz`: coordinate mappings, with `--save-mapping`.
 
 With `--host`, the profile files use the prefix `sample.pathogen`.
@@ -482,7 +482,7 @@ Terminal rows are normalized once across the whole profile, not per rank. A genu
 
 ### 6.3 Per-read classification
 
-`classify.txt` lists each classified read with its assigned taxid, the rank, the candidate taxids, and their EM fractions. A row is written only when at least one of the read's assigned taxa survives into the final profile; remaining fractions are renormalized when filtering removes candidates. This output is unavailable for fractional databases.
+`classify.txt.gz` is gzip-compressed text (read it with `zcat` or `zless`). It lists each classified read with its assigned taxid, the rank, the candidate taxids, and their EM fractions. A row is written only when at least one of the read's assigned taxa survives into the final profile; remaining fractions are renormalized when filtering removes candidates. This output is unavailable for fractional databases. On a database with marker-gene references, the file lists, for the species represented by marker genes, only the reads placed on those genes, a small part of each genome; reads from the rest of their genomes are not listed, and the log warns about this. Use `profile.txt` for abundances.
 
 ### 6.4 Mapping file
 
