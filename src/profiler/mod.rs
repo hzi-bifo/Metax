@@ -50,6 +50,7 @@ use crate::taxonomy::Taxonomy;
 pub(crate) mod community;
 pub(crate) mod evidence;
 mod identity;
+mod likelihood_em;
 mod markers;
 mod output;
 mod pathogen;
