@@ -333,6 +333,14 @@ struct ProfileArgs {
     strict_coverage: bool,
 
     #[arg(
+        long = "level-engine",
+        action = ArgAction::SetTrue,
+        hide = true,
+        help = "Development: profile with the level-wise engine."
+    )]
+    level_engine: bool,
+
+    #[arg(
         long = "estimate-unclassified",
         action = ArgAction::SetTrue,
         conflicts_with_all = ["strain", "host"],
@@ -1128,6 +1136,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
         let removed_to_genus =
             !args.strict_coverage && !args.strain && (is_paired || !sequencer.is_illumina());
         Ok(AppConfig {
+            level_engine: args.level_engine,
             db: args.db,
             dmp_dir: args.dmp_dir,
             skip_missing_taxa: args.skip_missing_taxa,

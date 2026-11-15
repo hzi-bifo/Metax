@@ -1126,7 +1126,7 @@ fn finite_between(value: f64, lower: f64, upper: f64) -> bool {
 }
 
 #[inline]
-fn pvalue_passes(breadth: Option<f64>, chunk: Option<f64>, strict: bool) -> bool {
+pub(crate) fn pvalue_passes(breadth: Option<f64>, chunk: Option<f64>, strict: bool) -> bool {
     match (breadth, chunk) {
         (Some(breadth), Some(chunk)) if strict => {
             breadth >= PVALUE_CUTOFF && chunk >= PVALUE_CUTOFF

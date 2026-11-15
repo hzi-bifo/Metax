@@ -15,9 +15,6 @@
 //! Reads with the same candidates and the same rounded error counts form one
 //! group, so an iteration costs the number of distinct groups, not of reads.
 
-// Used by the level-wise engine, which follows in the next commits.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 /// Error counts are rounded to this step when reads are grouped.
@@ -56,10 +53,12 @@ struct Group {
 
 impl ReadGroups {
     /// Add a read with weight `weight` (1 for a read or fragment; larger for
-    /// scaled reads). Candidates of one unit keep their fewest errors.
-    pub(crate) fn add(&mut self, mut candidates: Candidates, weight: f64) {
+    /// scaled reads) and return the index of its group. Candidates of one unit
+    /// keep their fewest errors. Reads without candidates or weight are not
+    /// added.
+    pub(crate) fn add(&mut self, mut candidates: Candidates, weight: f64) -> Option<usize> {
         if candidates.is_empty() || weight.is_nan() || weight <= 0.0 {
-            return;
+            return None;
         }
         candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
         candidates.dedup_by_key(|c| c.0);
@@ -70,14 +69,16 @@ impl ReadGroups {
             .collect::<Vec<_>>();
         if let Some(&slot) = self.index.get(&key) {
             self.groups[slot].weight += weight;
-            return;
+            return Some(slot);
         }
         self.groups.push(Group {
             units: key.iter().map(|k| k.0).collect(),
             excess_steps: key.iter().map(|k| k.1).collect(),
             weight,
         });
-        self.index.insert(key, self.groups.len() - 1);
+        let slot = self.groups.len() - 1;
+        self.index.insert(key, slot);
+        Some(slot)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -244,15 +245,15 @@ mod tests {
     #[test]
     fn a_unit_keeps_its_fewest_errors_and_reads_are_grouped() {
         let mut groups = ReadGroups::default();
-        groups.add(vec![(1, 2.0), (1, 0.0), (2, 0.4)], 1.0);
-        groups.add(vec![(2, 0.6), (1, 0.1)], 1.0);
+        assert_eq!(groups.add(vec![(1, 2.0), (1, 0.0), (2, 0.4)], 1.0), Some(0));
+        assert_eq!(groups.add(vec![(2, 0.6), (1, 0.1)], 1.0), Some(0));
         assert_eq!(
             groups.len(),
             1,
             "same units and rounded excess errors form one group"
         );
-        groups.add(vec![], 1.0);
-        groups.add(vec![(1, 0.0)], 0.0);
+        assert_eq!(groups.add(vec![], 1.0), None);
+        assert_eq!(groups.add(vec![(1, 0.0)], 0.0), None);
         assert_eq!(groups.len(), 1, "empty reads and zero weights are ignored");
     }
 

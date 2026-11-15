@@ -638,6 +638,9 @@ impl std::fmt::Display for ExactTiePolicy {
 /// - `min_coebr`: Minimum observed/expected chunk breadth ratio
 #[derive(Debug, Clone)]
 pub struct ProfilerConfig {
+    /// Development: profile with the level-wise engine (`community/levels.rs`).
+    pub level_engine: bool,
+
     /// Path to a Metax mapping TSV. Unset when mappings are streamed from the
     /// mapper.
     pub mapper_mappings: Option<String>,
@@ -1386,6 +1389,7 @@ mod chunk_basis_tests {
 
     fn minimal_cfg() -> ProfilerConfig {
         ProfilerConfig {
+            level_engine: false,
             mapper_mappings: None,
             mapping_profile_memory: None,
             db_metadata: None,

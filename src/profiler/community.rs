@@ -125,6 +125,8 @@ fn record_terminal_rank(
 /// are invariant for a given alignment, so the taxonomy-assignment loop is
 /// purely arithmetic and touches no `HashMap` or `String::split` per
 /// alignment.
+mod levels;
+
 type AlignmentEntry = EvidenceAlignment;
 
 /// Narrow a genomic coordinate/length to `u32` for the packed
@@ -1097,6 +1099,9 @@ impl CommunityProfiler {
     /// 4. Filter taxa based on coverage statistics
     /// 5. Write output files
     fn profile(&self, mut mapping_data: MappingData) -> Result<()> {
+        if self.cfg.level_engine {
+            return levels::profile(self, mapping_data);
+        }
         let MappingData {
             read_alignments,
             fallback_mode,
@@ -5286,6 +5291,7 @@ mod tests {
     /// fields relevant to the scenario under test.
     fn make_cfg(sequencer: Sequencer, host: Option<&str>) -> ProfilerConfig {
         ProfilerConfig {
+            level_engine: false,
             mapper_mappings: None,
             mapping_profile_memory: None,
             db_metadata: None,

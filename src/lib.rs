@@ -75,6 +75,8 @@ impl ResolvedProfilerThresholds {
 // CLI-facing configuration that gets resolved into profiler settings.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
+    /// Development: profile with the level-wise engine.
+    pub level_engine: bool,
     // Input database and taxonomy locations.
     pub db: Option<String>,
     pub dmp_dir: Option<String>,
@@ -1009,6 +1011,7 @@ impl MetaxApp {
             );
         }
         Ok(ProfilerConfig {
+            level_engine: self.config.level_engine,
             mapper_mappings,
             mapping_profile_memory,
             db_metadata,
@@ -1159,6 +1162,7 @@ mod tests {
     /// the specific fields they care about.
     fn test_app_config() -> AppConfig {
         AppConfig {
+            level_engine: false,
             db: None,
             dmp_dir: None,
             skip_missing_taxa: false,
