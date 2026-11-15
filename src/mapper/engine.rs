@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{File, Permissions};
 use std::io::{BufWriter, Write};
@@ -421,7 +422,13 @@ pub struct Mapper {
     /// The profiler's species identity cutoff for this sample; short-read
     /// mate rescue scans a long window without seeds only within it.
     species_identity: f64,
+    /// Keep the best mapping of every genome (genome-level profiling).
+    genome_level: bool,
 }
+
+/// Fewest candidate mappings per read kept for genome-level profiling, so
+/// that the genomes of a species with many genomes can all be compared.
+const GENOME_LEVEL_TOP_N: usize = 50;
 
 impl Mapper {
     pub fn new(
@@ -437,7 +444,16 @@ impl Mapper {
             outprefix,
             noisy_long_reads,
             species_identity,
+            genome_level: false,
         }
+    }
+
+    /// Keep the best mapping of every genome before repeated positions and at
+    /// least [`GENOME_LEVEL_TOP_N`] mappings per read, for profiling below the
+    /// species.
+    pub fn with_genome_level(mut self, genome_level: bool) -> Self {
+        self.genome_level = genome_level;
+        self
     }
 
     pub fn run_saved(
@@ -613,6 +629,7 @@ impl Mapper {
             outprefix: self.outprefix.clone(),
             noisy_long_reads: self.noisy_long_reads,
             species_identity: self.species_identity,
+            genome_level: self.genome_level,
         };
         let extra_args = extra_args.to_vec();
         let profile_for_worker = profile.clone();
@@ -788,6 +805,15 @@ impl Mapper {
         if config.preset == MappingPreset::Illumina {
             config.seedless_rescue_identity = Some(self.species_identity);
         }
+        if self.genome_level {
+            config.genome_level = true;
+            config.params.top_n = config.params.top_n.max(GENOME_LEVEL_TOP_N);
+            log::info!(
+                target: "MAPPER",
+                "Genome level: the best mapping of every genome is kept, top-n {}.",
+                config.params.top_n
+            );
+        }
         if config.preset == MappingPreset::Ont && config.allow_single_strobe_matches {
             log::info!(
                 target: "MAPPER",
@@ -935,7 +961,8 @@ impl Mapper {
                 index_load_start.elapsed().as_secs_f64()
             );
         }
-        let reference_candidate_groups = build_reference_candidate_groups(&loaded_index, &db)?;
+        let reference_candidate_groups =
+            build_reference_candidate_groups(&loaded_index, &db, config.genome_level)?;
         let mut runtime_index = RuntimeIndex::from_loaded_with_options(
             loaded_index,
             RuntimeIndexOptions {
@@ -998,9 +1025,12 @@ impl Mapper {
 /// Database rows and index references are created in the same order, but an
 /// explicit name check prevents a moved or hand-edited metadata file from
 /// silently assigning the wrong taxon to a numeric reference ID.
+/// Candidate endpoints of every reference (see [`reference_candidate_groups`]),
+/// after checking that the index and the database list the same references.
 fn build_reference_candidate_groups(
     index: &LoadedIndex,
     database: &DatabaseMetadata,
+    genome_level: bool,
 ) -> Result<Vec<ReferenceCandidateGroups>> {
     if index.reference_count() != database.references.len() {
         bail!(
@@ -1009,11 +1039,6 @@ fn build_reference_candidate_groups(
             database.references.len()
         );
     }
-
-    let mut groups = Vec::with_capacity(database.references.len());
-    // The references of a genome share its taxonomy field, so a field equal to
-    // the previous one is not parsed again.
-    let mut previous: Option<(&str, ReferenceCandidateGroups)> = None;
     for (reference_index, reference) in database.references.iter().enumerate() {
         let index_name = index.reference_id(reference_index as u32);
         if index_name != reference.name {
@@ -1024,6 +1049,23 @@ fn build_reference_candidate_groups(
                 reference.name
             );
         }
+    }
+    reference_candidate_groups(database, genome_level)
+}
+
+/// Candidate endpoints of every reference: its profile taxon and its most
+/// specific endpoint, which is the strain taxon when declared, or with
+/// `genome_level` the genome itself.
+fn reference_candidate_groups(
+    database: &DatabaseMetadata,
+    genome_level: bool,
+) -> Result<Vec<ReferenceCandidateGroups>> {
+    let mut groups = Vec::with_capacity(database.references.len());
+    // The references of a genome share its taxonomy field, so a field equal to
+    // the previous one is not parsed again.
+    let mut previous: Option<(&str, ReferenceCandidateGroups)> = None;
+    let mut genome_ids: HashMap<&str, u32> = HashMap::new();
+    for reference in &database.references {
         let group = match previous {
             Some((field, group)) if field == &*reference.taxonomy_field => group,
             _ => {
@@ -1042,7 +1084,15 @@ fn build_reference_candidate_groups(
                 group
             }
         };
-        groups.push(group);
+        groups.push(if genome_level {
+            let next = genome_ids.len() as u32;
+            ReferenceCandidateGroups::new(
+                group.profile_taxon,
+                *genome_ids.entry(&*reference.genome).or_insert(next),
+            )
+        } else {
+            group
+        });
     }
     Ok(groups)
 }
@@ -1074,6 +1124,8 @@ enum MappingPreset {
 struct MappingConfig {
     preset: MappingPreset,
     params: MapParams,
+    /// The most specific candidate endpoint of a reference is its genome.
+    genome_level: bool,
     batch_size: usize,
     batch_base_limit: Option<usize>,
     allow_single_strobe_matches: bool,
@@ -1225,6 +1277,7 @@ impl MappingConfig {
                 .mate_rescue_taxa
                 .unwrap_or(DEFAULT_MATE_RESCUE_TAXA),
             seedless_rescue_identity: None,
+            genome_level: false,
             index_cache: overrides
                 .index_cache
                 .unwrap_or_else(|| Some("auto".to_string())),
@@ -3606,6 +3659,41 @@ mod tests {
             candidate_groups: ReferenceCandidateGroups::new(1, 1),
             candidate_boundary: CandidateBoundary::COMPLETE,
         }
+    }
+
+    #[test]
+    fn genome_level_makes_every_genome_its_own_endpoint() {
+        let reference = |name: &str, genome: &str, taxonomy: &str| crate::db::ReferenceMetadata {
+            name: name.to_string(),
+            length: 1_000,
+            genome: genome.into(),
+            contig: name.to_string(),
+            full_genome_size: 2_000,
+            effective_indexed_size: 2_000,
+            taxonomy_field: taxonomy.into(),
+            reference_type: ReferenceType::Genome,
+            declared_genome_size: None,
+        };
+        let database = DatabaseMetadata {
+            metam_index: PathBuf::from("metax_db.mxi"),
+            references: vec![
+                reference("a1", "A", "s:562"),
+                reference("a2", "A", "s:562"),
+                reference("b1", "B", "s:562"),
+                reference("c1", "C", "t:83333;s:562"),
+            ],
+            is_fractional: false,
+        };
+        let community = reference_candidate_groups(&database, false).unwrap();
+        assert!(community[..3]
+            .iter()
+            .all(|g| g.profile_taxon == 562 && g.terminal_taxon == 562));
+        assert_eq!(community[3].terminal_taxon, 83333);
+        let genomes = reference_candidate_groups(&database, true).unwrap();
+        assert!(genomes.iter().all(|g| g.profile_taxon == 562));
+        assert_eq!(genomes[0].terminal_taxon, genomes[1].terminal_taxon);
+        assert_ne!(genomes[0].terminal_taxon, genomes[2].terminal_taxon);
+        assert_ne!(genomes[2].terminal_taxon, genomes[3].terminal_taxon);
     }
 
     #[test]

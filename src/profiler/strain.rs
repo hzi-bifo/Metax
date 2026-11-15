@@ -2491,6 +2491,7 @@ mod tests {
     fn output_test_config() -> ProfilerConfig {
         ProfilerConfig {
             level_engine: false,
+            genome_level: false,
             mapper_mappings: None,
             mapping_profile_memory: None,
             db_metadata: None,

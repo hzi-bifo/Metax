@@ -5292,6 +5292,7 @@ mod tests {
     fn make_cfg(sequencer: Sequencer, host: Option<&str>) -> ProfilerConfig {
         ProfilerConfig {
             level_engine: false,
+            genome_level: false,
             mapper_mappings: None,
             mapping_profile_memory: None,
             db_metadata: None,

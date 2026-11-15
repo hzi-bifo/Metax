@@ -641,6 +641,10 @@ pub struct ProfilerConfig {
     /// Development: profile with the level-wise engine (`community/levels.rs`).
     pub level_engine: bool,
 
+    /// Development: with the level-wise engine, also profile genomes within
+    /// each species (`--strain` with `--level-engine`).
+    pub genome_level: bool,
+
     /// Path to a Metax mapping TSV. Unset when mappings are streamed from the
     /// mapper.
     pub mapper_mappings: Option<String>,
@@ -1390,6 +1394,7 @@ mod chunk_basis_tests {
     fn minimal_cfg() -> ProfilerConfig {
         ProfilerConfig {
             level_engine: false,
+            genome_level: false,
             mapper_mappings: None,
             mapping_profile_memory: None,
             db_metadata: None,

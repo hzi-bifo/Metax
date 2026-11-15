@@ -77,6 +77,9 @@ impl ResolvedProfilerThresholds {
 pub struct AppConfig {
     /// Development: profile with the level-wise engine.
     pub level_engine: bool,
+    /// Development: the level-wise engine's genome level (`--strain` with
+    /// `--level-engine`).
+    pub genome_level: bool,
     // Input database and taxonomy locations.
     pub db: Option<String>,
     pub dmp_dir: Option<String>,
@@ -488,7 +491,8 @@ impl MetaxApp {
             self.config.outprefix.clone(),
             noisy_long_reads,
             profiler.identity,
-        );
+        )
+        .with_genome_level(self.config.genome_level);
         if self.config.verbose || self.config.very_verbose {
             log::info!(
                 target: "MAIN",
@@ -1012,6 +1016,7 @@ impl MetaxApp {
         }
         Ok(ProfilerConfig {
             level_engine: self.config.level_engine,
+            genome_level: self.config.genome_level,
             mapper_mappings,
             mapping_profile_memory,
             db_metadata,
@@ -1162,6 +1167,7 @@ mod tests {
     /// the specific fields they care about.
     fn test_app_config() -> AppConfig {
         AppConfig {
+            genome_level: false,
             level_engine: false,
             db: None,
             dmp_dir: None,

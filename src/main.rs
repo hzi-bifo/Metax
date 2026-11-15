@@ -1097,6 +1097,10 @@ impl TryFrom<ProfileArgs> for AppConfig {
         let mode = args
             .mode
             .unwrap_or_else(|| recorded_mode.unwrap_or(ProfileMode::Default));
+        // With the level-wise engine, --strain adds its genome level; the
+        // experimental strain profiler and its presets are not used.
+        let strain = args.strain && !args.level_engine;
+        let genome_level = args.strain && args.level_engine;
         let requested_exact_ties = args.exact_ties;
         let chunk_guard_available =
             !args.lowbiomass && !args.chunk_breadth.is_some_and(|value| value <= 0.0);
@@ -1104,7 +1108,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             if !sequencer.is_illumina() {
                 bail!("--exact-ties guarded-map requires Illumina short-read input");
             }
-            if args.strain {
+            if strain {
                 bail!("--exact-ties guarded-map is supported only by community profiling, not --strain");
             }
             if args.lowbiomass {
@@ -1117,7 +1121,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             }
         }
         let exact_ties = requested_exact_ties.unwrap_or_else(|| {
-            if sequencer.is_illumina() && !args.strain && chunk_guard_available {
+            if sequencer.is_illumina() && !strain && chunk_guard_available {
                 ExactTiePolicy::GuardedMap
             } else {
                 ExactTiePolicy::Ambiguous
@@ -1127,14 +1131,13 @@ impl TryFrom<ProfileArgs> for AppConfig {
             None
         } else {
             args.identity_margin.or_else(|| {
-                (sequencer.is_illumina() && is_paired && !args.strain)
-                    .then_some(DEFAULT_IDENTITY_MARGIN)
+                (sequencer.is_illumina() && is_paired && !strain).then_some(DEFAULT_IDENTITY_MARGIN)
             })
         };
         // Not for single-end short reads, where both add more false rows than
         // they recover.
         let removed_to_genus =
-            !args.strict_coverage && !args.strain && (is_paired || !sequencer.is_illumina());
+            !args.strict_coverage && !strain && (is_paired || !sequencer.is_illumina());
         Ok(AppConfig {
             level_engine: args.level_engine,
             db: args.db,
@@ -1148,7 +1151,8 @@ impl TryFrom<ProfileArgs> for AppConfig {
             sequencer,
             is_paired,
             exact_ties,
-            strain: args.strain,
+            strain,
+            genome_level,
             mode,
             batch_size: args.batch_size,
             max_em_iterations: args.max_em_iterations,
