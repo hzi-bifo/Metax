@@ -22,6 +22,9 @@ pub(crate) struct ProfileAnnotations {
 pub(crate) struct BestFitReport {
     pub(crate) genome: Arc<str>,
     pub(crate) evidence_depth: f64,
+    /// Mean identity of the row's fragments to the genome and the estimated
+    /// ANI of the sample's strain to it; written as two more columns when set.
+    pub(crate) identity: Option<(f64, f64)>,
 }
 
 /// Typed profile row retained at full precision until the final write.
@@ -239,6 +242,10 @@ impl ProfileRow {
             Some(best_fit) => {
                 fields.push(format_five(best_fit.evidence_depth));
                 fields.push(best_fit.genome.to_string());
+                if let Some((mean_identity, ani)) = best_fit.identity {
+                    fields.push(format_five(mean_identity));
+                    fields.push(format_five(ani));
+                }
             }
             None => fields.extend(["NA".to_string(), "NA".to_string()]),
         }
@@ -345,6 +352,7 @@ mod tests {
         let mut row = row();
         assert_eq!(write(&row)[13..], ["NA", "NA"]);
         row.best_fit = Some(BestFitReport {
+            identity: None,
             genome: Arc::from("GCF_000000001.1"),
             evidence_depth: 1.5,
         });

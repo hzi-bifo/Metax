@@ -2162,6 +2162,7 @@ impl CommunityProfiler {
                 .zip(evidence_metrics)
                 .and_then(|(genome, metrics)| {
                     Some(BestFitReport {
+                        identity: None,
                         genome: Arc::clone(data.assembly_names.get(genome.assembly_id as usize)?),
                         evidence_depth: metrics.depth,
                     })

@@ -25,7 +25,9 @@ use crate::profiler::evidence::{
 };
 use crate::profiler::likelihood_em::{self, ReadGroups};
 use crate::profiler::output::{BestFitReport, ProfileRow};
-use crate::profiler::ProfileRank;
+use crate::profiler::{parse_reference_taxonomy, ProfileRank};
+
+mod genomes;
 
 /// Each base that a candidate aligns less than the read's longest alignment
 /// counts as this many errors in the EM.
@@ -223,47 +225,146 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
         }
     }
 
-    let mut rows = Vec::new();
-    for (&taxid, &assembly_id) in &best_fit {
+    // Genomes within each kept species, for the fragments the species-level EM
+    // gives to one species.
+    let species_of = kept
+        .group_of
+        .iter()
+        .map(|group| {
+            group.and_then(|g| {
+                em.posteriors[g]
+                    .iter()
+                    .find(|p| p.1 >= RESOLVE_POSTERIOR)
+                    .map(|p| p.0)
+            })
+        })
+        .collect::<Vec<_>>();
+    let genome_result = genomes::resolve(
+        &data,
+        &fragments,
+        &species_of,
+        &genomes::GenomeLevel {
+            policy,
+            error_rate,
+            penalty,
+            report_strains: cfg.genome_level,
+            chunk_cutoff: data.min_chunk_breadth,
+            ratio_bounds: (min_oebr, min_coebr),
+            max_iterations: cfg.max_em_iterations,
+            tolerance: EM_TOLERANCE,
+        },
+    );
+    let strain_taxids = if cfg.genome_level {
+        strain_taxids(cfg)
+    } else {
+        HashMap::new()
+    };
+    let species_genomes = &genome_result.species;
+    let baseline_identity = genome_result.baseline_identity;
+    log::info!(
+        target: "PROFILER",
+        "Level-wise engine: baseline identity {:.5} (median identity of the species to their best-fit genome).",
+        baseline_identity
+    );
+    if cfg.keep_raw && cfg.genome_level {
+        write_strain_diagnostics(profiler, &data, &genome_result.diagnostics)?;
+    }
+    // Estimated ANI of the sample's strain to a genome: its fragments' mean
+    // identity to the genome relative to the sample's baseline identity.
+    let ani = |identity: f64| (1.0 - (baseline_identity - identity)).min(1.0);
+
+    // Species rows, each followed by the genomes reported on their own.
+    let mut blocks: Vec<(ProfileRow, Vec<ProfileRow>)> = Vec::new();
+    for (&taxid, &fallback) in &best_fit {
+        let found = species_genomes.get(&taxid);
+        let assembly_id = found
+            .map(|g| g.best_fit)
+            .filter(|id| genomes.contains_key(id))
+            .unwrap_or(fallback);
         let genome = &genomes[&assembly_id];
         let coverage = genome.coverage.as_ref().expect("measured above");
         let depth = bases.get(&taxid).copied().unwrap_or(0.0) / genome.assembly.asm_len.max(1.0);
         let reads = em.weight.get(&taxid).copied().unwrap_or(0.0);
-        rows.push(species_row(
-            profiler,
+        let species_name = profiler.taxonomy.get_name(taxid).unwrap_or("unknown");
+        let identity = found.map(|g| (g.mean_identity, ani(g.mean_identity)));
+        let species = profile_row(
+            species_name.to_string(),
             taxid,
-            reads,
-            depth,
+            "species",
+            (reads, depth),
             coverage,
-            &data,
-            assembly_id,
-        ));
+            data.assembly_names[assembly_id as usize].clone(),
+            identity,
+        );
+        let mut strains = Vec::new();
+        for strain in found.map_or(&[][..], |g| &g.strains[..]) {
+            let strain_ani = ani(strain.mean_identity);
+            if strain_ani.is_nan() || strain_ani < genomes::SAME_STRAIN_ANI {
+                continue;
+            }
+            let accession = data.assembly_names[strain.assembly_id as usize].clone();
+            let (name, strain_taxid) = match strain_taxids.get(&*accession) {
+                Some(&t) => (
+                    profiler
+                        .taxonomy
+                        .get_name(t)
+                        .unwrap_or(species_name)
+                        .to_string(),
+                    t,
+                ),
+                None => (format!("{species_name} {accession}"), taxid),
+            };
+            strains.push(profile_row(
+                name,
+                strain_taxid,
+                "strain",
+                (strain.reads, strain.bases / strain.asm_len.max(1.0)),
+                &strain.coverage,
+                accession,
+                Some((strain.mean_identity, strain_ani)),
+            ));
+        }
+        blocks.push((species, strains));
     }
-    let total_depth: f64 = rows.iter().map(|row| row.depth).sum();
-    for row in &mut rows {
-        row.abundance = if total_depth > 0.0 {
-            100.0 * row.depth / total_depth
+    let total_depth: f64 = blocks.iter().map(|b| b.0.depth).sum();
+    let abundance = |depth: f64| {
+        if total_depth > 0.0 {
+            100.0 * depth / total_depth
         } else {
             0.0
-        };
+        }
+    };
+    for (species, strains) in &mut blocks {
+        species.abundance = abundance(species.depth);
+        for strain in strains {
+            strain.abundance = abundance(strain.depth);
+        }
     }
-    rows.sort_by(|a, b| {
-        b.abundance
-            .total_cmp(&a.abundance)
-            .then(a.taxid.cmp(&b.taxid))
+    blocks.sort_by(|a, b| {
+        b.0.abundance
+            .total_cmp(&a.0.abundance)
+            .then(a.0.taxid.cmp(&b.0.taxid))
     });
+    let rows = blocks
+        .into_iter()
+        .flat_map(|(species, strains)| std::iter::once(species).chain(strains))
+        .collect::<Vec<_>>();
 
     let mut raw_rows = Vec::new();
     for (&assembly_id, genome) in &genomes {
         let coverage = genome.coverage.as_ref().expect("measured above");
-        raw_rows.push(species_row(
-            profiler,
+        raw_rows.push(profile_row(
+            profiler
+                .taxonomy
+                .get_name(genome.taxid)
+                .unwrap_or("unknown")
+                .to_string(),
             genome.taxid,
-            genome.assembly.count as f64,
-            coverage.depth,
+            "species",
+            (genome.assembly.count as f64, coverage.depth),
             coverage,
-            &data,
-            assembly_id,
+            data.assembly_names[assembly_id as usize].clone(),
+            None,
         ));
     }
     raw_rows.sort_by(|a, b| {
@@ -398,23 +499,20 @@ fn within(ratio: f64, lower: f64) -> bool {
     ratio.is_finite() && ratio >= lower && ratio <= STANDARD_RATIO_UPPER
 }
 
-fn species_row(
-    profiler: &CommunityProfiler,
+/// One profile row; `amount` is `(reads, depth)`.
+fn profile_row(
+    name: String,
     taxid: u32,
-    reads: f64,
-    depth: f64,
+    rank: &str,
+    (reads, depth): (f64, f64),
     coverage: &EvidenceCoverage,
-    data: &MappingData,
-    assembly_id: u32,
+    genome: std::sync::Arc<str>,
+    identity: Option<(f64, f64)>,
 ) -> ProfileRow {
     ProfileRow {
-        taxname: profiler
-            .taxonomy
-            .get_name(taxid)
-            .unwrap_or("unknown")
-            .to_string(),
+        taxname: name,
         taxid,
-        rank: "species".to_string(),
+        rank: rank.to_string(),
         equivalent_mapcount: reads,
         depth,
         abundance: 0.0,
@@ -426,11 +524,34 @@ fn species_row(
         expected_flex_chunk: coverage.expected_flex_chunk,
         chunk_pvalue: coverage.chunk_pvalue,
         best_fit: Some(BestFitReport {
-            genome: data.assembly_names[assembly_id as usize].clone(),
+            genome,
             evidence_depth: coverage.depth,
+            identity,
         }),
         annotations: None,
     }
+}
+
+/// Strain taxid of every genome that declares one.
+fn strain_taxids(cfg: &crate::profiler::ProfilerConfig) -> HashMap<std::sync::Arc<str>, u32> {
+    let mut out = HashMap::new();
+    let Some(database) = cfg.db_metadata.as_deref() else {
+        return out;
+    };
+    let mut previous: Option<&str> = None;
+    for reference in &database.references {
+        if previous == Some(&*reference.genome) {
+            continue;
+        }
+        previous = Some(&*reference.genome);
+        if let Some(strain) = parse_reference_taxonomy(&reference.taxonomy_field)
+            .ok()
+            .and_then(|t| t.primary_taxid)
+        {
+            out.insert(reference.genome.clone(), strain);
+        }
+    }
+    out
 }
 
 /// Development diagnostics: one row per genome with resolved fragments, with
@@ -487,6 +608,47 @@ fn write_genome_diagnostics(
                 coverage.chunk_pvalue,
                 profiler.cfg.strict
             ),
+        )?;
+    }
+    Ok(())
+}
+
+/// Development diagnostics of the genome level: one row per genome that
+/// fragments resolve to, and per species its best-fit genome.
+fn write_strain_diagnostics(
+    profiler: &CommunityProfiler,
+    data: &MappingData,
+    rows: &[genomes::StrainDiagnostic],
+) -> Result<()> {
+    use std::io::Write;
+    let path = format!("{}.levels_strains.tsv", profiler.cfg.outprefix);
+    let mut out = std::io::BufWriter::new(std::fs::File::create(&path)?);
+    writeln!(
+        out,
+        "taxid\tname\tgenome\tbest_fit\tem_share\tresolved_fragments\tstrain_identity_fragments\toebr\tcoebr\tfixed_chunk\tchunk_cutoff\tkept"
+    )?;
+    for row in rows {
+        let (oebr, coebr, chunk) = row
+            .coverage
+            .as_ref()
+            .map_or((f64::NAN, f64::NAN, f64::NAN), |c| {
+                (c.oebr, c.coebr, c.fixed_chunk)
+            });
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}",
+            row.taxid,
+            profiler.taxonomy.get_name(row.taxid).unwrap_or("unknown"),
+            data.assembly_names[row.assembly_id as usize],
+            row.best_fit,
+            row.em_share,
+            row.resolved,
+            row.gated,
+            oebr,
+            coebr,
+            chunk,
+            data.min_chunk_breadth,
+            row.kept,
         )?;
     }
     Ok(())
