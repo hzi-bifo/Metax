@@ -16,6 +16,7 @@ use crate::profiler::evidence::{
     calculate_coverage, CandidateScratch, EvidenceCoverage, EvidenceMode, EvidencePolicy,
 };
 use crate::profiler::likelihood_em::{self, ReadGroups};
+use crate::profiler::ProfileRank;
 
 /// Genome candidates of a short fragment whose errors exceed the best by
 /// less than this count as tied.
@@ -51,7 +52,8 @@ pub(super) struct StrainGenome {
 /// What the genome level finds for one species.
 pub(super) struct SpeciesGenomes {
     pub(super) best_fit: u32,
-    /// Mean identity of the species' fragments to the best-fit genome.
+    /// Mean identity to the best-fit genome of the fragments whose best species
+    /// match is this species, at any identity the mapper reports.
     pub(super) mean_identity: f64,
     pub(super) strains: Vec<StrainGenome>,
 }
@@ -73,7 +75,7 @@ pub(super) struct GenomeResult {
     pub(super) species: HashMap<u32, SpeciesGenomes>,
     /// Identity of reads to the genome they come from, measured on the
     /// species: the fragment-weighted median of their mean identity to their
-    /// best-fit genome.
+    /// best-fit genome (`SpeciesGenomes::mean_identity`).
     pub(super) baseline_identity: f64,
     pub(super) diagnostics: Vec<StrainDiagnostic>,
 }
@@ -110,7 +112,7 @@ pub(super) fn resolve(
     species_of: &[Option<u32>],
     level: &GenomeLevel,
 ) -> GenomeResult {
-    let shares = genome_fragments(data, fragments, species_of, level.policy)
+    let mut shares = genome_fragments(data, fragments, species_of, level.policy)
         .into_iter()
         .map(|(taxid, members)| {
             let mut groups = ReadGroups::default();
@@ -131,23 +133,23 @@ pub(super) fn resolve(
                 .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(a.0)))
                 .map(|(&assembly, _)| assembly)
                 .expect("a species has at least one genome");
-            let mean_identity = mean_identity_on(&members, best_fit);
             SpeciesShare {
                 taxid,
                 members,
                 group_of,
                 em,
                 best_fit,
-                mean_identity,
+                mean_identity: f64::NAN,
             }
         })
         .collect::<Vec<_>>();
-    let baseline_identity = weighted_median(
-        shares
-            .iter()
-            .map(|s| (s.mean_identity, s.members.len() as f64)),
-    )
-    .unwrap_or(1.0 - level.error_rate);
+    let best_fit = shares.iter().map(|s| (s.taxid, s.best_fit)).collect();
+    let identity = identity_to_best_fit(data, &best_fit, level.policy);
+    for share in &mut shares {
+        share.mean_identity = identity.get(&share.taxid).map_or(f64::NAN, |m| m.0);
+    }
+    let baseline_identity =
+        weighted_median(identity.values().copied()).unwrap_or(1.0 - level.error_rate);
     let mut diagnostics = Vec::new();
     let mut scratch = CandidateScratch::default();
     let species = shares
@@ -252,17 +254,71 @@ fn genome_fragments(
     out
 }
 
-/// Mean identity of the fragments that align to `assembly`.
-fn mean_identity_on(members: &[GenomeFragment], assembly: u32) -> f64 {
-    let (sum, count) = members
-        .iter()
-        .filter_map(|m| m.genomes.iter().find(|g| g.0 == assembly).map(|g| g.2))
-        .fold((0.0, 0usize), |(s, n), x| (s + x, n + 1));
-    if count > 0 {
-        sum / count as f64
-    } else {
-        f64::NAN
+/// Per species with a best-fit genome in `best_fit`, the mean identity to
+/// that genome and the number of fragments behind it. A fragment counts when
+/// the species is its best species match at any identity the mapper reports
+/// (fewest errors, within the species-level tie margin) and it aligns to the
+/// best-fit genome. With the species identity cutoff off, the mean of a
+/// distant strain is not cut off from below; fragments that match another
+/// species better stay out.
+fn identity_to_best_fit(
+    data: &MappingData,
+    best_fit: &HashMap<u32, u32>,
+    policy: EvidencePolicy,
+) -> HashMap<u32, (f64, f64)> {
+    let ungated = EvidencePolicy {
+        identity: 0.0,
+        collect_exact_ties: false,
+        collect_identities: false,
+        collect_best_placements: false,
+        ..policy
+    };
+    let mut scratch = CandidateScratch::default();
+    let mut sums: HashMap<u32, (f64, f64)> = HashMap::new();
+    for bundle in &data.read_alignments {
+        let candidates = scratch.build(&bundle.alignments, ungated);
+        let longest = candidates
+            .iter()
+            .map(|c| f64::from(c.best.both_mapped))
+            .fold(0.0, f64::max);
+        let species = candidates
+            .iter()
+            .filter(|c| c.profile_rank == ProfileRank::Species)
+            .map(|c| {
+                let errors = c.best.pair_errors
+                    + super::UNALIGNED_ERROR_WEIGHT
+                        * (longest - f64::from(c.best.both_mapped)).max(0.0);
+                (c, errors)
+            })
+            .collect::<Vec<_>>();
+        let Some(&(best, fewest)) = species.iter().min_by(|a, b| a.1.total_cmp(&b.1)) else {
+            continue;
+        };
+        let margin = match policy.mode {
+            EvidenceMode::Long => super::LONG_TIE_SHARE * f64::from(best.best.both_mapped),
+            EvidenceMode::Paired | EvidenceMode::Single => super::SHORT_TIE_ERRORS,
+        };
+        for &(candidate, errors) in &species {
+            if errors - fewest >= margin {
+                continue;
+            }
+            let Some(placement) = best_fit.get(&candidate.taxid).and_then(|&assembly| {
+                candidate
+                    .placements
+                    .iter()
+                    .find(|p| p.assembly_id == assembly)
+            }) else {
+                continue;
+            };
+            let identity = 1.0 - placement.pair_errors / f64::from(placement.both_mapped).max(1.0);
+            let entry = sums.entry(candidate.taxid).or_insert((0.0, 0.0));
+            entry.0 += identity;
+            entry.1 += 1.0;
+        }
     }
+    sums.into_iter()
+        .map(|(taxid, (sum, count))| (taxid, (sum / count, count)))
+        .collect()
 }
 
 /// Genomes of one species reported on their own: strain-level coverage from
@@ -424,7 +480,6 @@ mod tests {
     use super::*;
     use crate::profiler::community::ReadBundle;
     use crate::profiler::evidence::{EvidenceAlignment, MappingRole};
-    use crate::profiler::ProfileRank;
 
     /// A single-end read of 100 bases aligned over its whole length.
     fn row(taxid: u32, assembly: u32, identity: f32) -> EvidenceAlignment {
@@ -553,8 +608,28 @@ mod tests {
         let result = resolve(&data, &fragments, &species_of, &level());
         let species = &result.species[&1];
         assert_eq!(species.best_fit, 10);
-        // Fragments that align to the best-fit genome: the six exact ones.
+        // Fragments whose best species is species 1 and that align to the best-fit genome: the six exact ones.
         assert!((species.mean_identity - 1.0).abs() < 1e-9);
         assert!(species.strains.is_empty());
+    }
+
+    #[test]
+    fn identity_counts_fragments_below_the_species_cutoff_whose_best_species_it_is() {
+        let data = data(vec![
+            // Above the species cutoff of 0.97.
+            vec![row(1, 10, 0.99)],
+            // Below it, with species 1 still the best match: counted.
+            vec![row(1, 10, 0.95)],
+            // Species 2 matches better: left out of species 1.
+            vec![row(1, 10, 0.93), row(2, 20, 0.99)],
+            // Species 1 only on another of its genomes: no identity to the best-fit genome.
+            vec![row(1, 11, 0.99)],
+        ]);
+        let best_fit = HashMap::from([(1, 10), (2, 20)]);
+        let identity = identity_to_best_fit(&data, &best_fit, level().policy);
+        let (mean, count) = identity[&1];
+        assert_eq!(count, 2.0);
+        assert!((mean - 0.97).abs() < 1e-9, "{mean}");
+        assert_eq!(identity[&2], (0.99, 1.0));
     }
 }
