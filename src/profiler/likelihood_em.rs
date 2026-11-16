@@ -97,8 +97,12 @@ pub(crate) struct EmResult {
 
 /// Share the grouped reads among their candidates. `prior` gives the starting
 /// weight of units (for example reads that units have alone); units without
-/// one start equal. Stops when no unit's share changes by more than `tolerance`
-/// (relative to the total) or after `max_iterations` rounds.
+/// one start equal. The EM is accelerated by SQUAREM (two EM steps, an
+/// extrapolation along their direction, one stabilising step): when nearly
+/// all reads tie between near-identical units, a plain EM moves the shares by
+/// a tiny fraction per round and would need thousands of rounds. Stops when no
+/// unit's share changes by more than `tolerance` (relative to the total) or
+/// after `max_iterations` EM steps.
 pub(crate) fn run(
     groups: &ReadGroups,
     prior: &HashMap<u32, f64>,
@@ -106,72 +110,123 @@ pub(crate) fn run(
     max_iterations: usize,
     tolerance: f64,
 ) -> EmResult {
-    let total: f64 = groups.groups.iter().map(|g| g.weight).sum();
-    let mut share: HashMap<u32, f64> = HashMap::new();
-    for group in &groups.groups {
-        for &unit in &group.units {
-            share.entry(unit).or_insert(1.0);
-        }
-    }
-    for (unit, value) in share.iter_mut() {
-        if let Some(&p) = prior.get(unit) {
-            *value = p.max(f64::MIN_POSITIVE);
-        }
-    }
-    // Likelihood of each candidate relative to its group's best candidate.
-    let relative = groups
+    let mut units: Vec<u32> = groups
+        .groups
+        .iter()
+        .flat_map(|g| g.units.iter().copied())
+        .collect();
+    units.sort_unstable();
+    units.dedup();
+    let slot: HashMap<u32, usize> = units.iter().enumerate().map(|(i, &u)| (u, i)).collect();
+    // Per group: unit slots and each candidate's likelihood relative to the
+    // group's best candidate.
+    let indexed = groups
         .groups
         .iter()
         .map(|g| {
-            g.excess_steps
+            let slots = g.units.iter().map(|u| slot[u]).collect::<Vec<_>>();
+            let relative = g
+                .excess_steps
                 .iter()
                 .map(|&s| (-penalty * ERROR_STEP * f64::from(s)).exp())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (slots, relative, g.weight)
         })
         .collect::<Vec<_>>();
+    let total: f64 = indexed.iter().map(|g| g.2).sum();
+    let mut share = units
+        .iter()
+        .map(|u| prior.get(u).map_or(1.0, |&p| p.max(f64::MIN_POSITIVE)))
+        .collect::<Vec<_>>();
+    normalise(&mut share, total);
+
+    let step = |from: &[f64], into: &mut Vec<f64>| {
+        into.clear();
+        into.resize(from.len(), 0.0);
+        for (slots, relative, weight) in &indexed {
+            let norm: f64 = slots.iter().zip(relative).map(|(&u, r)| from[u] * r).sum();
+            if norm > 0.0 {
+                for (&u, r) in slots.iter().zip(relative) {
+                    into[u] += weight * from[u] * r / norm;
+                }
+            }
+        }
+    };
+    let (mut first, mut second, mut jumped) = (Vec::new(), Vec::new(), Vec::new());
     let mut iterations = 0;
-    let mut next: HashMap<u32, f64> = HashMap::with_capacity(share.len());
-    for iteration in 0..max_iterations.max(1) {
-        iterations = iteration + 1;
-        next.clear();
-        for (group, rel) in groups.groups.iter().zip(&relative) {
-            let norm: f64 = group.units.iter().zip(rel).map(|(u, r)| share[u] * r).sum();
-            if norm <= 0.0 {
-                continue;
-            }
-            for (unit, r) in group.units.iter().zip(rel) {
-                *next.entry(*unit).or_insert(0.0) += group.weight * share[unit] * r / norm;
-            }
-        }
-        let change = share
+    while iterations < max_iterations.max(1) {
+        step(&share, &mut first);
+        step(&first, &mut second);
+        iterations += 2;
+        let r = first
             .iter()
-            .map(|(u, old)| (next.get(u).copied().unwrap_or(0.0) - old).abs())
+            .zip(&share)
+            .map(|(a, b)| a - b)
+            .collect::<Vec<_>>();
+        let v = second
+            .iter()
+            .zip(&first)
+            .zip(&r)
+            .map(|((c, b), r)| c - b - r)
+            .collect::<Vec<_>>();
+        let r_norm = r.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let v_norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let next = if v_norm > 0.0 && r_norm > 0.0 {
+            let alpha = (-r_norm / v_norm).min(-1.0);
+            jumped.clear();
+            jumped.extend(
+                share
+                    .iter()
+                    .zip(&r)
+                    .zip(&v)
+                    .map(|((s, r), v)| (s - 2.0 * alpha * r + alpha * alpha * v).max(0.0)),
+            );
+            if jumped.iter().all(|x| x.is_finite()) && jumped.iter().sum::<f64>() > 0.0 {
+                normalise(&mut jumped, total);
+                step(&jumped, &mut first);
+                iterations += 1;
+                &first
+            } else {
+                &second
+            }
+        } else {
+            &second
+        };
+        let change = next
+            .iter()
+            .zip(&share)
+            .map(|(a, b)| (a - b).abs())
             .fold(0.0, f64::max);
-        for (unit, value) in share.iter_mut() {
-            *value = next.get(unit).copied().unwrap_or(0.0);
-        }
+        share.clone_from(next);
         if change <= tolerance * total.max(1e-12) {
             break;
         }
     }
-    let posteriors = groups
-        .groups
+    let posteriors = indexed
         .iter()
-        .zip(&relative)
-        .map(|(group, rel)| {
-            let norm: f64 = group.units.iter().zip(rel).map(|(u, r)| share[u] * r).sum();
-            group
-                .units
+        .map(|(slots, relative, _)| {
+            let norm: f64 = slots.iter().zip(relative).map(|(&u, r)| share[u] * r).sum();
+            slots
                 .iter()
-                .zip(rel)
-                .map(|(u, r)| (*u, if norm > 0.0 { share[u] * r / norm } else { 0.0 }))
+                .zip(relative)
+                .map(|(&u, r)| (units[u], if norm > 0.0 { share[u] * r / norm } else { 0.0 }))
                 .collect()
         })
         .collect();
     EmResult {
-        weight: share,
+        weight: units.iter().copied().zip(share).collect(),
         posteriors,
         iterations,
+    }
+}
+
+/// Scale `values` to sum to `total`.
+fn normalise(values: &mut [f64], total: f64) {
+    let sum: f64 = values.iter().sum();
+    if sum > 0.0 {
+        for value in values.iter_mut() {
+            *value *= total / sum;
+        }
     }
 }
 
@@ -207,6 +262,22 @@ mod tests {
         let result = run_default(&groups);
         assert!(result.weight[&1] > 990.0, "unit 1 {}", result.weight[&1]);
         assert!(result.weight[&2] < 10.0, "unit 2 {}", result.weight[&2]);
+    }
+
+    #[test]
+    fn near_identical_units_are_resolved_within_the_iteration_limit() {
+        // 9,990 reads tie between two units and 10 match unit 1 better: a
+        // plain EM would leave unit 2 near half after 200 rounds.
+        let mut groups = ReadGroups::default();
+        groups.add(vec![(1, 0.0), (2, 0.0)], 9_990.0);
+        groups.add(vec![(1, 0.0), (2, 1.0)], 10.0);
+        let result = run(&groups, &HashMap::new(), error_penalty(0.003), 200, 1e-9);
+        assert!(result.weight[&2] < 100.0, "unit 2 {}", result.weight[&2]);
+        assert!(
+            result.posteriors[0][0].1 > 0.99,
+            "tied reads {:?}",
+            result.posteriors[0]
+        );
     }
 
     #[test]
