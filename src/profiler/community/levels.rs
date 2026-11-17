@@ -18,13 +18,14 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
+use rayon::prelude::*;
 
 use super::{CommunityProfiler, MappingData};
 use crate::profiler::evidence::{
     calculate_coverage, pvalue_passes, standard_ratio_lower_bounds, witness_is_better,
     CandidatePlacement, CandidateScratch, EvidenceCoverage, EvidenceMode, EvidencePolicy,
-    PremapChunkGuard, PresenceAssembly, PresenceInterval, RescueKinds, WitnessDecision,
-    STANDARD_RATIO_UPPER,
+    PremapChunkGuard, PresenceAssembly, PresenceInterval, RescueKinds, TerminalCandidate,
+    WitnessDecision, STANDARD_RATIO_UPPER,
 };
 use crate::profiler::likelihood_em::{self, ReadGroups};
 use crate::profiler::output::{BestFitReport, ProfileRow};
@@ -61,6 +62,10 @@ const EM_TOLERANCE: f64 = 1e-7;
 /// The sample's error rate is measured on this share of the fragments that
 /// match their best candidate best.
 const ERROR_RATE_SHARE: f64 = 0.75;
+/// The candidate passes build the candidates of this many fragments at once on
+/// the profiler's threads, then fold the results in fragment order, so that
+/// interval lists and sums come out as in a single pass.
+const PARALLEL_BLOCK: usize = 1 << 16;
 
 /// A fragment's candidate species with their errors (estimated errors of the
 /// species' best placement plus the unaligned-base penalty), the read it comes
@@ -89,6 +94,13 @@ struct GenomeEvidence {
 }
 
 pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result<()> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(profiler.cfg.threads.max(1))
+        .build()?
+        .install(|| profile_levels(profiler, data))
+}
+
+fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()> {
     let cfg = &profiler.cfg;
     let policy = EvidencePolicy::from_config(cfg).ok_or_else(|| {
         anyhow::anyhow!(
@@ -142,21 +154,28 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
             *counts.won.entry(taxid).or_default() += 1;
         }
     }
+    let resolved_fragments = fragments
+        .iter()
+        .zip(&all.group_of)
+        .filter_map(|(fragment, group)| {
+            group
+                .and_then(|g| resolved_taxid[g])
+                .map(|taxid| (fragment.read, taxid))
+        })
+        .collect::<Vec<_>>();
     let mut genomes: HashMap<u32, GenomeEvidence> = HashMap::new();
-    let mut scratch = CandidateScratch::default();
-    for (fragment, group) in fragments.iter().zip(&all.group_of) {
-        let Some(taxid) = group.and_then(|g| resolved_taxid[g]) else {
-            continue;
-        };
-        add_fragment(
-            &mut genomes,
-            &mut scratch,
-            &data,
-            policy,
-            fragment.read,
-            taxid,
-        );
-    }
+    fold_candidates(
+        &data,
+        policy,
+        &resolved_fragments,
+        |r| r.0,
+        |r, candidates| species_placements(candidates, r.1),
+        |r, placements| {
+            for (placement, fits) in placements {
+                add_placement(&mut genomes, r.1, &placement, fits);
+            }
+        },
+    );
 
     let (oebr_default, coebr_default) = standard_ratio_lower_bounds(ProfileRank::Species, mode);
     let min_oebr = cfg.min_oebr.unwrap_or(oebr_default);
@@ -166,11 +185,11 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
         chunk_cutoff: data.min_chunk_breadth,
         ratio_bounds: (min_oebr, min_coebr),
     };
-    for genome in genomes.values_mut() {
+    genomes.par_iter_mut().for_each(|(_, genome)| {
         let won = counts.won.get(&genome.taxid).copied().unwrap_or(0);
         let candidates = counts.candidates.get(&genome.taxid).copied().unwrap_or(0);
         tests.judge(genome, won, candidates);
-    }
+    });
     let (second_kept, second_taken) = second_look(
         &data,
         policy,
@@ -467,44 +486,64 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
 /// Every fragment with at least one candidate species, and the sample's error
 /// rate.
 fn collect_fragments(data: &MappingData, policy: EvidencePolicy) -> (Vec<Fragment>, f64) {
-    let mut scratch = CandidateScratch::default();
-    let mut fragments = Vec::with_capacity(data.read_alignments.len());
-    let mut best_matches: Vec<(f32, f32)> = Vec::with_capacity(data.read_alignments.len());
-    for (read, bundle) in data.read_alignments.iter().enumerate() {
-        let candidates = scratch.build(&bundle.alignments, policy);
-        let longest = candidates
-            .iter()
-            .map(|c| f64::from(c.best.both_mapped))
-            .fold(0.0, f64::max);
-        let mut species = candidates
-            .iter()
-            .filter(|c| c.profile_rank == ProfileRank::Species)
-            .map(|c| {
-                let errors = c.best.pair_errors
-                    + UNALIGNED_ERROR_WEIGHT * (longest - f64::from(c.best.both_mapped)).max(0.0);
-                (c.taxid, errors, c.best.both_mapped, c.best.r1_mapped)
-            })
-            .collect::<Vec<_>>();
-        if species.is_empty() {
-            continue;
-        }
-        species.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
-        let fewest = species[0].1;
-        let margin = match policy.mode {
-            EvidenceMode::Long => LONG_TIE_SHARE * f64::from(species[0].2),
-            EvidenceMode::Paired | EvidenceMode::Single => SHORT_TIE_ERRORS,
-        };
-        best_matches.push((fewest as f32, species[0].2 as f32));
-        fragments.push(Fragment {
-            read,
-            candidates: species
-                .iter()
-                .map(|c| (c.0, if c.1 - fewest < margin { fewest } else { c.1 }))
-                .collect(),
-            bases: f64::from(species[0].3),
-        });
-    }
+    let reads = (0..data.read_alignments.len()).collect::<Vec<_>>();
+    let mut fragments = Vec::with_capacity(reads.len());
+    let mut best_matches: Vec<(f32, f32)> = Vec::with_capacity(reads.len());
+    fold_candidates(
+        data,
+        policy,
+        &reads,
+        |&read| read,
+        |&read, candidates| fragment_of(read, candidates, policy),
+        |_, found| {
+            if let Some((fragment, best)) = found {
+                fragments.push(fragment);
+                best_matches.push(best);
+            }
+        },
+    );
     (fragments, error_rate(&mut best_matches))
+}
+
+/// Read `read` as a fragment with its candidate species and their errors,
+/// with the errors and aligned bases of its best candidate; `None` without a
+/// candidate species.
+fn fragment_of(
+    read: usize,
+    candidates: &[TerminalCandidate],
+    policy: EvidencePolicy,
+) -> Option<(Fragment, (f32, f32))> {
+    let longest = candidates
+        .iter()
+        .map(|c| f64::from(c.best.both_mapped))
+        .fold(0.0, f64::max);
+    let mut species = candidates
+        .iter()
+        .filter(|c| c.profile_rank == ProfileRank::Species)
+        .map(|c| {
+            let errors = c.best.pair_errors
+                + UNALIGNED_ERROR_WEIGHT * (longest - f64::from(c.best.both_mapped)).max(0.0);
+            (c.taxid, errors, c.best.both_mapped, c.best.r1_mapped)
+        })
+        .collect::<Vec<_>>();
+    if species.is_empty() {
+        return None;
+    }
+    species.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    let fewest = species[0].1;
+    let margin = match policy.mode {
+        EvidenceMode::Long => LONG_TIE_SHARE * f64::from(species[0].2),
+        EvidenceMode::Paired | EvidenceMode::Single => SHORT_TIE_ERRORS,
+    };
+    let fragment = Fragment {
+        read,
+        candidates: species
+            .iter()
+            .map(|c| (c.0, if c.1 - fewest < margin { fewest } else { c.1 }))
+            .collect(),
+        bases: f64::from(species[0].3),
+    };
+    Some((fragment, (fewest as f32, species[0].2 as f32)))
 }
 
 /// Group the fragments for the EM over the species that `allowed` admits,
@@ -584,22 +623,48 @@ fn add_placement(
     });
 }
 
-/// Add the placements of read `read` on the genomes of species `taxid`.
-fn add_fragment(
-    genomes: &mut HashMap<u32, GenomeEvidence>,
-    scratch: &mut CandidateScratch,
+/// Build the candidates of each item's read on the profiler's threads, take
+/// what a pass needs with `extract`, and hand the results to `fold` in item
+/// order, [`PARALLEL_BLOCK`] items at a time.
+pub(super) fn fold_candidates<I: Sync, T: Send>(
     data: &MappingData,
     policy: EvidencePolicy,
-    read: usize,
-    taxid: u32,
+    items: &[I],
+    read_of: impl Fn(&I) -> usize + Sync,
+    extract: impl Fn(&I, &[TerminalCandidate]) -> T + Sync,
+    mut fold: impl FnMut(&I, T),
 ) {
-    let candidates = scratch.build(&data.read_alignments[read].alignments, policy);
-    if let Some(candidate) = candidates.iter().find(|c| c.taxid == taxid) {
-        for placement in &candidate.placements {
-            let fits = placement.assembly_id == candidate.best.assembly_id;
-            add_placement(genomes, taxid, placement, fits);
+    for block in items.chunks(PARALLEL_BLOCK) {
+        let results = block
+            .par_iter()
+            .map_init(CandidateScratch::default, |scratch, item| {
+                let candidates =
+                    scratch.build(&data.read_alignments[read_of(item)].alignments, policy);
+                extract(item, candidates)
+            })
+            .collect::<Vec<_>>();
+        for (item, result) in block.iter().zip(results) {
+            fold(item, result);
         }
     }
+}
+
+/// The placements of species `taxid` among a fragment's `candidates`, each
+/// with whether it is on the species' best genome.
+fn species_placements(
+    candidates: &[TerminalCandidate],
+    taxid: u32,
+) -> Vec<(CandidatePlacement, bool)> {
+    candidates
+        .iter()
+        .find(|c| c.taxid == taxid)
+        .map_or_else(Vec::new, |candidate| {
+            candidate
+                .placements
+                .iter()
+                .map(|p| (*p, p.assembly_id == candidate.best.assembly_id))
+                .collect()
+        })
 }
 
 /// Fragments listing each species among their candidates, those resolved to
@@ -692,7 +757,6 @@ fn second_look(
         }
     }
     let members = GroupMembers::new(first.group_of, first.em.posteriors.len());
-    let mut scratch = CandidateScratch::default();
     let (mut kept_now, mut taken_total) = (0, 0);
     for &(taxid, _) in &order {
         let Some(groups) = open_groups.get(&taxid) else {
@@ -713,16 +777,22 @@ fn second_look(
             .flatten()
             .map(|id| (*id, genomes[id].clone()))
             .collect();
-        for &fragment in &taken_fragments {
-            add_fragment(
-                &mut trial,
-                &mut scratch,
-                data,
-                policy,
-                first.fragments[fragment].read,
-                taxid,
-            );
-        }
+        let reads = taken_fragments
+            .iter()
+            .map(|&fragment| first.fragments[fragment].read)
+            .collect::<Vec<_>>();
+        fold_candidates(
+            data,
+            policy,
+            &reads,
+            |&read| read,
+            |_, candidates| species_placements(candidates, taxid),
+            |_, placements| {
+                for (placement, fits) in placements {
+                    add_placement(&mut trial, taxid, &placement, fits);
+                }
+            },
+        );
         let taken = taken_fragments.len() as u64;
         counts.second_look.insert(taxid, taken);
         let won = counts.won.get(&taxid).copied().unwrap_or(0) + taken;
