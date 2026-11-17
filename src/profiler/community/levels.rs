@@ -261,10 +261,13 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
     };
     let species_genomes = &genome_result.species;
     let baseline_identity = genome_result.baseline_identity;
+    let strain_baseline = genome_result.strain_baseline_identity;
     log::info!(
         target: "PROFILER",
-        "Level-wise engine: baseline identity {:.5} (median identity of the species to their best-fit genome).",
-        baseline_identity
+        "Level-wise engine: baseline identity {:.5} (median identity of the species to their best-fit genome); \
+         {:.5} over strain-level matches.",
+        baseline_identity,
+        strain_baseline
     );
     if cfg.keep_raw && cfg.genome_level {
         write_strain_diagnostics(profiler, &data, &genome_result.diagnostics)?;
@@ -298,10 +301,7 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
         );
         let mut strains = Vec::new();
         for strain in found.map_or(&[][..], |g| &g.strains[..]) {
-            let strain_ani = ani(strain.mean_identity);
-            if strain_ani.is_nan() || strain_ani < genomes::SAME_STRAIN_ANI {
-                continue;
-            }
+            let strain_ani = (1.0 - (strain_baseline - strain.mean_identity)).min(1.0);
             let accession = data.assembly_names[strain.assembly_id as usize].clone();
             let (name, strain_taxid) = match strain_taxids.get(&*accession) {
                 Some(&t) => (

@@ -28,8 +28,12 @@ const LONG_TIE_SHARE: f64 = 0.001;
 /// genomes less this margin.
 const SHORT_STRAIN_MARGIN: f64 = 0.005;
 const LONG_STRAIN_MARGIN: f64 = 0.01;
-/// A genome is the sample's strain itself at an estimated ANI of at least this.
-pub(super) const SAME_STRAIN_ANI: f64 = 0.995;
+/// A genome is reported on its own only when the fragments that the genome EM
+/// gives to it match it within sequencing error: an estimated ANI of at least
+/// this. Those fragments are the ones it fits best among the species' genomes,
+/// so a relative's estimate reads high; for a genome in the sample it stays
+/// within this of 1.
+const GENOME_ROW_ANI: f64 = 0.999;
 
 /// One fragment of a species: its read, mapped bases for depth, and per
 /// genome of the species `(assembly, errors, identity)`.
@@ -77,7 +81,19 @@ pub(super) struct GenomeResult {
     /// species: the fragment-weighted median of their mean identity to their
     /// best-fit genome (`SpeciesGenomes::mean_identity`).
     pub(super) baseline_identity: f64,
+    /// The same median over the fragments that match the best-fit genome at
+    /// strain-level identity: the baseline of genome rows, whose fragments are
+    /// all such matches.
+    pub(super) strain_baseline_identity: f64,
     pub(super) diagnostics: Vec<StrainDiagnostic>,
+}
+
+/// Strain-level identity and the baseline that genome rows are measured
+/// against.
+#[derive(Clone, Copy)]
+struct StrainLevel {
+    identity: f64,
+    baseline: f64,
 }
 
 /// One species' genome EM.
@@ -150,20 +166,27 @@ pub(super) fn resolve(
     }
     let baseline_identity =
         weighted_median(identity.values().copied()).unwrap_or(1.0 - level.error_rate);
+    let margin = match level.policy.mode {
+        EvidenceMode::Long => LONG_STRAIN_MARGIN,
+        EvidenceMode::Paired | EvidenceMode::Single => SHORT_STRAIN_MARGIN,
+    };
+    let strain_identity = baseline_identity - margin;
+    let strain = StrainLevel {
+        identity: strain_identity,
+        baseline: weighted_median(
+            shares
+                .iter()
+                .map(|s| strain_level_identity(&s.members, s.best_fit, strain_identity)),
+        )
+        .unwrap_or(baseline_identity),
+    };
     let mut diagnostics = Vec::new();
     let mut scratch = CandidateScratch::default();
     let species = shares
         .into_iter()
         .map(|share| {
             let strains = if level.report_strains {
-                strain_genomes(
-                    data,
-                    &share,
-                    baseline_identity,
-                    level,
-                    &mut scratch,
-                    &mut diagnostics,
-                )
+                strain_genomes(data, &share, strain, level, &mut scratch, &mut diagnostics)
             } else {
                 Vec::new()
             };
@@ -180,8 +203,26 @@ pub(super) fn resolve(
     GenomeResult {
         species,
         baseline_identity,
+        strain_baseline_identity: strain.baseline,
         diagnostics,
     }
+}
+
+/// Mean identity to `assembly` of the fragments that match it at
+/// `strain_identity` or above, and their number.
+fn strain_level_identity(
+    members: &[GenomeFragment],
+    assembly: u32,
+    strain_identity: f64,
+) -> (f64, f64) {
+    let (sum, count) = members
+        .iter()
+        .filter_map(|m| m.genomes.iter().find(|g| g.0 == assembly).map(|g| g.2))
+        .filter(|&identity| identity >= strain_identity)
+        .fold((0.0, 0.0), |(sum, count), identity| {
+            (sum + identity, count + 1.0)
+        });
+    (if count > 0.0 { sum / count } else { f64::NAN }, count)
 }
 
 /// Median of `(value, weight)` pairs with finite values and positive weight;
@@ -328,7 +369,7 @@ fn identity_to_best_fit(
 fn strain_genomes(
     data: &MappingData,
     share: &SpeciesShare,
-    baseline_identity: f64,
+    strain: StrainLevel,
     level: &GenomeLevel,
     scratch: &mut CandidateScratch,
     diagnostics: &mut Vec<StrainDiagnostic>,
@@ -339,11 +380,7 @@ fn strain_genomes(
         &share.group_of,
         &share.em.posteriors,
     );
-    let margin = match level.policy.mode {
-        EvidenceMode::Long => LONG_STRAIN_MARGIN,
-        EvidenceMode::Paired | EvidenceMode::Single => SHORT_STRAIN_MARGIN,
-    };
-    let strain_identity = baseline_identity - margin;
+    let strain_identity = strain.identity;
     let mut evidence: HashMap<u32, GenomeEvidence> = HashMap::new();
     let mut resolved: HashMap<u32, (u64, u64)> = HashMap::new();
     for (member, group) in members.iter().zip(group_of) {
@@ -410,10 +447,75 @@ fn strain_genomes(
             kept,
         });
     }
-    if kept.is_empty() {
-        return Vec::new();
+    // Second genome EM over the kept genomes, with the fragments that match at
+    // least one of them at strain-level identity; the rest stay with the
+    // species. A genome whose fragments do not match it within sequencing
+    // error is dropped and the EM rerun over the rest.
+    loop {
+        if kept.is_empty() {
+            return Vec::new();
+        }
+        let KeptShares {
+            em,
+            bases,
+            identity,
+        } = share_among_kept(members, &kept, strain_identity, level);
+        let mean_identity = |assembly: &u32| {
+            identity
+                .get(assembly)
+                .filter(|(_, weight)| *weight > 0.0)
+                .map_or(f64::NAN, |(sum, weight)| sum / weight)
+        };
+        let failing = kept
+            .keys()
+            .filter(|assembly| {
+                let ani = 1.0 - (strain.baseline - mean_identity(assembly));
+                ani.is_nan() || ani < GENOME_ROW_ANI
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if !failing.is_empty() {
+            for assembly in failing {
+                kept.remove(&assembly);
+            }
+            continue;
+        }
+        let mut strains = kept
+            .iter()
+            .map(|(&assembly_id, &(coverage, asm_len))| StrainGenome {
+                assembly_id,
+                reads: em.weight.get(&assembly_id).copied().unwrap_or(0.0),
+                bases: bases.get(&assembly_id).copied().unwrap_or(0.0),
+                mean_identity: mean_identity(&assembly_id),
+                coverage,
+                asm_len,
+            })
+            .collect::<Vec<_>>();
+        strains.sort_by(|a, b| {
+            b.reads
+                .total_cmp(&a.reads)
+                .then(a.assembly_id.cmp(&b.assembly_id))
+        });
+        return strains;
     }
-    // Second genome EM over the kept genomes.
+}
+
+/// The genome EM over the kept genomes of a species, sharing each fragment
+/// among the kept genomes it matches at strain-level identity, with each
+/// genome's fragment bases and the posterior-weighted sum and weight of its
+/// fragments' identity to it.
+struct KeptShares {
+    em: likelihood_em::EmResult,
+    bases: HashMap<u32, f64>,
+    identity: HashMap<u32, (f64, f64)>,
+}
+
+fn share_among_kept(
+    members: &[GenomeFragment],
+    kept: &HashMap<u32, (EvidenceCoverage, f64)>,
+    strain_identity: f64,
+    level: &GenomeLevel,
+) -> KeptShares {
     let mut groups = ReadGroups::default();
     let slots = members
         .iter()
@@ -421,7 +523,7 @@ fn strain_genomes(
             let candidates = member
                 .genomes
                 .iter()
-                .filter(|g| kept.contains_key(&g.0))
+                .filter(|g| kept.contains_key(&g.0) && g.2 >= strain_identity)
                 .map(|g| (g.0, g.1))
                 .collect::<Vec<_>>();
             groups.add(candidates, 1.0)
@@ -449,26 +551,11 @@ fn strain_genomes(
             }
         }
     }
-    let mut strains = kept
-        .into_iter()
-        .map(|(assembly_id, (coverage, asm_len))| {
-            let (sum, weight) = identity.get(&assembly_id).copied().unwrap_or((0.0, 0.0));
-            StrainGenome {
-                assembly_id,
-                reads: em.weight.get(&assembly_id).copied().unwrap_or(0.0),
-                bases: bases.get(&assembly_id).copied().unwrap_or(0.0),
-                mean_identity: if weight > 0.0 { sum / weight } else { f64::NAN },
-                coverage,
-                asm_len,
-            }
-        })
-        .collect::<Vec<_>>();
-    strains.sort_by(|a, b| {
-        b.reads
-            .total_cmp(&a.reads)
-            .then(a.assembly_id.cmp(&b.assembly_id))
-    });
-    strains
+    KeptShares {
+        em,
+        bases,
+        identity,
+    }
 }
 
 #[cfg(test)]
@@ -631,5 +718,85 @@ mod tests {
         assert_eq!(count, 2.0);
         assert!((mean - 0.97).abs() < 1e-9, "{mean}");
         assert_eq!(identity[&2], (0.99, 1.0));
+    }
+
+    /// A read of 100 bases at the `i`-th of 300 positions tiling a genome of 10 kb.
+    fn tiled(taxid: u32, assembly: u32, identity: f32, i: u32) -> EvidenceAlignment {
+        let start = i * 33;
+        EvidenceAlignment {
+            asm_len: 10_000.0,
+            span: (start, start + 100),
+            fixed_chunk: (start, start + 100),
+            flex_chunk: (start, start + 100),
+            ..row(taxid, assembly, identity)
+        }
+    }
+
+    #[test]
+    fn a_genome_whose_fragments_match_it_only_as_a_relative_is_not_reported() {
+        // Strain A is genome 10. Strain B is a relative of genome 11: its reads match genome 11 better than genome 10
+        // but still with errors beyond sequencing error.
+        let mut reads = (0..300)
+            .map(|i| vec![tiled(1, 10, 0.998, i), tiled(1, 11, 0.990, i)])
+            .collect::<Vec<_>>();
+        reads.extend((0..300).map(|i| vec![tiled(1, 11, 0.995, i), tiled(1, 10, 0.985, i)]));
+        let data = data(reads);
+        let (fragments, species_of) = fragments(&data);
+        let level = GenomeLevel {
+            report_strains: true,
+            chunk_cutoff: 0.1,
+            ratio_bounds: (0.5, 0.5),
+            ..level()
+        };
+        let result = resolve(&data, &fragments, &species_of, &level);
+        let strains = &result.species[&1].strains;
+        // Genome 11 passes the coverage tests but its fragments read about 99.8 % to it: dropped. Strain B's reads
+        // do not match genome 10 at strain-level identity, so they stay with the species instead of going to 10.
+        assert_eq!(strains.len(), 1);
+        assert_eq!(strains[0].assembly_id, 10);
+        assert!(
+            (strains[0].reads - 300.0).abs() < 1e-6,
+            "{}",
+            strains[0].reads
+        );
+        assert!((strains[0].mean_identity - 0.998).abs() < 1e-9);
+        let kept_by_coverage = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.kept)
+            .map(|d| d.assembly_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(kept_by_coverage, [10, 11].into());
+    }
+
+    #[test]
+    fn genome_rows_are_measured_against_a_baseline_cut_off_like_them() {
+        // Species 2, 3 and 4 are exact strains of genomes 20, 30 and 40, with a tail of reads carrying more
+        // sequencing errors. Species 1 is a strain related to genome 10: half its reads match it closely, half
+        // poorly. Baseline 0.9981 (all reads), strain-level identity 0.9931, strain baseline 0.999.
+        let mut reads = Vec::new();
+        for (taxid, assembly) in [(2, 20), (3, 30), (4, 40)] {
+            reads.extend((0..270).map(|i| vec![tiled(taxid, assembly, 0.999, i)]));
+            reads.extend((270..300).map(|i| vec![tiled(taxid, assembly, 0.990, i)]));
+        }
+        reads.extend((0..300).map(|i| vec![tiled(1, 10, 0.9975, i)]));
+        reads.extend((0..300).map(|i| vec![tiled(1, 10, 0.985, i)]));
+        let data = data(reads);
+        let (fragments, species_of) = fragments(&data);
+        let level = GenomeLevel {
+            report_strains: true,
+            chunk_cutoff: 0.1,
+            ratio_bounds: (0.5, 0.5),
+            ..level()
+        };
+        let result = resolve(&data, &fragments, &species_of, &level);
+        assert!((result.baseline_identity - 0.9981).abs() < 1e-9);
+        assert!((result.strain_baseline_identity - 0.999).abs() < 1e-9);
+        // Genome 10's strain-level fragments read 0.9975: within 0.001 of the all-read baseline, but 0.0015 below
+        // the strain baseline they are comparable with.
+        assert!(result.species[&1].strains.is_empty());
+        for taxid in [2, 3, 4] {
+            assert_eq!(result.species[&taxid].strains.len(), 1, "species {taxid}");
+        }
     }
 }
