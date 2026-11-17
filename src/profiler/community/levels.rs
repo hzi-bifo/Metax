@@ -367,10 +367,13 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
             None,
         ));
     }
+    // One row per genome: genomes of a species with the same reads are ordered
+    // by accession, so the order does not depend on hash-map iteration.
     raw_rows.sort_by(|a, b| {
         b.equivalent_mapcount
             .total_cmp(&a.equivalent_mapcount)
             .then(a.taxid.cmp(&b.taxid))
+            .then_with(|| row_genome(a).cmp(&row_genome(b)))
     });
     profiler.write_profile_files(&rows, None, raw_rows)
 }
@@ -497,6 +500,11 @@ fn add_placement(
 
 fn within(ratio: f64, lower: f64) -> bool {
     ratio.is_finite() && ratio >= lower && ratio <= STANDARD_RATIO_UPPER
+}
+
+/// The genome a row is measured on, if any.
+fn row_genome(row: &ProfileRow) -> Option<&str> {
+    row.best_fit.as_ref().map(|g| &*g.genome)
 }
 
 /// One profile row; `amount` is `(reads, depth)`.
