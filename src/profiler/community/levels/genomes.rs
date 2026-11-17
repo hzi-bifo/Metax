@@ -556,67 +556,9 @@ fn share_among_kept(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use metam::mapper::CandidateBoundary;
-
+    use super::super::test_fixtures::{data, row};
     use super::*;
-    use crate::profiler::community::ReadBundle;
-    use crate::profiler::evidence::{EvidenceAlignment, MappingRole};
-
-    /// A single-end read of 100 bases aligned over its whole length.
-    fn row(taxid: u32, assembly: u32, identity: f32) -> EvidenceAlignment {
-        EvidenceAlignment {
-            asm: Arc::from(format!("asm{assembly}")),
-            acc: Arc::from(format!("ref{assembly}")),
-            profile_taxid: taxid,
-            profile_rank: ProfileRank::Species,
-            reference_id: assembly,
-            assembly_id: assembly,
-            role: MappingRole::Unpaired,
-            pair_id: 0,
-            candidate_boundary: CandidateBoundary::COMPLETE,
-            sampling_scale: 1.0,
-            asm_len: 1_000_000.0,
-            identity,
-            fraction: 1.0,
-            mapped_len: 100,
-            read_len: 100,
-            span: (100, 200),
-            fixed_chunk: (100, 200),
-            flex_chunk: (100, 200),
-            marker_gene_len: 0,
-        }
-    }
-
-    fn data(reads: Vec<Vec<EvidenceAlignment>>) -> MappingData {
-        MappingData {
-            read_alignments: reads
-                .into_iter()
-                .enumerate()
-                .map(|(i, alignments)| ReadBundle {
-                    read_name: Arc::from(format!("read{i}")),
-                    alignments,
-                })
-                .collect(),
-            asm_lengths: Arc::new(HashMap::new()),
-            min_breadth: 0.0,
-            min_chunk_breadth: 0.0,
-            safeguard_min_chunk_breadth: 0.0,
-            has_scaled_genomes: false,
-            total_reads: 0,
-            aligned_reads: 0,
-            mapping_rate: 1.0,
-            fallback_mode: false,
-            species_to_genus: Arc::new(HashMap::new()),
-            terminal_ranks: Arc::new(HashMap::new()),
-            skipped_reference_at_load: 0,
-            marker_model: None,
-            genus_rollup: None,
-            unclassified_species: None,
-            assembly_names: Vec::new(),
-        }
-    }
+    use crate::profiler::evidence::EvidenceAlignment;
 
     fn level() -> GenomeLevel {
         GenomeLevel {

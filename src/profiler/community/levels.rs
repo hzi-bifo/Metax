@@ -13,18 +13,20 @@
 //! on each species' best-fit genome. With `--save-raw-profile` the engine also
 //! writes `<prefix>.levels_genomes.tsv`, the tests of every measured genome.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 
 use super::{CommunityProfiler, MappingData};
 use crate::profiler::evidence::{
-    calculate_coverage, pvalue_passes, standard_ratio_lower_bounds, CandidatePlacement,
-    CandidateScratch, EvidenceCoverage, EvidenceMode, EvidencePolicy, PresenceAssembly,
-    PresenceInterval, STANDARD_RATIO_UPPER,
+    calculate_coverage, pvalue_passes, standard_ratio_lower_bounds, witness_is_better,
+    CandidatePlacement, CandidateScratch, EvidenceCoverage, EvidenceMode, EvidencePolicy,
+    PremapChunkGuard, PresenceAssembly, PresenceInterval, RescueKinds, WitnessDecision,
+    STANDARD_RATIO_UPPER,
 };
 use crate::profiler::likelihood_em::{self, ReadGroups};
 use crate::profiler::output::{BestFitReport, ProfileRow};
+use crate::profiler::rollup::{GenusRollup, GenusRow, OrphanedFragments};
 use crate::profiler::{parse_reference_taxonomy, ProfileRank};
 
 mod genomes;
@@ -197,6 +199,29 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
         }
     }
 
+    // Genus level, where the data carries the roll-up: each measured species'
+    // strongest genome is its decision, and a removed species whose reads
+    // cover its genome evenly is kept on that genome.
+    let rollup = data.genus_rollup.as_deref();
+    let decisions = rollup.map_or_else(HashMap::new, |rollup| {
+        species_decisions(&mut genomes, rollup)
+    });
+    let decision_metrics: HashMap<u32, WitnessDecision> = decisions
+        .iter()
+        .map(|(&taxid, &(decision, _))| (taxid, decision))
+        .collect();
+    let mut even_species = 0;
+    if let Some(rollup) = rollup {
+        for taxid in rollup.even_coverage_species(
+            &decision_metrics,
+            |taxid| data.terminal_ranks.get(&taxid).copied(),
+            data.min_chunk_breadth,
+        ) {
+            best_fit.insert(taxid, decisions[&taxid].1);
+            even_species += 1;
+        }
+    }
+
     // Second EM over the kept species.
     let kept = share_reads(&fragments, |taxid| best_fit.contains_key(&taxid), penalty);
     let em = likelihood_em::run(
@@ -216,6 +241,28 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
         em.iterations,
         without_kept
     );
+    let genus_rows = rollup.map_or_else(Vec::new, |rollup| {
+        let accepted: HashSet<u32> = best_fit.keys().copied().collect();
+        orphan_genus_rows(
+            &data,
+            &fragments,
+            &kept.group_of,
+            policy,
+            rollup,
+            &decision_metrics,
+            &accepted,
+        )
+    });
+    if rollup.is_some() {
+        log::info!(
+            target: "PROFILER",
+            "Level-wise engine: {} species kept for even coverage; {} genus rows from {:.0} fragments of removed species.",
+            even_species,
+            genus_rows.len(),
+            // A float sum of no rows is -0.0, printed "-0".
+            genus_rows.iter().fold(0.0, |total, row| total + row.fragments)
+        );
+    }
     let group_bases = &kept.group_bases;
     // Each species' share of the fragments' bases.
     let mut bases: HashMap<u32, f64> = HashMap::new();
@@ -279,7 +326,7 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
     // Species rows, each followed by the genomes reported on their own. The
     // rows of a species are exclusive: the species row keeps what no reported
     // genome holds and is left out when less than one read is left.
-    let mut blocks: Vec<SpeciesBlock> = Vec::new();
+    let mut blocks: Vec<TaxonBlock> = Vec::new();
     for (&taxid, &fallback) in &best_fit {
         let found = species_genomes.get(&taxid);
         let assembly_id = found
@@ -336,13 +383,28 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
                 Some((strain.mean_identity, strain_ani)),
             ));
         }
-        blocks.push(SpeciesBlock {
+        blocks.push(TaxonBlock {
             taxid,
-            species,
-            strains,
+            taxon: species,
+            genomes: strains,
         });
     }
-    let total_depth: f64 = blocks.iter().map(SpeciesBlock::depth).sum();
+    for row in &genus_rows {
+        blocks.push(TaxonBlock {
+            taxid: row.genus,
+            taxon: Some(genus_profile_row(
+                profiler
+                    .taxonomy
+                    .get_name(row.genus)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                row,
+                data.assembly_names[decisions[&row.donors[0]].1 as usize].clone(),
+            )),
+            genomes: Vec::new(),
+        });
+    }
+    let total_depth: f64 = blocks.iter().map(TaxonBlock::depth).sum();
     let abundance = |depth: f64| {
         if total_depth > 0.0 {
             100.0 * depth / total_depth
@@ -351,15 +413,15 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
         }
     };
     for block in &mut blocks {
-        for row in block.species.iter_mut().chain(block.strains.iter_mut()) {
+        for row in block.taxon.iter_mut().chain(block.genomes.iter_mut()) {
             row.abundance = abundance(row.depth);
         }
     }
-    // By the species' total depth, then taxid.
+    // By the taxon's total depth, then taxid.
     blocks.sort_by(|a, b| b.depth().total_cmp(&a.depth()).then(a.taxid.cmp(&b.taxid)));
     let rows = blocks
         .into_iter()
-        .flat_map(|block| block.species.into_iter().chain(block.strains))
+        .flat_map(|block| block.taxon.into_iter().chain(block.genomes))
         .collect::<Vec<_>>();
 
     let mut raw_rows = Vec::new();
@@ -532,18 +594,119 @@ fn species_remainder(
     (!any || reads >= 1.0).then(|| (reads, (bases - held_bases).max(0.0)))
 }
 
-/// A species' rows: its species row, unless every read is in a genome row, and
-/// its genome rows.
-struct SpeciesBlock {
+/// The rows of one taxon: a species row (unless every read is in a genome
+/// row) with its genome rows, or a genus row.
+struct TaxonBlock {
     taxid: u32,
-    species: Option<ProfileRow>,
-    strains: Vec<ProfileRow>,
+    taxon: Option<ProfileRow>,
+    genomes: Vec<ProfileRow>,
 }
 
-impl SpeciesBlock {
+impl TaxonBlock {
     fn depth(&self) -> f64 {
-        self.species.as_ref().map_or(0.0, |s| s.depth)
-            + self.strains.iter().map(|s| s.depth).sum::<f64>()
+        self.taxon.as_ref().map_or(0.0, |s| s.depth)
+            + self.genomes.iter().map(|s| s.depth).sum::<f64>()
+    }
+}
+
+/// Each measured species' decision for the genus level: its strongest genome
+/// in the default engine's witness order (lowest assembly id on a tie), with
+/// the window spread of its reads, and that genome.
+fn species_decisions(
+    genomes: &mut HashMap<u32, GenomeEvidence>,
+    rollup: &GenusRollup,
+) -> HashMap<u32, (WitnessDecision, u32)> {
+    let mut decisions: HashMap<u32, (WitnessDecision, u32)> = HashMap::new();
+    for (&assembly_id, genome) in genomes.iter_mut() {
+        let Some(coverage) = genome.coverage.as_mut() else {
+            continue;
+        };
+        coverage.window_spread = rollup
+            .layout
+            .window_spread(assembly_id, &genome.assembly.intervals);
+        let decision = WitnessDecision {
+            metrics: *coverage,
+            standard: genome.kept,
+            rescues: RescueKinds::default(),
+            required_premap_guard: PremapChunkGuard::default(),
+        };
+        let better = decisions
+            .get(&genome.taxid)
+            .is_none_or(|&(current, current_id)| {
+                witness_is_better(decision, current)
+                    || (!witness_is_better(current, decision) && assembly_id < current_id)
+            });
+        if better {
+            decisions.insert(genome.taxid, (decision, assembly_id));
+        }
+    }
+    decisions
+}
+
+/// Genus rows from the fragments with no kept candidate species, offered to the
+/// roll-up with all their candidate species and their best one's placement.
+fn orphan_genus_rows(
+    data: &MappingData,
+    fragments: &[Fragment],
+    group_of: &[Option<usize>],
+    policy: EvidencePolicy,
+    rollup: &GenusRollup,
+    decisions: &HashMap<u32, WitnessDecision>,
+    accepted: &HashSet<u32>,
+) -> Vec<GenusRow> {
+    let mut orphans = OrphanedFragments::new(rollup, false);
+    let mut scratch = CandidateScratch::default();
+    for (fragment, group) in fragments.iter().zip(group_of) {
+        if group.is_some() {
+            continue;
+        }
+        let bundle = &data.read_alignments[fragment.read];
+        // Candidates are ordered by errors; the first is the best.
+        let taxids = fragment.candidates.iter().map(|c| c.0).collect::<Vec<_>>();
+        let candidates = scratch.build(&bundle.alignments, policy);
+        let Some(best) = candidates
+            .iter()
+            .find(|c| c.taxid == taxids[0])
+            .map(|c| c.best)
+        else {
+            continue;
+        };
+        orphans.offer(
+            &taxids,
+            0,
+            f64::from(best.r1_mapped) / best.asm_len.max(1.0),
+            f64::from(best.r1_mapped),
+            best.sampling_scale,
+            &bundle.read_name,
+        );
+    }
+    orphans.into_genus_rows(decisions, accepted)
+}
+
+/// A genus row of the roll-up: its fragments and depth, and the coverage of
+/// the main donor species on `genome`, its strongest genome; identity NA.
+fn genus_profile_row(name: String, row: &GenusRow, genome: std::sync::Arc<str>) -> ProfileRow {
+    let coverage = &row.witness;
+    ProfileRow {
+        taxname: name,
+        taxid: row.genus,
+        rank: "genus".to_string(),
+        equivalent_mapcount: row.fragments,
+        depth: row.depth,
+        abundance: 0.0,
+        breadth: coverage.breadth,
+        expected_breadth: coverage.expected_breadth,
+        breadth_pvalue: coverage.breadth_pvalue,
+        fixed_chunk: coverage.fixed_chunk,
+        flex_chunk: coverage.flex_chunk,
+        expected_flex_chunk: coverage.expected_flex_chunk,
+        chunk_pvalue: coverage.chunk_pvalue,
+        best_fit: Some(BestFitReport {
+            genome,
+            evidence_depth: coverage.depth,
+            identity: Some((f64::NAN, f64::NAN)),
+        }),
+        annotations: None,
     }
 }
 
@@ -707,8 +870,76 @@ fn write_strain_diagnostics(
     Ok(())
 }
 
+/// Mapping data for the tests of the level-wise engine and its genome level.
+#[cfg(test)]
+mod test_fixtures {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use metam::mapper::CandidateBoundary;
+
+    use crate::profiler::community::{MappingData, ReadBundle};
+    use crate::profiler::evidence::{EvidenceAlignment, MappingRole};
+    use crate::profiler::ProfileRank;
+
+    /// A single-end read of 100 bases aligned over its whole length.
+    pub(super) fn row(taxid: u32, assembly: u32, identity: f32) -> EvidenceAlignment {
+        EvidenceAlignment {
+            asm: Arc::from(format!("asm{assembly}")),
+            acc: Arc::from(format!("ref{assembly}")),
+            profile_taxid: taxid,
+            profile_rank: ProfileRank::Species,
+            reference_id: assembly,
+            assembly_id: assembly,
+            role: MappingRole::Unpaired,
+            pair_id: 0,
+            candidate_boundary: CandidateBoundary::COMPLETE,
+            sampling_scale: 1.0,
+            asm_len: 1_000_000.0,
+            identity,
+            fraction: 1.0,
+            mapped_len: 100,
+            read_len: 100,
+            span: (100, 200),
+            fixed_chunk: (100, 200),
+            flex_chunk: (100, 200),
+            marker_gene_len: 0,
+        }
+    }
+
+    pub(super) fn data(reads: Vec<Vec<EvidenceAlignment>>) -> MappingData {
+        MappingData {
+            read_alignments: reads
+                .into_iter()
+                .enumerate()
+                .map(|(i, alignments)| ReadBundle {
+                    read_name: Arc::from(format!("read{i}")),
+                    alignments,
+                })
+                .collect(),
+            asm_lengths: Arc::new(HashMap::new()),
+            min_breadth: 0.0,
+            min_chunk_breadth: 0.0,
+            safeguard_min_chunk_breadth: 0.0,
+            has_scaled_genomes: false,
+            total_reads: 0,
+            aligned_reads: 0,
+            mapping_rate: 1.0,
+            fallback_mode: false,
+            species_to_genus: Arc::new(HashMap::new()),
+            terminal_ranks: Arc::new(HashMap::new()),
+            skipped_reference_at_load: 0,
+            marker_model: None,
+            genus_rollup: None,
+            unclassified_species: None,
+            assembly_names: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_fixtures::{data, row};
     use super::*;
 
     #[test]
@@ -739,6 +970,127 @@ mod tests {
         );
     }
 
+    /// Single-reference genomes 0..=12 of 1 Mb each; species 1 and 2 in genus 100, species 3 in genus 200.
+    fn rollup() -> GenusRollup {
+        GenusRollup {
+            genus_of: HashMap::from([(1, 100), (2, 100), (3, 200)]),
+            marker_only: HashMap::new(),
+            layout: crate::profiler::rollup::GenomeLayout::new((0..=12).map(|id| (id, 1_000_000))),
+            fractional: false,
+        }
+    }
+
+    /// A genome's evidence from `n` placements spread along its 1 Mb.
+    fn evidence(taxid: u32, kept: bool, n: u32) -> GenomeEvidence {
+        let mut assembly = PresenceAssembly {
+            asm_len: 1_000_000.0,
+            sampling_scale: 1.0,
+            ..PresenceAssembly::default()
+        };
+        for i in 0..n {
+            let start = i * (1_000_000 / n);
+            assembly.count += 1;
+            assembly.reference_span_bases += 100;
+            assembly.intervals.push(PresenceInterval {
+                reference_id: 0,
+                span: (start, start + 100),
+                mate_span: (0, 0),
+                fixed_chunk: (start, start + 100),
+                flex_chunk: (start, start + 100),
+            });
+        }
+        let coverage = calculate_coverage(&mut assembly, 1);
+        GenomeEvidence {
+            taxid,
+            assembly,
+            coverage: Some(coverage),
+            kept,
+        }
+    }
+
+    #[test]
+    fn a_species_decision_is_its_strongest_genome() {
+        // Species 1: genome 10 kept, genome 11 not kept but with more reads; species 2: genome 12, not kept.
+        let mut genomes = HashMap::from([
+            (10, evidence(1, true, 40)),
+            (11, evidence(1, false, 80)),
+            (12, evidence(2, false, 40)),
+        ]);
+        let decisions = species_decisions(&mut genomes, &rollup());
+        let (one, genome) = decisions[&1];
+        assert_eq!(genome, 10);
+        assert!(one.standard);
+        let (two, genome) = decisions[&2];
+        assert_eq!(genome, 12);
+        assert!(!two.standard);
+        assert!(two.metrics.window_spread.is_some());
+    }
+
+    #[test]
+    fn fragments_of_removed_species_of_one_genus_go_to_the_genus() {
+        // 250 fragments only on species 1 (genus 100) and 30 on species 1 and 3 (two genera); nothing kept.
+        let mut reads = (0..250).map(|_| vec![row(1, 1, 0.98)]).collect::<Vec<_>>();
+        reads.extend((0..30).map(|_| vec![row(1, 1, 0.98), row(3, 3, 0.98)]));
+        let data = data(reads);
+        let fragments = (0..280)
+            .map(|read| Fragment {
+                read,
+                candidates: if read < 250 {
+                    vec![(1, 2.0)]
+                } else {
+                    vec![(1, 2.0), (3, 2.0)]
+                },
+                bases: 100.0,
+            })
+            .collect::<Vec<_>>();
+        let group_of = vec![None; fragments.len()];
+        let policy = EvidencePolicy {
+            mode: EvidenceMode::Single,
+            identity: 0.97,
+            mapped_len: 50,
+            fraction: 0.5,
+            collect_exact_ties: false,
+            collect_identities: false,
+            collect_best_placements: false,
+        };
+        let decision = |coebr: f64| WitnessDecision {
+            metrics: EvidenceCoverage {
+                coebr,
+                window_spread: Some(0.9),
+                ..EvidenceCoverage::default()
+            },
+            standard: false,
+            rescues: RescueKinds::default(),
+            required_premap_guard: PremapChunkGuard::default(),
+        };
+        let rollup = rollup();
+        let rows = orphan_genus_rows(
+            &data,
+            &fragments,
+            &group_of,
+            policy,
+            &rollup,
+            &HashMap::from([(1, decision(0.8)), (3, decision(0.8))]),
+            &HashSet::new(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].genus, 100);
+        assert_eq!(rows[0].fragments, 250.0);
+        // Read-1 bases over the genome's length, per fragment.
+        assert!((rows[0].depth - 250.0 * 100.0 / 1_000_000.0).abs() < 1e-12);
+        // A donor whose reads do not spread over its genome gives no row.
+        let rows = orphan_genus_rows(
+            &data,
+            &fragments,
+            &group_of,
+            policy,
+            &rollup,
+            &HashMap::from([(1, decision(0.2))]),
+            &HashSet::new(),
+        );
+        assert!(rows.is_empty());
+    }
+
     #[test]
     fn species_rows_write_the_identity_columns_even_when_unknown() {
         let coverage = EvidenceCoverage::default();
@@ -767,5 +1119,43 @@ mod tests {
         let lines = text.lines().collect::<Vec<_>>();
         assert!(lines.iter().all(|line| line.split('\t').count() == 17));
         assert!(lines[1].ends_with("GCF_1\tNA\tNA"));
+    }
+
+    #[test]
+    fn genus_rows_write_the_same_columns_as_species_rows() {
+        let coverage = EvidenceCoverage::default();
+        let species = profile_row(
+            "Species one".to_string(),
+            1,
+            "species",
+            (10.0, 1.0),
+            &coverage,
+            std::sync::Arc::from("GCF_1"),
+            Some((0.99, 0.995)),
+        );
+        let genus = genus_profile_row(
+            "Genus".to_string(),
+            &GenusRow {
+                genus: 100,
+                fragments: 250.0,
+                equivalent: 250.0,
+                depth: 0.5,
+                mapped_len: 25_000.0,
+                witness: coverage,
+                donors: vec![3],
+                reads: None,
+            },
+            std::sync::Arc::from("GCF_3"),
+        );
+        let mut writer = csv::WriterBuilder::new()
+            .has_headers(false)
+            .delimiter(b'\t')
+            .from_writer(Vec::new());
+        species.write(&mut writer).unwrap();
+        genus.write(&mut writer).unwrap();
+        let text = String::from_utf8(writer.into_inner().unwrap()).unwrap();
+        let lines = text.lines().collect::<Vec<_>>();
+        assert!(lines.iter().all(|line| line.split('\t').count() == 17));
+        assert!(lines[1].ends_with("GCF_3\tNA\tNA"));
     }
 }
