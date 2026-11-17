@@ -276,8 +276,10 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
     // identity to the genome relative to the sample's baseline identity.
     let ani = |identity: f64| (1.0 - (baseline_identity - identity)).min(1.0);
 
-    // Species rows, each followed by the genomes reported on their own.
-    let mut blocks: Vec<(ProfileRow, Vec<ProfileRow>)> = Vec::new();
+    // Species rows, each followed by the genomes reported on their own. The
+    // rows of a species are exclusive: the species row keeps what no reported
+    // genome holds and is left out when less than one read is left.
+    let mut blocks: Vec<SpeciesBlock> = Vec::new();
     for (&taxid, &fallback) in &best_fit {
         let found = species_genomes.get(&taxid);
         let assembly_id = found
@@ -286,21 +288,27 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
             .unwrap_or(fallback);
         let genome = &genomes[&assembly_id];
         let coverage = genome.coverage.as_ref().expect("measured above");
-        let depth = bases.get(&taxid).copied().unwrap_or(0.0) / genome.assembly.asm_len.max(1.0);
-        let reads = em.weight.get(&taxid).copied().unwrap_or(0.0);
+        let reported = found.map_or(&[][..], |g| &g.strains[..]);
         let species_name = profiler.taxonomy.get_name(taxid).unwrap_or("unknown");
         let identity = found.map(|g| (g.mean_identity, ani(g.mean_identity)));
-        let species = profile_row(
-            species_name.to_string(),
-            taxid,
-            "species",
-            (reads, depth),
-            coverage,
-            data.assembly_names[assembly_id as usize].clone(),
-            identity,
-        );
+        let species = species_remainder(
+            em.weight.get(&taxid).copied().unwrap_or(0.0),
+            bases.get(&taxid).copied().unwrap_or(0.0),
+            reported.iter().map(|s| (s.reads, s.bases)),
+        )
+        .map(|(reads, species_bases)| {
+            profile_row(
+                species_name.to_string(),
+                taxid,
+                "species",
+                (reads, species_bases / genome.assembly.asm_len.max(1.0)),
+                coverage,
+                data.assembly_names[assembly_id as usize].clone(),
+                identity,
+            )
+        });
         let mut strains = Vec::new();
-        for strain in found.map_or(&[][..], |g| &g.strains[..]) {
+        for strain in reported {
             let strain_ani = (1.0 - (strain_baseline - strain.mean_identity)).min(1.0);
             let accession = data.assembly_names[strain.assembly_id as usize].clone();
             let (name, strain_taxid) = match strain_taxids.get(&*accession) {
@@ -324,9 +332,13 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
                 Some((strain.mean_identity, strain_ani)),
             ));
         }
-        blocks.push((species, strains));
+        blocks.push(SpeciesBlock {
+            taxid,
+            species,
+            strains,
+        });
     }
-    let total_depth: f64 = blocks.iter().map(|b| b.0.depth).sum();
+    let total_depth: f64 = blocks.iter().map(SpeciesBlock::depth).sum();
     let abundance = |depth: f64| {
         if total_depth > 0.0 {
             100.0 * depth / total_depth
@@ -334,20 +346,16 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
             0.0
         }
     };
-    for (species, strains) in &mut blocks {
-        species.abundance = abundance(species.depth);
-        for strain in strains {
-            strain.abundance = abundance(strain.depth);
+    for block in &mut blocks {
+        for row in block.species.iter_mut().chain(block.strains.iter_mut()) {
+            row.abundance = abundance(row.depth);
         }
     }
-    blocks.sort_by(|a, b| {
-        b.0.abundance
-            .total_cmp(&a.0.abundance)
-            .then(a.0.taxid.cmp(&b.0.taxid))
-    });
+    // By the species' total depth, then taxid.
+    blocks.sort_by(|a, b| b.depth().total_cmp(&a.depth()).then(a.taxid.cmp(&b.taxid)));
     let rows = blocks
         .into_iter()
-        .flat_map(|(species, strains)| std::iter::once(species).chain(strains))
+        .flat_map(|block| block.species.into_iter().chain(block.strains))
         .collect::<Vec<_>>();
 
     let mut raw_rows = Vec::new();
@@ -500,6 +508,39 @@ fn add_placement(
 
 fn within(ratio: f64, lower: f64) -> bool {
     ratio.is_finite() && ratio >= lower && ratio <= STANDARD_RATIO_UPPER
+}
+
+/// The reads and bases of a species that its reported genomes, given as
+/// `(reads, bases)`, do not hold; `None` when genomes are reported and less
+/// than one read is left, so the species gets no row of its own.
+fn species_remainder(
+    reads: f64,
+    bases: f64,
+    reported: impl Iterator<Item = (f64, f64)>,
+) -> Option<(f64, f64)> {
+    let (mut held_reads, mut held_bases, mut any) = (0.0, 0.0, false);
+    for (r, b) in reported {
+        held_reads += r;
+        held_bases += b;
+        any = true;
+    }
+    let reads = (reads - held_reads).max(0.0);
+    (!any || reads >= 1.0).then(|| (reads, (bases - held_bases).max(0.0)))
+}
+
+/// A species' rows: its species row, unless every read is in a genome row, and
+/// its genome rows.
+struct SpeciesBlock {
+    taxid: u32,
+    species: Option<ProfileRow>,
+    strains: Vec<ProfileRow>,
+}
+
+impl SpeciesBlock {
+    fn depth(&self) -> f64 {
+        self.species.as_ref().map_or(0.0, |s| s.depth)
+            + self.strains.iter().map(|s| s.depth).sum::<f64>()
+    }
 }
 
 /// The genome a row is measured on, if any.
@@ -660,4 +701,37 @@ fn write_strain_diagnostics(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn species_rows_keep_what_their_genome_rows_do_not_hold() {
+        // No genome reported: the species row keeps everything.
+        assert_eq!(
+            species_remainder(100.0, 15_000.0, std::iter::empty()),
+            Some((100.0, 15_000.0))
+        );
+        // Two genomes hold most reads: the species row keeps the rest.
+        assert_eq!(
+            species_remainder(
+                100.0,
+                15_000.0,
+                [(60.0, 9_000.0), (30.0, 4_500.0)].into_iter()
+            ),
+            Some((10.0, 1_500.0))
+        );
+        // Less than one read left: no species row.
+        assert_eq!(
+            species_remainder(100.0, 15_000.0, [(99.6, 14_940.0)].into_iter()),
+            None
+        );
+        // Genome rows never leave a negative remainder.
+        assert_eq!(
+            species_remainder(100.0, 15_000.0, [(100.0, 15_100.0)].into_iter()),
+            None
+        );
+    }
 }
