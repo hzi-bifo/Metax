@@ -8,7 +8,9 @@
 //! fragment supports every genome of that species it aligns to. A species is
 //! kept when one of its genomes shows enough evenly spread coverage and the
 //! species wins enough of the fragments it could explain, and is reported on
-//! the kept genome where most of its fragments fit best. A second EM shares
+//! the kept genome where most of its fragments fit best. Removed species are
+//! then judged again, strongest first, against the species kept so far, so
+//! that a removed sister no longer splits the fragments it ties on. A second EM shares
 //! the fragments among the kept species, and abundance is the resulting depth
 //! on each species' best-fit genome. With `--save-raw-profile` the engine also
 //! writes `<prefix>.levels_genomes.tsv`, the tests of every measured genome.
@@ -78,6 +80,7 @@ struct SharedReads {
 }
 
 /// Coverage of one genome from the fragments that resolve to its species.
+#[derive(Clone)]
 struct GenomeEvidence {
     taxid: u32,
     assembly: PresenceAssembly,
@@ -126,19 +129,17 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
         .collect::<Vec<_>>();
     // Fragments listing each species among their candidates, and those resolved
     // to it.
-    let mut candidate_fragments: HashMap<u32, u64> = HashMap::new();
-    let mut resolved_candidate_fragments: HashMap<u32, u64> = HashMap::new();
-    let mut won_fragments: HashMap<u32, u64> = HashMap::new();
+    let mut counts = FragmentCounts::default();
     for &group in all.group_of.iter().flatten() {
         let resolved = resolved_taxid[group];
         for &(taxid, _) in &first.posteriors[group] {
-            *candidate_fragments.entry(taxid).or_default() += 1;
+            *counts.candidates.entry(taxid).or_default() += 1;
             if resolved.is_some() {
-                *resolved_candidate_fragments.entry(taxid).or_default() += 1;
+                *counts.resolved_candidates.entry(taxid).or_default() += 1;
             }
         }
         if let Some(taxid) = resolved {
-            *won_fragments.entry(taxid).or_default() += 1;
+            *counts.won.entry(taxid).or_default() += 1;
         }
     }
     let mut genomes: HashMap<u32, GenomeEvidence> = HashMap::new();
@@ -147,39 +148,50 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
         let Some(taxid) = group.and_then(|g| resolved_taxid[g]) else {
             continue;
         };
-        let candidates = scratch.build(&data.read_alignments[fragment.read].alignments, policy);
-        if let Some(candidate) = candidates.iter().find(|c| c.taxid == taxid) {
-            for placement in &candidate.placements {
-                let fits = placement.assembly_id == candidate.best.assembly_id;
-                add_placement(&mut genomes, taxid, placement, fits);
-            }
-        }
+        add_fragment(
+            &mut genomes,
+            &mut scratch,
+            &data,
+            policy,
+            fragment.read,
+            taxid,
+        );
     }
 
-    let tests = genomes.len().max(1);
     let (oebr_default, coebr_default) = standard_ratio_lower_bounds(ProfileRank::Species, mode);
     let min_oebr = cfg.min_oebr.unwrap_or(oebr_default);
     let min_coebr = cfg.min_coebr.unwrap_or(coebr_default);
+    let tests = SpeciesTests {
+        multiple_tests: genomes.len().max(1),
+        chunk_cutoff: data.min_chunk_breadth,
+        ratio_bounds: (min_oebr, min_coebr),
+    };
     for genome in genomes.values_mut() {
-        let coverage = calculate_coverage(&mut genome.assembly, tests);
-        let won = won_fragments.get(&genome.taxid).copied().unwrap_or(0) as f64;
-        let candidates = candidate_fragments.get(&genome.taxid).copied().unwrap_or(0);
-        genome.kept = coverage.fixed_chunk > data.min_chunk_breadth
-            && within(coverage.oebr, min_oebr)
-            && within(coverage.coebr, min_coebr)
-            && won >= MIN_WON_SHARE * candidates.max(1) as f64;
-        genome.coverage = Some(coverage);
+        let won = counts.won.get(&genome.taxid).copied().unwrap_or(0);
+        let candidates = counts.candidates.get(&genome.taxid).copied().unwrap_or(0);
+        tests.judge(genome, won, candidates);
     }
+    let (second_kept, second_taken) = second_look(
+        &data,
+        policy,
+        &FirstEm {
+            fragments: &fragments,
+            group_of: &all.group_of,
+            em: &first,
+            resolved: &resolved_taxid,
+        },
+        &tests,
+        &mut counts,
+        &mut genomes,
+    );
+    log::info!(
+        target: "PROFILER",
+        "Level-wise engine: second look kept {} removed species on {} fragments their removed sisters tied on.",
+        second_kept,
+        second_taken
+    );
     if cfg.keep_raw {
-        write_genome_diagnostics(
-            profiler,
-            &data,
-            &genomes,
-            &candidate_fragments,
-            &resolved_candidate_fragments,
-            &won_fragments,
-            (min_oebr, min_coebr),
-        )?;
+        write_genome_diagnostics(profiler, &data, &genomes, &counts, (min_oebr, min_coebr))?;
     }
     // Best-fit genome of each kept species: its kept genome where most of its
     // fragments fit best, then the one with most fragments.
@@ -572,6 +584,219 @@ fn add_placement(
     });
 }
 
+/// Add the placements of read `read` on the genomes of species `taxid`.
+fn add_fragment(
+    genomes: &mut HashMap<u32, GenomeEvidence>,
+    scratch: &mut CandidateScratch,
+    data: &MappingData,
+    policy: EvidencePolicy,
+    read: usize,
+    taxid: u32,
+) {
+    let candidates = scratch.build(&data.read_alignments[read].alignments, policy);
+    if let Some(candidate) = candidates.iter().find(|c| c.taxid == taxid) {
+        for placement in &candidate.placements {
+            let fits = placement.assembly_id == candidate.best.assembly_id;
+            add_placement(genomes, taxid, placement, fits);
+        }
+    }
+}
+
+/// Fragments listing each species among their candidates, those resolved to
+/// any species, those resolved to it, and those it took on the second look.
+#[derive(Default)]
+struct FragmentCounts {
+    candidates: HashMap<u32, u64>,
+    resolved_candidates: HashMap<u32, u64>,
+    won: HashMap<u32, u64>,
+    second_look: HashMap<u32, u64>,
+}
+
+/// The species tests: enough coverage, evenly spread, and a large enough share
+/// of the fragments listing the species won.
+struct SpeciesTests {
+    multiple_tests: usize,
+    chunk_cutoff: f64,
+    ratio_bounds: (f64, f64),
+}
+
+impl SpeciesTests {
+    /// Measure a genome and decide whether it keeps its species, which won
+    /// `won` of the `candidates` fragments listing it.
+    fn judge(&self, genome: &mut GenomeEvidence, won: u64, candidates: u64) {
+        let coverage = calculate_coverage(&mut genome.assembly, self.multiple_tests);
+        genome.kept = coverage.fixed_chunk > self.chunk_cutoff
+            && within(coverage.oebr, self.ratio_bounds.0)
+            && within(coverage.coebr, self.ratio_bounds.1)
+            && won as f64 >= MIN_WON_SHARE * candidates.max(1) as f64;
+        genome.coverage = Some(coverage);
+    }
+}
+
+/// The first EM over every candidate species and the species each read group
+/// resolves to.
+struct FirstEm<'a> {
+    fragments: &'a [Fragment],
+    group_of: &'a [Option<usize>],
+    em: &'a likelihood_em::EmResult,
+    resolved: &'a [Option<u32>],
+}
+
+/// Second look at the removed species, largest first-EM weight first. Sister
+/// species that tie on most fragments split them in the first EM by their
+/// distinguishing fragments, so that neither reaches the resolving posterior
+/// and both are removed, the present one with them. Judged again, a removed
+/// species takes the read groups on which no other removed species is more
+/// likely and that it holds with at least the resolving posterior against the
+/// kept species, and is tested again on a copy of its genomes with them added.
+/// Only if it passes does the copy replace its evidence; it is then kept and
+/// competes with the species judged after it. A species that still fails is
+/// left as the first judgment measured it, so the second look only adds
+/// species. Every group it won before is still won, as its posterior against
+/// fewer rivals only rises. Returns the number of species kept and of the
+/// fragments they took.
+fn second_look(
+    data: &MappingData,
+    policy: EvidencePolicy,
+    first: &FirstEm,
+    tests: &SpeciesTests,
+    counts: &mut FragmentCounts,
+    genomes: &mut HashMap<u32, GenomeEvidence>,
+) -> (usize, u64) {
+    let mut kept: HashSet<u32> = genomes
+        .values()
+        .filter(|g| g.kept)
+        .map(|g| g.taxid)
+        .collect();
+    let mut order = first
+        .em
+        .weight
+        .iter()
+        .filter(|&(taxid, &weight)| weight > 0.0 && !kept.contains(taxid))
+        .map(|(&taxid, &weight)| (taxid, weight))
+        .collect::<Vec<_>>();
+    order.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let removed: HashSet<u32> = order.iter().map(|o| o.0).collect();
+    let mut open_groups: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (group, posteriors) in first.em.posteriors.iter().enumerate() {
+        for &(taxid, _) in posteriors {
+            if removed.contains(&taxid) && first.resolved[group] != Some(taxid) {
+                open_groups.entry(taxid).or_default().push(group);
+            }
+        }
+    }
+    let mut genomes_of: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (&id, genome) in genomes.iter() {
+        if removed.contains(&genome.taxid) {
+            genomes_of.entry(genome.taxid).or_default().push(id);
+        }
+    }
+    let members = GroupMembers::new(first.group_of, first.em.posteriors.len());
+    let mut scratch = CandidateScratch::default();
+    let (mut kept_now, mut taken_total) = (0, 0);
+    for &(taxid, _) in &order {
+        let Some(groups) = open_groups.get(&taxid) else {
+            continue;
+        };
+        let taken_fragments = groups
+            .iter()
+            .filter(|&&group| takes_group(&first.em.posteriors[group], taxid, &kept))
+            .flat_map(|&group| members.of(group))
+            .copied()
+            .collect::<Vec<_>>();
+        if taken_fragments.is_empty() {
+            continue;
+        }
+        let mut trial: HashMap<u32, GenomeEvidence> = genomes_of
+            .get(&taxid)
+            .into_iter()
+            .flatten()
+            .map(|id| (*id, genomes[id].clone()))
+            .collect();
+        for &fragment in &taken_fragments {
+            add_fragment(
+                &mut trial,
+                &mut scratch,
+                data,
+                policy,
+                first.fragments[fragment].read,
+                taxid,
+            );
+        }
+        let taken = taken_fragments.len() as u64;
+        counts.second_look.insert(taxid, taken);
+        let won = counts.won.get(&taxid).copied().unwrap_or(0) + taken;
+        let candidates = counts.candidates.get(&taxid).copied().unwrap_or(0);
+        let mut passes = false;
+        for genome in trial.values_mut() {
+            tests.judge(genome, won, candidates);
+            passes |= genome.kept;
+        }
+        if passes {
+            counts.won.insert(taxid, won);
+            genomes.extend(trial);
+            kept.insert(taxid);
+            kept_now += 1;
+            taken_total += taken;
+        }
+    }
+    (kept_now, taken_total)
+}
+
+/// Whether removed species `taxid` takes a read group with first-EM
+/// `posteriors` on the second look: no other removed species is more likely
+/// there, and it holds at least the resolving posterior against the `kept`
+/// species.
+fn takes_group(posteriors: &[(u32, f64)], taxid: u32, kept: &HashSet<u32>) -> bool {
+    let own = posteriors
+        .iter()
+        .find(|p| p.0 == taxid)
+        .map_or(0.0, |p| p.1);
+    let mut with_kept = own;
+    for &(other, posterior) in posteriors {
+        if other == taxid {
+            continue;
+        }
+        if kept.contains(&other) {
+            with_kept += posterior;
+        } else if posterior > own {
+            return false;
+        }
+    }
+    own > 0.0 && own >= RESOLVE_POSTERIOR * with_kept
+}
+
+/// The fragments of each read group.
+struct GroupMembers {
+    start: Vec<usize>,
+    fragments: Vec<usize>,
+}
+
+impl GroupMembers {
+    fn new(group_of: &[Option<usize>], groups: usize) -> Self {
+        let mut start = vec![0; groups + 1];
+        for &group in group_of.iter().flatten() {
+            start[group + 1] += 1;
+        }
+        for group in 0..groups {
+            start[group + 1] += start[group];
+        }
+        let mut next = start.clone();
+        let mut fragments = vec![0; start[groups]];
+        for (fragment, group) in group_of.iter().enumerate() {
+            if let &Some(group) = group {
+                fragments[next[group]] = fragment;
+                next[group] += 1;
+            }
+        }
+        Self { start, fragments }
+    }
+
+    fn of(&self, group: usize) -> &[usize] {
+        &self.fragments[self.start[group]..self.start[group + 1]]
+    }
+}
+
 fn within(ratio: f64, lower: f64) -> bool {
     ratio.is_finite() && ratio >= lower && ratio <= STANDARD_RATIO_UPPER
 }
@@ -776,9 +1001,7 @@ fn write_genome_diagnostics(
     profiler: &CommunityProfiler,
     data: &MappingData,
     genomes: &HashMap<u32, GenomeEvidence>,
-    candidate_fragments: &HashMap<u32, u64>,
-    resolved_candidate_fragments: &HashMap<u32, u64>,
-    won_fragments: &HashMap<u32, u64>,
+    counts: &FragmentCounts,
     (min_oebr, min_coebr): (f64, f64),
 ) -> Result<()> {
     use std::io::Write;
@@ -786,7 +1009,7 @@ fn write_genome_diagnostics(
     let mut out = std::io::BufWriter::new(std::fs::File::create(&path)?);
     writeln!(
         out,
-        "taxid\tname\tgenome\tfragments\tfits\tspecies_candidate_fragments\tspecies_resolved_candidate_fragments\tspecies_won_fragments\toebr\tcoebr\tfixed_chunk\tchunk_cutoff\tbreadth_pvalue\tchunk_pvalue\tamount_ok\tevenness_ok\tpvalue_ok"
+        "taxid\tname\tgenome\tfragments\tfits\tspecies_candidate_fragments\tspecies_resolved_candidate_fragments\tspecies_won_fragments\toebr\tcoebr\tfixed_chunk\tchunk_cutoff\tbreadth_pvalue\tchunk_pvalue\tamount_ok\tevenness_ok\tpvalue_ok\tsecond_look_fragments"
     )?;
     let mut ids = genomes.keys().copied().collect::<Vec<_>>();
     ids.sort_unstable();
@@ -794,9 +1017,10 @@ fn write_genome_diagnostics(
         let genome = &genomes[&id];
         let coverage = genome.coverage.as_ref().expect("measured before");
         let p = |v: Option<f64>| v.map_or("NA".to_string(), |v| format!("{v:.3e}"));
+        let count = |map: &HashMap<u32, u64>| map.get(&genome.taxid).copied().unwrap_or(0);
         writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}",
             genome.taxid,
             profiler
                 .taxonomy
@@ -805,12 +1029,9 @@ fn write_genome_diagnostics(
             data.assembly_names[id as usize],
             genome.assembly.count,
             genome.assembly.fits,
-            candidate_fragments.get(&genome.taxid).copied().unwrap_or(0),
-            resolved_candidate_fragments
-                .get(&genome.taxid)
-                .copied()
-                .unwrap_or(0),
-            won_fragments.get(&genome.taxid).copied().unwrap_or(0),
+            count(&counts.candidates),
+            count(&counts.resolved_candidates),
+            count(&counts.won),
             coverage.oebr,
             coverage.coebr,
             coverage.fixed_chunk,
@@ -824,6 +1045,7 @@ fn write_genome_diagnostics(
                 coverage.chunk_pvalue,
                 profiler.cfg.strict
             ),
+            count(&counts.second_look),
         )?;
     }
     Ok(())
@@ -1157,5 +1379,31 @@ mod tests {
         let lines = text.lines().collect::<Vec<_>>();
         assert!(lines.iter().all(|line| line.split('\t').count() == 17));
         assert!(lines[1].ends_with("GCF_3\tNA\tNA"));
+    }
+
+    #[test]
+    fn a_removed_species_takes_the_fragments_it_ties_on_with_a_weaker_removed_sister() {
+        let none = HashSet::new();
+        // Tied with a removed sister that the first EM gives less weight.
+        assert!(takes_group(&[(1, 0.82), (2, 0.18)], 1, &none));
+        // The weaker sister does not take them.
+        assert!(!takes_group(&[(1, 0.82), (2, 0.18)], 2, &none));
+        // Nor fragments that another removed species fits better.
+        assert!(!takes_group(&[(1, 0.05), (2, 0.95)], 1, &none));
+        // Against a kept species it needs the resolving posterior.
+        let kept = HashSet::from([3]);
+        assert!(!takes_group(&[(1, 0.82), (3, 0.18)], 1, &kept));
+        assert!(takes_group(&[(1, 0.82), (2, 0.1), (3, 0.08)], 1, &kept));
+        // The sister judged after a kept species keeps losing the ties.
+        let after = HashSet::from([1]);
+        assert!(!takes_group(&[(1, 0.82), (2, 0.18)], 2, &after));
+    }
+
+    #[test]
+    fn group_members_list_each_group_s_fragments_in_order() {
+        let members = GroupMembers::new(&[Some(1), None, Some(0), Some(1), Some(2)], 3);
+        assert_eq!(members.of(0), &[2]);
+        assert_eq!(members.of(1), &[0, 3]);
+        assert_eq!(members.of(2), &[4]);
     }
 }
