@@ -23,7 +23,8 @@ pub(crate) struct BestFitReport {
     pub(crate) genome: Arc<str>,
     pub(crate) evidence_depth: f64,
     /// Mean identity of the row's fragments to the genome and the estimated
-    /// ANI of the sample's strain to it; written as two more columns when set.
+    /// ANI of the sample's strain to it; written as two more columns when set,
+    /// `NA` for a value that is not known.
     pub(crate) identity: Option<(f64, f64)>,
 }
 
@@ -243,8 +244,8 @@ impl ProfileRow {
                 fields.push(format_five(best_fit.evidence_depth));
                 fields.push(best_fit.genome.to_string());
                 if let Some((mean_identity, ani)) = best_fit.identity {
-                    fields.push(format_five(mean_identity));
-                    fields.push(format_five(ani));
+                    fields.push(format_known(mean_identity));
+                    fields.push(format_known(ani));
                 }
             }
             None => fields.extend(["NA".to_string(), "NA".to_string()]),
@@ -276,6 +277,15 @@ pub(crate) fn format_probability(value: Option<f64>) -> String {
 #[inline]
 fn format_five(value: f64) -> String {
     format!("{value:.5}")
+}
+
+/// A value that may be unknown (not finite): `NA` then.
+fn format_known(value: f64) -> String {
+    if value.is_finite() {
+        format_five(value)
+    } else {
+        "NA".to_string()
+    }
 }
 
 #[cfg(test)]

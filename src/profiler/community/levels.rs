@@ -290,7 +290,11 @@ pub(super) fn profile(profiler: &CommunityProfiler, data: MappingData) -> Result
         let coverage = genome.coverage.as_ref().expect("measured above");
         let reported = found.map_or(&[][..], |g| &g.strains[..]);
         let species_name = profiler.taxonomy.get_name(taxid).unwrap_or("unknown");
-        let identity = found.map(|g| (g.mean_identity, ani(g.mean_identity)));
+        // Every row of the level-wise engine has the identity columns, NA when
+        // the species has no fragments of its own.
+        let identity = Some(found.map_or((f64::NAN, f64::NAN), |g| {
+            (g.mean_identity, ani(g.mean_identity))
+        }));
         let species = species_remainder(
             em.weight.get(&taxid).copied().unwrap_or(0.0),
             bases.get(&taxid).copied().unwrap_or(0.0),
@@ -733,5 +737,35 @@ mod tests {
             species_remainder(100.0, 15_000.0, [(100.0, 15_100.0)].into_iter()),
             None
         );
+    }
+
+    #[test]
+    fn species_rows_write_the_identity_columns_even_when_unknown() {
+        let coverage = EvidenceCoverage::default();
+        let row = |name: &str, identity| {
+            profile_row(
+                name.to_string(),
+                1,
+                "species",
+                (10.0, 1.0),
+                &coverage,
+                std::sync::Arc::from("GCF_1"),
+                identity,
+            )
+        };
+        let mut writer = csv::WriterBuilder::new()
+            .has_headers(false)
+            .delimiter(b'\t')
+            .from_writer(Vec::new());
+        row("Known", Some((0.99, 0.995)))
+            .write(&mut writer)
+            .unwrap();
+        row("Unknown", Some((f64::NAN, f64::NAN)))
+            .write(&mut writer)
+            .unwrap();
+        let text = String::from_utf8(writer.into_inner().unwrap()).unwrap();
+        let lines = text.lines().collect::<Vec<_>>();
+        assert!(lines.iter().all(|line| line.split('\t').count() == 17));
+        assert!(lines[1].ends_with("GCF_1\tNA\tNA"));
     }
 }
