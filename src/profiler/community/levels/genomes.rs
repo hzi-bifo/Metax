@@ -23,11 +23,11 @@ use crate::profiler::ProfileRank;
 const SHORT_TIE_ERRORS: f64 = 0.5;
 /// Long reads: the same as a share of the best genome's aligned bases.
 const LONG_TIE_SHARE: f64 = 0.001;
-/// A fragment counts for a genome's strain-level coverage when it aligns to
-/// the genome at an identity of at least the sample's identity to its own
-/// genomes less this margin.
-const SHORT_STRAIN_MARGIN: f64 = 0.005;
-const LONG_STRAIN_MARGIN: f64 = 0.01;
+/// A fragment matches a genome at strain-level identity when it aligns to the
+/// genome at an identity of at least the sample's identity to its own genomes
+/// less this margin: a strain within 99.5 % ANI of the genome, for every read
+/// technology.
+const STRAIN_MARGIN: f64 = 0.005;
 /// A genome is reported on its own only when the fragments that the genome EM
 /// gives to it match it within sequencing error: an estimated ANI of at least
 /// this. Those fragments are the ones it fits best among the species' genomes,
@@ -166,11 +166,7 @@ pub(super) fn resolve(
     }
     let baseline_identity =
         weighted_median(identity.values().copied()).unwrap_or(1.0 - level.error_rate);
-    let margin = match level.policy.mode {
-        EvidenceMode::Long => LONG_STRAIN_MARGIN,
-        EvidenceMode::Paired | EvidenceMode::Single => SHORT_STRAIN_MARGIN,
-    };
-    let strain_identity = baseline_identity - margin;
+    let strain_identity = baseline_identity - STRAIN_MARGIN;
     let strain = StrainLevel {
         identity: strain_identity,
         baseline: weighted_median(
@@ -798,5 +794,29 @@ mod tests {
         for taxid in [2, 3, 4] {
             assert_eq!(result.species[&taxid].strains.len(), 1, "species {taxid}");
         }
+    }
+
+    #[test]
+    fn long_reads_use_the_same_strain_level_margin() {
+        // An exact strain of genome 10 and, as many reads, a strain at 99.0 % to it. Baseline 0.997, so strain-level
+        // identity is 0.992: the relative's reads at 0.989 must not count as matches of genome 10 at strain level.
+        let mut reads = (0..300)
+            .map(|i| vec![tiled(1, 10, 0.999, i)])
+            .collect::<Vec<_>>();
+        reads.extend((0..300).map(|i| vec![tiled(1, 10, 0.989, i)]));
+        let data = data(reads);
+        let (fragments, species_of) = fragments(&data);
+        let mut level = GenomeLevel {
+            report_strains: true,
+            chunk_cutoff: 0.1,
+            ratio_bounds: (0.5, 0.5),
+            ..level()
+        };
+        level.policy.mode = EvidenceMode::Long;
+        let result = resolve(&data, &fragments, &species_of, &level);
+        let strains = &result.species[&1].strains;
+        assert_eq!(strains.len(), 1);
+        assert!((strains[0].mean_identity - 0.999).abs() < 1e-9);
+        assert!((strains[0].reads - 300.0).abs() < 1e-6);
     }
 }
