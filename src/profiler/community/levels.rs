@@ -209,6 +209,30 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         second_kept,
         second_taken
     );
+    let rescued = own_evidence_look(
+        &FirstEm {
+            fragments: &fragments,
+            group_of: &all.group_of,
+            em: &first,
+            resolved: &resolved_taxid,
+        },
+        &tests,
+        &mut counts,
+        &mut genomes,
+        |taxid, list| coverage_of(&data, policy, &fragments, &tests, taxid, list),
+    );
+    let at_genus: HashSet<u32> = rescued
+        .iter()
+        .filter(|&(_, &genus)| genus)
+        .map(|(&taxid, _)| taxid)
+        .collect();
+    log::info!(
+        target: "PROFILER",
+        "Level-wise engine: {} removed species kept on fragments that no kept species explains; {} of them \
+         reported at their genus, as their reads tie with other species along their genome.",
+        rescued.len(),
+        at_genus.len()
+    );
     if cfg.keep_raw {
         write_genome_diagnostics(profiler, &data, &genomes, &counts, (min_oebr, min_coebr))?;
     }
@@ -358,6 +382,8 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     // rows of a species are exclusive: the species row keeps what no reported
     // genome holds and is left out when less than one read is left.
     let mut blocks: Vec<TaxonBlock> = Vec::new();
+    // Species reported at their genus: (genus, species, row).
+    let mut genus_parts: Vec<(u32, u32, ProfileRow)> = Vec::new();
     for (&taxid, &fallback) in &best_fit {
         let found = species_genomes.get(&taxid);
         let assembly_id = found
@@ -373,6 +399,29 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         let identity = Some(found.map_or((f64::NAN, f64::NAN), |g| {
             (g.mean_identity, ani(g.mean_identity))
         }));
+        if let Some(&genus) = at_genus
+            .contains(&taxid)
+            .then(|| data.species_to_genus.get(&taxid))
+            .flatten()
+        {
+            let reads = em.weight.get(&taxid).copied().unwrap_or(0.0);
+            let species_bases = bases.get(&taxid).copied().unwrap_or(0.0);
+            let genus_name = profiler.taxonomy.get_name(genus).unwrap_or("unknown");
+            genus_parts.push((
+                genus,
+                taxid,
+                profile_row(
+                    genus_name.to_string(),
+                    genus,
+                    "genus",
+                    (reads, species_bases / genome.assembly.asm_len.max(1.0)),
+                    coverage,
+                    data.assembly_names[assembly_id as usize].clone(),
+                    Some((f64::NAN, f64::NAN)),
+                ),
+            ));
+            continue;
+        }
         let species = species_remainder(
             em.weight.get(&taxid).copied().unwrap_or(0.0),
             bases.get(&taxid).copied().unwrap_or(0.0),
@@ -420,18 +469,39 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             genomes: strains,
         });
     }
-    for row in &genus_rows {
+    // One genus row per genus: the roll-up's, then the species reported at
+    // their genus, added in taxid order.
+    genus_parts.sort_by_key(|part| (part.0, part.1));
+    let mut genus_blocks: Vec<(u32, ProfileRow)> = genus_rows
+        .iter()
+        .map(|row| {
+            (
+                row.genus,
+                genus_profile_row(
+                    profiler
+                        .taxonomy
+                        .get_name(row.genus)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    row,
+                    data.assembly_names[decisions[&row.donors[0]].1 as usize].clone(),
+                ),
+            )
+        })
+        .collect();
+    for (genus, _, part) in genus_parts {
+        match genus_blocks.iter_mut().find(|block| block.0 == genus) {
+            Some((_, row)) => {
+                row.equivalent_mapcount += part.equivalent_mapcount;
+                row.depth += part.depth;
+            }
+            None => genus_blocks.push((genus, part)),
+        }
+    }
+    for (genus, row) in genus_blocks {
         blocks.push(TaxonBlock {
-            taxid: row.genus,
-            taxon: Some(genus_profile_row(
-                profiler
-                    .taxonomy
-                    .get_name(row.genus)
-                    .unwrap_or("unknown")
-                    .to_string(),
-                row,
-                data.assembly_names[decisions[&row.donors[0]].1 as usize].clone(),
-            )),
+            taxid: genus,
+            taxon: Some(row),
             genomes: Vec::new(),
         });
     }
@@ -668,13 +738,15 @@ fn species_placements(
 }
 
 /// Fragments listing each species among their candidates, those resolved to
-/// any species, those resolved to it, and those it took on the second look.
+/// any species, those resolved to it, those it took on the second look, and
+/// those it won with no kept species among their candidates.
 #[derive(Default)]
 struct FragmentCounts {
     candidates: HashMap<u32, u64>,
     resolved_candidates: HashMap<u32, u64>,
     won: HashMap<u32, u64>,
     second_look: HashMap<u32, u64>,
+    own: HashMap<u32, u64>,
 }
 
 /// The species tests: enough coverage, evenly spread, and a large enough share
@@ -690,11 +762,16 @@ impl SpeciesTests {
     /// `won` of the `candidates` fragments listing it.
     fn judge(&self, genome: &mut GenomeEvidence, won: u64, candidates: u64) {
         let coverage = calculate_coverage(&mut genome.assembly, self.multiple_tests);
-        genome.kept = coverage.fixed_chunk > self.chunk_cutoff
+        genome.kept =
+            self.covers(&coverage) && won as f64 >= MIN_WON_SHARE * candidates.max(1) as f64;
+        genome.coverage = Some(coverage);
+    }
+
+    /// Whether a genome's coverage is enough and evenly spread.
+    fn covers(&self, coverage: &EvidenceCoverage) -> bool {
+        coverage.fixed_chunk > self.chunk_cutoff
             && within(coverage.oebr, self.ratio_bounds.0)
             && within(coverage.coebr, self.ratio_bounds.1)
-            && won as f64 >= MIN_WON_SHARE * candidates.max(1) as f64;
-        genome.coverage = Some(coverage);
     }
 }
 
@@ -811,6 +888,160 @@ fn second_look(
         }
     }
     (kept_now, taken_total)
+}
+
+/// Last look at the removed species that cover one of their genomes well
+/// enough but win too small a share of their candidate fragments, largest
+/// first-EM weight first; `coverage` measures a species' genomes on a list of
+/// fragments alone.
+///
+/// - A species whose fragments shared with a kept species (both among the
+///   candidates) alone span one of its genomes, above the chunk-breadth
+///   cutoff, cannot be told apart from that relative and stays removed, its
+///   reads with the relative.
+/// - Otherwise it is kept when its own fragments, those it won in the first
+///   judgment with no kept species among their candidates, alone pass the
+///   coverage tests on one of its genomes; it then counts as kept for the
+///   species judged after it. A species that collects reads of a present
+///   relative's strain owns almost none of them; one that collects reads of a
+///   genome missing from the database, or of an element shared across
+///   genera, owns only the parts where it matches best, which leaves its own
+///   coverage patchy.
+/// - A kept species is reported at its genus when the fragments where it
+///   shares the best match with another species alone span one of its
+///   genomes: a near-identical relative ties along the whole genome, an
+///   element shared with other genera in one region only.
+///
+/// Returns the species kept, each with whether it is reported at its genus.
+fn own_evidence_look(
+    first: &FirstEm,
+    tests: &SpeciesTests,
+    counts: &mut FragmentCounts,
+    genomes: &mut HashMap<u32, GenomeEvidence>,
+    mut coverage: impl FnMut(u32, &[usize]) -> Vec<(u32, EvidenceCoverage)>,
+) -> HashMap<u32, bool> {
+    let mut kept: HashSet<u32> = genomes
+        .values()
+        .filter(|g| g.kept)
+        .map(|g| g.taxid)
+        .collect();
+    let judged: HashSet<u32> = genomes
+        .values()
+        .filter(|g| !kept.contains(&g.taxid))
+        .filter(|g| g.coverage.as_ref().is_some_and(|c| tests.covers(c)))
+        .map(|g| g.taxid)
+        .collect();
+    // The fragments each such species won, and those listing it.
+    let mut won: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut listing: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (index, (fragment, group)) in first.fragments.iter().zip(first.group_of).enumerate() {
+        if let Some(taxid) = group.and_then(|g| first.resolved[g]) {
+            if judged.contains(&taxid) {
+                won.entry(taxid).or_default().push(index);
+            }
+        }
+        for &(taxid, _) in &fragment.candidates {
+            if judged.contains(&taxid) {
+                listing.entry(taxid).or_default().push(index);
+            }
+        }
+    }
+    let mut order = won
+        .keys()
+        .map(|&taxid| (taxid, first.em.weight.get(&taxid).copied().unwrap_or(0.0)))
+        .collect::<Vec<_>>();
+    order.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let spans_genome = |coverages: &[(u32, EvidenceCoverage)]| {
+        coverages
+            .iter()
+            .any(|(_, c)| c.fixed_chunk > tests.chunk_cutoff)
+    };
+    let mut rescued = HashMap::new();
+    for (taxid, _) in order {
+        let with_kept = |f: &usize| {
+            first.fragments[*f]
+                .candidates
+                .iter()
+                .any(|c| c.0 != taxid && kept.contains(&c.0))
+        };
+        let listed = &listing[&taxid];
+        let shared = listed.iter().copied().filter(with_kept).collect::<Vec<_>>();
+        if !shared.is_empty() && spans_genome(&coverage(taxid, &shared)) {
+            continue;
+        }
+        let own = won[&taxid]
+            .iter()
+            .copied()
+            .filter(|f| !with_kept(f))
+            .collect::<Vec<_>>();
+        counts.own.insert(taxid, own.len() as u64);
+        if own.is_empty() {
+            continue;
+        }
+        let own_genomes: HashSet<u32> = coverage(taxid, &own)
+            .into_iter()
+            .filter(|(_, c)| tests.covers(c))
+            .map(|(id, _)| id)
+            .collect();
+        if own_genomes.is_empty() {
+            continue;
+        }
+        for (id, genome) in genomes.iter_mut() {
+            if own_genomes.contains(id) {
+                genome.kept = true;
+            }
+        }
+        let tied = listed
+            .iter()
+            .copied()
+            .filter(|&f| {
+                let candidates = &first.fragments[f].candidates;
+                let best = candidates
+                    .iter()
+                    .take_while(|c| c.1 == candidates[0].1)
+                    .count();
+                best > 1 && candidates[..best].iter().any(|c| c.0 == taxid)
+            })
+            .collect::<Vec<_>>();
+        let at_genus = !tied.is_empty() && spans_genome(&coverage(taxid, &tied));
+        kept.insert(taxid);
+        rescued.insert(taxid, at_genus);
+    }
+    rescued
+}
+
+/// The coverage of each genome of species `taxid` from the fragments `list`
+/// alone.
+fn coverage_of(
+    data: &MappingData,
+    policy: EvidencePolicy,
+    fragments: &[Fragment],
+    tests: &SpeciesTests,
+    taxid: u32,
+    list: &[usize],
+) -> Vec<(u32, EvidenceCoverage)> {
+    let mut genomes: HashMap<u32, GenomeEvidence> = HashMap::new();
+    fold_candidates(
+        data,
+        policy,
+        list,
+        |&f| fragments[f].read,
+        |_, candidates| species_placements(candidates, taxid),
+        |_, placements| {
+            for (placement, fits) in placements {
+                add_placement(&mut genomes, taxid, &placement, fits);
+            }
+        },
+    );
+    genomes
+        .into_iter()
+        .map(|(id, mut genome)| {
+            (
+                id,
+                calculate_coverage(&mut genome.assembly, tests.multiple_tests),
+            )
+        })
+        .collect()
 }
 
 /// Whether removed species `taxid` takes a read group with first-EM
@@ -1079,7 +1310,7 @@ fn write_genome_diagnostics(
     let mut out = std::io::BufWriter::new(std::fs::File::create(&path)?);
     writeln!(
         out,
-        "taxid\tname\tgenome\tfragments\tfits\tspecies_candidate_fragments\tspecies_resolved_candidate_fragments\tspecies_won_fragments\toebr\tcoebr\tfixed_chunk\tchunk_cutoff\tbreadth_pvalue\tchunk_pvalue\tamount_ok\tevenness_ok\tpvalue_ok\tsecond_look_fragments"
+        "taxid\tname\tgenome\tfragments\tfits\tspecies_candidate_fragments\tspecies_resolved_candidate_fragments\tspecies_won_fragments\toebr\tcoebr\tfixed_chunk\tchunk_cutoff\tbreadth_pvalue\tchunk_pvalue\tamount_ok\tevenness_ok\tpvalue_ok\tsecond_look_fragments\town_won_fragments"
     )?;
     let mut ids = genomes.keys().copied().collect::<Vec<_>>();
     ids.sort_unstable();
@@ -1090,7 +1321,7 @@ fn write_genome_diagnostics(
         let count = |map: &HashMap<u32, u64>| map.get(&genome.taxid).copied().unwrap_or(0);
         writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             genome.taxid,
             profiler
                 .taxonomy
@@ -1116,6 +1347,7 @@ fn write_genome_diagnostics(
                 profiler.cfg.strict
             ),
             count(&counts.second_look),
+            count(&counts.own),
         )?;
     }
     Ok(())
@@ -1475,5 +1707,98 @@ mod tests {
         assert_eq!(members.of(0), &[2]);
         assert_eq!(members.of(1), &[0, 3]);
         assert_eq!(members.of(2), &[4]);
+    }
+
+    #[test]
+    fn the_last_look_keeps_species_with_reads_of_their_own() {
+        // Species 1 is kept. Species 2 won 10 fragments: one shared with species
+        // 1, one tied with removed species 5, eight its own. Species 3 won 10
+        // fragments that all list species 1.
+        let fragment = |candidates: &[(u32, f64)]| Fragment {
+            read: 0,
+            candidates: candidates.to_vec(),
+            bases: 100.0,
+        };
+        let mut fragments = Vec::new();
+        let mut resolved = Vec::new();
+        for i in 0..10 {
+            fragments.push(fragment(match i {
+                0 => &[(2, 0.0), (1, 1.0)],
+                1 => &[(2, 0.0), (5, 0.0)],
+                _ => &[(2, 0.0)],
+            }));
+            resolved.push(Some(2));
+            fragments.push(fragment(&[(3, 0.0), (1, 0.0)]));
+            resolved.push(Some(3));
+        }
+        let group_of = (0..fragments.len()).map(Some).collect::<Vec<_>>();
+        let em = likelihood_em::EmResult {
+            weight: HashMap::from([(1, 100.0), (2, 10.0), (3, 10.0)]),
+            posteriors: Vec::new(),
+            iterations: 0,
+        };
+        let tests = SpeciesTests {
+            multiple_tests: 1,
+            chunk_cutoff: 0.5,
+            ratio_bounds: (0.5, 0.5),
+        };
+        let measured = |fixed_chunk| EvidenceCoverage {
+            fixed_chunk,
+            oebr: 1.0,
+            coebr: 1.0,
+            ..EvidenceCoverage::default()
+        };
+        let genome = |taxid, kept| GenomeEvidence {
+            taxid,
+            assembly: PresenceAssembly::default(),
+            coverage: Some(measured(1.0)),
+            kept,
+        };
+        let start = HashMap::from([
+            (10, genome(1, true)),
+            (20, genome(2, false)),
+            (30, genome(3, false)),
+        ]);
+        let first = FirstEm {
+            fragments: &fragments,
+            group_of: &group_of,
+            em: &em,
+            resolved: &resolved,
+        };
+        // Coverage of genome 20 or 30 from a list: whether the shared list
+        // (one fragment for species 2), the own list (nine fragments) and the
+        // tied list (one fragment) reach the cutoff.
+        let look = |shared: f64, own: f64, tied: f64| {
+            let mut genomes = start.clone();
+            let mut counts = FragmentCounts::default();
+            let rescued =
+                own_evidence_look(&first, &tests, &mut counts, &mut genomes, |taxid, list| {
+                    let id = if taxid == 2 { 20 } else { 30 };
+                    let chunk = match (taxid, list.len()) {
+                        (2, 9) => own,
+                        (2, _) if list[0] == 0 => shared,
+                        (2, _) => tied,
+                        _ => 0.0,
+                    };
+                    vec![(id, measured(chunk))]
+                });
+            (
+                rescued,
+                genomes[&20].kept,
+                counts.own.get(&2).copied(),
+                counts.own.get(&3).copied(),
+            )
+        };
+        // Own reads covering the genome keep species 2; species 3 owns none.
+        assert_eq!(
+            look(0.0, 1.0, 0.0),
+            (HashMap::from([(2, false)]), true, Some(9), Some(0))
+        );
+        // Reads shared with the kept species along the genome: stays with it.
+        assert_eq!(look(1.0, 1.0, 0.0), (HashMap::new(), false, None, Some(0)));
+        // Own reads in one region only: stays removed.
+        assert_eq!(look(0.0, 0.0, 0.0).0, HashMap::new());
+        // Ties along the genome: kept, reported at its genus.
+        assert_eq!(look(0.0, 1.0, 1.0).0, HashMap::from([(2, true)]));
     }
 }
