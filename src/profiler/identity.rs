@@ -17,7 +17,7 @@ use super::evidence::{EvidenceAlignment, MappingRole};
 use super::output::{ProfileAnnotations, ProfileRow};
 
 /// Fewest species with best placements for a baseline to be taken.
-const MIN_JUDGED_SPECIES: usize = 3;
+pub(crate) const MIN_JUDGED_SPECIES: usize = 3;
 
 /// Fragments whose best placement lies on a taxon, and the sum of their
 /// identities.

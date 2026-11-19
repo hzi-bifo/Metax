@@ -16,7 +16,10 @@
 //! the fragments among the kept species, and abundance is the resulting depth
 //! on each species' best-fit genome; a fragment on a marker genome counts as
 //! one on the whole genome ([`fragment_depth`]). Read counts are given as full-
-//! index equivalents, scaled up for genomes indexed in sampled segments. A genome represented by marker genes is
+//! index equivalents, scaled up for genomes indexed in sampled segments. On a
+//! database with such genomes, a species whose reads are far less identical
+//! than the sample's typical species is left out beside a kept congener and
+//! otherwise reported at its genus ([`sampled_relatives`]). A genome represented by marker genes is
 //! measured gene by gene ([`MarkerModel`]); the tests are the same. With
 //! `--save-raw-profile` the engine also writes `<prefix>.levels_genomes.tsv`,
 //! the tests of every measured genome.
@@ -34,6 +37,7 @@ use crate::profiler::evidence::{
     PremapChunkGuard, PresenceAssembly, PresenceInterval, RescueKinds, TerminalCandidate,
     WitnessDecision, STANDARD_RATIO_UPPER,
 };
+use crate::profiler::identity::MIN_JUDGED_SPECIES;
 use crate::profiler::likelihood_em::{self, ReadGroups};
 use crate::profiler::markers::MarkerModel;
 use crate::profiler::output::{BestFitReport, ProfileRow};
@@ -453,6 +457,29 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             (taxid, id)
         })
         .collect();
+    // Reads from the unindexed parts of a sampled genome land on its relatives.
+    let (left_out, low_at_genus) = match cfg.identity_margin {
+        Some(margin) if data.has_scaled_genomes => {
+            let identity = reported
+                .keys()
+                .filter_map(|taxid| {
+                    let mean = species_genomes.get(taxid)?.mean_identity;
+                    mean.is_finite().then_some((*taxid, mean))
+                })
+                .collect::<HashMap<_, _>>();
+            sampled_relatives(&data.genus_of_species, &identity, baseline_identity, margin)
+        }
+        _ => (HashSet::new(), HashSet::new()),
+    };
+    if data.has_scaled_genomes {
+        log::info!(
+            target: "PROFILER",
+            "Level-wise engine: {} species left out and {} reported at their genus, as their reads are far less \
+             identical than the sample's typical species on a database with sampled genomes.",
+            left_out.len(),
+            low_at_genus.len()
+        );
+    }
     let markers = data
         .marker_model
         .as_deref()
@@ -478,6 +505,9 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     // Species reported at their genus: (genus, species, row).
     let mut genus_parts: Vec<(u32, u32, ProfileRow)> = Vec::new();
     for (&taxid, &assembly_id) in &reported {
+        if left_out.contains(&taxid) {
+            continue;
+        }
         let found = species_genomes.get(&taxid);
         let genome = &genomes[&assembly_id];
         // Full-index-equivalent fragments, and the depth of the species' bases
@@ -498,8 +528,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         let identity = Some(found.map_or((f64::NAN, f64::NAN), |g| {
             (g.mean_identity, ani(g.mean_identity))
         }));
-        if let Some(&genus) = at_genus
-            .contains(&taxid)
+        if let Some(&genus) = (at_genus.contains(&taxid) || low_at_genus.contains(&taxid))
             .then(|| data.genus_of_species.get(&taxid))
             .flatten()
         {
@@ -821,6 +850,40 @@ fn add_placement(
         fixed_chunk: placement.fixed_chunk,
         flex_chunk: placement.flex_chunk,
     });
+}
+
+/// Kept species (with their mean `identity` to their best-fit genome) whose
+/// reads are more than `margin` less identical than the sample's `baseline`,
+/// on a database whose genomes are indexed in sampled segments: the reads of a
+/// genome's unindexed parts land there on the segments of its relatives. Such a
+/// species is left out (first set) when a congener within the margin is kept,
+/// whose read count already stands for its whole genome, and is otherwise
+/// reported at its genus (second set); one without a genus stays. Nothing is
+/// judged with fewer than [`MIN_JUDGED_SPECIES`] species.
+fn sampled_relatives(
+    genus_of: &HashMap<u32, u32>,
+    identity: &HashMap<u32, f64>,
+    baseline: f64,
+    margin: f64,
+) -> (HashSet<u32>, HashSet<u32>) {
+    let (mut left_out, mut at_genus) = (HashSet::new(), HashSet::new());
+    if identity.len() < MIN_JUDGED_SPECIES {
+        return (left_out, at_genus);
+    }
+    let low = |taxid: &u32| identity[taxid] < baseline - margin;
+    let close_genera = identity
+        .keys()
+        .filter(|taxid| !low(taxid))
+        .filter_map(|taxid| genus_of.get(taxid))
+        .collect::<HashSet<_>>();
+    for taxid in identity.keys().filter(|taxid| low(taxid)) {
+        match genus_of.get(taxid) {
+            Some(genus) if close_genera.contains(genus) => left_out.insert(*taxid),
+            Some(_) => at_genus.insert(*taxid),
+            None => false,
+        };
+    }
+    (left_out, at_genus)
 }
 
 /// What the fragments of species reported on marker genomes add: each such
@@ -2408,5 +2471,28 @@ mod tests {
         // shared one does not.
         assert_eq!(evidence.genome_reads.len(), 1);
         assert_eq!(evidence.genome_reads[&0].reads(), 2);
+    }
+
+    #[test]
+    fn far_less_identical_species_beside_a_close_congener_are_left_out() {
+        // Genus 10: species 1 close, species 2 far below; genus 20: species 3
+        // far below alone; genus 30: species 4 and 5 close; species 6 far below
+        // without a genus.
+        let genus_of = HashMap::from([(1, 10), (2, 10), (3, 20), (4, 30), (5, 30)]);
+        let identity = HashMap::from([
+            (1, 0.998),
+            (2, 0.96),
+            (3, 0.95),
+            (4, 0.997),
+            (5, 0.996),
+            (6, 0.94),
+        ]);
+        let (left_out, at_genus) = sampled_relatives(&genus_of, &identity, 0.997, 0.025);
+        assert_eq!(left_out, HashSet::from([2]));
+        assert_eq!(at_genus, HashSet::from([3]));
+        // Too few species for a baseline.
+        let few = HashMap::from([(1, 0.998), (2, 0.96)]);
+        let (left_out, at_genus) = sampled_relatives(&genus_of, &few, 0.997, 0.025);
+        assert!(left_out.is_empty() && at_genus.is_empty());
     }
 }
