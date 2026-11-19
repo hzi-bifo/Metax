@@ -332,7 +332,19 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     // genomes missing from the database, which their reads cannot place in a
     // genus.
     let family_level = rollup.map_or_else(Vec::new, |rollup| {
-        let family_of = family_map(&profiler.taxonomy, &data.species_to_genus);
+        let family_of = family_map(&profiler.taxonomy, &data.genus_of_species);
+        // On a fractional database, reads from the unindexed parts of a kept
+        // genome land on the sampled segments of its relatives, while the kept
+        // species' reads already stand for its whole genome: its family gets
+        // no family row (as its genus gets no roll-up row).
+        let excluded: HashSet<u32> = if rollup.fractional {
+            best_fit
+                .keys()
+                .filter_map(|taxid| family_of.get(taxid).copied())
+                .collect()
+        } else {
+            HashSet::new()
+        };
         unmatched_rows(
             profiler,
             &data,
@@ -351,6 +363,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                 tests: &tests,
                 layout: &rollup.layout,
                 unit_of: &family_of,
+                excluded: &excluded,
                 rank: "family",
             },
         )
@@ -475,7 +488,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         }));
         if let Some(&genus) = at_genus
             .contains(&taxid)
-            .then(|| data.species_to_genus.get(&taxid))
+            .then(|| data.genus_of_species.get(&taxid))
             .flatten()
         {
             let reads = em.weight.get(&taxid).copied().unwrap_or(0.0);
@@ -1369,14 +1382,16 @@ fn species_decisions(
 
 /// Where fragments without a species-level candidate go: the build `policy`
 /// (the genus identity, mapped length and aligned fraction), the unit each
-/// candidate species counts for (`unit_of`) and the `rank` of its rows, with the
-/// EM penalty, the species tests and the genome layout.
+/// candidate species counts for (`unit_of`), the units that get no row
+/// (`excluded`) and the `rank` of its rows, with the EM penalty, the species
+/// tests and the genome layout.
 struct UnmatchedLevel<'a> {
     policy: EvidencePolicy,
     penalty: f64,
     tests: &'a SpeciesTests,
     layout: &'a GenomeLayout,
     unit_of: &'a HashMap<u32, u32>,
+    excluded: &'a HashSet<u32>,
     rank: &'static str,
 }
 
@@ -1479,6 +1494,9 @@ fn unmatched_rows(
     }
     let mut rows = Vec::new();
     for (unit, id) in best {
+        if level.excluded.contains(&unit) {
+            continue;
+        }
         let genome = genomes.get_mut(&id).expect("measured above");
         let won = won.get(&unit).copied().unwrap_or(0.0);
         let spread = level.layout.window_spread(id, &genome.assembly.intervals);
@@ -1816,6 +1834,7 @@ mod test_fixtures {
             mapping_rate: 1.0,
             fallback_mode: false,
             species_to_genus: Arc::new(HashMap::new()),
+            genus_of_species: Arc::new(HashMap::new()),
             terminal_ranks: Arc::new(HashMap::new()),
             skipped_reference_at_load: 0,
             marker_model: None,

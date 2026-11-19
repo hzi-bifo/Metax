@@ -708,11 +708,12 @@ impl CommunityProfiler {
             .then(|| species_to_genus_raw.clone());
         let db_is_subsampled = db.is_fractional;
         let species_normalize = Arc::new(species_normalize_raw);
-        let species_to_genus = Arc::new(if db_is_subsampled && !self.cfg.genus_fallback {
-            HashMap::new()
+        let genus_of_species = Arc::new(species_to_genus_raw);
+        let species_to_genus = if db_is_subsampled && !self.cfg.genus_fallback {
+            Arc::new(HashMap::new())
         } else {
-            species_to_genus_raw
-        });
+            Arc::clone(&genus_of_species)
+        };
         let mut assembly_ids: HashMap<&str, u32> = HashMap::new();
         let mut assembly_names: Vec<Arc<str>> = Vec::new();
         for reference in &db.references {
@@ -964,6 +965,7 @@ impl CommunityProfiler {
             mapping_rate,
             fallback_mode,
             species_to_genus,
+            genus_of_species,
             terminal_ranks: Arc::new(terminal_ranks),
             skipped_reference_at_load: num_skipped_reference,
             marker_model,
@@ -5176,6 +5178,12 @@ struct MappingData {
     /// Species without a resolvable genus are simply absent from this map.
     species_to_genus: Arc<HashMap<u32, u32>>,
 
+    /// The genus of every species with whole-genome references, also on a
+    /// fractional database, where `species_to_genus` stays empty unless genus
+    /// fallback is asked for. Species represented only by marker genes are
+    /// absent.
+    genus_of_species: Arc<HashMap<u32, u32>>,
+
     /// Most-specific reference-supported rank for every terminal taxid. Other
     /// rows (genus fallback, LCA) take their rank from the taxonomy.
     terminal_ranks: Arc<HashMap<u32, ProfileRank>>,
@@ -5422,6 +5430,7 @@ mod tests {
             mapping_rate: 1.0,
             fallback_mode: false,
             species_to_genus: Arc::new(HashMap::new()),
+            genus_of_species: Arc::new(HashMap::new()),
             terminal_ranks: Arc::new(HashMap::new()),
             skipped_reference_at_load: 0,
             marker_model: None,
@@ -5862,6 +5871,7 @@ mod tests {
             mapping_rate: 1.0,
             fallback_mode: false,
             species_to_genus: Arc::new(HashMap::new()),
+            genus_of_species: Arc::new(HashMap::new()),
             terminal_ranks: Arc::new(HashMap::from([(101, ProfileRank::Species)])),
             skipped_reference_at_load: 0,
             marker_model: None,
@@ -5924,6 +5934,7 @@ mod tests {
             mapping_rate: 1.0,
             fallback_mode: true,
             species_to_genus: Arc::new(HashMap::new()),
+            genus_of_species: Arc::new(HashMap::new()),
             terminal_ranks: Arc::new(HashMap::from([(101, ProfileRank::Species)])),
             skipped_reference_at_load: 0,
             marker_model: None,
