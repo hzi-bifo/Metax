@@ -14,7 +14,9 @@
 //! with no candidate at the species identity are offered to their families.
 //! A second EM shares
 //! the fragments among the kept species, and abundance is the resulting depth
-//! on each species' best-fit genome. A genome represented by marker genes is
+//! on each species' best-fit genome; a fragment on a marker genome counts as
+//! one on the whole genome ([`fragment_depth`]). Read counts are given as full-
+//! index equivalents, scaled up for genomes indexed in sampled segments. A genome represented by marker genes is
 //! measured gene by gene ([`MarkerModel`]); the tests are the same. With
 //! `--save-raw-profile` the engine also writes `<prefix>.levels_genomes.tsv`,
 //! the tests of every measured genome.
@@ -25,7 +27,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use rayon::prelude::*;
 
-use super::{CommunityProfiler, MappingData};
+use super::{fragment_depth, CommunityProfiler, MappingData};
 use crate::profiler::evidence::{
     calculate_coverage, pvalue_passes, standard_ratio_lower_bounds, witness_is_better,
     CandidatePlacement, CandidateScratch, EvidenceCoverage, EvidenceMode, EvidencePolicy, GeneHit,
@@ -423,6 +425,26 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     // Estimated ANI of the sample's strain to a genome: its fragments' mean
     // identity to the genome relative to the sample's baseline identity.
     let ani = |identity: f64| (1.0 - (baseline_identity - identity)).min(1.0);
+    // The genome each kept species is reported on: its best-fit genome when
+    // the genome level found one among its measured genomes, otherwise the
+    // kept genome chosen above.
+    let reported: HashMap<u32, u32> = best_fit
+        .iter()
+        .map(|(&taxid, &fallback)| {
+            let id = species_genomes
+                .get(&taxid)
+                .map(|g| g.best_fit)
+                .filter(|id| genomes.contains_key(id))
+                .unwrap_or(fallback);
+            (taxid, id)
+        })
+        .collect();
+    let marker_depth = data
+        .marker_model
+        .as_deref()
+        .map_or_else(HashMap::new, |model| {
+            marker_depths(&data, policy, &fragments, (&kept, &em), &reported, model)
+        });
 
     // Species rows, each followed by the genomes reported on their own. The
     // rows of a species are exclusive: the species row keeps what no reported
@@ -430,13 +452,19 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     let mut blocks: Vec<TaxonBlock> = Vec::new();
     // Species reported at their genus: (genus, species, row).
     let mut genus_parts: Vec<(u32, u32, ProfileRow)> = Vec::new();
-    for (&taxid, &fallback) in &best_fit {
+    for (&taxid, &assembly_id) in &reported {
         let found = species_genomes.get(&taxid);
-        let assembly_id = found
-            .map(|g| g.best_fit)
-            .filter(|id| genomes.contains_key(id))
-            .unwrap_or(fallback);
         let genome = &genomes[&assembly_id];
+        // Full-index-equivalent fragments, and the depth of the species' bases
+        // on its genome; a species on a marker genome has no genome rows and
+        // takes the depth its fragments add there.
+        let scale = genome.assembly.sampling_scale.max(1.0);
+        let depth = |bases: f64| {
+            marker_depth
+                .get(&taxid)
+                .copied()
+                .unwrap_or(bases / genome.assembly.asm_len.max(1.0))
+        };
         let coverage = genome.coverage.as_ref().expect("measured above");
         let reported = found.map_or(&[][..], |g| &g.strains[..]);
         let species_name = profiler.taxonomy.get_name(taxid).unwrap_or("unknown");
@@ -460,7 +488,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                     genus_name.to_string(),
                     genus,
                     "genus",
-                    (reads, species_bases / genome.assembly.asm_len.max(1.0)),
+                    (reads * scale, depth(species_bases)),
                     coverage,
                     data.assembly_names[assembly_id as usize].clone(),
                     Some((f64::NAN, f64::NAN)),
@@ -478,7 +506,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                 species_name.to_string(),
                 taxid,
                 "species",
-                (reads, species_bases / genome.assembly.asm_len.max(1.0)),
+                (reads * scale, depth(species_bases)),
                 coverage,
                 data.assembly_names[assembly_id as usize].clone(),
                 identity,
@@ -503,7 +531,13 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                 name,
                 strain_taxid,
                 "strain",
-                (strain.reads, strain.bases / strain.asm_len.max(1.0)),
+                (
+                    strain.reads
+                        * genomes
+                            .get(&strain.assembly_id)
+                            .map_or(1.0, |g| g.assembly.sampling_scale.max(1.0)),
+                    strain.bases / strain.asm_len.max(1.0),
+                ),
                 &strain.coverage,
                 accession,
                 Some((strain.mean_identity, strain_ani)),
@@ -582,7 +616,10 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                 .to_string(),
             genome.taxid,
             "species",
-            (genome.assembly.count as f64, coverage.depth),
+            (
+                genome.assembly.count as f64 * genome.assembly.sampling_scale.max(1.0),
+                coverage.depth,
+            ),
             coverage,
             data.assembly_names[assembly_id as usize].clone(),
             None,
@@ -758,6 +795,74 @@ fn add_placement(
         fixed_chunk: placement.fixed_chunk,
         flex_chunk: placement.flex_chunk,
     });
+}
+
+/// Depth of each kept species reported on a marker genome (`reported`): the
+/// sum over its fragments of their share in the final EM (`shared`, `em`)
+/// times the depth one fragment adds on that genome,
+/// [`fragment_depth`]: its read length times the genes it hits over the
+/// placements that the genome's genes offer a read of its length. Only the
+/// fragments whose read group lists such a species are read again.
+fn marker_depths(
+    data: &MappingData,
+    policy: EvidencePolicy,
+    fragments: &[Fragment],
+    (shared, em): (&SharedReads, &likelihood_em::EmResult),
+    reported: &HashMap<u32, u32>,
+    model: &MarkerModel,
+) -> HashMap<u32, f64> {
+    let on_markers = |taxid: u32| {
+        reported
+            .get(&taxid)
+            .is_some_and(|&id| model.is_marker_genome(id))
+    };
+    let items = fragments
+        .iter()
+        .zip(&shared.group_of)
+        .filter_map(|(fragment, group)| {
+            let group = (*group)?;
+            em.posteriors[group]
+                .iter()
+                .any(|p| on_markers(p.0))
+                .then_some((fragment.read, group))
+        })
+        .collect::<Vec<_>>();
+    let mut depth: HashMap<u32, f64> = HashMap::new();
+    fold_candidates(
+        data,
+        policy,
+        &items,
+        |item| item.0,
+        |&(_, group), candidates| {
+            em.posteriors[group]
+                .iter()
+                .filter(|p| on_markers(p.0))
+                .filter_map(|&(taxid, share)| {
+                    let candidate = candidates.iter().find(|c| c.taxid == taxid)?;
+                    let placement = candidate
+                        .placements
+                        .iter()
+                        .find(|p| p.assembly_id == reported[&taxid])
+                        .copied()
+                        .unwrap_or(candidate.best);
+                    let mapped = match policy.mode {
+                        EvidenceMode::Paired | EvidenceMode::Single => placement.r1_mapped,
+                        EvidenceMode::Long => placement.both_mapped,
+                    };
+                    Some((
+                        taxid,
+                        share * fragment_depth(placement, mapped, Some(model)),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        },
+        |_, found| {
+            for (taxid, added) in found {
+                *depth.entry(taxid).or_insert(0.0) += added;
+            }
+        },
+    );
+    depth
 }
 
 /// Build the candidates of each item's read on the profiler's threads, take
@@ -1395,7 +1500,11 @@ fn unmatched_rows(
                     .to_string(),
                 unit,
                 level.rank,
-                (em.weight.get(&unit).copied().unwrap_or(0.0), depth),
+                (
+                    em.weight.get(&unit).copied().unwrap_or(0.0)
+                        * genome.assembly.sampling_scale.max(1.0),
+                    depth,
+                ),
                 &coverage,
                 data.assembly_names[id as usize].clone(),
                 Some((f64::NAN, f64::NAN)),
@@ -2167,5 +2276,60 @@ mod tests {
             tests.measure(8, &mut assembly(&[1, 2])).marker_genes_hit,
             None
         );
+    }
+
+    #[test]
+    fn a_species_on_a_marker_genome_takes_the_depth_of_its_whole_genome() {
+        use crate::profiler::evidence::EvidenceAlignment;
+        use crate::profiler::markers::{FragmentGeometry, FragmentLayout};
+        // Species 1 on marker genome 0 (one gene of 1,000 bases), species 2 on
+        // whole genome 1; three reads on the gene, one tied with genome 1.
+        let geometry = FragmentGeometry::new(FragmentLayout::Reads, 100, 100, 50, 0.5);
+        let model = MarkerModel::from_gene_lengths(&[(0, &[1_000][..])], geometry);
+        let gene = |taxid| EvidenceAlignment {
+            marker_gene_len: 1_000,
+            asm_len: 1_000.0,
+            ..row(taxid, 0, 1.0)
+        };
+        let mut data = data(vec![
+            vec![gene(1)],
+            vec![gene(1)],
+            vec![gene(1), row(2, 1, 1.0)],
+        ]);
+        data.marker_model = Some(Arc::new(model));
+        let policy = EvidencePolicy {
+            mode: EvidenceMode::Single,
+            identity: 0.8,
+            mapped_len: 50,
+            fraction: 0.5,
+            collect_exact_ties: false,
+            collect_identities: false,
+            collect_best_placements: false,
+        };
+        let fragments = (0..3)
+            .map(|read| Fragment {
+                read,
+                candidates: Vec::new(),
+                bases: 100.0,
+            })
+            .collect::<Vec<_>>();
+        let shared = SharedReads {
+            groups: ReadGroups::default(),
+            group_of: vec![Some(0), Some(0), Some(1)],
+            group_bases: Vec::new(),
+        };
+        let em = likelihood_em::EmResult {
+            weight: HashMap::new(),
+            posteriors: vec![vec![(1, 1.0)], vec![(1, 0.5), (2, 0.5)]],
+            iterations: 0,
+        };
+        let reported = HashMap::from([(1, 0), (2, 1)]);
+        let model = data.marker_model.clone().unwrap();
+        let depth = marker_depths(&data, policy, &fragments, (&shared, &em), &reported, &model);
+        // 2.5 fragments of read length 100 over the placements the gene offers;
+        // species 2 is on a whole genome and keeps bases over length.
+        let placements = model.fragment_placements(0).unwrap();
+        assert!((depth[&1] - 2.5 * 100.0 / placements).abs() < 1e-12);
+        assert!(!depth.contains_key(&2));
     }
 }
