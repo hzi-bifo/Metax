@@ -335,6 +335,17 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             genus_rows.iter().fold(0.0, |total, row| total + row.fragments)
         );
     }
+    // Fragments with no candidate at the species identity are built again with
+    // the default engine's genus fallback gates.
+    let genus_policy = EvidencePolicy {
+        identity: cfg.genus_identity,
+        mapped_len: super::genus_fallback_min_mapped_len(cfg),
+        fraction: super::GENUS_FALLBACK_MIN_FRACTION,
+        collect_exact_ties: false,
+        collect_identities: false,
+        collect_best_placements: false,
+        ..policy
+    };
     // On noisy long reads many reads of a present species align below the
     // species gates; those whose best match is a kept species are its reads,
     // not the family level's. Other reads keep the family level as it is.
@@ -343,10 +354,8 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     } else {
         HashSet::new()
     };
-    // Family rows from fragments with no candidate at the species identity,
-    // built with the default engine's genus fallback gates: they come from
-    // genomes missing from the database, which their reads cannot place in a
-    // genus.
+    // Family rows from those fragments: they come from genomes missing from
+    // the database, which their reads cannot place in a genus.
     let family_level = rollup.map_or_else(Vec::new, |rollup| {
         let family_of = family_map(&profiler.taxonomy, &data.genus_of_species);
         // On a fractional database, reads from the unindexed parts of a kept
@@ -366,15 +375,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             &data,
             &unmatched,
             &UnmatchedLevel {
-                policy: EvidencePolicy {
-                    identity: cfg.genus_identity,
-                    mapped_len: super::genus_fallback_min_mapped_len(cfg),
-                    fraction: super::GENUS_FALLBACK_MIN_FRACTION,
-                    collect_exact_ties: false,
-                    collect_identities: false,
-                    collect_best_placements: false,
-                    ..policy
-                },
+                policy: genus_policy,
                 penalty,
                 tests: &tests,
                 layout: &rollup.layout,
@@ -522,6 +523,32 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     } else {
         (HashSet::new(), HashSet::new())
     };
+    // The fragments that the family level leaves to a kept species, too noisy
+    // for the species gates, count for it.
+    let credit = rollup.is_some() && cfg.noisy_long_reads;
+    let credited = rollup
+        .filter(|_| credit)
+        .map_or_else(Credited::default, |_| {
+            credited_reads(&data, genus_policy, &unmatched, (&em.weight, &reported))
+        });
+    for (taxid, added) in &credited.bases {
+        *bases.entry(*taxid).or_insert(0.0) += added;
+    }
+    let mut marker_depth = marker_depth.clone();
+    for (taxid, added) in &credited.marker_depth {
+        *marker_depth.entry(*taxid).or_insert(0.0) += added;
+    }
+    let reads_of = |taxid: u32| {
+        em.weight.get(&taxid).copied().unwrap_or(0.0)
+            + credited.reads.get(&taxid).copied().unwrap_or(0.0)
+    };
+    if credit {
+        log::info!(
+            target: "PROFILER",
+            "Level-wise engine: {:.0} fragments without a species-level candidate credited to the kept species that match them best.",
+            credited.reads.values().sum::<f64>()
+        );
+    }
 
     // Species rows, each followed by the genomes reported on their own. The
     // rows of a species are exclusive: the species row keeps what no reported
@@ -557,7 +584,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             .then(|| data.genus_of_species.get(&taxid))
             .flatten()
         {
-            let reads = em.weight.get(&taxid).copied().unwrap_or(0.0);
+            let reads = reads_of(taxid);
             let species_bases = bases.get(&taxid).copied().unwrap_or(0.0);
             let genus_name = profiler.taxonomy.get_name(genus).unwrap_or("unknown");
             genus_parts.push((
@@ -576,7 +603,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             continue;
         }
         let species = species_remainder(
-            em.weight.get(&taxid).copied().unwrap_or(0.0),
+            reads_of(taxid),
             bases.get(&taxid).copied().unwrap_or(0.0),
             reported.iter().map(|s| (s.reads, s.bases)),
         )
@@ -1713,6 +1740,88 @@ fn best_match_kept(
     })
 }
 
+/// What the fragments credited to kept species add to each: reads, bases,
+/// and depth for a species reported on a marker genome.
+#[derive(Default)]
+struct Credited {
+    reads: HashMap<u32, f64>,
+    bases: HashMap<u32, f64>,
+    marker_depth: HashMap<u32, f64>,
+}
+
+/// The fragments `reads` without a species-level candidate whose best match
+/// under `policy` (the genus gates), or one tied with it, is a kept species
+/// (with an EM `weight` and a `reported` genome): each counts for the tied kept
+/// species, shared by their weights, as the final EM would share it. Its bases
+/// add to a species' depth, or on a marker genome the depth it adds there
+/// ([`fragment_depth`]).
+fn credited_reads(
+    data: &MappingData,
+    policy: EvidencePolicy,
+    reads: &[usize],
+    (weight, reported): (&HashMap<u32, f64>, &HashMap<u32, u32>),
+) -> Credited {
+    let markers = data.marker_model.as_deref();
+    let mut credited = Credited::default();
+    fold_candidates(
+        data,
+        policy,
+        reads,
+        |&read| read,
+        |&read, candidates| {
+            let (fragment, _) = fragment_of(read, candidates, policy, Some)?;
+            let fewest = fragment.candidates[0].1;
+            let tied = fragment
+                .candidates
+                .iter()
+                .filter(|&&(taxid, errors)| {
+                    errors <= fewest
+                        && reported.contains_key(&taxid)
+                        && weight.get(&taxid).is_some_and(|&w| w > 0.0)
+                })
+                .map(|&(taxid, _)| taxid)
+                .collect::<Vec<_>>();
+            let total: f64 = tied.iter().map(|taxid| weight[taxid]).sum();
+            (total > 0.0).then(|| {
+                tied.iter()
+                    .map(|&taxid| {
+                        let share = weight[&taxid] / total;
+                        let on_marker = markers
+                            .filter(|model| model.is_marker_genome(reported[&taxid]))
+                            .and_then(|model| {
+                                let candidate = candidates.iter().find(|c| c.taxid == taxid)?;
+                                let placement = candidate
+                                    .placements
+                                    .iter()
+                                    .find(|p| p.assembly_id == reported[&taxid])
+                                    .copied()
+                                    .unwrap_or(candidate.best);
+                                let mapped = match policy.mode {
+                                    EvidenceMode::Paired | EvidenceMode::Single => {
+                                        placement.r1_mapped
+                                    }
+                                    EvidenceMode::Long => placement.both_mapped,
+                                };
+                                Some(share * fragment_depth(placement, mapped, Some(model)))
+                            });
+                        (taxid, share, share * fragment.bases, on_marker)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        },
+        |_, found| {
+            for (taxid, share, bases, on_marker) in found.into_iter().flatten() {
+                *credited.reads.entry(taxid).or_insert(0.0) += share;
+                match on_marker {
+                    Some(depth) => *credited.marker_depth.entry(taxid).or_insert(0.0) += depth,
+                    None => *credited.bases.entry(taxid).or_insert(0.0) += bases,
+                }
+            }
+        },
+    );
+    credited
+}
+
 /// The family of every species in `species_to_genus` whose genus has one.
 fn family_map(taxonomy: &Taxonomy, species_to_genus: &HashMap<u32, u32>) -> HashMap<u32, u32> {
     let mut of_genus: HashMap<u32, Option<u32>> = HashMap::new();
@@ -2612,5 +2721,31 @@ mod tests {
             &HashSet::from([2, 4])
         ));
         assert!(!best_match_kept(0, candidates, policy, &HashSet::new()));
+    }
+
+    #[test]
+    fn a_read_below_the_species_gates_counts_for_the_kept_species_it_matches_best() {
+        // Read 0 ties on kept species 2 and 3 (weights 30 and 10); read 1
+        // matches species 4 (not kept) best and species 2 worse.
+        let data = data(vec![
+            vec![row(2, 20, 0.88), row(3, 30, 0.88)],
+            vec![row(4, 40, 0.90), row(2, 20, 0.85)],
+        ]);
+        let policy = EvidencePolicy {
+            mode: EvidenceMode::Single,
+            identity: 0.80,
+            mapped_len: 50,
+            fraction: 0.6,
+            collect_exact_ties: false,
+            collect_identities: false,
+            collect_best_placements: false,
+        };
+        let weight = HashMap::from([(2, 30.0), (3, 10.0)]);
+        let reported = HashMap::from([(2, 20), (3, 30)]);
+        let credited = credited_reads(&data, policy, &[0, 1], (&weight, &reported));
+        assert!((credited.reads[&2] - 0.75).abs() < 1e-12);
+        assert!((credited.reads[&3] - 0.25).abs() < 1e-12);
+        assert!((credited.bases[&2] - 75.0).abs() < 1e-9);
+        assert!(!credited.reads.contains_key(&4));
     }
 }
