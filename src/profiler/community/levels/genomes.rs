@@ -6,7 +6,8 @@
 //! species' fragments to it estimates how close the sample's strain is to it.
 //! At the genome level (`--strain`) a genome is also reported on its own when
 //! the fragments that clearly belong to it and match it at strain-level
-//! identity cover it evenly.
+//! identity cover it evenly. A genome represented by marker genes never is:
+//! its genes are conserved and too short to tell strains apart.
 
 use std::collections::HashMap;
 
@@ -427,6 +428,13 @@ fn strain_genomes(
         }) else {
             continue;
         };
+        if data
+            .marker_model
+            .as_deref()
+            .is_some_and(|model| model.is_marker_genome(assembly))
+        {
+            continue;
+        }
         let identity = member
             .genomes
             .iter()
