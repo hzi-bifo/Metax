@@ -15,15 +15,18 @@ use crate::{
     io::{open_reader, FastaReader, Record},
     seeds::{
         seeds_with_strobe_start_distance, validate_seed_params, RandstrobeHash, Seed, SeedMode,
-        StrobeStartDistance,
+        SeedThinning, StrobeStartDistance,
     },
     sequence::{code_base, pack_dna_2bit, unpack_dna_2bit, BitMask},
 };
 
 pub const INDEX_MAGIC: [u8; 8] = *b"METAMM02";
-/// Version 7: seeds keep the second strobe's orientation.
-pub const INDEX_VERSION: u32 = 7;
+/// Version 7: seeds keep the second strobe's orientation. Version 9: randstrobes are thinned by consecutive runs
+/// instead of fixed position blocks. Version 8 was never released and is refused.
+pub const INDEX_VERSION: u32 = 9;
 const STROBE2_ORIENTATION_INDEX_VERSION: u32 = 7;
+const CONSECUTIVE_RUN_INDEX_VERSION: u32 = 9;
+const UNRELEASED_INDEX_VERSION: u32 = 8;
 const MIN_SUPPORTED_INDEX_VERSION: u32 = 4;
 const INDEX_CACHE_MAGIC: [u8; 8] = *b"METAMMC1";
 const INDEX_CACHE_VERSION: u32 = 7;
@@ -688,6 +691,11 @@ impl IndexHeader {
     /// What this index's seeds keep of their randstrobe hash; reads are seeded the same way.
     pub fn randstrobe_hash(&self) -> RandstrobeHash {
         randstrobe_hash(self.version)
+    }
+
+    /// How this index thins its randstrobes; reads are thinned the same way.
+    pub fn seed_thinning(&self) -> SeedThinning {
+        seed_thinning(self.version)
     }
 }
 
@@ -1769,15 +1777,19 @@ fn emit_record_seeds<F>(
 where
     F: FnMut(Seed) -> Result<()>,
 {
-    if seq.len() <= INDEX_SEQUENCE_CHUNK {
-        for seed in seeds_with_strobe_start_distance(
-            seq,
+    let seeds_of = |part: &[u8]| {
+        seeds_with_strobe_start_distance(
+            part,
             k,
             w,
             mode,
             strobe_start_dist,
             randstrobe_hash(INDEX_VERSION),
-        ) {
+            seed_thinning(INDEX_VERSION),
+        )
+    };
+    if seq.len() <= INDEX_SEQUENCE_CHUNK {
+        for seed in seeds_of(seq) {
             emit(seed)?;
         }
         return Ok(());
@@ -1794,16 +1806,11 @@ where
     while start < seq.len() {
         let core_end = start.saturating_add(INDEX_SEQUENCE_CHUNK).min(seq.len());
         let seq_end = core_end.saturating_add(overlap).min(seq.len());
-        for mut seed in seeds_with_strobe_start_distance(
-            &seq[start..seq_end],
-            k,
-            w,
-            mode,
-            strobe_start_dist,
-            randstrobe_hash(INDEX_VERSION),
-        ) {
-            let global_pos = start + seed.pos as usize;
-            if global_pos < core_end {
+        // Seeding starts one overlap early, so runs of randstrobes across the chunk start are seen whole.
+        let seq_start = start.saturating_sub(overlap);
+        for mut seed in seeds_of(&seq[seq_start..seq_end]) {
+            let global_pos = seq_start + seed.pos as usize;
+            if (start..core_end).contains(&global_pos) {
                 seed.pos = global_pos as u32;
                 emit(seed)?;
             }
@@ -3735,9 +3742,11 @@ pub fn validate_index_identity(magic: [u8; 8], version: u32) -> Result<()> {
     if magic != INDEX_MAGIC {
         bail!("invalid index magic");
     }
-    if !(MIN_SUPPORTED_INDEX_VERSION..=INDEX_VERSION).contains(&version) {
+    if !(MIN_SUPPORTED_INDEX_VERSION..=INDEX_VERSION).contains(&version)
+        || version == UNRELEASED_INDEX_VERSION
+    {
         bail!(
-            "unsupported index version {version}; supported versions are {MIN_SUPPORTED_INDEX_VERSION} through {INDEX_VERSION}"
+            "unsupported index version {version}; supported versions are {MIN_SUPPORTED_INDEX_VERSION} through {INDEX_VERSION} except {UNRELEASED_INDEX_VERSION}; rebuild the index"
         );
     }
     Ok(())
@@ -3753,6 +3762,15 @@ fn randstrobe_hash(version: u32) -> RandstrobeHash {
         RandstrobeHash::Complete
     } else {
         RandstrobeHash::WithoutStrobe2Orientation
+    }
+}
+
+/// How the seeds of an index of this version were thinned.
+fn seed_thinning(version: u32) -> SeedThinning {
+    if version >= CONSECUTIVE_RUN_INDEX_VERSION {
+        SeedThinning::ConsecutiveRuns
+    } else {
+        SeedThinning::PositionBlocks
     }
 }
 
@@ -4449,6 +4467,45 @@ pub fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_records_are_seeded_as_if_whole() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let seq: Vec<u8> = (0..INDEX_SEQUENCE_CHUNK * 2 + 123_457)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                b"ACGT"[(state >> 62) as usize]
+            })
+            .collect();
+        let distance = Some(StrobeStartDistance::new(30, 90).unwrap());
+        let mut chunked = Vec::new();
+        emit_record_seeds(&seq, 16, 37, SeedMode::Randstrobe, distance, |seed| {
+            chunked.push(seed);
+            Ok(())
+        })
+        .unwrap();
+        let whole = seeds_with_strobe_start_distance(
+            &seq,
+            16,
+            37,
+            SeedMode::Randstrobe,
+            distance,
+            randstrobe_hash(INDEX_VERSION),
+            seed_thinning(INDEX_VERSION),
+        );
+        assert_eq!(chunked, whole);
+    }
+
+    #[test]
+    fn unreleased_index_version_is_refused() {
+        assert!(validate_index_identity(INDEX_MAGIC, INDEX_VERSION).is_ok());
+        assert!(validate_index_identity(INDEX_MAGIC, STROBE2_ORIENTATION_INDEX_VERSION).is_ok());
+        assert!(validate_index_identity(INDEX_MAGIC, UNRELEASED_INDEX_VERSION).is_err());
+        assert_eq!(seed_thinning(7), SeedThinning::PositionBlocks);
+        assert_eq!(seed_thinning(INDEX_VERSION), SeedThinning::ConsecutiveRuns);
+    }
 
     #[test]
     fn reference_order_digest_depends_on_order_and_boundaries() {

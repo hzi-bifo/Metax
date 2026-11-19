@@ -48,6 +48,19 @@ impl RandstrobeHash {
     }
 }
 
+/// How randstrobes are thinned to about one per `sparse_window(w)` positions. Reads are thinned like the index they
+/// are mapped to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SeedThinning {
+    /// The lowest randstrobe of each fixed block of positions, as in indexes before version 9. Which randstrobes a
+    /// read shares with a reference depends on where the read lies relative to the reference's blocks, so identical
+    /// references can give one read different seed counts.
+    PositionBlocks,
+    /// The lowest randstrobe of every run of consecutive randstrobes. This depends only on the sequence, so a read
+    /// keeps the randstrobes the reference keeps where it lies, apart from runs cut by the read's ends.
+    ConsecutiveRuns,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SeedMode {
     Minimizer,
@@ -154,7 +167,15 @@ pub fn validate_seed_params(k: usize, w: usize) -> Result<()> {
 }
 
 pub fn seeds(seq: &[u8], k: usize, w: usize, mode: SeedMode) -> Vec<Seed> {
-    seeds_with_strobe_start_distance(seq, k, w, mode, None, RandstrobeHash::Complete)
+    seeds_with_strobe_start_distance(
+        seq,
+        k,
+        w,
+        mode,
+        None,
+        RandstrobeHash::Complete,
+        SeedThinning::ConsecutiveRuns,
+    )
 }
 
 pub fn seeds_with_strobe_start_distance(
@@ -164,17 +185,30 @@ pub fn seeds_with_strobe_start_distance(
     mode: SeedMode,
     strobe_start_dist: Option<StrobeStartDistance>,
     hash: RandstrobeHash,
+    thinning: SeedThinning,
 ) -> Vec<Seed> {
     match mode {
         SeedMode::Minimizer => minimizer_seeds(seq, k, w),
-        SeedMode::Randstrobe => {
-            randstrobe_seeds_with_strobe_start_distance(seq, k, w, strobe_start_dist, hash)
-        }
+        SeedMode::Randstrobe => randstrobe_seeds_with_strobe_start_distance(
+            seq,
+            k,
+            w,
+            strobe_start_dist,
+            hash,
+            thinning,
+        ),
     }
 }
 
 pub fn randstrobe_seeds(seq: &[u8], k: usize, w: usize) -> Vec<Seed> {
-    randstrobe_seeds_with_strobe_start_distance(seq, k, w, None, RandstrobeHash::Complete)
+    randstrobe_seeds_with_strobe_start_distance(
+        seq,
+        k,
+        w,
+        None,
+        RandstrobeHash::Complete,
+        SeedThinning::ConsecutiveRuns,
+    )
 }
 
 pub fn randstrobe_seeds_with_strobe_start_distance(
@@ -183,6 +217,7 @@ pub fn randstrobe_seeds_with_strobe_start_distance(
     w: usize,
     strobe_start_dist: Option<StrobeStartDistance>,
     hash: RandstrobeHash,
+    thinning: SeedThinning,
 ) -> Vec<Seed> {
     if seq.len() < k {
         return Vec::new();
@@ -197,7 +232,10 @@ pub fn randstrobe_seeds_with_strobe_start_distance(
             span: (seed.strobe2_pos + k - seed.strobe1_pos) as u32,
         })
         .collect();
-    thin_position_windows(raw, sparse_window(w))
+    match thinning {
+        SeedThinning::PositionBlocks => thin_position_windows(raw, sparse_window(w)),
+        SeedThinning::ConsecutiveRuns => thin_consecutive_runs(raw, consecutive_run(k, w)),
+    }
 }
 
 pub fn minimizer_seeds(seq: &[u8], k: usize, w: usize) -> Vec<Seed> {
@@ -280,8 +318,48 @@ fn thin_position_windows(seeds: Vec<Seed>, window: usize) -> Vec<Seed> {
     out
 }
 
+/// The lowest seed (by hash, then position) of every run of `run` consecutive seeds, each kept once. Seeds come in
+/// position order, so the lowest seed of the next run is either the lowest of this run or the seed the next run adds.
+fn thin_consecutive_runs(seeds: Vec<Seed>, run: usize) -> Vec<Seed> {
+    if run <= 1 || seeds.len() <= 1 {
+        return seeds;
+    }
+    let run = run.min(seeds.len());
+    let lower = |a: usize, b: usize| (seeds[a].hash, seeds[a].pos) < (seeds[b].hash, seeds[b].pos);
+    let lowest_of = |start: usize, end: usize| {
+        (start + 1..end).fold(start, |best, i| if lower(i, best) { i } else { best })
+    };
+    let mut out = Vec::with_capacity(2 * seeds.len() / (run + 1) + 1);
+    let mut best = lowest_of(0, run);
+    out.push(seeds[best]);
+    for end in run..seeds.len() {
+        let start = end + 1 - run;
+        let next = if best < start {
+            lowest_of(start, end + 1)
+        } else if lower(end, best) {
+            end
+        } else {
+            best
+        };
+        if next != best {
+            out.push(seeds[next]);
+            best = next;
+        }
+    }
+    out
+}
+
 fn sparse_window(w: usize) -> usize {
     w.saturating_mul(2).div_ceil(3).max(1)
+}
+
+/// Run length for `SeedThinning::ConsecutiveRuns`: the longest run that keeps at least as many randstrobes as fixed
+/// blocks of `sparse_window(w)` positions. Randstrobes start at open syncmers, about one per k - s + 1 positions, and
+/// runs of m keep about 2 / (m + 1) of them.
+fn consecutive_run(k: usize, w: usize) -> usize {
+    let syncmer = syncmer_parameters(k, w);
+    let spacing = syncmer.k - syncmer.s + 1;
+    (2 * sparse_window(w) / spacing).saturating_sub(1).max(1)
 }
 
 fn randstrobe_parameters(
@@ -618,9 +696,9 @@ mod tests {
             .collect()
     }
 
-    fn index_default_seeds(seq: &[u8], hash: RandstrobeHash) -> Vec<Seed> {
+    fn index_default_seeds(seq: &[u8], hash: RandstrobeHash, thinning: SeedThinning) -> Vec<Seed> {
         let distance = StrobeStartDistance::new(30, 90).unwrap();
-        randstrobe_seeds_with_strobe_start_distance(seq, 16, 37, Some(distance), hash)
+        randstrobe_seeds_with_strobe_start_distance(seq, 16, 37, Some(distance), hash, thinning)
     }
 
     #[test]
@@ -629,6 +707,7 @@ mod tests {
         let seeds = index_default_seeds(
             &random_sequence(20_000),
             RandstrobeHash::WithoutStrobe2Orientation,
+            SeedThinning::PositionBlocks,
         );
         let digest = seeds.iter().fold(0u64, |digest, seed| {
             digest.rotate_left(7) ^ seed.hash ^ (u64::from(seed.pos) << 1) ^ u64::from(seed.span)
@@ -639,8 +718,13 @@ mod tests {
     #[test]
     fn complete_hash_adds_the_second_strobe_orientation() {
         let seq = random_sequence(20_000);
-        let complete = index_default_seeds(&seq, RandstrobeHash::Complete);
-        let older = index_default_seeds(&seq, RandstrobeHash::WithoutStrobe2Orientation);
+        let complete =
+            index_default_seeds(&seq, RandstrobeHash::Complete, SeedThinning::PositionBlocks);
+        let older = index_default_seeds(
+            &seq,
+            RandstrobeHash::WithoutStrobe2Orientation,
+            SeedThinning::PositionBlocks,
+        );
         let orientation = 1u64 << STROBE2_ORIENTATION_BIT;
         assert_eq!(complete.len(), older.len());
         for (seed, old) in complete.iter().zip(&older) {
@@ -667,6 +751,7 @@ mod tests {
             15,
             Some(distance),
             RandstrobeHash::Complete,
+            SeedThinning::ConsecutiveRuns,
         );
         let paired = seeds.iter().filter(|seed| seed.span > k as u32).count();
 
@@ -676,5 +761,78 @@ mod tests {
                 || ((u32::from(distance.min) + k as u32)..=(u32::from(distance.max) + k as u32))
                     .contains(&seed.span)
         }));
+    }
+
+    #[test]
+    fn consecutive_runs_keep_the_lowest_seed_of_every_run() {
+        let seeds: Vec<Seed> = [5u64, 3, 8, 1, 9, 7, 2]
+            .iter()
+            .enumerate()
+            .map(|(pos, &hash)| Seed {
+                hash,
+                pos: pos as u32,
+                span: 1,
+            })
+            .collect();
+        let kept = |run| -> Vec<u32> {
+            thin_consecutive_runs(seeds.clone(), run)
+                .iter()
+                .map(|seed| seed.pos)
+                .collect()
+        };
+        assert_eq!(kept(3), vec![1, 3, 6]);
+        assert_eq!(kept(10), vec![3]);
+        assert_eq!(kept(1), (0..7).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn consecutive_runs_keep_at_least_as_many_seeds_as_position_blocks() {
+        assert_eq!(consecutive_run(16, 37), 3);
+        assert_eq!(consecutive_run(17, 31), 2);
+        let seq = random_sequence(20_000);
+        let blocks =
+            index_default_seeds(&seq, RandstrobeHash::Complete, SeedThinning::PositionBlocks);
+        let runs = index_default_seeds(
+            &seq,
+            RandstrobeHash::Complete,
+            SeedThinning::ConsecutiveRuns,
+        );
+        assert!(runs.len() >= blocks.len() && runs.len() < blocks.len() * 13 / 10);
+    }
+
+    #[test]
+    fn seeds_a_read_shares_with_a_reference_do_not_depend_on_where_it_lies() {
+        // The same sequence behind prefixes of different lengths, as identical genomes hold a locus at different
+        // positions: a read from the locus shares the same seeds with every copy.
+        let locus = random_sequence(3_000);
+        let filler: Vec<u8> = random_sequence(3_100)[3_000..].to_vec();
+        let read = &locus[1_000..1_150];
+        let shared = |thinning: SeedThinning, offset: usize| -> Vec<(u64, u32)> {
+            let mut reference = filler[..offset].to_vec();
+            reference.extend_from_slice(&locus);
+            let at: std::collections::HashSet<(u64, u32)> =
+                index_default_seeds(&reference, RandstrobeHash::Complete, thinning)
+                    .iter()
+                    .map(|seed| (seed.hash, seed.pos))
+                    .collect();
+            index_default_seeds(read, RandstrobeHash::Complete, thinning)
+                .iter()
+                .map(|seed| (seed.hash, seed.pos + (offset + 1_000) as u32))
+                .filter(|seed| at.contains(seed))
+                .map(|(hash, pos)| (hash, pos - offset as u32))
+                .collect()
+        };
+        let first = shared(SeedThinning::ConsecutiveRuns, 0);
+        assert!(first.len() >= 2);
+        for offset in 1..25 {
+            assert_eq!(shared(SeedThinning::ConsecutiveRuns, offset), first);
+        }
+        let blocks: std::collections::HashSet<usize> = (0..25)
+            .map(|offset| shared(SeedThinning::PositionBlocks, offset).len())
+            .collect();
+        assert!(
+            blocks.len() > 1,
+            "fixed blocks were expected to depend on the position"
+        );
     }
 }
