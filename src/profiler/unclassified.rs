@@ -63,6 +63,11 @@ impl GenomeReads {
         self.fixed += other.fixed;
     }
 
+    #[cfg(test)]
+    pub(crate) fn reads(&self) -> u64 {
+        self.reads
+    }
+
     /// Gene hits per short-read fragment, 1 without fragments.
     fn hits_per_fragment(&self) -> f64 {
         if self.reads == 0 {
@@ -184,10 +189,12 @@ pub(crate) fn estimate(
 }
 
 /// The `unclassified` profile row; NA throughout when the estimate is
-/// unavailable.
+/// unavailable. With `identity_columns`, it also has the two identity columns
+/// of the other rows (the level-wise engine's), NA.
 pub(crate) fn write_row<W: Write>(
     writer: &mut Writer<W>,
     estimate: Option<UnclassifiedEstimate>,
+    identity_columns: bool,
 ) -> csv::Result<()> {
     let mut fields = vec![
         "unclassified".to_string(),
@@ -204,7 +211,8 @@ pub(crate) fn write_row<W: Write>(
     fields.push(fragments);
     fields.push("NA".to_string());
     fields.push(share);
-    fields.extend(std::iter::repeat_n("NA".to_string(), 9));
+    let na_columns = if identity_columns { 11 } else { 9 };
+    fields.extend(std::iter::repeat_n("NA".to_string(), na_columns));
     writer.write_record(fields)
 }
 
@@ -343,9 +351,10 @@ mod tests {
                 fragments: 200.0,
                 share: 0.2,
             }),
+            false,
         )
         .unwrap();
-        write_row(&mut writer, None).unwrap();
+        write_row(&mut writer, None, false).unwrap();
         let text = String::from_utf8(writer.into_inner().unwrap()).unwrap();
         let na = ["NA"; 9].join("\t");
         assert_eq!(
@@ -355,5 +364,12 @@ mod tests {
                  unclassified\t0\tunclassified\tNA\tNA\tNA\t{na}\n"
             )
         );
+        // Beside rows with the identity columns, the row has them too.
+        let mut writer = csv::WriterBuilder::new()
+            .delimiter(b'\t')
+            .from_writer(Vec::new());
+        write_row(&mut writer, None, true).unwrap();
+        let text = String::from_utf8(writer.into_inner().unwrap()).unwrap();
+        assert_eq!(text.trim_end().split('\t').count(), 17);
     }
 }

@@ -27,7 +27,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use rayon::prelude::*;
 
-use super::{fragment_depth, CommunityProfiler, MappingData};
+use super::{add_marker_genome_reads, fragment_depth, CommunityProfiler, MappingData};
 use crate::profiler::evidence::{
     calculate_coverage, pvalue_passes, standard_ratio_lower_bounds, witness_is_better,
     CandidatePlacement, CandidateScratch, EvidenceCoverage, EvidenceMode, EvidencePolicy, GeneHit,
@@ -40,6 +40,7 @@ use crate::profiler::output::{BestFitReport, ProfileRow};
 use crate::profiler::rollup::{
     GenomeLayout, GenusRollup, GenusRow, OrphanedFragments, MIN_GENUS_FRAGMENTS, MIN_WINDOW_SPREAD,
 };
+use crate::profiler::unclassified::GenomeReads;
 use crate::profiler::{parse_reference_taxonomy, ProfileRank};
 use crate::taxonomy::Taxonomy;
 
@@ -452,12 +453,23 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             (taxid, id)
         })
         .collect();
-    let marker_depth = data
+    let markers = data
         .marker_model
         .as_deref()
-        .map_or_else(HashMap::new, |model| {
-            marker_depths(&data, policy, &fragments, (&kept, &em), &reported, model)
+        .map_or_else(MarkerEvidence::default, |model| {
+            marker_evidence(
+                &data,
+                policy,
+                &fragments,
+                (&kept, &em),
+                &reported,
+                (
+                    model,
+                    cfg.estimate_unclassified.then(|| cfg.coverage_gate_is_or()),
+                ),
+            )
         });
+    let marker_depth = &markers.depth;
 
     // Species rows, each followed by the genomes reported on their own. The
     // rows of a species are exclusive: the species row keeps what no reported
@@ -646,7 +658,8 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             .then(a.taxid.cmp(&b.taxid))
             .then_with(|| row_genome(a).cmp(&row_genome(b)))
     });
-    profiler.write_profile_files(&rows, None, raw_rows)
+    let unclassified = profiler.estimate_unclassified(&data, &rows, &markers.genome_reads);
+    profiler.write_profile_files(&rows, unclassified, raw_rows)
 }
 
 /// Every fragment with at least one candidate species, and the sample's error
@@ -810,20 +823,33 @@ fn add_placement(
     });
 }
 
-/// Depth of each kept species reported on a marker genome (`reported`): the
-/// sum over its fragments of their share in the final EM (`shared`, `em`)
-/// times the depth one fragment adds on that genome,
-/// [`fragment_depth`]: its read length times the genes it hits over the
-/// placements that the genome's genes offer a read of its length. Only the
-/// fragments whose read group lists such a species are read again.
-fn marker_depths(
+/// What the fragments of species reported on marker genomes add: each such
+/// species' depth, and for the unclassified estimate the marker genome reads
+/// of the fragments resolved to it.
+#[derive(Default)]
+struct MarkerEvidence {
+    depth: HashMap<u32, f64>,
+    genome_reads: HashMap<u32, GenomeReads>,
+}
+
+/// [`MarkerEvidence`] of the kept species reported on a marker genome
+/// (`reported`). A species' depth is the sum over its fragments of their share
+/// in the final EM (`shared`, `em`) times the depth one
+/// fragment adds on that genome, [`fragment_depth`]: its read length times the
+/// genes it hits over the placements that the genome's genes offer a read of
+/// its length. With `unclassified` (`--estimate-unclassified`; `Some(true)` for
+/// long reads), each fragment resolved to such a species
+/// ([`RESOLVE_POSTERIOR`]) also records its placements on marker genomes, as in
+/// the default engine. Only the fragments whose read group lists such a
+/// species are read again.
+fn marker_evidence(
     data: &MappingData,
     policy: EvidencePolicy,
     fragments: &[Fragment],
     (shared, em): (&SharedReads, &likelihood_em::EmResult),
     reported: &HashMap<u32, u32>,
-    model: &MarkerModel,
-) -> HashMap<u32, f64> {
+    (model, unclassified): (&MarkerModel, Option<bool>),
+) -> MarkerEvidence {
     let on_markers = |taxid: u32| {
         reported
             .get(&taxid)
@@ -840,7 +866,7 @@ fn marker_depths(
                 .then_some((fragment.read, group))
         })
         .collect::<Vec<_>>();
-    let mut depth: HashMap<u32, f64> = HashMap::new();
+    let mut evidence = MarkerEvidence::default();
     fold_candidates(
         data,
         policy,
@@ -862,20 +888,40 @@ fn marker_depths(
                         EvidenceMode::Paired | EvidenceMode::Single => placement.r1_mapped,
                         EvidenceMode::Long => placement.both_mapped,
                     };
+                    let resolved =
+                        (unclassified.is_some() && share >= RESOLVE_POSTERIOR).then(|| {
+                            (
+                                candidate.placements.clone(),
+                                candidate.other_gene_hits.clone(),
+                            )
+                        });
                     Some((
                         taxid,
                         share * fragment_depth(placement, mapped, Some(model)),
+                        resolved,
                     ))
                 })
                 .collect::<Vec<_>>()
         },
         |_, found| {
-            for (taxid, added) in found {
-                *depth.entry(taxid).or_insert(0.0) += added;
+            for (taxid, added, resolved) in found {
+                *evidence.depth.entry(taxid).or_insert(0.0) += added;
+                for (placement, hits) in resolved
+                    .iter()
+                    .flat_map(|(p, h)| p.iter().map(move |p| (p, h)))
+                {
+                    add_marker_genome_reads(
+                        model,
+                        unclassified == Some(true),
+                        placement,
+                        hits,
+                        &mut evidence.genome_reads,
+                    );
+                }
             }
         },
     );
-    depth
+    evidence
 }
 
 /// Build the candidates of each item's read on the profiler's threads, take
@@ -2344,11 +2390,23 @@ mod tests {
         };
         let reported = HashMap::from([(1, 0), (2, 1)]);
         let model = data.marker_model.clone().unwrap();
-        let depth = marker_depths(&data, policy, &fragments, (&shared, &em), &reported, &model);
+        let evidence = marker_evidence(
+            &data,
+            policy,
+            &fragments,
+            (&shared, &em),
+            &reported,
+            (&model, Some(false)),
+        );
+        let depth = &evidence.depth;
         // 2.5 fragments of read length 100 over the placements the gene offers;
         // species 2 is on a whole genome and keeps bases over length.
         let placements = model.fragment_placements(0).unwrap();
         assert!((depth[&1] - 2.5 * 100.0 / placements).abs() < 1e-12);
         assert!(!depth.contains_key(&2));
+        // The two fragments resolved to species 1 count for the estimate; the
+        // shared one does not.
+        assert_eq!(evidence.genome_reads.len(), 1);
+        assert_eq!(evidence.genome_reads[&0].reads(), 2);
     }
 }

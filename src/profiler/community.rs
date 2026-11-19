@@ -65,8 +65,8 @@ use super::evidence::{
     calculate_coverage, evaluate_ranked_witness, guarded_map_winner, resolved_candidate_index,
     standard_ratio_lower_bounds, witness_is_better, CandidatePlacement, CandidateScratch,
     EvidenceAlignment, EvidenceCoverage, EvidenceMode, EvidencePolicy, EvidenceThresholds,
-    ExactTiePlacement, ExactTies, MappingRole, PresenceAssembly, PresenceInterval, PresenceKey,
-    TaxonEvidence, WitnessDecision, STANDARD_RATIO_UPPER,
+    ExactTiePlacement, ExactTies, GeneHit, MappingRole, PresenceAssembly, PresenceInterval,
+    PresenceKey, TaxonEvidence, WitnessDecision, STANDARD_RATIO_UPPER,
 };
 #[cfg(test)]
 use super::evidence::{PremapChunkGuard, RescueKinds};
@@ -1432,7 +1432,8 @@ impl CommunityProfiler {
         self.apply_relative_identity_guard(&mut normalized, &assignment);
         // Before species move to their genus, while marker species still
         // carry their own scale.
-        let unclassified = self.estimate_unclassified(&data, &normalized, &assignment);
+        let unclassified =
+            self.estimate_unclassified(&data, &normalized, &assignment.marker_genome_reads);
         if let Some(margin) = self.cfg.identity_margin {
             let moved = self.report_low_identity_species_at_genus(
                 &mut normalized,
@@ -1527,7 +1528,7 @@ impl CommunityProfiler {
         &self,
         data: &MappingData,
         rows: &[ProfileRow],
-        assignment: &AssignmentResult,
+        marker_genome_reads: &HashMap<u32, GenomeReads>,
     ) -> Option<Option<unclassified::UnclassifiedEstimate>> {
         data.unclassified_species.as_ref().map(|species| {
             // Long reads differ in length and in the genes each covers, so
@@ -1535,7 +1536,7 @@ impl CommunityProfiler {
             let scales = unclassified::marker_scales(
                 species,
                 data.marker_model.as_deref(),
-                &assignment.marker_genome_reads,
+                marker_genome_reads,
                 self.cfg.coverage_gate_is_or(),
             );
             let estimate = unclassified::estimate(rows, &scales, data.total_reads);
@@ -1603,7 +1604,10 @@ impl CommunityProfiler {
             row.write(&mut profile_writer)?;
         }
         if let Some(estimate) = unclassified {
-            unclassified::write_row(&mut profile_writer, estimate)?;
+            let identity_columns = rows
+                .iter()
+                .any(|row| row.best_fit.as_ref().is_some_and(|b| b.identity.is_some()));
+            unclassified::write_row(&mut profile_writer, estimate, identity_columns)?;
         }
         profile_writer.flush()?;
 
@@ -3584,6 +3588,41 @@ fn fragment_depth(
     }
 }
 
+/// Record a resolved fragment's `placement` on a marker genome for the
+/// unclassified estimate: for long reads (`long_reads`) the whole-genome reads
+/// that its hits on the genome's genes, with `other_gene_hits`, stand for; for
+/// other reads one fragment with its gene hits. Placements on other genomes
+/// are not recorded.
+fn add_marker_genome_reads(
+    model: &MarkerModel,
+    long_reads: bool,
+    placement: &CandidatePlacement,
+    other_gene_hits: &[GeneHit],
+    reads: &mut HashMap<u32, GenomeReads>,
+) {
+    if long_reads {
+        let genes = std::iter::once(placement.reference_id).chain(
+            other_gene_hits
+                .iter()
+                .filter(|hit| hit.assembly_id == placement.assembly_id)
+                .map(|hit| hit.interval.reference_id),
+        );
+        if let Some((hits, per_hit)) =
+            model.whole_genome_reads(placement.assembly_id, placement.read_len, genes)
+        {
+            reads
+                .entry(placement.assembly_id)
+                .or_default()
+                .add(hits, per_hit);
+        }
+    } else if model.is_marker_genome(placement.assembly_id) {
+        reads
+            .entry(placement.assembly_id)
+            .or_default()
+            .add_fragment(1 + placement.other_genes);
+    }
+}
+
 /// Native short-/long-read assignment policy.
 ///
 /// All valid terminal-taxon candidates are retained through evidence
@@ -3789,29 +3828,14 @@ fn record_resolved_winner(
             flex_chunk: placement.flex_chunk,
         });
         if cfg.estimate_unclassified {
-            if cfg.coverage_gate_is_or() {
-                let genes = std::iter::once(placement.reference_id).chain(
-                    winner
-                        .other_gene_hits
-                        .iter()
-                        .filter(|hit| hit.assembly_id == placement.assembly_id)
-                        .map(|hit| hit.interval.reference_id),
+            if let Some(model) = markers {
+                add_marker_genome_reads(
+                    model,
+                    cfg.coverage_gate_is_or(),
+                    placement,
+                    &winner.other_gene_hits,
+                    &mut result.marker_genome_reads,
                 );
-                if let Some((hits, per_hit)) = markers.and_then(|model| {
-                    model.whole_genome_reads(placement.assembly_id, placement.read_len, genes)
-                }) {
-                    result
-                        .marker_genome_reads
-                        .entry(placement.assembly_id)
-                        .or_default()
-                        .add(hits, per_hit);
-                }
-            } else if markers.is_some_and(|model| model.is_marker_genome(placement.assembly_id)) {
-                result
-                    .marker_genome_reads
-                    .entry(placement.assembly_id)
-                    .or_default()
-                    .add_fragment(1 + placement.other_genes);
             }
         }
     }
