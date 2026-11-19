@@ -19,7 +19,10 @@
 //! index equivalents, scaled up for genomes indexed in sampled segments. On a
 //! database with such genomes, a species whose reads are far less identical
 //! than the sample's typical species is left out beside a kept congener and
-//! otherwise reported at its genus ([`sampled_relatives`]). A genome represented by marker genes is
+//! otherwise reported at its genus; with `--relative-identity-gap` (on by
+//! default for single-end reads on such a database) a species is left out
+//! beside a deeper congener whose reads are that much more identical
+//! ([`identity_relatives`]). A genome represented by marker genes is
 //! measured gene by gene ([`MarkerModel`]); the tests are the same. With
 //! `--save-raw-profile` the engine also writes `<prefix>.levels_genomes.tsv`,
 //! the tests of every measured genome.
@@ -457,29 +460,6 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             (taxid, id)
         })
         .collect();
-    // Reads from the unindexed parts of a sampled genome land on its relatives.
-    let (left_out, low_at_genus) = match cfg.identity_margin {
-        Some(margin) if data.has_scaled_genomes => {
-            let identity = reported
-                .keys()
-                .filter_map(|taxid| {
-                    let mean = species_genomes.get(taxid)?.mean_identity;
-                    mean.is_finite().then_some((*taxid, mean))
-                })
-                .collect::<HashMap<_, _>>();
-            sampled_relatives(&data.genus_of_species, &identity, baseline_identity, margin)
-        }
-        _ => (HashSet::new(), HashSet::new()),
-    };
-    if data.has_scaled_genomes {
-        log::info!(
-            target: "PROFILER",
-            "Level-wise engine: {} species left out and {} reported at their genus, as their reads are far less \
-             identical than the sample's typical species on a database with sampled genomes.",
-            left_out.len(),
-            low_at_genus.len()
-        );
-    }
     let markers = data
         .marker_model
         .as_deref()
@@ -497,6 +477,42 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             )
         });
     let marker_depth = &markers.depth;
+    // Reads from the unindexed parts of a sampled genome land on its relatives:
+    // the margin on a database with sampled genomes, and the relative identity
+    // guard where it is on.
+    let margin = cfg.identity_margin.filter(|_| data.has_scaled_genomes);
+    let gap = cfg.relative_identity_gap;
+    let (left_out, low_at_genus) = if margin.is_some() || gap.is_some() {
+        let species = reported
+            .iter()
+            .filter_map(|(&taxid, &id)| {
+                let identity = species_genomes.get(&taxid)?.mean_identity;
+                let depth = marker_depth.get(&taxid).copied().unwrap_or_else(|| {
+                    bases.get(&taxid).copied().unwrap_or(0.0)
+                        / genomes[&id].assembly.asm_len.max(1.0)
+                });
+                identity.is_finite().then_some((taxid, (identity, depth)))
+            })
+            .collect::<HashMap<_, _>>();
+        let found = identity_relatives(
+            &data.genus_of_species,
+            &species,
+            baseline_identity,
+            (margin, gap),
+        );
+        log::info!(
+            target: "PROFILER",
+            "Level-wise engine: {} species left out and {} reported at their genus by the identity rules for \
+             relatives (margin {}, relative identity gap {}).",
+            found.0.len(),
+            found.1.len(),
+            margin.map_or_else(|| "off".to_string(), |m| m.to_string()),
+            gap.map_or_else(|| "off".to_string(), |g| g.to_string())
+        );
+        found
+    } else {
+        (HashSet::new(), HashSet::new())
+    };
 
     // Species rows, each followed by the genomes reported on their own. The
     // rows of a species are exclusive: the species row keeps what no reported
@@ -852,36 +868,54 @@ fn add_placement(
     });
 }
 
-/// Kept species (with their mean `identity` to their best-fit genome) whose
-/// reads are more than `margin` less identical than the sample's `baseline`,
-/// on a database whose genomes are indexed in sampled segments: the reads of a
-/// genome's unindexed parts land there on the segments of its relatives. Such a
-/// species is left out (first set) when a congener within the margin is kept,
-/// whose read count already stands for its whole genome, and is otherwise
-/// reported at its genus (second set); one without a genus stays. Nothing is
-/// judged with fewer than [`MIN_JUDGED_SPECIES`] species.
-fn sampled_relatives(
+/// The identity rules for relatives, over the kept `species` with their mean
+/// identity to their best-fit genome and their depth. With a `margin` (on a
+/// database whose genomes are indexed in sampled segments, where the reads of a
+/// genome's unindexed parts land on the segments of its relatives), a species
+/// whose reads are more than the margin less identical than the sample's
+/// `baseline` is left out (first set) when a congener within the margin is
+/// kept, whose read count already stands for its whole genome, and is
+/// otherwise reported at its genus (second set); one without a genus stays,
+/// and the margin judges nothing with fewer than [`MIN_JUDGED_SPECIES`]
+/// species. With a `gap` (`--relative-identity-gap`), a species is left out
+/// when a congener with more depth has a mean identity at least the gap
+/// higher, as its reads are better explained as that relative's.
+fn identity_relatives(
     genus_of: &HashMap<u32, u32>,
-    identity: &HashMap<u32, f64>,
+    species: &HashMap<u32, (f64, f64)>,
     baseline: f64,
-    margin: f64,
+    (margin, gap): (Option<f64>, Option<f64>),
 ) -> (HashSet<u32>, HashSet<u32>) {
     let (mut left_out, mut at_genus) = (HashSet::new(), HashSet::new());
-    if identity.len() < MIN_JUDGED_SPECIES {
-        return (left_out, at_genus);
+    let mut congeners: HashMap<u32, Vec<u32>> = HashMap::new();
+    for taxid in species.keys() {
+        if let Some(&genus) = genus_of.get(taxid) {
+            congeners.entry(genus).or_default().push(*taxid);
+        }
     }
-    let low = |taxid: &u32| identity[taxid] < baseline - margin;
-    let close_genera = identity
-        .keys()
-        .filter(|taxid| !low(taxid))
-        .filter_map(|taxid| genus_of.get(taxid))
-        .collect::<HashSet<_>>();
-    for taxid in identity.keys().filter(|taxid| low(taxid)) {
-        match genus_of.get(taxid) {
-            Some(genus) if close_genera.contains(genus) => left_out.insert(*taxid),
-            Some(_) => at_genus.insert(*taxid),
-            None => false,
-        };
+    if let Some(margin) = margin.filter(|_| species.len() >= MIN_JUDGED_SPECIES) {
+        let low = |taxid: u32| species[&taxid].0 < baseline - margin;
+        for &taxid in species.keys().filter(|&&taxid| low(taxid)) {
+            match genus_of.get(&taxid) {
+                Some(genus) if congeners[genus].iter().any(|&c| !low(c)) => left_out.insert(taxid),
+                Some(_) => at_genus.insert(taxid),
+                None => false,
+            };
+        }
+    }
+    if let Some(gap) = gap {
+        for members in congeners.values() {
+            for &taxid in members {
+                let (identity, depth) = species[&taxid];
+                if members
+                    .iter()
+                    .any(|c| species[c].1 > depth && species[c].0 >= identity + gap)
+                {
+                    at_genus.remove(&taxid);
+                    left_out.insert(taxid);
+                }
+            }
+        }
     }
     (left_out, at_genus)
 }
@@ -2477,22 +2511,38 @@ mod tests {
     fn far_less_identical_species_beside_a_close_congener_are_left_out() {
         // Genus 10: species 1 close, species 2 far below; genus 20: species 3
         // far below alone; genus 30: species 4 and 5 close; species 6 far below
-        // without a genus.
+        // without a genus. Depths are equal.
         let genus_of = HashMap::from([(1, 10), (2, 10), (3, 20), (4, 30), (5, 30)]);
-        let identity = HashMap::from([
-            (1, 0.998),
-            (2, 0.96),
-            (3, 0.95),
-            (4, 0.997),
-            (5, 0.996),
-            (6, 0.94),
+        let species = HashMap::from([
+            (1, (0.998, 1.0)),
+            (2, (0.96, 1.0)),
+            (3, (0.95, 1.0)),
+            (4, (0.997, 1.0)),
+            (5, (0.996, 1.0)),
+            (6, (0.94, 1.0)),
         ]);
-        let (left_out, at_genus) = sampled_relatives(&genus_of, &identity, 0.997, 0.025);
+        let (left_out, at_genus) =
+            identity_relatives(&genus_of, &species, 0.997, (Some(0.025), None));
         assert_eq!(left_out, HashSet::from([2]));
         assert_eq!(at_genus, HashSet::from([3]));
         // Too few species for a baseline.
-        let few = HashMap::from([(1, 0.998), (2, 0.96)]);
-        let (left_out, at_genus) = sampled_relatives(&genus_of, &few, 0.997, 0.025);
+        let few = HashMap::from([(1, (0.998, 1.0)), (2, (0.96, 1.0))]);
+        let (left_out, at_genus) = identity_relatives(&genus_of, &few, 0.997, (Some(0.025), None));
         assert!(left_out.is_empty() && at_genus.is_empty());
+    }
+
+    #[test]
+    fn a_species_is_left_out_beside_a_deeper_and_more_identical_congener() {
+        // Genus 40: species 7 deep and identical; species 8 shallower and 0.015
+        // less identical; species 9 deeper than 7 but less identical.
+        let genus_of = HashMap::from([(7, 40), (8, 40), (9, 40)]);
+        let species = HashMap::from([(7, (0.99, 1.0)), (8, (0.975, 0.5)), (9, (0.95, 2.0))]);
+        let (left_out, at_genus) =
+            identity_relatives(&genus_of, &species, 0.99, (None, Some(0.01)));
+        assert_eq!(left_out, HashSet::from([8]));
+        assert!(at_genus.is_empty());
+        // A wider gap keeps it.
+        let (left_out, _) = identity_relatives(&genus_of, &species, 0.99, (None, Some(0.02)));
+        assert!(left_out.is_empty());
     }
 }
