@@ -14,10 +14,13 @@
 //! with no candidate at the species identity are offered to their families.
 //! A second EM shares
 //! the fragments among the kept species, and abundance is the resulting depth
-//! on each species' best-fit genome. With `--save-raw-profile` the engine also
-//! writes `<prefix>.levels_genomes.tsv`, the tests of every measured genome.
+//! on each species' best-fit genome. A genome represented by marker genes is
+//! measured gene by gene ([`MarkerModel`]); the tests are the same. With
+//! `--save-raw-profile` the engine also writes `<prefix>.levels_genomes.tsv`,
+//! the tests of every measured genome.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::Result;
 use rayon::prelude::*;
@@ -25,11 +28,12 @@ use rayon::prelude::*;
 use super::{CommunityProfiler, MappingData};
 use crate::profiler::evidence::{
     calculate_coverage, pvalue_passes, standard_ratio_lower_bounds, witness_is_better,
-    CandidatePlacement, CandidateScratch, EvidenceCoverage, EvidenceMode, EvidencePolicy,
+    CandidatePlacement, CandidateScratch, EvidenceCoverage, EvidenceMode, EvidencePolicy, GeneHit,
     PremapChunkGuard, PresenceAssembly, PresenceInterval, RescueKinds, TerminalCandidate,
     WitnessDecision, STANDARD_RATIO_UPPER,
 };
 use crate::profiler::likelihood_em::{self, ReadGroups};
+use crate::profiler::markers::MarkerModel;
 use crate::profiler::output::{BestFitReport, ProfileRow};
 use crate::profiler::rollup::{
     GenomeLayout, GenusRollup, GenusRow, OrphanedFragments, MIN_GENUS_FRAGMENTS, MIN_WINDOW_SPREAD,
@@ -175,11 +179,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         &resolved_fragments,
         |r| r.0,
         |r, candidates| species_placements(candidates, r.1),
-        |r, placements| {
-            for (placement, fits) in placements {
-                add_placement(&mut genomes, r.1, &placement, fits);
-            }
-        },
+        |r, hits| add_hits(&mut genomes, r.1, hits),
     );
 
     let (oebr_default, coebr_default) = standard_ratio_lower_bounds(ProfileRank::Species, mode);
@@ -189,11 +189,13 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         multiple_tests: genomes.len().max(1),
         chunk_cutoff: data.min_chunk_breadth,
         ratio_bounds: (min_oebr, min_coebr),
+        markers: data.marker_model.clone(),
+        min_marker_genes: cfg.min_marker_genes,
     };
-    genomes.par_iter_mut().for_each(|(_, genome)| {
+    genomes.par_iter_mut().for_each(|(&id, genome)| {
         let won = counts.won.get(&genome.taxid).copied().unwrap_or(0);
         let candidates = counts.candidates.get(&genome.taxid).copied().unwrap_or(0);
-        tests.judge(genome, won, candidates);
+        tests.judge(id, genome, won, candidates);
     });
     let (second_kept, second_taken) = second_look(
         &data,
@@ -747,6 +749,7 @@ fn add_placement(
     let assembly = &mut genome.assembly;
     assembly.count += 1;
     assembly.fits += u64::from(fits);
+    assembly.other_gene_hits += u64::from(placement.other_genes);
     assembly.reference_span_bases += u64::from(placement.span.1.saturating_sub(placement.span.0));
     assembly.intervals.push(PresenceInterval {
         reference_id: placement.reference_id,
@@ -783,22 +786,45 @@ pub(super) fn fold_candidates<I: Sync, T: Send>(
     }
 }
 
-/// The placements of species `taxid` among a fragment's `candidates`, each
-/// with whether it is on the species' best genome.
-fn species_placements(
-    candidates: &[TerminalCandidate],
-    taxid: u32,
-) -> Vec<(CandidatePlacement, bool)> {
+/// A fragment's placements for one species, each with whether it is on the
+/// species' best genome, and its hits on further marker genes of those genomes.
+#[derive(Default)]
+struct SpeciesHits {
+    placements: Vec<(CandidatePlacement, bool)>,
+    gene_hits: Vec<GeneHit>,
+}
+
+/// The placements and gene hits of species `taxid` among a fragment's
+/// `candidates`.
+fn species_placements(candidates: &[TerminalCandidate], taxid: u32) -> SpeciesHits {
     candidates
         .iter()
         .find(|c| c.taxid == taxid)
-        .map_or_else(Vec::new, |candidate| {
-            candidate
+        .map_or_else(SpeciesHits::default, |candidate| SpeciesHits {
+            placements: candidate
                 .placements
                 .iter()
                 .map(|p| (*p, p.assembly_id == candidate.best.assembly_id))
-                .collect()
+                .collect(),
+            gene_hits: candidate.other_gene_hits.clone(),
         })
+}
+
+/// Add a fragment's placements for species `taxid` to their genomes, and the
+/// bases and intervals of its other marker genes, which a gene-by-gene
+/// measure counts as covered (genomes of other kinds have none).
+fn add_hits(genomes: &mut HashMap<u32, GenomeEvidence>, taxid: u32, hits: SpeciesHits) {
+    for (placement, fits) in &hits.placements {
+        add_placement(genomes, taxid, placement, *fits);
+    }
+    for hit in hits.gene_hits {
+        if let Some(genome) = genomes.get_mut(&hit.assembly_id) {
+            let assembly = &mut genome.assembly;
+            assembly.reference_span_bases +=
+                u64::from(hit.interval.span.1.saturating_sub(hit.interval.span.0));
+            assembly.intervals.push(hit.interval);
+        }
+    }
 }
 
 /// Fragments listing each species among their candidates, those resolved to
@@ -814,18 +840,31 @@ struct FragmentCounts {
 }
 
 /// The species tests: enough coverage, evenly spread, and a large enough share
-/// of the fragments listing the species won.
+/// of the fragments listing the species won. A genome represented by marker
+/// genes is measured by the `markers` model, its genes standing for the chunks
+/// of a whole genome, and needs at least `min_marker_genes` genes hit.
 struct SpeciesTests {
     multiple_tests: usize,
     chunk_cutoff: f64,
     ratio_bounds: (f64, f64),
+    markers: Option<Arc<MarkerModel>>,
+    min_marker_genes: usize,
 }
 
 impl SpeciesTests {
-    /// Measure a genome and decide whether it keeps its species, which won
-    /// `won` of the `candidates` fragments listing it.
-    fn judge(&self, genome: &mut GenomeEvidence, won: u64, candidates: u64) {
-        let coverage = calculate_coverage(&mut genome.assembly, self.multiple_tests);
+    /// Coverage of genome `assembly_id`: gene by gene for a marker genome,
+    /// otherwise over its sequence.
+    fn measure(&self, assembly_id: u32, assembly: &mut PresenceAssembly) -> EvidenceCoverage {
+        self.markers
+            .as_deref()
+            .and_then(|model| model.coverage(assembly_id, assembly, self.multiple_tests))
+            .unwrap_or_else(|| calculate_coverage(assembly, self.multiple_tests))
+    }
+
+    /// Measure genome `assembly_id` and decide whether it keeps its species,
+    /// which won `won` of the `candidates` fragments listing it.
+    fn judge(&self, assembly_id: u32, genome: &mut GenomeEvidence, won: u64, candidates: u64) {
+        let coverage = self.measure(assembly_id, &mut genome.assembly);
         genome.kept =
             self.covers(&coverage) && won as f64 >= MIN_WON_SHARE * candidates.max(1) as f64;
         genome.coverage = Some(coverage);
@@ -834,6 +873,9 @@ impl SpeciesTests {
     /// Whether a genome's coverage is enough and evenly spread.
     fn covers(&self, coverage: &EvidenceCoverage) -> bool {
         coverage.fixed_chunk > self.chunk_cutoff
+            && coverage
+                .marker_genes_hit
+                .is_none_or(|hit| hit >= self.min_marker_genes)
             && within(coverage.oebr, self.ratio_bounds.0)
             && within(coverage.coebr, self.ratio_bounds.1)
     }
@@ -928,19 +970,15 @@ fn second_look(
             &reads,
             |&read| read,
             |_, candidates| species_placements(candidates, taxid),
-            |_, placements| {
-                for (placement, fits) in placements {
-                    add_placement(&mut trial, taxid, &placement, fits);
-                }
-            },
+            |_, hits| add_hits(&mut trial, taxid, hits),
         );
         let taken = taken_fragments.len() as u64;
         counts.second_look.insert(taxid, taken);
         let won = counts.won.get(&taxid).copied().unwrap_or(0) + taken;
         let candidates = counts.candidates.get(&taxid).copied().unwrap_or(0);
         let mut passes = false;
-        for genome in trial.values_mut() {
-            tests.judge(genome, won, candidates);
+        for (&id, genome) in &mut trial {
+            tests.judge(id, genome, won, candidates);
             passes |= genome.kept;
         }
         if passes {
@@ -1091,20 +1129,11 @@ fn coverage_of(
         list,
         |&f| fragments[f].read,
         |_, candidates| species_placements(candidates, taxid),
-        |_, placements| {
-            for (placement, fits) in placements {
-                add_placement(&mut genomes, taxid, &placement, fits);
-            }
-        },
+        |_, hits| add_hits(&mut genomes, taxid, hits),
     );
     genomes
         .into_iter()
-        .map(|(id, mut genome)| {
-            (
-                id,
-                calculate_coverage(&mut genome.assembly, tests.multiple_tests),
-            )
-        })
+        .map(|(id, mut genome)| (id, tests.measure(id, &mut genome.assembly)))
         .collect()
 }
 
@@ -1354,7 +1383,7 @@ fn unmatched_rows(
         {
             continue;
         }
-        let coverage = calculate_coverage(&mut genome.assembly, level.tests.multiple_tests);
+        let coverage = level.tests.measure(id, &mut genome.assembly);
         let depth = bases.get(&unit).copied().unwrap_or(0.0) / genome.assembly.asm_len.max(1.0);
         rows.push((
             unit,
@@ -1968,6 +1997,8 @@ mod tests {
             multiple_tests: 1,
             chunk_cutoff: 0.5,
             ratio_bounds: (0.5, 0.5),
+            markers: None,
+            min_marker_genes: 3,
         };
         let measured = |fixed_chunk| EvidenceCoverage {
             fixed_chunk,
@@ -2086,5 +2117,55 @@ mod tests {
         );
         let families = family_map(&taxonomy, &HashMap::from([(11, 10), (12, 10), (21, 20)]));
         assert_eq!(families, HashMap::from([(11, 100), (12, 100)]));
+    }
+
+    #[test]
+    fn a_marker_genome_is_measured_gene_by_gene_and_needs_enough_genes() {
+        use crate::profiler::markers::{FragmentGeometry, FragmentLayout};
+        // Genome 7: five marker genes (references 1-5) of 1,000 bases; genome 8
+        // is a whole genome of 5,000 bases.
+        let geometry = FragmentGeometry::new(FragmentLayout::Reads, 100, 100, 50, 0.5);
+        let genes = [1_000u32; 5];
+        let model = MarkerModel::from_gene_lengths(&[(7, &genes[..])], geometry);
+        let tests = SpeciesTests {
+            multiple_tests: 1,
+            chunk_cutoff: 0.1,
+            ratio_bounds: (0.0, 0.0),
+            markers: Some(Arc::new(model)),
+            min_marker_genes: 3,
+        };
+        let assembly = |genes: &[u32]| {
+            let mut assembly = PresenceAssembly {
+                asm_len: 5_000.0,
+                ..PresenceAssembly::default()
+            };
+            for &gene in genes {
+                for start in [100, 500] {
+                    assembly.count += 1;
+                    assembly.reference_span_bases += 100;
+                    assembly.intervals.push(PresenceInterval {
+                        reference_id: gene,
+                        span: (start, start + 100),
+                        mate_span: (0, 0),
+                        fixed_chunk: (gene, gene),
+                        flex_chunk: (gene, gene),
+                    });
+                }
+            }
+            assembly
+        };
+        // Two of five genes hit: chunk breadth 0.4, but fewer than three genes.
+        let two = tests.measure(7, &mut assembly(&[1, 2]));
+        assert_eq!(two.marker_genes_hit, Some(2));
+        assert!((two.fixed_chunk - 0.4).abs() < 1e-9);
+        assert!(!tests.covers(&two));
+        let three = tests.measure(7, &mut assembly(&[1, 2, 3]));
+        assert_eq!(three.marker_genes_hit, Some(3));
+        assert!(tests.covers(&three));
+        // A genome without marker genes is measured over its sequence.
+        assert_eq!(
+            tests.measure(8, &mut assembly(&[1, 2])).marker_genes_hit,
+            None
+        );
     }
 }
