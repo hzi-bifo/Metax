@@ -189,6 +189,12 @@ fn is_noisy_long_read_accuracy(accuracy: f64) -> bool {
     accuracy.is_finite() && accuracy < NOISY_LONG_READ_ACCURACY
 }
 
+/// Whether reads from `sequencer` with this sampled mean predicted base
+/// `accuracy` are noisy long reads.
+fn noisy_long_reads(sequencer: Sequencer, accuracy: Option<f64>) -> bool {
+    sequencer.is_long_read() && accuracy.is_some_and(is_noisy_long_read_accuracy)
+}
+
 /// Map a sampled mean predicted base accuracy to a self-calibrated long-read
 /// identity cutoff, or `None` to keep the preset cutoff.
 ///
@@ -481,10 +487,8 @@ impl MetaxApp {
         // Invoke the in-process mapper with preset + mode parameters.
         // Short reads record their accuracy too, for their identity cutoff;
         // only long reads switch the mapper's seeding.
-        let noisy_long_reads = self.config.sequencer.is_long_read()
-            && profiler
-                .sampled_mean_base_accuracy
-                .is_some_and(is_noisy_long_read_accuracy);
+        let noisy_long_reads =
+            noisy_long_reads(self.config.sequencer, profiler.sampled_mean_base_accuracy);
         let mapper = Mapper::new(
             db.clone(),
             sequences,
@@ -953,7 +957,7 @@ impl MetaxApp {
             mapped_len,
             fraction,
             identity_check_accuracy,
-            ..
+            sampled_mean_base_accuracy,
         } = thresholds;
         // Reject invalid resolved thresholds early.
         if identity <= 0.0 || mapped_len == 0 || fraction <= 0.0 {
@@ -1028,6 +1032,7 @@ impl MetaxApp {
             exact_ties: self.config.exact_ties,
             identity,
             identity_check_accuracy,
+            noisy_long_reads: noisy_long_reads(self.config.sequencer, sampled_mean_base_accuracy),
             mapped_len,
             breadth: self.config.breadth,
             chunk_breadth: self.config.chunk_breadth,

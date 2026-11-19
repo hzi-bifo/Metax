@@ -2503,6 +2503,7 @@ mod tests {
             exact_ties: ExactTiePolicy::Ambiguous,
             identity: 0.97,
             identity_check_accuracy: None,
+            noisy_long_reads: false,
             mapped_len: 50,
             breadth: Some(0.0),
             chunk_breadth: Some(0.0),

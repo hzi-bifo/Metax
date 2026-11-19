@@ -686,6 +686,11 @@ pub struct ProfilerConfig {
     /// When set, the cutoff is lowered if the reads align worse than this.
     pub identity_check_accuracy: Option<f64>,
 
+    /// Long reads whose sampled mean predicted base accuracy is below the
+    /// noisy-read limit (as the mapper decides): many reads of a present
+    /// species then align below the species identity cutoff.
+    pub noisy_long_reads: bool,
+
     /// Minimum number of mapped bases to keep a mapping
     pub mapped_len: usize,
 
@@ -1405,6 +1410,7 @@ mod chunk_basis_tests {
             is_paired: false,
             exact_ties: ExactTiePolicy::GuardedMap,
             identity: 0.97,
+            noisy_long_reads: false,
             identity_check_accuracy: None,
             mapped_len: 50,
             breadth: None,

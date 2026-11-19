@@ -335,6 +335,14 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             genus_rows.iter().fold(0.0, |total, row| total + row.fragments)
         );
     }
+    // On noisy long reads many reads of a present species align below the
+    // species gates; those whose best match is a kept species are its reads,
+    // not the family level's. Other reads keep the family level as it is.
+    let noisy_kept: HashSet<u32> = if cfg.noisy_long_reads {
+        best_fit.keys().copied().collect()
+    } else {
+        HashSet::new()
+    };
     // Family rows from fragments with no candidate at the species identity,
     // built with the default engine's genus fallback gates: they come from
     // genomes missing from the database, which their reads cannot place in a
@@ -372,6 +380,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                 layout: &rollup.layout,
                 unit_of: &family_of,
                 excluded: &excluded,
+                kept: &noisy_kept,
                 rank: "family",
             },
         )
@@ -1526,8 +1535,9 @@ fn species_decisions(
 /// Where fragments without a species-level candidate go: the build `policy`
 /// (the genus identity, mapped length and aligned fraction), the unit each
 /// candidate species counts for (`unit_of`), the units that get no row
-/// (`excluded`) and the `rank` of its rows, with the EM penalty, the species
-/// tests and the genome layout.
+/// (`excluded`), the kept species whose best-matched reads stay with them
+/// (`kept`; noisy long reads only, else empty) and the `rank` of its rows, with
+/// the EM penalty, the species tests and the genome layout.
 struct UnmatchedLevel<'a> {
     policy: EvidencePolicy,
     penalty: f64,
@@ -1535,12 +1545,16 @@ struct UnmatchedLevel<'a> {
     layout: &'a GenomeLayout,
     unit_of: &'a HashMap<u32, u32>,
     excluded: &'a HashSet<u32>,
+    kept: &'a HashSet<u32>,
     rank: &'static str,
 }
 
 /// Rows from the fragments `reads` that have no candidate at the species
-/// identity. They are built again with the level's policy and their candidate
-/// species counted for their units; an EM shares them, and a fragment resolves
+/// identity. They are built again with the level's policy; a fragment whose
+/// best match, or one tied with it, is a kept species is that species' read,
+/// too noisy for the species gate, and is left out ([`best_match_kept`]). The
+/// others come from genomes missing from the database: their candidate
+/// species are counted for their units; an EM shares them, and a fragment resolves
 /// to a unit at [`RESOLVE_POSTERIOR`]. A unit gets a row when its resolved
 /// fragments number at least [`MIN_GENUS_FRAGMENTS`], reach
 /// [`MIN_WINDOW_SPREAD`] of the windows of the genome that holds most of them
@@ -1562,7 +1576,12 @@ fn unmatched_rows(
         policy,
         reads,
         |&read| read,
-        |&read, candidates| fragment_of(read, candidates, policy, unit_of),
+        |&read, candidates| {
+            if best_match_kept(read, candidates, policy, level.kept) {
+                return None;
+            }
+            fragment_of(read, candidates, policy, unit_of)
+        },
         |_, found| fragments.extend(found.map(|(fragment, _)| fragment)),
     );
     let shared = share_reads(&fragments, |_| true, level.penalty);
@@ -1674,6 +1693,24 @@ fn unmatched_rows(
     }
     rows.sort_by_key(|row| row.0);
     rows
+}
+
+/// Whether the best match of a fragment's `candidates` under `policy` (fewest
+/// errors, with the species-level tie margins), or one tied with it, is a
+/// species in `kept`.
+fn best_match_kept(
+    read: usize,
+    candidates: &[TerminalCandidate],
+    policy: EvidencePolicy,
+    kept: &HashSet<u32>,
+) -> bool {
+    fragment_of(read, candidates, policy, Some).is_some_and(|(fragment, _)| {
+        let fewest = fragment.candidates[0].1;
+        fragment
+            .candidates
+            .iter()
+            .any(|&(taxid, errors)| errors <= fewest && kept.contains(&taxid))
+    })
 }
 
 /// The family of every species in `species_to_genus` whose genus has one.
@@ -2544,5 +2581,36 @@ mod tests {
         // A wider gap keeps it.
         let (left_out, _) = identity_relatives(&genus_of, &species, 0.99, (None, Some(0.02)));
         assert!(left_out.is_empty());
+    }
+
+    #[test]
+    fn a_read_whose_best_match_is_a_kept_species_stays_with_it() {
+        // One read below the species identity: best on species 3 (identity
+        // 0.90), then species 2 (0.88) and 4 (0.85).
+        let data = data(vec![vec![
+            row(2, 20, 0.88),
+            row(3, 30, 0.90),
+            row(4, 40, 0.85),
+        ]]);
+        let policy = EvidencePolicy {
+            mode: EvidenceMode::Single,
+            identity: 0.80,
+            mapped_len: 50,
+            fraction: 0.6,
+            collect_exact_ties: false,
+            collect_identities: false,
+            collect_best_placements: false,
+        };
+        let mut scratch = CandidateScratch::default();
+        let candidates = scratch.build(&data.read_alignments[0].alignments, policy);
+        assert!(best_match_kept(0, candidates, policy, &HashSet::from([3])));
+        // Kept species that match worse than the best do not hold the read.
+        assert!(!best_match_kept(
+            0,
+            candidates,
+            policy,
+            &HashSet::from([2, 4])
+        ));
+        assert!(!best_match_kept(0, candidates, policy, &HashSet::new()));
     }
 }
