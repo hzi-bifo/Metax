@@ -117,6 +117,8 @@ fn record_terminal_rank(
     }
 }
 
+mod levels;
+
 /// Information about a single alignment of a read to a reference.
 ///
 /// Derived fields are computed once where the alignment enters the profiler --
@@ -125,8 +127,6 @@ fn record_terminal_rank(
 /// are invariant for a given alignment, so the taxonomy-assignment loop is
 /// purely arithmetic and touches no `HashMap` or `String::split` per
 /// alignment.
-mod levels;
-
 type AlignmentEntry = EvidenceAlignment;
 
 /// Narrow a genomic coordinate/length to `u32` for the packed

@@ -24,7 +24,8 @@ use super::ProfileRank;
 pub(crate) const MIN_CHUNK_RATIO: f64 = 0.40;
 /// Lowest share of genome windows that its reads must reach.
 pub(crate) const MIN_WINDOW_SPREAD: f64 = 0.50;
-/// Fewest fragments a genus row needs.
+/// Fewest fragments a genus row needs; the level-wise engine asks as many of
+/// a family row.
 pub(crate) const MIN_GENUS_FRAGMENTS: f64 = 200.0;
 
 /// Fewest fragments of a removed species reported at species for its even

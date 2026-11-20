@@ -112,14 +112,21 @@ struct SpeciesShare {
 /// Settings shared by every species.
 pub(super) struct GenomeLevel {
     pub(super) policy: EvidencePolicy,
+    /// The sample's error rate, which sets the EM's error penalty.
     pub(super) error_rate: f64,
-    pub(super) penalty: f64,
     /// Report genomes on their own (`--strain`).
     pub(super) report_strains: bool,
     pub(super) chunk_cutoff: f64,
     pub(super) ratio_bounds: (f64, f64),
     pub(super) max_iterations: usize,
     pub(super) tolerance: f64,
+}
+
+impl GenomeLevel {
+    /// The EM's penalty per error at the sample's error rate.
+    fn penalty(&self) -> f64 {
+        likelihood_em::error_penalty(self.error_rate)
+    }
 }
 
 /// For each species of `species_of`, share its fragments among its genomes;
@@ -131,6 +138,7 @@ pub(super) fn resolve(
     species_of: &[Option<u32>],
     level: &GenomeLevel,
 ) -> GenomeResult {
+    let penalty = level.penalty();
     let mut shares = genome_fragments(data, fragments, species_of, level.policy)
         .into_iter()
         .collect::<Vec<_>>()
@@ -141,12 +149,7 @@ pub(super) fn resolve(
                 .iter()
                 .map(|m| groups.add(m.genomes.iter().map(|g| (g.0, g.1)).collect()))
                 .collect::<Vec<_>>();
-            let em = likelihood_em::run(
-                &groups,
-                level.penalty,
-                level.max_iterations,
-                level.tolerance,
-            );
+            let em = likelihood_em::run(&groups, penalty, level.max_iterations, level.tolerance);
             let best_fit = em
                 .weight
                 .iter()
@@ -580,7 +583,7 @@ fn share_among_kept(
         .collect::<Vec<_>>();
     let em = likelihood_em::run(
         &groups,
-        level.penalty,
+        level.penalty(),
         level.max_iterations,
         level.tolerance,
     );
@@ -624,7 +627,6 @@ mod tests {
                 collect_best_placements: false,
             },
             error_rate: 0.003,
-            penalty: likelihood_em::error_penalty(0.003),
             report_strains: false,
             chunk_cutoff: 0.5,
             ratio_bounds: (0.75, 0.75),

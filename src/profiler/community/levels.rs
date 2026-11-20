@@ -10,22 +10,27 @@
 //! species wins enough of the fragments it could explain, and is reported on
 //! the kept genome where most of its fragments fit best. Removed species are
 //! then judged again, strongest first, against the species kept so far, so
-//! that a removed sister no longer splits the fragments it ties on. Fragments
-//! with no candidate at the species identity are offered to their families.
-//! A second EM shares
-//! the fragments among the kept species, and abundance is the resulting depth
-//! on each species' best-fit genome; a fragment on a marker genome counts as
-//! one on the whole genome ([`fragment_depth`]). Read counts are given as full-
-//! index equivalents, scaled up for genomes indexed in sampled segments. On a
-//! database with such genomes, a species whose reads are far less identical
-//! than the sample's typical species is left out beside a kept congener and
-//! otherwise reported at its genus; with `--relative-identity-gap` (on by
-//! default for single-end reads on such a database) a species is left out
-//! beside a deeper congener whose reads are that much more identical
-//! ([`identity_relatives`]). A genome represented by marker genes is
-//! measured gene by gene ([`MarkerModel`]); the tests are the same. With
-//! `--save-raw-profile` the engine also writes `<prefix>.levels_genomes.tsv`,
-//! the tests of every measured genome.
+//! that a removed sister no longer splits the fragments it ties on
+//! ([`second_look`]); a removed species is also kept when the fragments it won
+//! that list no kept species cover one of its genomes on their own
+//! ([`own_evidence_look`]), and a kept virus is removed when its own fragments
+//! do not cover the part of its genome that no kept bacterium or archaeon
+//! explains ([`prophage_look`]). Fragments with no candidate at the species
+//! identity are offered to their families; on noisy long reads, those whose
+//! best match is a kept species count for it instead ([`credited_reads`]). A
+//! second EM shares the fragments among the kept species, and abundance is the
+//! resulting depth on each species' best-fit genome; a fragment on a marker
+//! genome counts as one on the whole genome ([`fragment_depth`]). Read counts
+//! are given as full-index equivalents, scaled up for genomes indexed in
+//! sampled segments. On a database with such genomes, a species whose reads
+//! are far less identical than the sample's typical species is left out beside
+//! a kept congener and otherwise reported at its genus; with
+//! `--relative-identity-gap` (on by default for single-end reads on such a
+//! database) a species is left out beside a deeper congener whose reads are
+//! that much more identical ([`identity_relatives`]). A genome represented by
+//! marker genes is measured gene by gene ([`MarkerModel`]); the tests are the
+//! same. With `--save-raw-profile` the engine also writes
+//! `<prefix>.levels_genomes.tsv`, the tests of every measured genome.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -35,10 +40,10 @@ use rayon::prelude::*;
 
 use super::{add_marker_genome_reads, fragment_depth, CommunityProfiler, MappingData};
 use crate::profiler::evidence::{
-    calculate_coverage, pvalue_passes, standard_ratio_lower_bounds, witness_is_better,
-    CandidatePlacement, CandidateScratch, EvidenceCoverage, EvidenceMode, EvidencePolicy, GeneHit,
-    PremapChunkGuard, PresenceAssembly, PresenceInterval, RescueKinds, TerminalCandidate,
-    WitnessDecision, STANDARD_RATIO_UPPER,
+    calculate_coverage, pvalue_passes, standard_ratio_lower_bounds, CandidatePlacement,
+    CandidateScratch, EvidenceCoverage, EvidenceMode, EvidencePolicy, GeneHit, PremapChunkGuard,
+    PresenceAssembly, PresenceInterval, RescueKinds, TerminalCandidate, WitnessDecision,
+    STANDARD_RATIO_UPPER,
 };
 use crate::profiler::identity::MIN_JUDGED_SPECIES;
 use crate::profiler::likelihood_em::{self, ReadGroups};
@@ -100,6 +105,18 @@ struct Fragment {
     bases: f64,
 }
 
+impl Fragment {
+    /// The candidates tied with the best: candidates are sorted by errors, and
+    /// those within the tie margin of the best carry exactly its errors.
+    fn best_tied(&self) -> &[(u32, f64)] {
+        let Some(&(_, fewest)) = self.candidates.first() else {
+            return &[];
+        };
+        let tied = self.candidates.iter().take_while(|c| c.1 == fewest).count();
+        &self.candidates[..tied]
+    }
+}
+
 /// Fragments shared among a set of species: the EM's read groups, each
 /// fragment's group, and each group's bases.
 struct SharedReads {
@@ -154,7 +171,6 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             "the level-wise engine takes Illumina reads or long reads without --strain for now"
         )
     })?;
-    let mode = policy.mode;
     let (fragments, unmatched, error_rate) = collect_fragments(&data, policy);
     let penalty = likelihood_em::error_penalty(error_rate);
     log::info!(
@@ -169,35 +185,22 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     // species with posterior >= RESOLVE_POSTERIOR adds to the coverage of
     // that species' genomes.
     let all = share_reads(&fragments, |_| true, penalty);
-    let first = likelihood_em::run(&all.groups, penalty, cfg.max_em_iterations, EM_TOLERANCE);
-    let resolved_taxid = first
+    let first_em = likelihood_em::run(&all.groups, penalty, cfg.max_em_iterations, EM_TOLERANCE);
+    let resolved_taxid = first_em
         .posteriors
         .iter()
         .map(|posteriors| resolved_unit(posteriors))
         .collect::<Vec<_>>();
-    // Fragments listing each species among their candidates, and those resolved
-    // to it.
-    let mut counts = FragmentCounts::default();
-    for &group in all.group_of.iter().flatten() {
-        let resolved = resolved_taxid[group];
-        for &(taxid, _) in &first.posteriors[group] {
-            *counts.candidates.entry(taxid).or_default() += 1;
-            if resolved.is_some() {
-                *counts.resolved_candidates.entry(taxid).or_default() += 1;
-            }
-        }
-        if let Some(taxid) = resolved {
-            *counts.won.entry(taxid).or_default() += 1;
-        }
-    }
-    let resolved_fragments = fragments
-        .iter()
-        .zip(&all.group_of)
-        .filter_map(|(fragment, group)| {
-            group
-                .and_then(|g| resolved_taxid[g])
-                .map(|taxid| (fragment.read, taxid))
-        })
+    let first = FirstEm {
+        fragments: &fragments,
+        group_of: &all.group_of,
+        em: &first_em,
+        resolved: &resolved_taxid,
+    };
+    let mut counts = first.counts();
+    let resolved_fragments = first
+        .won()
+        .map(|(fragment, taxid)| (fragments[fragment].read, taxid))
         .collect::<Vec<_>>();
     let mut genomes: HashMap<u32, GenomeEvidence> = HashMap::new();
     fold_candidates(
@@ -209,14 +212,15 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         |r, hits| add_hits(&mut genomes, r.1, hits),
     );
 
-    let (oebr_default, coebr_default) = standard_ratio_lower_bounds(ProfileRank::Species, mode);
-    let min_oebr = cfg.min_oebr.unwrap_or(oebr_default);
+    let (oebr_default, coebr_default) =
+        standard_ratio_lower_bounds(ProfileRank::Species, policy.mode);
     let min_coebr = cfg.min_coebr.unwrap_or(coebr_default);
-    let species_bounds = (cfg.min_oebr.unwrap_or(SPECIES_MIN_OEBR), min_coebr);
+    // The genome level keeps the default engine's bounds.
+    let genome_bounds = (cfg.min_oebr.unwrap_or(oebr_default), min_coebr);
     let tests = SpeciesTests {
         multiple_tests: genomes.len().max(1),
         chunk_cutoff: data.min_chunk_breadth,
-        ratio_bounds: species_bounds,
+        ratio_bounds: (cfg.min_oebr.unwrap_or(SPECIES_MIN_OEBR), min_coebr),
         markers: data.marker_model.clone(),
         min_marker_genes: cfg.min_marker_genes,
     };
@@ -225,37 +229,16 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         let candidates = counts.candidates.get(&genome.taxid).copied().unwrap_or(0);
         tests.judge(id, genome, won, candidates);
     });
-    let taken = second_look(
-        &data,
-        policy,
-        &FirstEm {
-            fragments: &fragments,
-            group_of: &all.group_of,
-            em: &first,
-            resolved: &resolved_taxid,
-        },
-        &tests,
-        &mut counts,
-        &mut genomes,
-    );
+    let taken = second_look(&data, policy, &first, &tests, &mut counts, &mut genomes);
     log::info!(
         target: "PROFILER",
         "Level-wise engine: second look kept {} removed species on {} fragments their removed sisters tied on.",
         taken.len(),
         taken.values().map(Vec::len).sum::<usize>()
     );
-    let rescued = own_evidence_look(
-        &FirstEm {
-            fragments: &fragments,
-            group_of: &all.group_of,
-            em: &first,
-            resolved: &resolved_taxid,
-        },
-        &tests,
-        &mut counts,
-        &mut genomes,
-        |taxid, list| coverage_of(&data, policy, &fragments, &tests, taxid, list),
-    );
+    let rescued = own_evidence_look(&first, &tests, &mut counts, &mut genomes, |taxid, list| {
+        coverage_of(&data, policy, &fragments, &tests, taxid, list)
+    });
     let at_genus: HashSet<u32> = rescued
         .iter()
         .filter(|&(_, &genus)| genus)
@@ -269,12 +252,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         at_genus.len()
     );
     let removed_viruses = prophage_look(
-        &FirstEm {
-            fragments: &fragments,
-            group_of: &all.group_of,
-            em: &first,
-            resolved: &resolved_taxid,
-        },
+        &first,
         &taken,
         &tests,
         &mut genomes,
@@ -288,7 +266,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         removed_viruses.len()
     );
     if cfg.keep_raw {
-        write_genome_diagnostics(profiler, &data, &genomes, &counts, species_bounds)?;
+        write_genome_diagnostics(profiler, &data, &genomes, &counts, &tests)?;
     }
     // Best-fit genome of each kept species: its kept genome where most of its
     // fragments fit best, then the one with most fragments.
@@ -312,9 +290,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     // strongest genome is its decision, and a removed species whose reads
     // cover its genome evenly is kept on that genome.
     let rollup = data.genus_rollup.as_deref();
-    let decisions = rollup.map_or_else(HashMap::new, |rollup| {
-        species_decisions(&mut genomes, rollup)
-    });
+    let decisions = rollup.map_or_else(HashMap::new, |rollup| species_decisions(&genomes, rollup));
     let decision_metrics: HashMap<u32, WitnessDecision> = decisions
         .iter()
         .map(|(&taxid, &(decision, _))| (taxid, decision))
@@ -340,32 +316,34 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         "Level-wise engine: {} species kept, {} read groups, EM {} + {} iterations; {} fragments without a kept species.",
         best_fit.len(),
         kept.groups.len(),
-        first.iterations,
+        first_em.iterations,
         em.iterations,
         without_kept
     );
-    let genus_rows = rollup.map_or_else(Vec::new, |rollup| {
-        let accepted: HashSet<u32> = best_fit.keys().copied().collect();
-        orphan_genus_rows(
-            &data,
-            &fragments,
-            &kept.group_of,
-            policy,
-            rollup,
-            &decision_metrics,
-            &accepted,
-        )
-    });
-    if rollup.is_some() {
-        log::info!(
-            target: "PROFILER",
-            "Level-wise engine: {} species kept for even coverage; {} genus rows from {:.0} fragments of removed species.",
-            even_species,
-            genus_rows.len(),
-            // A float sum of no rows is -0.0, printed "-0".
-            genus_rows.iter().fold(0.0, |total, row| total + row.fragments)
-        );
-    }
+    let genus_rows = match rollup {
+        Some(rollup) => {
+            let accepted: HashSet<u32> = best_fit.keys().copied().collect();
+            let rows = orphan_genus_rows(
+                &data,
+                &fragments,
+                &kept.group_of,
+                policy,
+                rollup,
+                &decision_metrics,
+                &accepted,
+            );
+            log::info!(
+                target: "PROFILER",
+                "Level-wise engine: {} species kept for even coverage; {} genus rows from {:.0} fragments of removed species.",
+                even_species,
+                rows.len(),
+                // A float sum of no rows is -0.0, printed "-0".
+                rows.iter().fold(0.0, |total, row| total + row.fragments)
+            );
+            rows
+        }
+        None => Vec::new(),
+    };
     // Fragments with no candidate at the species identity are built again with
     // the default engine's genus fallback gates.
     let genus_policy = EvidencePolicy {
@@ -387,47 +365,48 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     };
     // Family rows from those fragments: they come from genomes missing from
     // the database, which their reads cannot place in a genus.
-    let family_level = rollup.map_or_else(Vec::new, |rollup| {
-        let family_of = family_map(&profiler.taxonomy, &data.genus_of_species);
-        // On a fractional database, reads from the unindexed parts of a kept
-        // genome land on the sampled segments of its relatives, while the kept
-        // species' reads already stand for its whole genome: its family gets
-        // no family row (as its genus gets no roll-up row).
-        let excluded: HashSet<u32> = if rollup.fractional {
-            best_fit
-                .keys()
-                .filter_map(|taxid| family_of.get(taxid).copied())
-                .collect()
-        } else {
-            HashSet::new()
-        };
-        unmatched_rows(
-            profiler,
-            &data,
-            &unmatched,
-            &UnmatchedLevel {
-                policy: genus_policy,
-                penalty,
-                tests: &tests,
-                layout: &rollup.layout,
-                unit_of: &family_of,
-                excluded: &excluded,
-                kept: &noisy_kept,
-                rank: "family",
-            },
-        )
-    });
-    if rollup.is_some() {
-        log::info!(
-            target: "PROFILER",
-            "Level-wise engine: {} fragments without a species-level candidate; {} family rows from {:.0} of them.",
-            unmatched.len(),
-            family_level.len(),
-            family_level
-                .iter()
-                .fold(0.0, |total, (_, row)| total + row.equivalent_mapcount)
-        );
-    }
+    let family_level = match rollup {
+        Some(rollup) => {
+            let family_of = family_map(&profiler.taxonomy, &data.genus_of_species);
+            // On a fractional database, reads from the unindexed parts of a kept
+            // genome land on the sampled segments of its relatives, while the kept
+            // species' reads already stand for its whole genome: its family gets
+            // no family row (as its genus gets no roll-up row).
+            let excluded: HashSet<u32> = if rollup.fractional {
+                best_fit
+                    .keys()
+                    .filter_map(|taxid| family_of.get(taxid).copied())
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+            let rows = unmatched_rows(
+                profiler,
+                &data,
+                &unmatched,
+                &UnmatchedLevel {
+                    policy: genus_policy,
+                    penalty,
+                    tests: &tests,
+                    layout: &rollup.layout,
+                    unit_of: &family_of,
+                    excluded: &excluded,
+                    kept: &noisy_kept,
+                    rank: "family",
+                },
+            );
+            log::info!(
+                target: "PROFILER",
+                "Level-wise engine: {} fragments without a species-level candidate; {} family rows from {:.0} of them.",
+                unmatched.len(),
+                rows.len(),
+                rows.iter()
+                    .fold(0.0, |total, (_, row)| total + row.equivalent_mapcount)
+            );
+            rows
+        }
+        None => Vec::new(),
+    };
     // Each species' share of the fragments' bases.
     let mut bases = kept.unit_bases(&em);
 
@@ -445,10 +424,9 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         &genomes::GenomeLevel {
             policy,
             error_rate,
-            penalty,
             report_strains: cfg.genome_level,
             chunk_cutoff: data.min_chunk_breadth,
-            ratio_bounds: (min_oebr, min_coebr),
+            ratio_bounds: genome_bounds,
             max_iterations: cfg.max_em_iterations,
             tolerance: EM_TOLERANCE,
         },
@@ -471,9 +449,6 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     if cfg.keep_raw && cfg.genome_level {
         write_strain_diagnostics(profiler, &data, &genome_result.diagnostics)?;
     }
-    // Estimated ANI of the sample's strain to a genome: its fragments' mean
-    // identity to the genome relative to the sample's baseline identity.
-    let ani = |identity: f64| (1.0 - (baseline_identity - identity)).min(1.0);
     // The genome each kept species is reported on: its best-fit genome when
     // the genome level found one among its measured genomes, otherwise the
     // kept genome chosen above.
@@ -488,7 +463,10 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             (taxid, id)
         })
         .collect();
-    let markers = data
+    let MarkerEvidence {
+        depth: mut marker_depth,
+        genome_reads,
+    } = data
         .marker_model
         .as_deref()
         .map_or_else(MarkerEvidence::default, |model| {
@@ -504,7 +482,6 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                 ),
             )
         });
-    let marker_depth = &markers.depth;
     // Reads from the unindexed parts of a sampled genome land on its relatives:
     // the margin on a database with sampled genomes, and the relative identity
     // guard where it is on.
@@ -543,16 +520,20 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     };
     // The fragments that the family level leaves to a kept species, too noisy
     // for the species gates, count for it.
-    let credit = rollup.is_some() && cfg.noisy_long_reads;
-    let credited = rollup
-        .filter(|_| credit)
-        .map_or_else(Credited::default, |_| {
-            credited_reads(&data, genus_policy, &unmatched, (&em.weight, &reported))
-        });
+    let credited = if rollup.is_some() && cfg.noisy_long_reads {
+        let credited = credited_reads(&data, genus_policy, &unmatched, (&em.weight, &reported));
+        log::info!(
+            target: "PROFILER",
+            "Level-wise engine: {:.0} fragments without a species-level candidate credited to the kept species that match them best.",
+            credited.reads.values().sum::<f64>()
+        );
+        credited
+    } else {
+        Credited::default()
+    };
     for (taxid, added) in &credited.bases {
         *bases.entry(*taxid).or_insert(0.0) += added;
     }
-    let mut marker_depth = marker_depth.clone();
     for (taxid, added) in &credited.marker_depth {
         *marker_depth.entry(*taxid).or_insert(0.0) += added;
     }
@@ -560,13 +541,6 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         em.weight.get(&taxid).copied().unwrap_or(0.0)
             + credited.reads.get(&taxid).copied().unwrap_or(0.0)
     };
-    if credit {
-        log::info!(
-            target: "PROFILER",
-            "Level-wise engine: {:.0} fragments without a species-level candidate credited to the kept species that match them best.",
-            credited.reads.values().sum::<f64>()
-        );
-    }
 
     // Species rows, each followed by the genomes reported on their own. The
     // rows of a species are exclusive: the species row keeps what no reported
@@ -596,11 +570,16 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         // Every row of the level-wise engine has the identity columns, NA when
         // the species has no fragments of its own.
         let identity = Some(found.map_or((f64::NAN, f64::NAN), |g| {
-            (g.mean_identity, ani(g.mean_identity))
+            (
+                g.mean_identity,
+                estimated_ani(baseline_identity, g.mean_identity),
+            )
         }));
-        if let Some(&genus) = (at_genus.contains(&taxid) || low_at_genus.contains(&taxid))
-            .then(|| data.genus_of_species.get(&taxid))
-            .flatten()
+        let reported_at_genus = at_genus.contains(&taxid) || low_at_genus.contains(&taxid);
+        if let Some(&genus) = data
+            .genus_of_species
+            .get(&taxid)
+            .filter(|_| reported_at_genus)
         {
             let reads = reads_of(taxid);
             let species_bases = bases.get(&taxid).copied().unwrap_or(0.0);
@@ -638,7 +617,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         });
         let mut strains = Vec::new();
         for strain in reported {
-            let strain_ani = (1.0 - (strain_baseline - strain.mean_identity)).min(1.0);
+            let strain_ani = estimated_ani(strain_baseline, strain.mean_identity);
             let accession = data.assembly_names[strain.assembly_id as usize].clone();
             let (name, strain_taxid) = match strain_taxids.get(&*accession) {
                 Some(&t) => (
@@ -681,14 +660,18 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         .map(|row| {
             (
                 row.genus,
-                genus_profile_row(
+                profile_row(
                     profiler
                         .taxonomy
                         .get_name(row.genus)
                         .unwrap_or("unknown")
                         .to_string(),
-                    row,
+                    row.genus,
+                    "genus",
+                    (row.fragments, row.depth),
+                    &row.witness,
                     data.assembly_names[decisions[&row.donors[0]].1 as usize].clone(),
+                    Some((f64::NAN, f64::NAN)),
                 ),
             )
         })
@@ -757,7 +740,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             .then(a.taxid.cmp(&b.taxid))
             .then_with(|| row_genome(a).cmp(&row_genome(b)))
     });
-    let unclassified = profiler.estimate_unclassified(&data, &rows, &markers.genome_reads);
+    let unclassified = profiler.estimate_unclassified(&data, &rows, &genome_reads);
     profiler.write_profile_files(&rows, unclassified, raw_rows)
 }
 
@@ -806,7 +789,7 @@ fn longest_alignment(candidates: &[TerminalCandidate]) -> f64 {
 /// Read `read` as a fragment with its candidate units and their errors, with
 /// the errors and aligned bases of its best candidate; `None` without one.
 /// `unit` gives the unit a candidate species counts for (the species itself,
-/// or its genus); a unit keeps the fewest errors of its species.
+/// or its family); a unit keeps the fewest errors of its species.
 fn fragment_of(
     read: usize,
     candidates: &[TerminalCandidate],
@@ -922,6 +905,12 @@ fn add_placement(
     });
 }
 
+/// Estimated ANI of the sample's strain to a genome: its fragments' mean
+/// `identity` to the genome relative to the sample's `baseline` identity.
+fn estimated_ani(baseline: f64, identity: f64) -> f64 {
+    (1.0 - (baseline - identity)).min(1.0)
+}
+
 /// The identity rules for relatives, over the kept `species` with their mean
 /// identity to their best-fit genome and their depth. With a `margin` (on a
 /// database whose genomes are indexed in sampled segments, where the reads of a
@@ -1029,16 +1018,6 @@ fn marker_evidence(
                 .filter(|p| on_markers(p.0))
                 .filter_map(|&(taxid, share)| {
                     let candidate = candidates.iter().find(|c| c.taxid == taxid)?;
-                    let placement = candidate
-                        .placements
-                        .iter()
-                        .find(|p| p.assembly_id == reported[&taxid])
-                        .copied()
-                        .unwrap_or(candidate.best);
-                    let mapped = match policy.mode {
-                        EvidenceMode::Paired | EvidenceMode::Single => placement.r1_mapped,
-                        EvidenceMode::Long => placement.both_mapped,
-                    };
                     let resolved =
                         (unclassified.is_some() && share >= RESOLVE_POSTERIOR).then(|| {
                             (
@@ -1048,7 +1027,13 @@ fn marker_evidence(
                         });
                     Some((
                         taxid,
-                        share * fragment_depth(placement, mapped, Some(model)),
+                        share
+                            * marker_fragment_depth(
+                                candidate,
+                                reported[&taxid],
+                                policy.mode,
+                                model,
+                            ),
                         resolved,
                     ))
                 })
@@ -1075,10 +1060,32 @@ fn marker_evidence(
     evidence
 }
 
+/// The depth that a fragment adds on marker genome `assembly_id` of its
+/// `candidate` species ([`fragment_depth`]), from its placement there or else
+/// its best one, with the first mate's mapped bases for short reads.
+fn marker_fragment_depth(
+    candidate: &TerminalCandidate,
+    assembly_id: u32,
+    mode: EvidenceMode,
+    model: &MarkerModel,
+) -> f64 {
+    let placement = candidate
+        .placements
+        .iter()
+        .find(|p| p.assembly_id == assembly_id)
+        .copied()
+        .unwrap_or(candidate.best);
+    let mapped = match mode {
+        EvidenceMode::Paired | EvidenceMode::Single => placement.r1_mapped,
+        EvidenceMode::Long => placement.both_mapped,
+    };
+    fragment_depth(placement, mapped, Some(model))
+}
+
 /// Build the candidates of each item's read on the profiler's threads, take
 /// what a pass needs with `extract`, and hand the results to `fold` in item
 /// order, [`PARALLEL_BLOCK`] items at a time.
-pub(super) fn fold_candidates<I: Sync, T: Send>(
+fn fold_candidates<I: Sync, T: Send>(
     data: &MappingData,
     policy: EvidencePolicy,
     items: &[I],
@@ -1142,6 +1149,25 @@ fn add_hits(genomes: &mut HashMap<u32, GenomeEvidence>, taxid: u32, hits: Specie
     }
 }
 
+/// Add the placements of the fragments `list` for species `taxid` to
+/// `genomes`, in list order ([`add_hits`]).
+fn add_fragment_hits(
+    data: &MappingData,
+    policy: EvidencePolicy,
+    fragments: &[Fragment],
+    (taxid, list): (u32, &[usize]),
+    genomes: &mut HashMap<u32, GenomeEvidence>,
+) {
+    fold_candidates(
+        data,
+        policy,
+        list,
+        |&f| fragments[f].read,
+        |_, candidates| species_placements(candidates, taxid),
+        |_, hits| add_hits(genomes, taxid, hits),
+    );
+}
+
 /// Fragments listing each species among their candidates, those resolved to
 /// any species, those resolved to it, those it took on the second look, and
 /// those it won with no kept species among their candidates.
@@ -1187,12 +1213,21 @@ impl SpeciesTests {
 
     /// Whether a genome's coverage is enough and evenly spread.
     fn covers(&self, coverage: &EvidenceCoverage) -> bool {
-        coverage.fixed_chunk > self.chunk_cutoff
+        self.amount_ok(coverage)
             && coverage
                 .marker_genes_hit
                 .is_none_or(|hit| hit >= self.min_marker_genes)
-            && within(coverage.oebr, self.ratio_bounds.0)
-            && within(coverage.coebr, self.ratio_bounds.1)
+            && self.evenness_ok(coverage)
+    }
+
+    /// Whether a genome's chunk breadth is above the cutoff.
+    fn amount_ok(&self, coverage: &EvidenceCoverage) -> bool {
+        coverage.fixed_chunk > self.chunk_cutoff
+    }
+
+    /// Whether both breadth ratios are within their bounds.
+    fn evenness_ok(&self, coverage: &EvidenceCoverage) -> bool {
+        within(coverage.oebr, self.ratio_bounds.0) && within(coverage.coebr, self.ratio_bounds.1)
     }
 }
 
@@ -1203,6 +1238,58 @@ struct FirstEm<'a> {
     group_of: &'a [Option<usize>],
     em: &'a likelihood_em::EmResult,
     resolved: &'a [Option<u32>],
+}
+
+impl FirstEm<'_> {
+    /// Fragments listing each species among their candidates, those resolved
+    /// to any species, and those resolved to it.
+    fn counts(&self) -> FragmentCounts {
+        let mut counts = FragmentCounts::default();
+        for &group in self.group_of.iter().flatten() {
+            let resolved = self.resolved[group];
+            for &(taxid, _) in &self.em.posteriors[group] {
+                *counts.candidates.entry(taxid).or_default() += 1;
+                if resolved.is_some() {
+                    *counts.resolved_candidates.entry(taxid).or_default() += 1;
+                }
+            }
+            if let Some(taxid) = resolved {
+                *counts.won.entry(taxid).or_default() += 1;
+            }
+        }
+        counts
+    }
+
+    /// Each fragment resolved to a species, with that species, in fragment
+    /// order.
+    fn won(&self) -> impl Iterator<Item = (usize, u32)> + '_ {
+        self.group_of
+            .iter()
+            .enumerate()
+            .filter_map(|(fragment, group)| {
+                group
+                    .and_then(|g| self.resolved[g])
+                    .map(|taxid| (fragment, taxid))
+            })
+    }
+
+    /// `taxids` ordered by their weight in the first EM, largest first, then
+    /// by taxid.
+    fn by_weight(&self, taxids: impl Iterator<Item = u32>) -> Vec<u32> {
+        let weight = |taxid: &u32| self.em.weight.get(taxid).copied().unwrap_or(0.0);
+        let mut order = taxids.collect::<Vec<_>>();
+        order.sort_by(|a, b| weight(b).total_cmp(&weight(a)).then(a.cmp(b)));
+        order
+    }
+}
+
+/// The species with a kept genome.
+fn kept_species(genomes: &HashMap<u32, GenomeEvidence>) -> HashSet<u32> {
+    genomes
+        .values()
+        .filter(|g| g.kept)
+        .map(|g| g.taxid)
+        .collect()
 }
 
 /// Second look at the removed species, largest first-EM weight first. Sister
@@ -1225,20 +1312,16 @@ fn second_look(
     counts: &mut FragmentCounts,
     genomes: &mut HashMap<u32, GenomeEvidence>,
 ) -> HashMap<u32, Vec<usize>> {
-    let mut kept: HashSet<u32> = genomes
-        .values()
-        .filter(|g| g.kept)
-        .map(|g| g.taxid)
-        .collect();
-    let mut order = first
-        .em
-        .weight
-        .iter()
-        .filter(|&(taxid, &weight)| weight > 0.0 && !kept.contains(taxid))
-        .map(|(&taxid, &weight)| (taxid, weight))
-        .collect::<Vec<_>>();
-    order.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-    let removed: HashSet<u32> = order.iter().map(|o| o.0).collect();
+    let mut kept = kept_species(genomes);
+    let order = first.by_weight(
+        first
+            .em
+            .weight
+            .iter()
+            .filter(|&(taxid, &weight)| weight > 0.0 && !kept.contains(taxid))
+            .map(|(&taxid, _)| taxid),
+    );
+    let removed: HashSet<u32> = order.iter().copied().collect();
     let mut open_groups: HashMap<u32, Vec<usize>> = HashMap::new();
     for (group, posteriors) in first.em.posteriors.iter().enumerate() {
         for &(taxid, _) in posteriors {
@@ -1255,7 +1338,7 @@ fn second_look(
     }
     let members = GroupMembers::new(first.group_of, first.em.posteriors.len());
     let mut taken_by = HashMap::new();
-    for &(taxid, _) in &order {
+    for taxid in order {
         let Some(groups) = open_groups.get(&taxid) else {
             continue;
         };
@@ -1274,17 +1357,12 @@ fn second_look(
             .flatten()
             .map(|id| (*id, genomes[id].clone()))
             .collect();
-        let reads = taken_fragments
-            .iter()
-            .map(|&fragment| first.fragments[fragment].read)
-            .collect::<Vec<_>>();
-        fold_candidates(
+        add_fragment_hits(
             data,
             policy,
-            &reads,
-            |&read| read,
-            |_, candidates| species_placements(candidates, taxid),
-            |_, hits| add_hits(&mut trial, taxid, hits),
+            first.fragments,
+            (taxid, &taken_fragments),
+            &mut trial,
         );
         let taken = taken_fragments.len() as u64;
         counts.second_look.insert(taxid, taken);
@@ -1335,11 +1413,7 @@ fn own_evidence_look(
     genomes: &mut HashMap<u32, GenomeEvidence>,
     mut coverage: impl FnMut(u32, &[usize]) -> Vec<(u32, EvidenceCoverage)>,
 ) -> HashMap<u32, bool> {
-    let mut kept: HashSet<u32> = genomes
-        .values()
-        .filter(|g| g.kept)
-        .map(|g| g.taxid)
-        .collect();
+    let mut kept = kept_species(genomes);
     let judged: HashSet<u32> = genomes
         .values()
         .filter(|g| !kept.contains(&g.taxid))
@@ -1348,31 +1422,27 @@ fn own_evidence_look(
         .collect();
     // The fragments each such species won, and those listing it.
     let mut won: HashMap<u32, Vec<usize>> = HashMap::new();
-    let mut listing: HashMap<u32, Vec<usize>> = HashMap::new();
-    for (index, (fragment, group)) in first.fragments.iter().zip(first.group_of).enumerate() {
-        if let Some(taxid) = group.and_then(|g| first.resolved[g]) {
-            if judged.contains(&taxid) {
-                won.entry(taxid).or_default().push(index);
-            }
+    for (index, taxid) in first.won() {
+        if judged.contains(&taxid) {
+            won.entry(taxid).or_default().push(index);
         }
+    }
+    let mut listing: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (index, fragment) in first.fragments.iter().enumerate() {
         for &(taxid, _) in &fragment.candidates {
             if judged.contains(&taxid) {
                 listing.entry(taxid).or_default().push(index);
             }
         }
     }
-    let mut order = won
-        .keys()
-        .map(|&taxid| (taxid, first.em.weight.get(&taxid).copied().unwrap_or(0.0)))
-        .collect::<Vec<_>>();
-    order.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let order = first.by_weight(won.keys().copied());
     let spans_genome = |coverages: &[(u32, EvidenceCoverage)]| {
         coverages
             .iter()
             .any(|(_, c)| c.fixed_chunk > tests.chunk_cutoff)
     };
     let mut rescued = HashMap::new();
-    for (taxid, _) in order {
+    for taxid in order {
         let with_kept = |f: &usize| {
             first.fragments[*f]
                 .candidates
@@ -1410,12 +1480,8 @@ fn own_evidence_look(
             .iter()
             .copied()
             .filter(|&f| {
-                let candidates = &first.fragments[f].candidates;
-                let best = candidates
-                    .iter()
-                    .take_while(|c| c.1 == candidates[0].1)
-                    .count();
-                best > 1 && candidates[..best].iter().any(|c| c.0 == taxid)
+                let best = first.fragments[f].best_tied();
+                best.len() > 1 && best.iter().any(|c| c.0 == taxid)
             })
             .collect::<Vec<_>>();
         let at_genus = !tied.is_empty() && spans_genome(&coverage(taxid, &tied));
@@ -1460,11 +1526,9 @@ fn prophage_look(
         return Vec::new();
     }
     let mut held: HashMap<u32, Vec<usize>> = HashMap::new();
-    for (index, group) in first.group_of.iter().enumerate() {
-        if let Some(taxid) = group.and_then(|g| first.resolved[g]) {
-            if viruses.contains(&taxid) {
-                held.entry(taxid).or_default().push(index);
-            }
+    for (index, taxid) in first.won() {
+        if viruses.contains(&taxid) {
+            held.entry(taxid).or_default().push(index);
         }
     }
     for (taxid, list) in taken {
@@ -1616,15 +1680,8 @@ fn evidence_of(
     taxid: u32,
     list: &[usize],
 ) -> HashMap<u32, GenomeEvidence> {
-    let mut genomes: HashMap<u32, GenomeEvidence> = HashMap::new();
-    fold_candidates(
-        data,
-        policy,
-        list,
-        |&f| fragments[f].read,
-        |_, candidates| species_placements(candidates, taxid),
-        |_, hits| add_hits(&mut genomes, taxid, hits),
-    );
+    let mut genomes = HashMap::new();
+    add_fragment_hits(data, policy, fragments, (taxid, list), &mut genomes);
     genomes
 }
 
@@ -1705,7 +1762,7 @@ fn species_remainder(
 }
 
 /// The rows of one taxon: a species row (unless every read is in a genome
-/// row) with its genome rows, or a genus row.
+/// row) with its genome rows, or a genus or family row.
 struct TaxonBlock {
     taxid: u32,
     taxon: Option<ProfileRow>,
@@ -1723,42 +1780,42 @@ impl TaxonBlock {
 /// in the default engine's witness order (lowest assembly id on a tie), with
 /// the window spread of its reads, and that genome.
 fn species_decisions(
-    genomes: &mut HashMap<u32, GenomeEvidence>,
+    genomes: &HashMap<u32, GenomeEvidence>,
     rollup: &GenusRollup,
 ) -> HashMap<u32, (WitnessDecision, u32)> {
     let mut decisions: HashMap<u32, (WitnessDecision, u32)> = HashMap::new();
-    for (&assembly_id, genome) in genomes.iter_mut() {
-        let Some(coverage) = genome.coverage.as_mut() else {
+    for (&assembly_id, genome) in genomes {
+        let Some(coverage) = genome.coverage else {
             continue;
         };
-        coverage.window_spread = rollup
-            .layout
-            .window_spread(assembly_id, &genome.assembly.intervals);
         let decision = WitnessDecision {
-            metrics: *coverage,
+            metrics: EvidenceCoverage {
+                window_spread: rollup
+                    .layout
+                    .window_spread(assembly_id, &genome.assembly.intervals),
+                ..coverage
+            },
             standard: genome.kept,
             rescues: RescueKinds::default(),
             required_premap_guard: PremapChunkGuard::default(),
         };
-        let better = decisions
-            .get(&genome.taxid)
-            .is_none_or(|&(current, current_id)| {
-                witness_is_better(decision, current)
-                    || (!witness_is_better(current, decision) && assembly_id < current_id)
-            });
-        if better {
-            decisions.insert(genome.taxid, (decision, assembly_id));
-        }
+        let (id, decision) = match decisions.get(&genome.taxid) {
+            Some(&(current, current_id)) => {
+                super::coherent_witness_max((current_id, current), (assembly_id, decision))
+            }
+            None => (assembly_id, decision),
+        };
+        decisions.insert(genome.taxid, (decision, id));
     }
     decisions
 }
 
 /// Where fragments without a species-level candidate go: the build `policy`
-/// (the genus identity, mapped length and aligned fraction), the unit each
-/// candidate species counts for (`unit_of`), the units that get no row
-/// (`excluded`), the kept species whose best-matched reads stay with them
-/// (`kept`; noisy long reads only, else empty) and the `rank` of its rows, with
-/// the EM penalty, the species tests and the genome layout.
+/// (the genus fallback identity, mapped length and aligned fraction), the
+/// unit each candidate species counts for (`unit_of`), the units that get no
+/// row (`excluded`), the kept species whose best-matched reads stay with them
+/// (`kept`; noisy long reads only, else empty) and the `rank` of its rows,
+/// with the EM penalty, the species tests and the genome layout.
 struct UnmatchedLevel<'a> {
     policy: EvidencePolicy,
     penalty: f64,
@@ -1775,14 +1832,14 @@ struct UnmatchedLevel<'a> {
 /// best match, or one tied with it, is a kept species is that species' read,
 /// too noisy for the species gate, and is left out ([`best_match_kept`]). The
 /// others come from genomes missing from the database: their candidate
-/// species are counted for their units; an EM shares them, and a fragment resolves
-/// to a unit at [`RESOLVE_POSTERIOR`]. A unit gets a row when its resolved
-/// fragments number at least [`MIN_GENUS_FRAGMENTS`], reach
-/// [`MIN_WINDOW_SPREAD`] of the windows of the genome that holds most of them
-/// (the reads of a genome missing from the database spread over the genome of
-/// a relative; reads of conserved genes from elsewhere stay in a few places),
-/// and are at least [`MIN_WON_SHARE`] of the fragments listing the unit.
-/// Returns the rows in unit order.
+/// species are counted for their units; an EM shares them, and a fragment
+/// resolves to a unit at [`RESOLVE_POSTERIOR`]. A unit gets a row when its
+/// resolved fragments number at least [`MIN_GENUS_FRAGMENTS`] (as many as a
+/// genus row of the roll-up needs), reach [`MIN_WINDOW_SPREAD`] of the windows
+/// of the genome that holds most of them (the reads of a genome missing from
+/// the database spread over the genome of a relative; reads of conserved genes
+/// from elsewhere stay in a few places), and are at least [`MIN_WON_SHARE`] of
+/// the fragments listing the unit. Returns the rows in unit order.
 fn unmatched_rows(
     profiler: &CommunityProfiler,
     data: &MappingData,
@@ -1920,11 +1977,10 @@ fn best_match_kept(
     kept: &HashSet<u32>,
 ) -> bool {
     fragment_of(read, candidates, policy, Some).is_some_and(|(fragment, _)| {
-        let fewest = fragment.candidates[0].1;
         fragment
-            .candidates
+            .best_tied()
             .iter()
-            .any(|&(taxid, errors)| errors <= fewest && kept.contains(&taxid))
+            .any(|(taxid, _)| kept.contains(taxid))
     })
 }
 
@@ -1958,16 +2014,13 @@ fn credited_reads(
         |&read| read,
         |&read, candidates| {
             let (fragment, _) = fragment_of(read, candidates, policy, Some)?;
-            let fewest = fragment.candidates[0].1;
             let tied = fragment
-                .candidates
+                .best_tied()
                 .iter()
-                .filter(|&&(taxid, errors)| {
-                    errors <= fewest
-                        && reported.contains_key(&taxid)
-                        && weight.get(&taxid).is_some_and(|&w| w > 0.0)
-                })
                 .map(|&(taxid, _)| taxid)
+                .filter(|taxid| {
+                    reported.contains_key(taxid) && weight.get(taxid).is_some_and(|&w| w > 0.0)
+                })
                 .collect::<Vec<_>>();
             let total: f64 = tied.iter().map(|taxid| weight[taxid]).sum();
             (total > 0.0).then(|| {
@@ -1978,19 +2031,15 @@ fn credited_reads(
                             .filter(|model| model.is_marker_genome(reported[&taxid]))
                             .and_then(|model| {
                                 let candidate = candidates.iter().find(|c| c.taxid == taxid)?;
-                                let placement = candidate
-                                    .placements
-                                    .iter()
-                                    .find(|p| p.assembly_id == reported[&taxid])
-                                    .copied()
-                                    .unwrap_or(candidate.best);
-                                let mapped = match policy.mode {
-                                    EvidenceMode::Paired | EvidenceMode::Single => {
-                                        placement.r1_mapped
-                                    }
-                                    EvidenceMode::Long => placement.both_mapped,
-                                };
-                                Some(share * fragment_depth(placement, mapped, Some(model)))
+                                Some(
+                                    share
+                                        * marker_fragment_depth(
+                                            candidate,
+                                            reported[&taxid],
+                                            policy.mode,
+                                            model,
+                                        ),
+                                )
                             });
                         (taxid, share, share * fragment.bases, on_marker)
                     })
@@ -2084,33 +2133,6 @@ fn orphan_genus_rows(
     orphans.into_genus_rows(decisions, accepted)
 }
 
-/// A genus row of the roll-up: its fragments and depth, and the coverage of
-/// the main donor species on `genome`, its strongest genome; identity NA.
-fn genus_profile_row(name: String, row: &GenusRow, genome: std::sync::Arc<str>) -> ProfileRow {
-    let coverage = &row.witness;
-    ProfileRow {
-        taxname: name,
-        taxid: row.genus,
-        rank: "genus".to_string(),
-        equivalent_mapcount: row.fragments,
-        depth: row.depth,
-        abundance: 0.0,
-        breadth: coverage.breadth,
-        expected_breadth: coverage.expected_breadth,
-        breadth_pvalue: coverage.breadth_pvalue,
-        fixed_chunk: coverage.fixed_chunk,
-        flex_chunk: coverage.flex_chunk,
-        expected_flex_chunk: coverage.expected_flex_chunk,
-        chunk_pvalue: coverage.chunk_pvalue,
-        best_fit: Some(BestFitReport {
-            genome,
-            evidence_depth: coverage.depth,
-            identity: Some((f64::NAN, f64::NAN)),
-        }),
-        annotations: None,
-    }
-}
-
 /// The genome a row is measured on, if any.
 fn row_genome(row: &ProfileRow) -> Option<&str> {
     row.best_fit.as_ref().map(|g| &*g.genome)
@@ -2123,7 +2145,7 @@ fn profile_row(
     rank: &str,
     (reads, depth): (f64, f64),
     coverage: &EvidenceCoverage,
-    genome: std::sync::Arc<str>,
+    genome: Arc<str>,
     identity: Option<(f64, f64)>,
 ) -> ProfileRow {
     ProfileRow {
@@ -2150,7 +2172,7 @@ fn profile_row(
 }
 
 /// Strain taxid of every genome that declares one.
-fn strain_taxids(cfg: &crate::profiler::ProfilerConfig) -> HashMap<std::sync::Arc<str>, u32> {
+fn strain_taxids(cfg: &crate::profiler::ProfilerConfig) -> HashMap<Arc<str>, u32> {
     let mut out = HashMap::new();
     let Some(database) = cfg.db_metadata.as_deref() else {
         return out;
@@ -2178,7 +2200,7 @@ fn write_genome_diagnostics(
     data: &MappingData,
     genomes: &HashMap<u32, GenomeEvidence>,
     counts: &FragmentCounts,
-    (min_oebr, min_coebr): (f64, f64),
+    tests: &SpeciesTests,
 ) -> Result<()> {
     use std::io::Write;
     let path = format!("{}.levels_genomes.tsv", profiler.cfg.outprefix);
@@ -2211,11 +2233,11 @@ fn write_genome_diagnostics(
             coverage.oebr,
             coverage.coebr,
             coverage.fixed_chunk,
-            data.min_chunk_breadth,
+            tests.chunk_cutoff,
             p(coverage.breadth_pvalue),
             p(coverage.chunk_pvalue),
-            coverage.fixed_chunk > data.min_chunk_breadth,
-            within(coverage.oebr, min_oebr) && within(coverage.coebr, min_coebr),
+            tests.amount_ok(coverage),
+            tests.evenness_ok(coverage),
             pvalue_passes(
                 coverage.breadth_pvalue,
                 coverage.chunk_pvalue,
@@ -2411,12 +2433,12 @@ mod tests {
     #[test]
     fn a_species_decision_is_its_strongest_genome() {
         // Species 1: genome 10 kept, genome 11 not kept but with more reads; species 2: genome 12, not kept.
-        let mut genomes = HashMap::from([
+        let genomes = HashMap::from([
             (10, evidence(1, true, 40)),
             (11, evidence(1, false, 80)),
             (12, evidence(2, false, 40)),
         ]);
-        let decisions = species_decisions(&mut genomes, &rollup());
+        let decisions = species_decisions(&genomes, &rollup());
         let (one, genome) = decisions[&1];
         assert_eq!(genome, 10);
         assert!(one.standard);
@@ -2501,7 +2523,7 @@ mod tests {
                 "species",
                 (10.0, 1.0),
                 &coverage,
-                std::sync::Arc::from("GCF_1"),
+                Arc::from("GCF_1"),
                 identity,
             )
         };
@@ -2519,44 +2541,6 @@ mod tests {
         let lines = text.lines().collect::<Vec<_>>();
         assert!(lines.iter().all(|line| line.split('\t').count() == 17));
         assert!(lines[1].ends_with("GCF_1\tNA\tNA"));
-    }
-
-    #[test]
-    fn genus_rows_write_the_same_columns_as_species_rows() {
-        let coverage = EvidenceCoverage::default();
-        let species = profile_row(
-            "Species one".to_string(),
-            1,
-            "species",
-            (10.0, 1.0),
-            &coverage,
-            std::sync::Arc::from("GCF_1"),
-            Some((0.99, 0.995)),
-        );
-        let genus = genus_profile_row(
-            "Genus".to_string(),
-            &GenusRow {
-                genus: 100,
-                fragments: 250.0,
-                equivalent: 250.0,
-                depth: 0.5,
-                mapped_len: 25_000.0,
-                witness: coverage,
-                donors: vec![3],
-                reads: None,
-            },
-            std::sync::Arc::from("GCF_3"),
-        );
-        let mut writer = csv::WriterBuilder::new()
-            .has_headers(false)
-            .delimiter(b'\t')
-            .from_writer(Vec::new());
-        species.write(&mut writer).unwrap();
-        genus.write(&mut writer).unwrap();
-        let text = String::from_utf8(writer.into_inner().unwrap()).unwrap();
-        let lines = text.lines().collect::<Vec<_>>();
-        assert!(lines.iter().all(|line| line.split('\t').count() == 17));
-        assert!(lines[1].ends_with("GCF_3\tNA\tNA"));
     }
 
     #[test]
