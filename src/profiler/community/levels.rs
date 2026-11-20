@@ -207,7 +207,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         let candidates = counts.candidates.get(&genome.taxid).copied().unwrap_or(0);
         tests.judge(id, genome, won, candidates);
     });
-    let (second_kept, second_taken) = second_look(
+    let taken = second_look(
         &data,
         policy,
         &FirstEm {
@@ -223,8 +223,8 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     log::info!(
         target: "PROFILER",
         "Level-wise engine: second look kept {} removed species on {} fragments their removed sisters tied on.",
-        second_kept,
-        second_taken
+        taken.len(),
+        taken.values().map(Vec::len).sum::<usize>()
     );
     let rescued = own_evidence_look(
         &FirstEm {
@@ -249,6 +249,25 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
          reported at their genus, as their reads tie with other species along their genome.",
         rescued.len(),
         at_genus.len()
+    );
+    let removed_viruses = prophage_look(
+        &FirstEm {
+            fragments: &fragments,
+            group_of: &all.group_of,
+            em: &first,
+            resolved: &resolved_taxid,
+        },
+        &taken,
+        &tests,
+        &mut genomes,
+        |taxid| domain(&profiler.taxonomy, taxid),
+        |taxid, list| evidence_of(&data, policy, &fragments, taxid, list),
+    );
+    log::info!(
+        target: "PROFILER",
+        "Level-wise engine: {} kept virus species removed: their own fragments do not cover the rest of their \
+         genome, beyond the part that kept cellular species explain.",
+        removed_viruses.len()
     );
     if cfg.keep_raw {
         write_genome_diagnostics(profiler, &data, &genomes, &counts, (min_oebr, min_coebr))?;
@@ -1198,8 +1217,7 @@ struct FirstEm<'a> {
 /// competes with the species judged after it. A species that still fails is
 /// left as the first judgment measured it, so the second look only adds
 /// species. Every group it won before is still won, as its posterior against
-/// fewer rivals only rises. Returns the number of species kept and of the
-/// fragments they took.
+/// fewer rivals only rises. Returns the fragments each species it kept took.
 fn second_look(
     data: &MappingData,
     policy: EvidencePolicy,
@@ -1207,7 +1225,7 @@ fn second_look(
     tests: &SpeciesTests,
     counts: &mut FragmentCounts,
     genomes: &mut HashMap<u32, GenomeEvidence>,
-) -> (usize, u64) {
+) -> HashMap<u32, Vec<usize>> {
     let mut kept: HashSet<u32> = genomes
         .values()
         .filter(|g| g.kept)
@@ -1237,7 +1255,7 @@ fn second_look(
         }
     }
     let members = GroupMembers::new(first.group_of, first.em.posteriors.len());
-    let (mut kept_now, mut taken_total) = (0, 0);
+    let mut taken_by = HashMap::new();
     for &(taxid, _) in &order {
         let Some(groups) = open_groups.get(&taxid) else {
             continue;
@@ -1282,11 +1300,10 @@ fn second_look(
             counts.won.insert(taxid, won);
             genomes.extend(trial);
             kept.insert(taxid);
-            kept_now += 1;
-            taken_total += taken;
+            taken_by.insert(taxid, taken_fragments);
         }
     }
-    (kept_now, taken_total)
+    taken_by
 }
 
 /// Last look at the removed species that cover one of their genomes well
@@ -1409,6 +1426,172 @@ fn own_evidence_look(
     rescued
 }
 
+/// Kept viruses judged on their own reads. A virus integrated in a host genome
+/// (a prophage) collects the reads of that region of a host strain in the
+/// sample whose copy matches the virus better than the copies in the indexed
+/// genomes of its species, which align the same reads a little worse. The
+/// hosts are the kept bacteria and archaea. The fragments that list a kept
+/// virus together with a host, whichever of them won each, mark the part of
+/// the virus' genomes that a host explains. The virus' own fragments, those it
+/// holds (won in the first EM or took on the second look) that list no host,
+/// must pass the
+/// coverage tests over the rest of one of its genomes alone
+/// ([`without_bases`]). A free virus whose host carries a related prophage
+/// covers the rest evenly; reads of a prophage leave it bare or patchy. A virus
+/// that fails is removed, its reads going to the kept species in the second
+/// EM; one that no fragment lists together with a host is left as it is.
+/// Returns the species removed, in taxid order.
+fn prophage_look(
+    first: &FirstEm,
+    taken: &HashMap<u32, Vec<usize>>,
+    tests: &SpeciesTests,
+    genomes: &mut HashMap<u32, GenomeEvidence>,
+    domain: impl Fn(u32) -> Option<u32>,
+    mut evidence: impl FnMut(u32, &[usize]) -> HashMap<u32, GenomeEvidence>,
+) -> Vec<u32> {
+    let (mut viruses, mut hosts) = (HashSet::new(), HashSet::new());
+    for genome in genomes.values().filter(|g| g.kept) {
+        match domain(genome.taxid) {
+            Some(VIRUSES) => viruses.insert(genome.taxid),
+            Some(BACTERIA | ARCHAEA) => hosts.insert(genome.taxid),
+            _ => false,
+        };
+    }
+    if viruses.is_empty() || hosts.is_empty() {
+        return Vec::new();
+    }
+    let mut held: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (index, group) in first.group_of.iter().enumerate() {
+        if let Some(taxid) = group.and_then(|g| first.resolved[g]) {
+            if viruses.contains(&taxid) {
+                held.entry(taxid).or_default().push(index);
+            }
+        }
+    }
+    for (taxid, list) in taken {
+        if viruses.contains(taxid) {
+            held.entry(*taxid).or_default().extend(list);
+        }
+    }
+    let lists_host = |f: usize| {
+        first.fragments[f]
+            .candidates
+            .iter()
+            .any(|c| hosts.contains(&c.0))
+    };
+    let mut shared: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (index, fragment) in first.fragments.iter().enumerate() {
+        if lists_host(index) {
+            for c in &fragment.candidates {
+                if viruses.contains(&c.0) {
+                    shared.entry(c.0).or_default().push(index);
+                }
+            }
+        }
+    }
+    let mut shared = shared.into_iter().collect::<Vec<_>>();
+    shared.sort_unstable_by_key(|entry| entry.0);
+    let mut removed = Vec::new();
+    for (taxid, shared) in shared {
+        let list = held.remove(&taxid).unwrap_or_default();
+        let own = list
+            .iter()
+            .copied()
+            .filter(|&f| !lists_host(f))
+            .collect::<Vec<_>>();
+        let covered = !own.is_empty() && {
+            let hosts = evidence(taxid, &shared);
+            evidence(taxid, &own).into_iter().any(|(id, genome)| {
+                let mut rest = match hosts.get(&id) {
+                    Some(host) => without_bases(&genome.assembly, &host.assembly),
+                    None => genome.assembly,
+                };
+                tests.covers(&tests.measure(id, &mut rest))
+            })
+        };
+        if covered {
+            continue;
+        }
+        for genome in genomes.values_mut() {
+            if genome.taxid == taxid {
+                genome.kept = false;
+            }
+        }
+        removed.push(taxid);
+    }
+    removed
+}
+
+/// `assembly` without the bases that the reads of `other` cover: each position
+/// moves back by the covered bases before it on its contig and the genome
+/// shrinks by all of them, so that the coverage tests measure `assembly` over
+/// the remaining bases alone. A window within covered bases shrinks to
+/// nothing, and a fragment whose reads all lie within them no longer counts.
+fn without_bases(assembly: &PresenceAssembly, other: &PresenceAssembly) -> PresenceAssembly {
+    let mut reads = other
+        .intervals
+        .iter()
+        .flat_map(|r| [(r.reference_id, r.span), (r.reference_id, r.mate_span)])
+        .filter(|(_, span)| span.1 > span.0)
+        .collect::<Vec<_>>();
+    reads.sort_unstable();
+    // Covered segments, merged per contig, each with the covered bases before
+    // it on its contig.
+    let mut segments: Vec<(u32, (u32, u32), u32)> = Vec::new();
+    for (contig, span) in reads {
+        match segments.last_mut() {
+            Some(last) if last.0 == contig && span.0 <= last.1 .1 => {
+                last.1 .1 = last.1 .1.max(span.1);
+            }
+            last => {
+                let before = match last {
+                    Some(&mut (c, (start, end), before)) if c == contig => before + (end - start),
+                    _ => 0,
+                };
+                segments.push((contig, span, before));
+            }
+        }
+    }
+    let covered: u32 = segments.iter().map(|s| s.1 .1 - s.1 .0).sum();
+    let shift = |contig: u32, position: u32| {
+        let after = segments.partition_point(|s| (s.0, s.1 .0) <= (contig, position));
+        match after.checked_sub(1).map(|i| segments[i]) {
+            Some((c, (start, end), before)) if c == contig => {
+                position - before - (position.min(end) - start)
+            }
+            _ => position,
+        }
+    };
+    let window = |contig: u32, span: (u32, u32)| (shift(contig, span.0), shift(contig, span.1));
+    let mut rest = PresenceAssembly {
+        asm_len: (assembly.asm_len - f64::from(covered)).max(0.0),
+        sampling_scale: assembly.sampling_scale,
+        ..PresenceAssembly::default()
+    };
+    for record in &assembly.intervals {
+        let contig = record.reference_id;
+        let span = window(contig, record.span);
+        let mate_span = if record.mate_span.1 > record.mate_span.0 {
+            window(contig, record.mate_span)
+        } else {
+            record.mate_span
+        };
+        if span.1 <= span.0 && mate_span.1 <= mate_span.0 {
+            continue;
+        }
+        rest.count += 1;
+        rest.reference_span_bases += u64::from(span.1 - span.0);
+        rest.intervals.push(PresenceInterval {
+            reference_id: contig,
+            span,
+            mate_span,
+            fixed_chunk: window(contig, record.fixed_chunk),
+            flex_chunk: window(contig, record.flex_chunk),
+        });
+    }
+    rest
+}
+
 /// The coverage of each genome of species `taxid` from the fragments `list`
 /// alone.
 fn coverage_of(
@@ -1419,6 +1602,21 @@ fn coverage_of(
     taxid: u32,
     list: &[usize],
 ) -> Vec<(u32, EvidenceCoverage)> {
+    evidence_of(data, policy, fragments, taxid, list)
+        .into_iter()
+        .map(|(id, mut genome)| (id, tests.measure(id, &mut genome.assembly)))
+        .collect()
+}
+
+/// The genomes of species `taxid` with the placements of the fragments `list`
+/// alone.
+fn evidence_of(
+    data: &MappingData,
+    policy: EvidencePolicy,
+    fragments: &[Fragment],
+    taxid: u32,
+    list: &[usize],
+) -> HashMap<u32, GenomeEvidence> {
     let mut genomes: HashMap<u32, GenomeEvidence> = HashMap::new();
     fold_candidates(
         data,
@@ -1429,9 +1627,6 @@ fn coverage_of(
         |_, hits| add_hits(&mut genomes, taxid, hits),
     );
     genomes
-        .into_iter()
-        .map(|(id, mut genome)| (id, tests.measure(id, &mut genome.assembly)))
-        .collect()
 }
 
 /// Whether removed species `taxid` takes a read group with first-EM
@@ -1820,6 +2015,21 @@ fn credited_reads(
         },
     );
     credited
+}
+
+/// NCBI taxids of the viruses, the bacteria and the archaea.
+const VIRUSES: u32 = 10239;
+const BACTERIA: u32 = 2;
+const ARCHAEA: u32 = 2157;
+
+/// Which of [`VIRUSES`], [`BACTERIA`] and [`ARCHAEA`] the lineage of `taxid`
+/// reaches, if any.
+fn domain(taxonomy: &Taxonomy, taxid: u32) -> Option<u32> {
+    taxonomy
+        .get_parents(taxid)
+        .iter()
+        .map(|&(id, _, _)| id)
+        .find(|&id| matches!(id, VIRUSES | BACTERIA | ARCHAEA))
 }
 
 /// The family of every species in `species_to_genus` whose genus has one.
@@ -2380,6 +2590,168 @@ mod tests {
         assert_eq!(members.of(0), &[2]);
         assert_eq!(members.of(1), &[0, 3]);
         assert_eq!(members.of(2), &[4]);
+    }
+
+    /// A fragment's placement on contig `contig` of a genome, its windows the
+    /// read itself.
+    fn read_at(contig: u32, span: (u32, u32)) -> PresenceInterval {
+        PresenceInterval {
+            reference_id: contig,
+            span,
+            mate_span: (0, 0),
+            fixed_chunk: span,
+            flex_chunk: span,
+        }
+    }
+
+    #[test]
+    fn bases_covered_by_other_reads_are_cut_out_of_the_genome() {
+        // Other reads cover 100..300 of contig 0 and 0..50 of contig 1.
+        let other = PresenceAssembly {
+            intervals: vec![
+                read_at(0, (100, 200)),
+                read_at(0, (150, 300)),
+                read_at(1, (0, 50)),
+            ],
+            ..PresenceAssembly::default()
+        };
+        let assembly = PresenceAssembly {
+            asm_len: 1000.0,
+            count: 4,
+            reference_span_bases: 310,
+            intervals: vec![
+                read_at(0, (0, 50)),
+                read_at(0, (250, 400)),
+                read_at(0, (120, 180)),
+                read_at(1, (40, 100)),
+            ],
+            ..PresenceAssembly::default()
+        };
+        let rest = without_bases(&assembly, &other);
+        assert_eq!(rest.asm_len, 750.0);
+        assert_eq!(rest.count, 3);
+        assert_eq!(rest.reference_span_bases, 50 + 100 + 50);
+        let spans = rest
+            .intervals
+            .iter()
+            .map(|r| (r.reference_id, r.span))
+            .collect::<Vec<_>>();
+        assert_eq!(spans, [(0, (0, 50)), (0, (100, 200)), (1, (0, 50))]);
+    }
+
+    #[test]
+    fn kept_viruses_must_cover_what_no_kept_cellular_species_explains() {
+        // Bacterium 1 and eukaryote 2 are kept, as are viruses 7, 8 and 9.
+        // Virus 7 won 10 fragments, 4 of them listing species 1, and took 2
+        // more on the second look; virus 8 won 5 fragments that list species 2
+        // only; every fragment of virus 9 lists species 1.
+        let fragment = |candidates: &[(u32, f64)]| Fragment {
+            read: 0,
+            candidates: candidates.to_vec(),
+            bases: 100.0,
+        };
+        let mut fragments = Vec::new();
+        let mut resolved = Vec::new();
+        for i in 0..10 {
+            fragments.push(fragment(if i < 4 {
+                &[(7, 0.0), (1, 1.0)]
+            } else {
+                &[(7, 0.0)]
+            }));
+            resolved.push(Some(7));
+        }
+        for _ in 0..5 {
+            fragments.push(fragment(&[(8, 0.0), (2, 0.0)]));
+            resolved.push(Some(8));
+            fragments.push(fragment(&[(9, 0.0), (1, 0.0)]));
+            resolved.push(Some(9));
+        }
+        let taken = HashMap::from([(7, vec![fragments.len(), fragments.len() + 1])]);
+        for _ in 0..2 {
+            fragments.push(fragment(&[(7, 0.0), (8, 1.0)]));
+            resolved.push(None);
+        }
+        let group_of = (0..fragments.len()).map(Some).collect::<Vec<_>>();
+        let em = likelihood_em::EmResult {
+            weight: HashMap::new(),
+            posteriors: Vec::new(),
+            iterations: 0,
+        };
+        let first = FirstEm {
+            fragments: &fragments,
+            group_of: &group_of,
+            em: &em,
+            resolved: &resolved,
+        };
+        let tests = SpeciesTests {
+            multiple_tests: 1,
+            chunk_cutoff: 0.3,
+            ratio_bounds: (0.5, 0.5),
+            markers: None,
+            min_marker_genes: 3,
+        };
+        let genome = |taxid, intervals: Vec<PresenceInterval>| GenomeEvidence {
+            taxid,
+            assembly: PresenceAssembly {
+                asm_len: 1000.0,
+                count: intervals.len() as u64,
+                reference_span_bases: intervals
+                    .iter()
+                    .map(|r| u64::from(r.span.1 - r.span.0))
+                    .sum(),
+                intervals,
+                ..PresenceAssembly::default()
+            },
+            coverage: None,
+            kept: true,
+        };
+        let start = HashMap::from([
+            (10, genome(1, Vec::new())),
+            (20, genome(2, Vec::new())),
+            (70, genome(7, Vec::new())),
+            (80, genome(8, Vec::new())),
+            (90, genome(9, Vec::new())),
+        ]);
+        // Virus 7's 4 shared fragments cover the first 600 bases of its
+        // genome; its 8 own ones lie every 50 bases over the other 400, or all
+        // in one place.
+        let look = |spread: bool| {
+            let mut genomes = start.clone();
+            let removed = prophage_look(
+                &first,
+                &taken,
+                &tests,
+                &mut genomes,
+                |taxid| match taxid {
+                    1 => Some(BACTERIA),
+                    2 => None,
+                    _ => Some(VIRUSES),
+                },
+                |taxid, list| {
+                    assert_eq!(taxid, 7);
+                    let reads = match list.len() {
+                        4 => (0..4)
+                            .map(|i| read_at(0, (150 * i, 150 * i + 150)))
+                            .collect(),
+                        8 => (0..8)
+                            .map(|i| {
+                                let start = if spread { 600 + 50 * i } else { 600 };
+                                read_at(0, (start, start + 25))
+                            })
+                            .collect(),
+                        n => panic!("unexpected list of {n}"),
+                    };
+                    HashMap::from([(70, genome(7, reads))])
+                },
+            );
+            let kept = [10, 20, 70, 80, 90].map(|id| genomes[&id].kept);
+            (removed, kept)
+        };
+        // Own reads spread over the unshared 400 bases: kept, though over the
+        // whole genome they would cover too little of it.
+        assert_eq!(look(true), (vec![9], [true, true, true, true, false]));
+        // Own reads in one place: removed with virus 9.
+        assert_eq!(look(false), (vec![7, 9], [true, true, false, true, false]));
     }
 
     #[test]
