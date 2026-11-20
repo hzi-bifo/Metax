@@ -771,11 +771,20 @@ fn collect_fragments(
     (fragments, unmatched, error_rate(&mut best_matches))
 }
 
-/// Estimated errors of a candidate's best placement, counting the bases it
-/// aligns less than the fragment's longest alignment (`longest`).
-fn candidate_errors(candidate: &TerminalCandidate, longest: f64) -> f64 {
-    candidate.best.pair_errors
-        + UNALIGNED_ERROR_WEIGHT * (longest - f64::from(candidate.best.both_mapped)).max(0.0)
+/// Estimated errors of a candidate's placement, counting the bases it aligns
+/// less than the fragment's longest alignment (`longest`).
+fn candidate_errors(placement: &CandidatePlacement, longest: f64) -> f64 {
+    placement.pair_errors
+        + UNALIGNED_ERROR_WEIGHT * (longest - f64::from(placement.both_mapped)).max(0.0)
+}
+
+/// The margin within which a candidate's errors tie with the best: short
+/// reads by [`SHORT_TIE_ERRORS`], long reads by `long_share` of `bases`.
+fn tie_margin(mode: EvidenceMode, bases: f64, long_share: f64) -> f64 {
+    match mode {
+        EvidenceMode::Long => long_share * bases,
+        EvidenceMode::Paired | EvidenceMode::Single => SHORT_TIE_ERRORS,
+    }
 }
 
 /// Bases of a fragment's longest candidate alignment.
@@ -801,7 +810,7 @@ fn fragment_of(
         .iter()
         .filter(|c| c.profile_rank == ProfileRank::Species)
         .filter_map(|c| {
-            let errors = candidate_errors(c, longest);
+            let errors = candidate_errors(&c.best, longest);
             Some((unit(c.taxid)?, errors, c.best.both_mapped, c.best.r1_mapped))
         })
         .collect::<Vec<_>>();
@@ -812,10 +821,7 @@ fn fragment_of(
     units.dedup_by_key(|u| u.0);
     units.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     let fewest = units[0].1;
-    let margin = match policy.mode {
-        EvidenceMode::Long => LONG_TIE_SHARE * f64::from(units[0].2),
-        EvidenceMode::Paired | EvidenceMode::Single => SHORT_TIE_ERRORS,
-    };
+    let margin = tie_margin(policy.mode, f64::from(units[0].2), LONG_TIE_SHARE);
     let fragment = Fragment {
         read,
         candidates: units
@@ -1903,8 +1909,8 @@ fn unmatched_rows(
                     c.profile_rank == ProfileRank::Species && unit_of(c.taxid) == Some(unit)
                 })
                 .min_by(|a, b| {
-                    candidate_errors(a, longest)
-                        .total_cmp(&candidate_errors(b, longest))
+                    candidate_errors(&a.best, longest)
+                        .total_cmp(&candidate_errors(&b.best, longest))
                         .then(a.taxid.cmp(&b.taxid))
                 })
                 .map(|c| c.best)

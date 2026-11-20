@@ -13,19 +13,22 @@ use std::collections::HashMap;
 
 use rayon::prelude::*;
 
-use super::{add_placement, fold_candidates, resolved_unit, within, Fragment, GenomeEvidence};
+use super::{
+    add_placement, candidate_errors, fold_candidates, longest_alignment, resolved_unit, tie_margin,
+    Fragment, GenomeEvidence, SpeciesTests, LONG_TIE_SHARE,
+};
 use crate::profiler::community::MappingData;
 use crate::profiler::evidence::{
-    calculate_coverage, EvidenceCoverage, EvidenceMode, EvidencePolicy, TerminalCandidate,
+    CandidatePlacement, EvidenceCoverage, EvidenceMode, EvidencePolicy, TerminalCandidate,
 };
+use crate::profiler::identity::MIN_JUDGED_SPECIES;
 use crate::profiler::likelihood_em::{self, ReadGroups};
 use crate::profiler::ProfileRank;
 
-/// Genome candidates of a short fragment whose errors exceed the best by
-/// less than this count as tied.
-const SHORT_TIE_ERRORS: f64 = 0.5;
-/// Long reads: the same as a share of the best genome's aligned bases.
-const LONG_TIE_SHARE: f64 = 0.001;
+/// Genome candidates of a long fragment whose errors exceed the best by less
+/// than this share of the fragment's longest placement count as tied; short
+/// fragments tie as species candidates do ([`tie_margin`]).
+const GENOME_LONG_TIE_SHARE: f64 = 0.001;
 /// A fragment matches a genome at strain-level identity when it aligns to the
 /// genome at an identity of at least the sample's identity to its own genomes
 /// less this margin: a strain within 99.5 % ANI of the genome, for every read
@@ -106,7 +109,6 @@ struct SpeciesShare {
     group_of: Vec<Option<usize>>,
     em: likelihood_em::EmResult,
     best_fit: u32,
-    mean_identity: f64,
 }
 
 /// Settings shared by every species.
@@ -139,7 +141,7 @@ pub(super) fn resolve(
     level: &GenomeLevel,
 ) -> GenomeResult {
     let penalty = level.penalty();
-    let mut shares = genome_fragments(data, fragments, species_of, level.policy)
+    let shares = genome_fragments(data, fragments, species_of, level.policy)
         .into_iter()
         .collect::<Vec<_>>()
         .into_par_iter()
@@ -162,15 +164,11 @@ pub(super) fn resolve(
                 group_of,
                 em,
                 best_fit,
-                mean_identity: f64::NAN,
             }
         })
         .collect::<Vec<_>>();
     let best_fit = shares.iter().map(|s| (s.taxid, s.best_fit)).collect();
     let identity = identity_to_best_fit(data, &best_fit, level.policy);
-    for share in &mut shares {
-        share.mean_identity = identity.get(&share.taxid).map_or(f64::NAN, |m| m.0);
-    }
     let baseline_identity =
         weighted_median(identity.values().copied()).unwrap_or(1.0 - level.error_rate);
     let strain_identity = baseline_identity - STRAIN_MARGIN;
@@ -196,7 +194,7 @@ pub(super) fn resolve(
                 share.taxid,
                 SpeciesGenomes {
                     best_fit: share.best_fit,
-                    mean_identity: share.mean_identity,
+                    mean_identity: identity.get(&share.taxid).map_or(f64::NAN, |m| m.0),
                     strains,
                 },
             )
@@ -227,13 +225,13 @@ fn strain_level_identity(
     (if count > 0.0 { sum / count } else { f64::NAN }, count)
 }
 
-/// Median of `(value, weight)` pairs with finite values and positive weight;
-/// `None` for fewer than three.
+/// Median of `(value, weight)` pairs (one per species) with finite values
+/// and positive weight; `None` for fewer than [`MIN_JUDGED_SPECIES`].
 fn weighted_median(values: impl Iterator<Item = (f64, f64)>) -> Option<f64> {
     let mut values = values
         .filter(|v| v.0.is_finite() && v.1 > 0.0)
         .collect::<Vec<_>>();
-    if values.len() < 3 {
+    if values.len() < MIN_JUDGED_SPECIES {
         return None;
     }
     values.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -296,23 +294,26 @@ fn candidate_genomes(
         .placements
         .iter()
         .map(|p| {
-            let mapped = f64::from(p.both_mapped).max(1.0);
-            let errors = p.pair_errors
-                + super::UNALIGNED_ERROR_WEIGHT * (longest - f64::from(p.both_mapped)).max(0.0);
-            (p.assembly_id, errors, 1.0 - p.pair_errors / mapped)
+            (
+                p.assembly_id,
+                candidate_errors(p, longest),
+                placement_identity(p),
+            )
         })
         .collect::<Vec<_>>();
     let fewest = genomes.iter().map(|g| g.1).fold(f64::INFINITY, f64::min);
-    let margin = match policy.mode {
-        EvidenceMode::Long => LONG_TIE_SHARE * longest,
-        EvidenceMode::Paired | EvidenceMode::Single => SHORT_TIE_ERRORS,
-    };
+    let margin = tie_margin(policy.mode, longest, GENOME_LONG_TIE_SHARE);
     for genome in &mut genomes {
         if genome.1 - fewest < margin {
             genome.1 = fewest;
         }
     }
     genomes
+}
+
+/// Identity of a placement: one less its estimated errors per aligned base.
+fn placement_identity(placement: &CandidatePlacement) -> f64 {
+    1.0 - placement.pair_errors / f64::from(placement.both_mapped).max(1.0)
 }
 
 /// Per species with a best-fit genome in `best_fit`, the mean identity to
@@ -363,27 +364,16 @@ fn best_fit_identities(
     best_fit: &HashMap<u32, u32>,
     mode: EvidenceMode,
 ) -> Vec<(u32, f64)> {
-    let longest = candidates
-        .iter()
-        .map(|c| f64::from(c.best.both_mapped))
-        .fold(0.0, f64::max);
+    let longest = longest_alignment(candidates);
     let species = candidates
         .iter()
         .filter(|c| c.profile_rank == ProfileRank::Species)
-        .map(|c| {
-            let errors = c.best.pair_errors
-                + super::UNALIGNED_ERROR_WEIGHT
-                    * (longest - f64::from(c.best.both_mapped)).max(0.0);
-            (c, errors)
-        })
+        .map(|c| (c, candidate_errors(&c.best, longest)))
         .collect::<Vec<_>>();
     let Some(&(best, fewest)) = species.iter().min_by(|a, b| a.1.total_cmp(&b.1)) else {
         return Vec::new();
     };
-    let margin = match mode {
-        EvidenceMode::Long => super::LONG_TIE_SHARE * f64::from(best.best.both_mapped),
-        EvidenceMode::Paired | EvidenceMode::Single => super::SHORT_TIE_ERRORS,
-    };
+    let margin = tie_margin(mode, f64::from(best.best.both_mapped), LONG_TIE_SHARE);
     species
         .iter()
         .filter(|&&(_, errors)| errors - fewest < margin)
@@ -393,10 +383,7 @@ fn best_fit_identities(
                 .placements
                 .iter()
                 .find(|p| p.assembly_id == assembly)?;
-            Some((
-                candidate.taxid,
-                1.0 - placement.pair_errors / f64::from(placement.both_mapped).max(1.0),
-            ))
+            Some((candidate.taxid, placement_identity(placement)))
         })
         .collect()
 }
@@ -464,20 +451,20 @@ fn strain_genomes(
             }
         },
     );
-    let tests = evidence.len().max(1);
-    let total_weight: f64 = share.em.weight.values().sum::<f64>().max(1e-12);
-    let mut kept: HashMap<u32, (EvidenceCoverage, f64)> = HashMap::new();
-    let mut measured: HashMap<u32, (EvidenceCoverage, bool)> = HashMap::new();
+    let tests = SpeciesTests {
+        multiple_tests: evidence.len().max(1),
+        chunk_cutoff: level.chunk_cutoff,
+        ratio_bounds: level.ratio_bounds,
+        // Marker genomes are left out above.
+        markers: None,
+        min_marker_genes: 0,
+    };
     for (&assembly, genome) in evidence.iter_mut() {
-        let coverage = calculate_coverage(&mut genome.assembly, tests);
-        let passes = coverage.fixed_chunk > level.chunk_cutoff
-            && within(coverage.oebr, level.ratio_bounds.0)
-            && within(coverage.coebr, level.ratio_bounds.1);
-        if passes {
-            kept.insert(assembly, (coverage, genome.assembly.asm_len));
-        }
-        measured.insert(assembly, (coverage, passes));
+        let coverage = tests.measure(assembly, &mut genome.assembly);
+        genome.kept = tests.covers(&coverage);
+        genome.coverage = Some(coverage);
     }
+    let total_weight: f64 = share.em.weight.values().sum::<f64>().max(1e-12);
     let mut listed = resolved.keys().copied().collect::<Vec<_>>();
     if !resolved.contains_key(&share.best_fit) {
         listed.push(share.best_fit);
@@ -485,9 +472,9 @@ fn strain_genomes(
     listed.sort_unstable();
     for assembly in listed {
         let (resolved, gated) = resolved.get(&assembly).copied().unwrap_or((0, 0));
-        let (coverage, kept) = measured
-            .remove(&assembly)
-            .map_or((None, false), |(c, k)| (Some(c), k));
+        let (coverage, kept) = evidence
+            .get(&assembly)
+            .map_or((None, false), |genome| (genome.coverage, genome.kept));
         diagnostics.push(StrainDiagnostic {
             taxid,
             assembly_id: assembly,
@@ -503,6 +490,14 @@ fn strain_genomes(
     // least one of them at strain-level identity; the rest stay with the
     // species. A genome whose fragments do not match it within sequencing
     // error is dropped and the EM rerun over the rest.
+    let mut kept: HashMap<u32, (EvidenceCoverage, f64)> = evidence
+        .into_iter()
+        .filter(|(_, genome)| genome.kept)
+        .map(|(assembly, genome)| {
+            let coverage = genome.coverage.expect("measured above");
+            (assembly, (coverage, genome.assembly.asm_len))
+        })
+        .collect();
     loop {
         if kept.is_empty() {
             return Vec::new();
