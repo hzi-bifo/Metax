@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use rayon::prelude::*;
 
-use super::{add_placement, fold_candidates, within, Fragment, GenomeEvidence, RESOLVE_POSTERIOR};
+use super::{add_placement, fold_candidates, resolved_unit, within, Fragment, GenomeEvidence};
 use crate::profiler::community::MappingData;
 use crate::profiler::evidence::{
     calculate_coverage, EvidenceCoverage, EvidenceMode, EvidencePolicy, TerminalCandidate,
@@ -139,11 +139,10 @@ pub(super) fn resolve(
             let mut groups = ReadGroups::default();
             let group_of = members
                 .iter()
-                .map(|m| groups.add(m.genomes.iter().map(|g| (g.0, g.1)).collect(), 1.0))
+                .map(|m| groups.add(m.genomes.iter().map(|g| (g.0, g.1)).collect()))
                 .collect::<Vec<_>>();
             let em = likelihood_em::run(
                 &groups,
-                &HashMap::new(),
                 level.penalty,
                 level.max_iterations,
                 level.tolerance,
@@ -420,12 +419,7 @@ fn strain_genomes(
     let mut resolved: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut strain_level = Vec::new();
     for (member, group) in members.iter().zip(group_of) {
-        let Some(assembly) = group.and_then(|g| {
-            posteriors[g]
-                .iter()
-                .find(|p| p.1 >= RESOLVE_POSTERIOR)
-                .map(|p| p.0)
-        }) else {
+        let Some(assembly) = group.and_then(|g| resolved_unit(&posteriors[g])) else {
             continue;
         };
         if data
@@ -581,12 +575,11 @@ fn share_among_kept(
                 .filter(|g| kept.contains_key(&g.0) && g.2 >= strain_identity)
                 .map(|g| (g.0, g.1))
                 .collect::<Vec<_>>();
-            groups.add(candidates, 1.0)
+            groups.add(candidates)
         })
         .collect::<Vec<_>>();
     let em = likelihood_em::run(
         &groups,
-        &HashMap::new(),
         level.penalty,
         level.max_iterations,
         level.tolerance,

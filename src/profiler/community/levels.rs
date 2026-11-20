@@ -108,6 +108,29 @@ struct SharedReads {
     group_bases: Vec<f64>,
 }
 
+impl SharedReads {
+    /// Each unit's share of the fragments' bases in `em`, the EM over these
+    /// read groups.
+    fn unit_bases(&self, em: &likelihood_em::EmResult) -> HashMap<u32, f64> {
+        let mut bases: HashMap<u32, f64> = HashMap::new();
+        for (posteriors, &group_total) in em.posteriors.iter().zip(&self.group_bases) {
+            for &(unit, posterior) in posteriors {
+                *bases.entry(unit).or_insert(0.0) += group_total * posterior;
+            }
+        }
+        bases
+    }
+}
+
+/// The unit a read group resolves to: the first of its `posteriors` at
+/// [`RESOLVE_POSTERIOR`] or above.
+fn resolved_unit(posteriors: &[(u32, f64)]) -> Option<u32> {
+    posteriors
+        .iter()
+        .find(|p| p.1 >= RESOLVE_POSTERIOR)
+        .map(|p| p.0)
+}
+
 /// Coverage of one genome from the fragments that resolve to its species.
 #[derive(Clone)]
 struct GenomeEvidence {
@@ -146,22 +169,11 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     // species with posterior >= RESOLVE_POSTERIOR adds to the coverage of
     // that species' genomes.
     let all = share_reads(&fragments, |_| true, penalty);
-    let first = likelihood_em::run(
-        &all.groups,
-        &HashMap::new(),
-        penalty,
-        cfg.max_em_iterations,
-        EM_TOLERANCE,
-    );
+    let first = likelihood_em::run(&all.groups, penalty, cfg.max_em_iterations, EM_TOLERANCE);
     let resolved_taxid = first
         .posteriors
         .iter()
-        .map(|posteriors| {
-            posteriors
-                .iter()
-                .find(|p| p.1 >= RESOLVE_POSTERIOR)
-                .map(|p| p.0)
-        })
+        .map(|posteriors| resolved_unit(posteriors))
         .collect::<Vec<_>>();
     // Fragments listing each species among their candidates, and those resolved
     // to it.
@@ -321,13 +333,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
 
     // Second EM over the kept species.
     let kept = share_reads(&fragments, |taxid| best_fit.contains_key(&taxid), penalty);
-    let em = likelihood_em::run(
-        &kept.groups,
-        &HashMap::new(),
-        penalty,
-        cfg.max_em_iterations,
-        EM_TOLERANCE,
-    );
+    let em = likelihood_em::run(&kept.groups, penalty, cfg.max_em_iterations, EM_TOLERANCE);
     let without_kept = kept.group_of.iter().filter(|g| g.is_none()).count();
     log::info!(
         target: "PROFILER",
@@ -422,28 +428,15 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                 .fold(0.0, |total, (_, row)| total + row.equivalent_mapcount)
         );
     }
-    let group_bases = &kept.group_bases;
     // Each species' share of the fragments' bases.
-    let mut bases: HashMap<u32, f64> = HashMap::new();
-    for (posteriors, &group_total) in em.posteriors.iter().zip(group_bases) {
-        for &(taxid, posterior) in posteriors {
-            *bases.entry(taxid).or_insert(0.0) += group_total * posterior;
-        }
-    }
+    let mut bases = kept.unit_bases(&em);
 
     // Genomes within each kept species, for the fragments the species-level EM
     // gives to one species.
     let species_of = kept
         .group_of
         .iter()
-        .map(|group| {
-            group.and_then(|g| {
-                em.posteriors[g]
-                    .iter()
-                    .find(|p| p.1 >= RESOLVE_POSTERIOR)
-                    .map(|p| p.0)
-            })
-        })
+        .map(|group| group.and_then(|g| resolved_unit(&em.posteriors[g])))
         .collect::<Vec<_>>();
     let genome_result = genomes::resolve(
         &data,
@@ -870,7 +863,7 @@ fn share_reads(fragments: &[Fragment], allowed: impl Fn(u32) -> bool, penalty: f
             .collect::<Vec<_>>();
         let fewest = candidates.iter().map(|c| c.1).fold(f64::INFINITY, f64::min);
         candidates.retain(|c| c.1 - fewest <= max_excess_errors);
-        let slot = shared.groups.add(candidates, 1.0);
+        let slot = shared.groups.add(candidates);
         if let Some(slot) = slot {
             if slot == shared.group_bases.len() {
                 shared.group_bases.push(0.0);
@@ -1815,7 +1808,6 @@ fn unmatched_rows(
     let shared = share_reads(&fragments, |_| true, level.penalty);
     let em = likelihood_em::run(
         &shared.groups,
-        &HashMap::new(),
         level.penalty,
         profiler.cfg.max_em_iterations,
         EM_TOLERANCE,
@@ -1825,7 +1817,6 @@ fn unmatched_rows(
     let mut listing: HashMap<u32, f64> = HashMap::new();
     let mut won: HashMap<u32, f64> = HashMap::new();
     let mut resolved: Vec<(usize, u32)> = Vec::new();
-    let mut bases: HashMap<u32, f64> = HashMap::new();
     for (fragment, group) in fragments.iter().zip(&shared.group_of) {
         let Some(group) = *group else {
             continue;
@@ -1834,16 +1825,12 @@ fn unmatched_rows(
         for &(unit, _) in posteriors {
             *listing.entry(unit).or_default() += 1.0;
         }
-        if let Some(&(unit, _)) = posteriors.iter().find(|p| p.1 >= RESOLVE_POSTERIOR) {
+        if let Some(unit) = resolved_unit(posteriors) {
             resolved.push((fragment.read, unit));
             *won.entry(unit).or_default() += 1.0;
         }
     }
-    for (posteriors, &group_total) in em.posteriors.iter().zip(&shared.group_bases) {
-        for &(unit, posterior) in posteriors {
-            *bases.entry(unit).or_insert(0.0) += group_total * posterior;
-        }
-    }
+    let bases = shared.unit_bases(&em);
     // Each resolved fragment on the best genome of its unit's best species.
     let mut genomes: HashMap<u32, GenomeEvidence> = HashMap::new();
     fold_candidates(
