@@ -1590,38 +1590,63 @@ impl CommunityProfiler {
         unclassified: Option<Option<unclassified::UnclassifiedEstimate>>,
         raw_rows: Vec<ProfileRow>,
     ) -> Result<()> {
-        let out_prefix = if self.cfg.host.is_some() {
+        let identity_columns = unclassified.is_some()
+            && rows
+                .iter()
+                .any(|row| row.best_fit.as_ref().is_some_and(|b| b.identity.is_some()));
+        self.write_profile("", rows, unclassified, identity_columns)?;
+        if self.cfg.keep_raw {
+            self.write_raw_profile(raw_rows)?;
+        }
+        Ok(())
+    }
+
+    /// Write the raw profile, `<prefix>.rprofile.txt`.
+    fn write_raw_profile(&self, raw_rows: Vec<ProfileRow>) -> Result<()> {
+        let raw_path = format!("{}.rprofile.txt", self.profile_prefix());
+        let mut raw_writer = WriterBuilder::new()
+            .has_headers(false)
+            .delimiter(b'\t')
+            .from_writer(File::create(&raw_path)?);
+        for row in raw_rows {
+            row.write(&mut raw_writer)?;
+        }
+        raw_writer.flush()?;
+        Ok(())
+    }
+
+    /// Path prefix of the profile files: `<prefix>.pathogen` with `--host`.
+    fn profile_prefix(&self) -> String {
+        if self.cfg.host.is_some() {
             format!("{}.pathogen", self.cfg.outprefix)
         } else {
             self.cfg.outprefix.clone()
-        };
-        let profile_path = format!("{}.profile.txt", out_prefix);
+        }
+    }
+
+    /// Write `<prefix>.profile.txt`: the `header` text, then the rows and, with
+    /// `--estimate-unclassified`, the unclassified row, which has the two
+    /// identity columns when `identity_columns`.
+    fn write_profile(
+        &self,
+        header: &str,
+        rows: &[ProfileRow],
+        unclassified: Option<Option<unclassified::UnclassifiedEstimate>>,
+        identity_columns: bool,
+    ) -> Result<()> {
+        let mut file = File::create(format!("{}.profile.txt", self.profile_prefix()))?;
+        file.write_all(header.as_bytes())?;
         let mut profile_writer = WriterBuilder::new()
             .has_headers(false)
             .delimiter(b'\t')
-            .from_writer(File::create(&profile_path)?);
+            .from_writer(file);
         for row in rows {
             row.write(&mut profile_writer)?;
         }
         if let Some(estimate) = unclassified {
-            let identity_columns = rows
-                .iter()
-                .any(|row| row.best_fit.as_ref().is_some_and(|b| b.identity.is_some()));
             unclassified::write_row(&mut profile_writer, estimate, identity_columns)?;
         }
         profile_writer.flush()?;
-
-        if self.cfg.keep_raw {
-            let raw_path = format!("{}.rprofile.txt", out_prefix);
-            let mut raw_writer = WriterBuilder::new()
-                .has_headers(false)
-                .delimiter(b'\t')
-                .from_writer(File::create(&raw_path)?);
-            for row in raw_rows {
-                row.write(&mut raw_writer)?;
-            }
-            raw_writer.flush()?;
-        }
         Ok(())
     }
 

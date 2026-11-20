@@ -29,7 +29,8 @@
 //! database) a species is left out beside a deeper congener whose reads are
 //! that much more identical ([`identity_relatives`]). A genome represented by
 //! marker genes is measured gene by gene ([`MarkerModel`]); the tests are the
-//! same. With `--save-raw-profile` the engine also writes
+//! same. The profile opens with two `#` lines: the run's metadata and the
+//! column names ([`tables`]). With `--save-raw-profile` the engine also writes
 //! `<prefix>.levels_genomes.tsv`, the tests of every measured genome.
 
 use std::collections::{HashMap, HashSet};
@@ -57,6 +58,9 @@ use crate::profiler::{parse_reference_taxonomy, ProfileRank};
 use crate::taxonomy::Taxonomy;
 
 mod genomes;
+mod tables;
+
+use tables::{TableHeader, PROFILE_COLUMNS};
 
 /// Each base that a candidate aligns less than the read's longest alignment
 /// counts as this many errors in the EM.
@@ -749,7 +753,16 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             .then_with(|| row_genome(a).cmp(&row_genome(b)))
     });
     let unclassified = profiler.estimate_unclassified(&data, &rows, &genome_reads);
-    profiler.write_profile_files(&rows, unclassified, raw_rows)
+    profiler.write_profile(
+        &TableHeader::of(cfg).lines("profile", &PROFILE_COLUMNS),
+        &rows,
+        unclassified,
+        true,
+    )?;
+    if cfg.keep_raw {
+        profiler.write_raw_profile(raw_rows)?;
+    }
+    Ok(())
 }
 
 /// Every fragment with at least one candidate species, and the sample's error
