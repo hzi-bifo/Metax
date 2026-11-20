@@ -275,7 +275,7 @@ pub(crate) fn format_probability(value: Option<f64>) -> String {
 }
 
 #[inline]
-fn format_five(value: f64) -> String {
+pub(crate) fn format_five(value: f64) -> String {
     format!("{value:.5}")
 }
 

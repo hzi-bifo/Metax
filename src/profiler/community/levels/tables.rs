@@ -1,10 +1,82 @@
-//! Tables of the level-wise engine: the lines that open its profile, two lines
-//! starting with `#`: the run's metadata, in the style of the mapping file's
-//! header, then the column names.
+//! Tables of the level-wise engine: the lines that open its profile and, with
+//! `--save-raw-profile`, the decisions table (`<prefix>.decisions.tsv`). Each
+//! opens with two lines starting with `#`: the run's metadata, in the style of
+//! the mapping file's header, then the column names.
+//!
+//! The decisions table has one row per taxon the engine judged, at every rank,
+//! kept or not:
+//!
+//! - `species`: one row per measured genome of every candidate species, its
+//!   coverage from the reads that resolve to the species;
+//! - `strain` (with `--strain`): one row per genome the genome level considered;
+//! - `genus`: one row per genus row of the profile: the roll-up of removed
+//!   species' reads and the species reported at their genus, merged as in the
+//!   profile (roll-up candidates that fail are not listed);
+//! - `family`: one row per unit of the family level, kept or not.
+//!
+//! Species rows come first, by the species' abundance in the profile (largest
+//! first, then taxid; species not in the profile last), each species' decided
+//! genome first, then by reads (most first) and accession; then strain rows,
+//! by species taxid, best-fit genome first, then by EM share (largest first)
+//! and accession; then genus rows and family rows, each by abundance and
+//! taxid. Columns, `NA` where they do not apply:
+//!
+//! - `rank`, `taxid`, `name`: the taxon (a strain row is named and numbered as
+//!   its row in the profile);
+//! - `parent_taxid`: the species of a strain, the genus of a species, the
+//!   family of a genus; `NA` for a family;
+//! - `genome`: the genome the row's evidence is measured on;
+//! - `decided`: species rows: the genome the species' decision rests on (the
+//!   genome it is reported on when kept, otherwise its genome with most
+//!   reads); strain rows: each genome reported as a strain row of the
+//!   profile; genus and family rows: `true`;
+//! - `reads`: observed reads behind the evidence, a read pair counting once,
+//!   not scaled like column 4 of the profile: species rows: reads resolved to
+//!   the species and placed on the genome; strain rows: reads the genome EM
+//!   resolves to the genome; genus rows: the roll-up's reads plus those of the
+//!   species reported at the genus; family rows: reads resolved to the family
+//!   and placed on the genome;
+//! - `depth` to `chunk_pvalue`: the coverage on `genome` and the chunk-breadth
+//!   cutoff of the tests (as in the profile; ratios to four decimals);
+//! - `candidate_reads`, `won_reads`: reads listing the species (family) and
+//!   those resolved to it; `second_look_reads`: reads the species took on the
+//!   second look; `own_reads`: reads it won that no kept species lists;
+//! - `em_share`, `strain_identity_reads`: a strain's share of its species' reads
+//!   in the genome EM, and its resolved reads at strain-level identity;
+//! - `window_spread`: share of genome windows the reads reach (genus: the
+//!   roll-up's witness; family: the family's genome);
+//! - `genome_tests`: the row's own tests, `passed` or each failed test with its
+//!   value and bound;
+//! - `decision`: `kept` when the taxon has rows of its own in the profile,
+//!   otherwise `removed`; the same on every row of a species;
+//! - `reason`: the taxon's outcome in words, the same on every row of a
+//!   species;
+//! - `reported_as`: the rank of the profile rows holding the taxon's reads
+//!   (`species` for a species row and its strain rows), `none` when none;
+//! - `final_reads`, `final_abundance`: columns 4 and 6 of the taxon's profile
+//!   row; for a species its species row plus its strain rows; on species rows
+//!   only on the decided genome; `NA` when the taxon has no row of its own.
 
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+
+use super::genomes::{SpeciesGenomes, StrainDiagnostic};
+use super::{
+    strain_label, wins_enough, within, FragmentCounts, GenomeEvidence, SpeciesTests, TaxonBlock,
+    UnitCandidate, MIN_WON_SHARE,
+};
 use crate::db::DatabaseMetadata;
+use crate::profiler::evidence::{EvidenceCoverage, WitnessDecision, STANDARD_RATIO_UPPER};
+use crate::profiler::output::format_five;
+use crate::profiler::rollup::{GenusRow, MIN_CHUNK_RATIO, MIN_GENUS_FRAGMENTS, MIN_WINDOW_SPREAD};
 use crate::profiler::ProfilerConfig;
 use crate::sequencer::Sequencer;
+use crate::taxonomy::Taxonomy;
 
 /// Columns of the level-wise engine's profile. Every row has all of them, the
 /// unclassified row included.
@@ -26,6 +98,41 @@ pub(super) const PROFILE_COLUMNS: [&str; 17] = [
     "best_fit_genome",
     "mean_identity",
     "estimated_ani",
+];
+
+/// Columns of the decisions table (see the module documentation).
+const DECISION_COLUMNS: [&str; 31] = [
+    "rank",
+    "taxid",
+    "name",
+    "parent_taxid",
+    "genome",
+    "decided",
+    "reads",
+    "depth",
+    "breadth",
+    "expected_breadth",
+    "oebr",
+    "fixed_chunk_breadth",
+    "flex_chunk_breadth",
+    "expected_flex_chunk_breadth",
+    "coebr",
+    "chunk_cutoff",
+    "breadth_pvalue",
+    "chunk_pvalue",
+    "candidate_reads",
+    "won_reads",
+    "second_look_reads",
+    "own_reads",
+    "em_share",
+    "strain_identity_reads",
+    "window_spread",
+    "genome_tests",
+    "decision",
+    "reason",
+    "reported_as",
+    "final_reads",
+    "final_abundance",
 ];
 
 /// The run named on the first line of each table.
@@ -65,13 +172,730 @@ impl TableHeader {
     }
 }
 
+/// Names of taxa and genomes (by assembly id).
+pub(super) struct Names<'a> {
+    pub(super) taxonomy: &'a Taxonomy,
+    pub(super) genomes: &'a [Arc<str>],
+}
+
+impl Names<'_> {
+    fn taxon(&self, taxid: u32) -> String {
+        self.taxonomy
+            .get_name(taxid)
+            .unwrap_or("unknown")
+            .to_string()
+    }
+
+    fn genome(&self, assembly_id: u32) -> &str {
+        &self.genomes[assembly_id as usize]
+    }
+
+    /// The ancestor of `taxid` at `rank`.
+    fn ancestor(&self, taxid: u32, rank: &str) -> Option<u32> {
+        self.taxonomy
+            .get_parents(taxid)
+            .into_iter()
+            .find(|(_, _, r)| r == rank)
+            .map(|(ancestor, _, _)| ancestor)
+    }
+}
+
+/// What each taxon holds in the profile: reads and abundance (columns 4 and 6).
+pub(super) struct FinalRows {
+    /// Of each species with rows of its own, summed over its species row and
+    /// genome rows in profile order.
+    species: HashMap<u32, [f64; 2]>,
+    /// Of each genome (strain) row, by genome.
+    strains: HashMap<Arc<str>, [f64; 2]>,
+    /// Of each genus and family row, by taxid.
+    taxa: HashMap<u32, [f64; 2]>,
+}
+
+impl FinalRows {
+    /// From the profile's taxon blocks, in profile order.
+    pub(super) fn of(blocks: &[TaxonBlock]) -> Self {
+        let mut finals = Self {
+            species: HashMap::new(),
+            strains: HashMap::new(),
+            taxa: HashMap::new(),
+        };
+        let amount =
+            |row: &crate::profiler::output::ProfileRow| [row.equivalent_mapcount, row.abundance];
+        for block in blocks {
+            let species_row = block.taxon.as_ref().filter(|row| row.rank == "species");
+            if species_row.is_none() && block.genomes.is_empty() {
+                if let Some(row) = &block.taxon {
+                    finals.taxa.insert(block.taxid, amount(row));
+                }
+                continue;
+            }
+            let mut total = [0.0; 2];
+            for row in species_row.into_iter().chain(&block.genomes) {
+                total[0] += row.equivalent_mapcount;
+                total[1] += row.abundance;
+            }
+            for row in &block.genomes {
+                if let Some(best_fit) = &row.best_fit {
+                    finals
+                        .strains
+                        .insert(Arc::clone(&best_fit.genome), amount(row));
+                }
+            }
+            finals.species.insert(block.taxid, total);
+        }
+        finals
+    }
+}
+
+/// Write a table to `path`.
+pub(super) fn write_file(
+    path: &str,
+    write: impl FnOnce(&mut dyn Write) -> std::io::Result<()>,
+) -> Result<()> {
+    let mut out =
+        BufWriter::new(File::create(path).with_context(|| format!("failed to create {path}"))?);
+    write(&mut out)
+        .and_then(|()| out.flush())
+        .with_context(|| format!("failed to write {path}"))
+}
+
+/// What became of a measured species.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SpeciesDecision {
+    /// Kept by the first judgment.
+    KeptTests,
+    /// Kept on the second look.
+    KeptSecondLook,
+    /// Kept on the last look, on its own reads.
+    KeptOwnEvidence,
+    /// Kept by the genus roll-up for even coverage.
+    KeptEvenCoverage,
+    /// Kept on the last look, reported at its genus as its reads tie with
+    /// relatives along its genome.
+    AtGenusTie,
+    /// Reported at its genus by the identity rules for relatives.
+    AtGenusIdentity,
+    /// Left out by the identity rules for relatives.
+    LeftOut,
+    /// Kept, then removed by the prophage check.
+    RemovedProphage,
+    /// Never kept.
+    Removed,
+}
+
+impl SpeciesDecision {
+    fn kept(self) -> bool {
+        matches!(
+            self,
+            Self::KeptTests | Self::KeptSecondLook | Self::KeptOwnEvidence | Self::KeptEvenCoverage
+        )
+    }
+
+    fn at_genus(self) -> bool {
+        matches!(self, Self::AtGenusTie | Self::AtGenusIdentity)
+    }
+
+    /// The outcome in words; `tests` are those of the species' decided genome.
+    fn reason(self, tests: &str) -> String {
+        match self {
+            Self::KeptTests => "passed amount, evenness and won share".to_string(),
+            Self::KeptSecondLook => {
+                "kept on the second look: a removed sister no longer splits its reads".to_string()
+            }
+            Self::KeptOwnEvidence => {
+                "kept on its own reads, which no kept species explains".to_string()
+            }
+            Self::KeptEvenCoverage => {
+                "kept by the roll-up: its reads cover its genome evenly".to_string()
+            }
+            Self::AtGenusTie | Self::AtGenusIdentity => format!("reported at genus: {}", self.why_at_genus()),
+            Self::LeftOut => "left out: a relative with more identical reads is kept".to_string(),
+            Self::RemovedProphage => "removed by the prophage check: its own reads do not cover the genome outside the part a kept host explains".to_string(),
+            Self::Removed => format!("removed: {tests}"),
+        }
+    }
+
+    fn why_at_genus(self) -> &'static str {
+        if self == Self::AtGenusTie {
+            "its reads tie with relatives along its genome"
+        } else {
+            "its reads are less identical than the sample's typical species"
+        }
+    }
+}
+
+/// The species that the looks after the first judgment kept or removed.
+pub(super) struct Looks<'a> {
+    /// Kept on the second look, with the fragments each took.
+    pub(super) second_look: &'a HashMap<u32, Vec<usize>>,
+    /// Kept on the last look, with whether each is reported at its genus.
+    pub(super) own_evidence: &'a HashMap<u32, bool>,
+    /// Kept viruses removed by the prophage check.
+    pub(super) prophage: &'a [u32],
+    /// Kept by the genus roll-up for even coverage.
+    pub(super) even_coverage: &'a [u32],
+}
+
+/// The decision of each species with a measured genome once the looks are
+/// done: how a species with a best-fit genome in `kept` was kept, and why one
+/// without was not. The identity rules and the genus reports then turn some
+/// kept species into `LeftOut` or `AtGenus*`.
+pub(super) fn judged_species(
+    genomes: &HashMap<u32, GenomeEvidence>,
+    kept: &HashMap<u32, u32>,
+    looks: &Looks,
+) -> HashMap<u32, SpeciesDecision> {
+    let prophage: HashSet<u32> = looks.prophage.iter().copied().collect();
+    let even: HashSet<u32> = looks.even_coverage.iter().copied().collect();
+    let decision = |taxid: u32| {
+        if !kept.contains_key(&taxid) {
+            if prophage.contains(&taxid) {
+                SpeciesDecision::RemovedProphage
+            } else {
+                SpeciesDecision::Removed
+            }
+        } else if even.contains(&taxid) {
+            SpeciesDecision::KeptEvenCoverage
+        } else if looks.own_evidence.contains_key(&taxid) {
+            SpeciesDecision::KeptOwnEvidence
+        } else if looks.second_look.contains_key(&taxid) {
+            SpeciesDecision::KeptSecondLook
+        } else {
+            SpeciesDecision::KeptTests
+        }
+    };
+    let mut decisions = HashMap::new();
+    for genome in genomes.values() {
+        decisions
+            .entry(genome.taxid)
+            .or_insert_with(|| decision(genome.taxid));
+    }
+    decisions
+}
+
+/// The genome level, with `--strain`.
+pub(super) struct StrainLevel<'a> {
+    pub(super) rows: &'a [StrainDiagnostic],
+    /// The genomes the genome level reports for each species.
+    pub(super) species: &'a HashMap<u32, SpeciesGenomes>,
+    /// Its coverage tests (chunk-breadth cutoff and ratio bounds).
+    pub(super) tests: SpeciesTests,
+    pub(super) strain_taxids: &'a HashMap<Arc<str>, u32>,
+}
+
+/// What the decisions table is written from.
+pub(super) struct Decisions<'a> {
+    pub(super) genomes: &'a HashMap<u32, GenomeEvidence>,
+    pub(super) counts: &'a FragmentCounts,
+    pub(super) tests: &'a SpeciesTests,
+    pub(super) outcomes: &'a HashMap<u32, SpeciesDecision>,
+    /// The genome each kept species is reported on.
+    pub(super) reported: &'a HashMap<u32, u32>,
+    pub(super) strains: Option<StrainLevel<'a>>,
+    /// Genus rows of the roll-up.
+    pub(super) rollup_rows: &'a [GenusRow],
+    /// Each measured species' decision for the roll-up and its genome.
+    pub(super) rollup_genomes: &'a HashMap<u32, (WitnessDecision, u32)>,
+    /// Species reported at their genus: (genus, species, reads).
+    pub(super) genus_members: &'a [(u32, u32, f64)],
+    pub(super) families: &'a [UnitCandidate],
+}
+
+/// What a genus row of the profile is made of: the roll-up's row, and the
+/// species reported at the genus with their reads.
+#[derive(Default)]
+struct GenusParts<'a> {
+    rollup: Option<&'a GenusRow>,
+    members: Vec<(u32, f64)>,
+}
+
+/// One row of the decisions table.
+struct DecisionRow<'n> {
+    rank: &'static str,
+    taxid: u32,
+    name: String,
+    parent: Option<u32>,
+    genome: Option<&'n str>,
+    decided: bool,
+    reads: String,
+    coverage: Option<EvidenceCoverage>,
+    chunk_cutoff: Option<f64>,
+    /// Candidate, won, second-look and own reads.
+    counts: [Option<f64>; 4],
+    em_share: Option<f64>,
+    strain_identity_reads: Option<u64>,
+    window_spread: Option<f64>,
+    genome_tests: String,
+    kept: bool,
+    reason: String,
+    reported_as: &'static str,
+    finals: Option<[f64; 2]>,
+}
+
+fn na() -> String {
+    "NA".to_string()
+}
+
+fn four_decimals(value: f64) -> String {
+    format!("{value:.4}")
+}
+
+fn pvalue(value: Option<f64>) -> String {
+    value.map_or_else(na, |v| format!("{v:.3e}"))
+}
+
+impl DecisionRow<'_> {
+    fn fields(&self) -> [String; DECISION_COLUMNS.len()] {
+        let coverage = self.coverage.as_ref();
+        let measured = |value: fn(&EvidenceCoverage) -> String| coverage.map_or_else(na, value);
+        let count = |value: Option<f64>| value.map_or_else(na, |v| format!("{v:.0}"));
+        let finals = |i: usize| self.finals.map_or_else(na, |f| format_five(f[i]));
+        [
+            self.rank.to_string(),
+            self.taxid.to_string(),
+            self.name.clone(),
+            self.parent.map_or_else(na, |t| t.to_string()),
+            self.genome.map_or_else(na, str::to_string),
+            self.decided.to_string(),
+            self.reads.clone(),
+            measured(|c| format_five(c.depth)),
+            measured(|c| format_five(c.breadth)),
+            measured(|c| format_five(c.expected_breadth)),
+            measured(|c| four_decimals(c.oebr)),
+            measured(|c| four_decimals(c.fixed_chunk)),
+            measured(|c| format_five(c.flex_chunk)),
+            measured(|c| format_five(c.expected_flex_chunk)),
+            measured(|c| four_decimals(c.coebr)),
+            self.chunk_cutoff.map_or_else(na, four_decimals),
+            pvalue(coverage.and_then(|c| c.breadth_pvalue)),
+            pvalue(coverage.and_then(|c| c.chunk_pvalue)),
+            count(self.counts[0]),
+            count(self.counts[1]),
+            count(self.counts[2]),
+            count(self.counts[3]),
+            self.em_share.map_or_else(na, four_decimals),
+            self.strain_identity_reads
+                .map_or_else(na, |r| r.to_string()),
+            self.window_spread.map_or_else(na, four_decimals),
+            self.genome_tests.clone(),
+            if self.kept { "kept" } else { "removed" }.to_string(),
+            self.reason.clone(),
+            self.reported_as.to_string(),
+            finals(0),
+            finals(1),
+        ]
+    }
+}
+
+/// `passed`, or each failed test.
+fn tests_in_words(failed: &[String]) -> String {
+    if failed.is_empty() {
+        "passed".to_string()
+    } else {
+        format!("failed {}", failed.join("; failed "))
+    }
+}
+
+/// The coverage tests of `tests` that `coverage` fails, in words.
+fn coverage_failures(tests: &SpeciesTests, coverage: &EvidenceCoverage) -> Vec<String> {
+    let mut failed = Vec::new();
+    if !tests.amount_ok(coverage) {
+        failed.push(format!(
+            "amount: fixed chunk {:.4} <= cutoff {:.4}",
+            coverage.fixed_chunk, tests.chunk_cutoff
+        ));
+    }
+    if !tests.marker_genes_ok(coverage) {
+        failed.push(format!(
+            "marker genes: {} < {}",
+            coverage.marker_genes_hit.unwrap_or(0),
+            tests.min_marker_genes
+        ));
+    }
+    for (name, ratio, lower) in [
+        ("OEBR", coverage.oebr, tests.ratio_bounds.0),
+        ("COEBR", coverage.coebr, tests.ratio_bounds.1),
+    ] {
+        if !within(ratio, lower) {
+            failed.push(if ratio > STANDARD_RATIO_UPPER {
+                format!("evenness: {name} {ratio:.4} > {STANDARD_RATIO_UPPER}")
+            } else {
+                format!("evenness: {name} {ratio:.4} < {lower}")
+            });
+        }
+    }
+    failed
+}
+
+/// Larger final abundance first; taxa without one last.
+fn by_abundance(a: Option<[f64; 2]>, b: Option<[f64; 2]>) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => b[1].total_cmp(&a[1]),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+impl Decisions<'_> {
+    /// Write the table.
+    pub(super) fn write(
+        &self,
+        out: &mut dyn Write,
+        header: &TableHeader,
+        names: &Names,
+        finals: &FinalRows,
+    ) -> std::io::Result<()> {
+        out.write_all(header.lines("decisions", &DECISION_COLUMNS).as_bytes())?;
+        for row in self.rows(names, finals) {
+            writeln!(out, "{}", row.fields().join("\t"))?;
+        }
+        Ok(())
+    }
+
+    fn rows<'n>(&self, names: &'n Names, finals: &FinalRows) -> Vec<DecisionRow<'n>> {
+        let mut rows = self.species_rows(names, finals);
+        rows.extend(self.strain_rows(names, finals));
+        for mut level in [
+            self.genus_rows(names, finals),
+            self.family_rows(names, finals),
+        ] {
+            level.sort_by(|a, b| by_abundance(a.finals, b.finals).then(a.taxid.cmp(&b.taxid)));
+            rows.extend(level);
+        }
+        rows
+    }
+
+    /// The tests of genome `genome` of its species, in words.
+    fn species_genome_tests(&self, genome: &GenomeEvidence) -> String {
+        let coverage = genome.coverage.as_ref().expect("measured before");
+        let mut failed = coverage_failures(self.tests, coverage);
+        let count = |map: &HashMap<u32, u64>| map.get(&genome.taxid).copied().unwrap_or(0);
+        let (won, candidates) = (count(&self.counts.won), count(&self.counts.candidates));
+        if !wins_enough(won, candidates) {
+            failed.push(format!(
+                "won share: {:.4} < {MIN_WON_SHARE}",
+                won as f64 / candidates.max(1) as f64
+            ));
+        }
+        tests_in_words(&failed)
+    }
+
+    fn species_rows<'n>(&self, names: &'n Names, finals: &FinalRows) -> Vec<DecisionRow<'n>> {
+        let mut by_species: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (&id, genome) in self.genomes {
+            by_species.entry(genome.taxid).or_default().push(id);
+        }
+        let mut species = by_species.into_iter().collect::<Vec<_>>();
+        species.sort_by(|a, b| {
+            by_abundance(
+                finals.species.get(&a.0).copied(),
+                finals.species.get(&b.0).copied(),
+            )
+            .then(a.0.cmp(&b.0))
+        });
+        let mut rows = Vec::new();
+        for (taxid, mut ids) in species {
+            // Most reads first, then accession; the decided genome leads.
+            ids.sort_by(|&a, &b| {
+                self.genomes[&b]
+                    .assembly
+                    .count
+                    .cmp(&self.genomes[&a].assembly.count)
+                    .then_with(|| names.genome(a).cmp(names.genome(b)))
+            });
+            let decided = self.reported.get(&taxid).copied().unwrap_or(ids[0]);
+            if let Some(position) = ids.iter().position(|&id| id == decided) {
+                ids[..=position].rotate_right(1);
+            }
+            let decision = self.outcomes[&taxid];
+            let reason = decision.reason(&self.species_genome_tests(&self.genomes[&decided]));
+            let total = finals.species.get(&taxid).copied();
+            let reported_as = match total {
+                Some(_) => "species",
+                None if decision.at_genus() => "genus",
+                None => "none",
+            };
+            let count =
+                |map: &HashMap<u32, u64>| Some(map.get(&taxid).copied().unwrap_or(0) as f64);
+            for id in ids {
+                let genome = &self.genomes[&id];
+                rows.push(DecisionRow {
+                    rank: "species",
+                    taxid,
+                    name: names.taxon(taxid),
+                    parent: names.ancestor(taxid, "genus"),
+                    genome: Some(names.genome(id)),
+                    decided: id == decided,
+                    reads: genome.assembly.count.to_string(),
+                    coverage: genome.coverage,
+                    chunk_cutoff: Some(self.tests.chunk_cutoff),
+                    counts: [
+                        count(&self.counts.candidates),
+                        count(&self.counts.won),
+                        count(&self.counts.second_look),
+                        count(&self.counts.own),
+                    ],
+                    em_share: None,
+                    strain_identity_reads: None,
+                    window_spread: None,
+                    genome_tests: self.species_genome_tests(genome),
+                    kept: decision.kept(),
+                    reason: reason.clone(),
+                    reported_as,
+                    finals: total.filter(|_| id == decided),
+                });
+            }
+        }
+        rows
+    }
+
+    fn strain_rows<'n>(&self, names: &'n Names, finals: &FinalRows) -> Vec<DecisionRow<'n>> {
+        let Some(level) = &self.strains else {
+            return Vec::new();
+        };
+        let mut diagnostics = level.rows.iter().collect::<Vec<_>>();
+        diagnostics.sort_by(|a, b| {
+            a.taxid
+                .cmp(&b.taxid)
+                .then(b.best_fit.cmp(&a.best_fit))
+                .then(b.em_share.total_cmp(&a.em_share))
+                .then_with(|| names.genome(a.assembly_id).cmp(names.genome(b.assembly_id)))
+        });
+        let mut rows = Vec::new();
+        for row in diagnostics {
+            let accession = names.genome(row.assembly_id);
+            let (name, taxid) =
+                strain_label(names.taxonomy, level.strain_taxids, row.taxid, accession);
+            let strain_row = finals.strains.get(accession).copied();
+            let passed = level.species.get(&row.taxid).is_some_and(|species| {
+                species
+                    .strains
+                    .iter()
+                    .any(|strain| strain.assembly_id == row.assembly_id)
+            });
+            let (genome_tests, reason) = if strain_row.is_some() {
+                (
+                    "passed".to_string(),
+                    "same strain: its reads match it within sequencing error and cover it evenly",
+                )
+            } else if passed {
+                (
+                    "passed".to_string(),
+                    "species not reported: its species is left out or reported at its genus",
+                )
+            } else if row.kept {
+                (
+                    "failed identity: its reads do not match it within sequencing error"
+                        .to_string(),
+                    "relative only: its reads match it as a relative's, not its own strain's",
+                )
+            } else if let Some(coverage) = &row.coverage {
+                (
+                    tests_in_words(&coverage_failures(&level.tests, coverage)),
+                    "coverage failed: its reads at strain-level identity do not cover it evenly enough",
+                )
+            } else if row.resolved > 0 && row.gated == 0 {
+                (
+                    "failed identity: no read matches it at strain-level identity".to_string(),
+                    "low identity: its reads match it below strain-level identity",
+                )
+            } else {
+                (
+                    "not measured: no read resolves to it".to_string(),
+                    "not measured: no read resolves to it at strain-level identity",
+                )
+            };
+            rows.push(DecisionRow {
+                rank: "strain",
+                taxid,
+                name,
+                parent: Some(row.taxid),
+                genome: Some(accession),
+                decided: strain_row.is_some(),
+                reads: row.resolved.to_string(),
+                coverage: row.coverage,
+                chunk_cutoff: Some(level.tests.chunk_cutoff),
+                counts: [None; 4],
+                em_share: Some(row.em_share),
+                strain_identity_reads: Some(row.gated),
+                window_spread: None,
+                genome_tests,
+                kept: strain_row.is_some(),
+                reason: reason.to_string(),
+                reported_as: if strain_row.is_some() {
+                    "strain"
+                } else {
+                    "none"
+                },
+                finals: strain_row,
+            });
+        }
+        rows
+    }
+
+    /// One row per genus row of the profile: the roll-up's row and the species
+    /// reported at the genus, added in taxid order; the row's evidence is the
+    /// roll-up's witness, otherwise that of its first species.
+    fn genus_rows<'n>(&self, names: &'n Names, finals: &FinalRows) -> Vec<DecisionRow<'n>> {
+        let mut genera: BTreeMap<u32, GenusParts> = BTreeMap::new();
+        for row in self.rollup_rows {
+            genera.entry(row.genus).or_default().rollup = Some(row);
+        }
+        for &(genus, taxid, reads) in self.genus_members {
+            genera
+                .entry(genus)
+                .or_default()
+                .members
+                .push((taxid, reads));
+        }
+        let mut rows = Vec::new();
+        for (
+            genus,
+            GenusParts {
+                rollup,
+                mut members,
+            },
+        ) in genera
+        {
+            members.sort_by_key(|member| member.0);
+            let (coverage, genome) = match rollup {
+                Some(row) => (row.witness, self.rollup_genomes[&row.donors[0]].1),
+                None => {
+                    let id = self.reported[&members[0].0];
+                    (self.genomes[&id].coverage.expect("measured before"), id)
+                }
+            };
+            let reads = members
+                .iter()
+                .fold(rollup.map_or(0.0, |row| row.fragments), |total, member| {
+                    total + member.1
+                });
+            let mut parts = Vec::new();
+            if let Some(row) = rollup {
+                let donors = row.donors.iter().map(u32::to_string).collect::<Vec<_>>();
+                parts.push(format!(
+                    "roll-up of the reads of removed species {}",
+                    donors.join(", ")
+                ));
+            }
+            if !members.is_empty() {
+                let species = members
+                    .iter()
+                    .map(|&(taxid, reads)| {
+                        format!(
+                            "{taxid} ({reads:.0} reads; {})",
+                            self.outcomes[&taxid].why_at_genus()
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                parts.push(format!("species reported at genus: {}", species.join(", ")));
+            }
+            rows.push(DecisionRow {
+                rank: "genus",
+                taxid: genus,
+                name: names.taxon(genus),
+                parent: names.ancestor(genus, "family"),
+                genome: Some(names.genome(genome)),
+                decided: true,
+                reads: format_five(reads),
+                coverage: Some(coverage),
+                chunk_cutoff: None,
+                counts: [None; 4],
+                em_share: None,
+                strain_identity_reads: None,
+                window_spread: rollup.and_then(|row| row.witness.window_spread),
+                genome_tests: rollup.map_or_else(
+                    || "no genus tests: made of species reported at their genus".to_string(),
+                    |row| {
+                        format!(
+                            "passed: {:.0} reads >= {MIN_GENUS_FRAGMENTS} from removed species whose reads spread over their genome (COEBR >= {MIN_CHUNK_RATIO}, window spread >= {MIN_WINDOW_SPREAD})",
+                            row.fragments
+                        )
+                    },
+                ),
+                kept: true,
+                reason: format!("kept: {}", parts.join(" + ")),
+                reported_as: "genus",
+                finals: finals.taxa.get(&genus).copied(),
+            });
+        }
+        rows
+    }
+
+    fn family_rows<'n>(&self, names: &'n Names, finals: &FinalRows) -> Vec<DecisionRow<'n>> {
+        let mut rows = Vec::new();
+        for candidate in self.families {
+            let kept = candidate.coverage.is_some();
+            let (genome_tests, reason) = if candidate.excluded {
+                (
+                    "excluded: the family of a kept species, on a database of sampled genomes"
+                        .to_string(),
+                    "removed: its reads stand for the unindexed parts of a kept species' genome"
+                        .to_string(),
+                )
+            } else {
+                let mut failed = Vec::new();
+                if candidate.won < MIN_GENUS_FRAGMENTS {
+                    failed.push(format!(
+                        "reads: {:.0} < {MIN_GENUS_FRAGMENTS}",
+                        candidate.won
+                    ));
+                }
+                if candidate.won < MIN_WON_SHARE * candidate.listing {
+                    failed.push(format!(
+                        "won share: {:.4} < {MIN_WON_SHARE}",
+                        candidate.won / candidate.listing
+                    ));
+                }
+                match candidate.spread {
+                    None => failed.push("window spread: too few reads to measure".to_string()),
+                    Some(spread) if spread < MIN_WINDOW_SPREAD => {
+                        failed.push(format!("window spread: {spread:.4} < {MIN_WINDOW_SPREAD}"))
+                    }
+                    Some(_) => {}
+                }
+                let tests = tests_in_words(&failed);
+                let reason = if kept {
+                    "kept: reads without a species match spread over a relative's genome"
+                        .to_string()
+                } else {
+                    format!("removed: {tests}")
+                };
+                (tests, reason)
+            };
+            rows.push(DecisionRow {
+                rank: "family",
+                taxid: candidate.unit,
+                name: names.taxon(candidate.unit),
+                parent: None,
+                genome: Some(names.genome(candidate.genome)),
+                decided: true,
+                reads: candidate.reads.to_string(),
+                coverage: candidate.coverage,
+                chunk_cutoff: None,
+                counts: [Some(candidate.listing), Some(candidate.won), None, None],
+                em_share: None,
+                strain_identity_reads: None,
+                window_spread: candidate.spread,
+                genome_tests,
+                kept,
+                reason,
+                reported_as: if kept { "family" } else { "none" },
+                finals: finals.taxa.get(&candidate.unit).copied().filter(|_| kept),
+            });
+        }
+        rows
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
+    use super::super::genomes::StrainGenome;
     use super::super::profile_row;
     use super::*;
-    use crate::profiler::evidence::EvidenceCoverage;
+    use crate::profiler::evidence::{PremapChunkGuard, PresenceAssembly, RescueKinds};
+    use crate::profiler::output::ProfileRow;
     use crate::profiler::unclassified;
 
     fn header() -> TableHeader {
@@ -80,6 +904,314 @@ mod tests {
             sequencer: Sequencer::Illumina,
             paired: true,
         }
+    }
+
+    /// Family 1000 holds genus 100 (species 1 to 5, species 4 with strain 400) and family 2000 nothing named.
+    fn taxonomy() -> Taxonomy {
+        let mut nodes = HashMap::from([
+            (1, (1, "no rank".to_string())),
+            (1000, (1, "family".to_string())),
+            (2000, (1, "family".to_string())),
+            (100, (1000, "genus".to_string())),
+            (400, (4, "strain".to_string())),
+        ]);
+        let mut names = HashMap::from([
+            (1000, "Family A".to_string()),
+            (2000, "Family B".to_string()),
+            (100, "Genus".to_string()),
+            (400, "Strain 400".to_string()),
+        ]);
+        for taxid in 1..=5 {
+            nodes.insert(taxid, (100, "species".to_string()));
+            names.insert(taxid, format!("Species {taxid}"));
+        }
+        Taxonomy::from_parts(nodes, names, HashMap::new(), HashSet::new())
+    }
+
+    /// Accessions `GCF_<id>` of assembly ids 0-99.
+    fn accessions() -> Vec<Arc<str>> {
+        (0..100).map(|id| Arc::from(format!("GCF_{id}"))).collect()
+    }
+
+    /// A profile row of `rank` for `taxid` on genome `GCF_<genome>`.
+    fn final_row(taxid: u32, rank: &str, genome: u32, reads: f64, abundance: f64) -> ProfileRow {
+        let mut row = profile_row(
+            format!("Taxon {taxid}"),
+            taxid,
+            rank,
+            (reads, 1.0),
+            &EvidenceCoverage::default(),
+            Arc::from(format!("GCF_{genome}")),
+            Some((f64::NAN, f64::NAN)),
+        );
+        row.abundance = abundance;
+        row
+    }
+
+    fn coverage(fixed_chunk: f64, coebr: f64) -> EvidenceCoverage {
+        EvidenceCoverage {
+            fixed_chunk,
+            oebr: 1.0,
+            coebr,
+            window_spread: Some(0.8),
+            ..EvidenceCoverage::default()
+        }
+    }
+
+    fn evidence(taxid: u32, count: u64, coverage: EvidenceCoverage) -> GenomeEvidence {
+        GenomeEvidence {
+            taxid,
+            assembly: PresenceAssembly {
+                count,
+                ..PresenceAssembly::default()
+            },
+            coverage: Some(coverage),
+            kept: false,
+        }
+    }
+
+    /// A small run: species 1 kept (genomes 10 and 11), with a species row and a genome row; species 2 reported at
+    /// its genus; species 3 removed; species 4 kept on the second look, in a genome row under strain 400 only;
+    /// species 5 removed, its reads rolled up into genus 100; family 1000 kept, family 2000 not.
+    struct Fixture {
+        genomes: HashMap<u32, GenomeEvidence>,
+        counts: FragmentCounts,
+        tests: SpeciesTests,
+        outcomes: HashMap<u32, SpeciesDecision>,
+        reported: HashMap<u32, u32>,
+        diagnostics: Vec<StrainDiagnostic>,
+        species: HashMap<u32, SpeciesGenomes>,
+        strain_taxids: HashMap<Arc<str>, u32>,
+        rollup_rows: Vec<GenusRow>,
+        rollup_genomes: HashMap<u32, (WitnessDecision, u32)>,
+        genus_members: Vec<(u32, u32, f64)>,
+        families: Vec<UnitCandidate>,
+        blocks: Vec<TaxonBlock>,
+    }
+
+    fn fixture() -> Fixture {
+        let genomes = HashMap::from([
+            (10, evidence(1, 50, coverage(0.9, 1.0))),
+            (11, evidence(1, 80, coverage(0.02, 0.61))),
+            (20, evidence(2, 40, coverage(0.9, 1.0))),
+            (30, evidence(3, 60, coverage(0.9, 1.0))),
+            (40, evidence(4, 70, coverage(0.9, 1.0))),
+            (50, evidence(5, 30, coverage(0.1, 0.9))),
+        ]);
+        let counts = FragmentCounts {
+            candidates: HashMap::from([(1, 100), (2, 50), (3, 100), (4, 40)]),
+            won: HashMap::from([(1, 90), (2, 10), (3, 5), (4, 30)]),
+            second_look: HashMap::from([(4, 7)]),
+            ..FragmentCounts::default()
+        };
+        let tests = SpeciesTests {
+            multiple_tests: 1,
+            chunk_cutoff: 0.5,
+            ratio_bounds: (0.6, 0.75),
+            markers: None,
+            min_marker_genes: 0,
+        };
+        let reported = HashMap::from([(1, 10), (2, 20), (4, 40)]);
+        let mut outcomes = judged_species(
+            &genomes,
+            &reported,
+            &Looks {
+                second_look: &HashMap::from([(4, vec![0])]),
+                own_evidence: &HashMap::from([(2, true)]),
+                prophage: &[],
+                even_coverage: &[],
+            },
+        );
+        outcomes.insert(2, SpeciesDecision::AtGenusTie);
+        let diagnostic =
+            |taxid, assembly_id, best_fit, em_share, coverage, kept, gated| StrainDiagnostic {
+                taxid,
+                assembly_id,
+                best_fit,
+                em_share,
+                resolved: 5,
+                gated,
+                coverage,
+                kept,
+            };
+        let measured = Some(coverage(0.9, 1.0));
+        let diagnostics = vec![
+            diagnostic(4, 41, false, 0.1, None, false, 0),
+            diagnostic(4, 40, true, 0.9, measured, true, 5),
+            diagnostic(1, 10, true, 1.0, measured, true, 5),
+        ];
+        let strain = |assembly_id| StrainGenome {
+            assembly_id,
+            reads: 1.0,
+            bases: 1.0,
+            mean_identity: 1.0,
+            coverage: EvidenceCoverage::default(),
+            asm_len: 1.0,
+        };
+        let genomes_of = |best_fit| SpeciesGenomes {
+            best_fit,
+            mean_identity: 1.0,
+            strains: vec![strain(best_fit)],
+        };
+        let species = HashMap::from([(1, genomes_of(10)), (4, genomes_of(40))]);
+        let witness = coverage(0.1, 0.9);
+        let rollup_rows = vec![GenusRow {
+            genus: 100,
+            fragments: 250.0,
+            equivalent: 250.0,
+            depth: 0.1,
+            mapped_len: 1.0,
+            witness,
+            donors: vec![5],
+            reads: None,
+        }];
+        let rollup_genomes = HashMap::from([(
+            5,
+            (
+                WitnessDecision {
+                    metrics: witness,
+                    standard: false,
+                    rescues: RescueKinds::default(),
+                    required_premap_guard: PremapChunkGuard::None,
+                },
+                50,
+            ),
+        )]);
+        let family = |unit, genome, reads, listing, won, spread, coverage| UnitCandidate {
+            unit,
+            genome,
+            reads,
+            listing,
+            won,
+            spread,
+            excluded: false,
+            coverage,
+        };
+        let families = vec![
+            family(2000, 90, 20, 100.0, 20.0, None, None),
+            family(
+                1000,
+                80,
+                300,
+                400.0,
+                350.0,
+                Some(0.7),
+                Some(coverage(0.2, 0.9)),
+            ),
+        ];
+        let block = |taxid, taxon, genomes| TaxonBlock {
+            taxid,
+            taxon,
+            genomes,
+        };
+        let blocks = vec![
+            block(
+                1,
+                Some(final_row(1, "species", 10, 120.0, 60.0)),
+                vec![final_row(1, "strain", 10, 30.0, 15.0)],
+            ),
+            block(
+                100,
+                Some(final_row(100, "genus", 50, 262.0, 20.0)),
+                Vec::new(),
+            ),
+            block(4, None, vec![final_row(400, "strain", 40, 8.0, 4.0)]),
+            block(
+                1000,
+                Some(final_row(1000, "family", 80, 10.0, 1.0)),
+                Vec::new(),
+            ),
+        ];
+        Fixture {
+            genomes,
+            counts,
+            tests,
+            outcomes,
+            reported,
+            diagnostics,
+            species,
+            strain_taxids: HashMap::from([(Arc::from("GCF_40"), 400)]),
+            rollup_rows,
+            rollup_genomes,
+            genus_members: vec![(100, 2, 12.0)],
+            families,
+            blocks,
+        }
+    }
+
+    /// The fixture's decisions table: its two header lines and its rows by column name.
+    fn decisions(fixture: &Fixture) -> (Vec<String>, Vec<HashMap<&'static str, String>>) {
+        let table = Decisions {
+            genomes: &fixture.genomes,
+            counts: &fixture.counts,
+            tests: &fixture.tests,
+            outcomes: &fixture.outcomes,
+            reported: &fixture.reported,
+            strains: Some(StrainLevel {
+                rows: &fixture.diagnostics,
+                species: &fixture.species,
+                tests: SpeciesTests {
+                    multiple_tests: 1,
+                    chunk_cutoff: 0.5,
+                    ratio_bounds: (0.75, 0.75),
+                    markers: None,
+                    min_marker_genes: 0,
+                },
+                strain_taxids: &fixture.strain_taxids,
+            }),
+            rollup_rows: &fixture.rollup_rows,
+            rollup_genomes: &fixture.rollup_genomes,
+            genus_members: &fixture.genus_members,
+            families: &fixture.families,
+        };
+        let mut out = Vec::new();
+        table
+            .write(
+                &mut out,
+                &header(),
+                &Names {
+                    taxonomy: &taxonomy(),
+                    genomes: &accessions(),
+                },
+                &FinalRows::of(&fixture.blocks),
+            )
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines = text.lines().collect::<Vec<_>>();
+        let rows = lines[2..]
+            .iter()
+            .map(|line| {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                assert_eq!(fields.len(), DECISION_COLUMNS.len(), "{line}");
+                DECISION_COLUMNS
+                    .iter()
+                    .zip(fields)
+                    .map(|(&column, field)| (column, field.to_string()))
+                    .collect()
+            })
+            .collect();
+        (
+            lines[..2].iter().map(|line| line.to_string()).collect(),
+            rows,
+        )
+    }
+
+    /// The values of `columns` in each row of `rank`.
+    fn columns(
+        rows: &[HashMap<&'static str, String>],
+        rank: &str,
+        columns: &[&str],
+    ) -> Vec<Vec<String>> {
+        rows.iter()
+            .filter(|row| row["rank"] == rank)
+            .map(|row| columns.iter().map(|&c| row[c].clone()).collect())
+            .collect()
+    }
+
+    fn strings<const N: usize>(rows: &[[&str; N]]) -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|row| row.iter().map(|v| v.to_string()).collect())
+            .collect()
     }
 
     #[test]
@@ -110,17 +1242,9 @@ mod tests {
             .has_headers(false)
             .delimiter(b'\t')
             .from_writer(Vec::new());
-        profile_row(
-            "Species".to_string(),
-            1,
-            "species",
-            (5.0, 1.0),
-            &EvidenceCoverage::default(),
-            Arc::from("GCF_1"),
-            Some((f64::NAN, f64::NAN)),
-        )
-        .write(&mut writer)
-        .unwrap();
+        final_row(1, "species", 10, 5.0, 100.0)
+            .write(&mut writer)
+            .unwrap();
         unclassified::write_row(&mut writer, None, true).unwrap();
         let text = String::from_utf8(writer.into_inner().unwrap()).unwrap();
         let rows = text.lines().collect::<Vec<_>>();
@@ -128,5 +1252,309 @@ mod tests {
         assert!(rows
             .iter()
             .all(|row| row.split('\t').count() == PROFILE_COLUMNS.len()));
+    }
+
+    #[test]
+    fn the_decisions_table_opens_with_its_run_and_its_columns() {
+        let (lines, rows) = decisions(&fixture());
+        assert_eq!(
+            lines[0],
+            format!(
+                "#metax_decisions\tversion={}\tengine=level\tdatabase_fingerprint=NA\tsequencer=Illumina\tpaired=true",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        assert_eq!(lines[1], format!("#{}", DECISION_COLUMNS.join("\t")));
+        // Species rows, strain rows, then genus and family rows.
+        let ranks = rows
+            .iter()
+            .map(|row| row["rank"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ranks,
+            [
+                "species", "species", "species", "species", "species", "species", "strain",
+                "strain", "strain", "genus", "family", "family"
+            ]
+        );
+    }
+
+    #[test]
+    fn species_rows_tell_the_decided_genome_its_tests_and_the_reason() {
+        let (_, rows) = decisions(&fixture());
+        let found = columns(
+            &rows,
+            "species",
+            &[
+                "taxid",
+                "genome",
+                "parent_taxid",
+                "decided",
+                "genome_tests",
+                "decision",
+                "reported_as",
+                "final_reads",
+                "final_abundance",
+            ],
+        );
+        // By abundance in the profile (species 1, then 4), then species without rows of their own by taxid; the
+        // decided genome first.
+        let expected = strings(&[
+            ["1", "GCF_10", "100", "true", "passed", "kept", "species", "150.00000", "75.00000"],
+            [
+                "1",
+                "GCF_11",
+                "100",
+                "false",
+                "failed amount: fixed chunk 0.0200 <= cutoff 0.5000; failed evenness: COEBR 0.6100 < 0.75",
+                "kept",
+                "species",
+                "NA",
+                "NA",
+            ],
+            ["4", "GCF_40", "100", "true", "passed", "kept", "species", "8.00000", "4.00000"],
+            [
+                "2",
+                "GCF_20",
+                "100",
+                "true",
+                "failed won share: 0.2000 < 0.3",
+                "removed",
+                "genus",
+                "NA",
+                "NA",
+            ],
+            [
+                "3",
+                "GCF_30",
+                "100",
+                "true",
+                "failed won share: 0.0500 < 0.3",
+                "removed",
+                "none",
+                "NA",
+                "NA",
+            ],
+            [
+                "5",
+                "GCF_50",
+                "100",
+                "true",
+                "failed amount: fixed chunk 0.1000 <= cutoff 0.5000; failed won share: 0.0000 < 0.3",
+                "removed",
+                "none",
+                "NA",
+                "NA",
+            ],
+        ]);
+        assert_eq!(found, expected);
+        let reasons = columns(&rows, "species", &["taxid", "reason"]);
+        let reason = |taxid: &str| {
+            reasons
+                .iter()
+                .find(|row| row[0] == taxid)
+                .map(|row| row[1].clone())
+                .unwrap()
+        };
+        assert_eq!(reason("1"), "passed amount, evenness and won share");
+        assert_eq!(
+            reason("4"),
+            "kept on the second look: a removed sister no longer splits its reads"
+        );
+        assert_eq!(
+            reason("2"),
+            "reported at genus: its reads tie with relatives along its genome"
+        );
+        assert_eq!(reason("3"), "removed: failed won share: 0.0500 < 0.3");
+        // Counts of the species on each of its rows.
+        let counts = columns(
+            &rows,
+            "species",
+            &[
+                "candidate_reads",
+                "won_reads",
+                "second_look_reads",
+                "own_reads",
+            ],
+        );
+        assert_eq!(counts[0], ["100", "90", "0", "0"]);
+        assert_eq!(counts[2], ["40", "30", "7", "0"]);
+    }
+
+    #[test]
+    fn strain_rows_come_by_species_and_name_their_profile_row() {
+        let (_, rows) = decisions(&fixture());
+        let found = columns(
+            &rows,
+            "strain",
+            &[
+                "taxid",
+                "name",
+                "parent_taxid",
+                "genome",
+                "decided",
+                "decision",
+                "reason",
+                "final_reads",
+            ],
+        );
+        let expected = strings(&[
+            [
+                "1",
+                "Species 1 GCF_10",
+                "1",
+                "GCF_10",
+                "true",
+                "kept",
+                "same strain: its reads match it within sequencing error and cover it evenly",
+                "30.00000",
+            ],
+            [
+                "400",
+                "Strain 400",
+                "4",
+                "GCF_40",
+                "true",
+                "kept",
+                "same strain: its reads match it within sequencing error and cover it evenly",
+                "8.00000",
+            ],
+            [
+                "4",
+                "Species 4 GCF_41",
+                "4",
+                "GCF_41",
+                "false",
+                "removed",
+                "low identity: its reads match it below strain-level identity",
+                "NA",
+            ],
+        ]);
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn a_genus_row_lists_its_roll_up_and_the_species_reported_there() {
+        let (_, rows) = decisions(&fixture());
+        let found = columns(
+            &rows,
+            "genus",
+            &[
+                "taxid",
+                "parent_taxid",
+                "genome",
+                "reads",
+                "window_spread",
+                "decision",
+                "reason",
+                "final_reads",
+            ],
+        );
+        let expected = strings(&[[
+            "100",
+            "1000",
+            "GCF_50",
+            "262.00000",
+            "0.8000",
+            "kept",
+            "kept: roll-up of the reads of removed species 5 + species reported at genus: 2 (12 reads; its reads tie \
+             with relatives along its genome)",
+            "262.00000",
+        ]]);
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn family_candidates_are_listed_kept_or_not_with_their_tests() {
+        let (_, rows) = decisions(&fixture());
+        let found = columns(
+            &rows,
+            "family",
+            &[
+                "taxid",
+                "genome",
+                "reads",
+                "candidate_reads",
+                "won_reads",
+                "genome_tests",
+                "decision",
+                "reported_as",
+                "final_reads",
+            ],
+        );
+        let expected = strings(&[
+            ["1000", "GCF_80", "300", "400", "350", "passed", "kept", "family", "10.00000"],
+            [
+                "2000",
+                "GCF_90",
+                "20",
+                "100",
+                "20",
+                "failed reads: 20 < 200; failed won share: 0.2000 < 0.3; failed window spread: too few reads to \
+                 measure",
+                "removed",
+                "none",
+                "NA",
+            ],
+        ]);
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn every_profile_row_matches_one_kept_decided_row() {
+        let fixture = fixture();
+        let (_, rows) = decisions(&fixture);
+        let kept_decided = |rank: &str, taxid: u32| {
+            rows.iter()
+                .filter(|row| {
+                    row["rank"] == rank
+                        && row["taxid"] == taxid.to_string()
+                        && row["decision"] == "kept"
+                        && row["decided"] == "true"
+                })
+                .collect::<Vec<_>>()
+        };
+        let five = |value: f64| format_five(value);
+        let mut matched = 0;
+        for block in &fixture.blocks {
+            let species_row = block.taxon.as_ref().filter(|row| row.rank == "species");
+            if species_row.is_none() && block.genomes.is_empty() {
+                let row = block.taxon.as_ref().unwrap();
+                let found = kept_decided(&row.rank, block.taxid);
+                assert_eq!(found.len(), 1, "{}", block.taxid);
+                assert_eq!(found[0]["final_reads"], five(row.equivalent_mapcount));
+                assert_eq!(found[0]["final_abundance"], five(row.abundance));
+                matched += 1;
+                continue;
+            }
+            let found = kept_decided("species", block.taxid);
+            assert_eq!(found.len(), 1, "{}", block.taxid);
+            let total = species_row
+                .into_iter()
+                .chain(&block.genomes)
+                .fold(0.0, |total, row| total + row.equivalent_mapcount);
+            assert_eq!(found[0]["final_reads"], five(total));
+            matched += 1;
+            for row in &block.genomes {
+                let genome = &row.best_fit.as_ref().unwrap().genome;
+                let found = rows
+                    .iter()
+                    .filter(|r| {
+                        r["rank"] == "strain" && r["genome"] == **genome && r["decision"] == "kept"
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(found.len(), 1, "{genome}");
+                assert_eq!(found[0]["taxid"], row.taxid.to_string());
+                assert_eq!(found[0]["final_reads"], five(row.equivalent_mapcount));
+                assert_eq!(found[0]["final_abundance"], five(row.abundance));
+                matched += 1;
+            }
+        }
+        // No kept row beyond those the profile holds.
+        let kept = rows
+            .iter()
+            .filter(|row| row["decision"] == "kept" && row["final_reads"] != "NA")
+            .count();
+        assert_eq!(kept, matched);
     }
 }
