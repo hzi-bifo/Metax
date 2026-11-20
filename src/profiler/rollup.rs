@@ -115,6 +115,13 @@ pub(crate) struct GenusRollup {
 }
 
 impl GenusRollup {
+    /// The genus of `taxids` when every one of them lies in it.
+    pub(crate) fn common_genus(&self, taxids: impl IntoIterator<Item = u32>) -> Option<u32> {
+        let mut genera = taxids.into_iter().map(|taxid| self.genus_of.get(&taxid));
+        let genus = *genera.next()??;
+        genera.all(|other| other == Some(&genus)).then_some(genus)
+    }
+
     /// Species that the coverage evidence removed although their reads cover
     /// their genome evenly: at least [`EVEN_MIN_FRAGMENTS`] fragments, OEBR
     /// and COEBR within [`EVEN_RATIO_MIN`]-[`EVEN_RATIO_MAX`], a window spread
@@ -233,13 +240,9 @@ impl<'a> OrphanedFragments<'a> {
         sampling_scale: f64,
         read: &Arc<str>,
     ) {
-        let mut genera = taxids.iter().map(|taxid| self.rollup.genus_of.get(taxid));
-        let Some(Some(&genus)) = genera.next() else {
+        let Some(genus) = self.rollup.common_genus(taxids.iter().copied()) else {
             return;
         };
-        if !genera.all(|other| other == Some(&genus)) {
-            return;
-        }
         let donor = self.donors.entry(taxids[best]).or_default();
         donor.genus = genus;
         donor.fragments += 1.0;

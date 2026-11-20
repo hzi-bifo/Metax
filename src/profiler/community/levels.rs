@@ -211,6 +211,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         |r, candidates| species_placements(candidates, r.1),
         |r, hits| add_hits(&mut genomes, r.1, hits),
     );
+    drop(resolved_fragments);
 
     let (oebr_default, coebr_default) =
         standard_ratio_lower_bounds(ProfileRank::Species, policy.mode);
@@ -265,6 +266,9 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
          genome, beyond the part that kept cellular species explain.",
         removed_viruses.len()
     );
+    // The first EM is not read again.
+    let first_iterations = first_em.iterations;
+    drop((all, first_em, resolved_taxid));
     if cfg.keep_raw {
         write_genome_diagnostics(profiler, &data, &genomes, &counts, &tests)?;
     }
@@ -291,6 +295,10 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     // cover its genome evenly is kept on that genome.
     let rollup = data.genus_rollup.as_deref();
     let decisions = rollup.map_or_else(HashMap::new, |rollup| species_decisions(&genomes, rollup));
+    // The placements on the measured genomes are not read again.
+    for genome in genomes.values_mut() {
+        genome.assembly.intervals = Vec::new();
+    }
     let decision_metrics: HashMap<u32, WitnessDecision> = decisions
         .iter()
         .map(|(&taxid, &(decision, _))| (taxid, decision))
@@ -316,7 +324,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         "Level-wise engine: {} species kept, {} read groups, EM {} + {} iterations; {} fragments without a kept species.",
         best_fit.len(),
         kept.groups.len(),
-        first_em.iterations,
+        first_iterations,
         em.iterations,
         without_kept
     );
@@ -868,7 +876,7 @@ fn share_reads(fragments: &[Fragment], allowed: impl Fn(u32) -> bool, penalty: f
 /// [`ERROR_RATE_SHARE`] that match best: the sample's sequencing error rate,
 /// little affected by reads from relatives of the database genomes.
 fn error_rate(best_matches: &mut [(f32, f32)]) -> f64 {
-    best_matches.sort_by(|a, b| (a.0 / a.1.max(1.0)).total_cmp(&(b.0 / b.1.max(1.0))));
+    best_matches.par_sort_by(|a, b| (a.0 / a.1.max(1.0)).total_cmp(&(b.0 / b.1.max(1.0))));
     let kept = &best_matches[..(best_matches.len() as f64 * ERROR_RATE_SHARE).ceil() as usize];
     let errors: f64 = kept.iter().map(|m| f64::from(m.0)).sum();
     let bases: f64 = kept.iter().map(|m| f64::from(m.1)).sum();
@@ -1161,7 +1169,8 @@ fn add_fragment_hits(
     data: &MappingData,
     policy: EvidencePolicy,
     fragments: &[Fragment],
-    (taxid, list): (u32, &[usize]),
+    taxid: u32,
+    list: &[usize],
     genomes: &mut HashMap<u32, GenomeEvidence>,
 ) {
     fold_candidates(
@@ -1248,19 +1257,21 @@ struct FirstEm<'a> {
 
 impl FirstEm<'_> {
     /// Fragments listing each species among their candidates, those resolved
-    /// to any species, and those resolved to it.
+    /// to any species, and those resolved to it, counted per read group.
     fn counts(&self) -> FragmentCounts {
         let mut counts = FragmentCounts::default();
-        for &group in self.group_of.iter().flatten() {
-            let resolved = self.resolved[group];
-            for &(taxid, _) in &self.em.posteriors[group] {
-                *counts.candidates.entry(taxid).or_default() += 1;
+        let sizes = group_sizes(self.group_of, self.em.posteriors.len());
+        for ((posteriors, &resolved), size) in
+            self.em.posteriors.iter().zip(self.resolved).zip(sizes)
+        {
+            for &(taxid, _) in posteriors {
+                *counts.candidates.entry(taxid).or_default() += size;
                 if resolved.is_some() {
-                    *counts.resolved_candidates.entry(taxid).or_default() += 1;
+                    *counts.resolved_candidates.entry(taxid).or_default() += size;
                 }
             }
             if let Some(taxid) = resolved {
-                *counts.won.entry(taxid).or_default() += 1;
+                *counts.won.entry(taxid).or_default() += size;
             }
         }
         counts
@@ -1367,7 +1378,8 @@ fn second_look(
             data,
             policy,
             first.fragments,
-            (taxid, &taken_fragments),
+            taxid,
+            &taken_fragments,
             &mut trial,
         );
         let taken = taken_fragments.len() as u64;
@@ -1687,7 +1699,7 @@ fn evidence_of(
     list: &[usize],
 ) -> HashMap<u32, GenomeEvidence> {
     let mut genomes = HashMap::new();
-    add_fragment_hits(data, policy, fragments, (taxid, list), &mut genomes);
+    add_fragment_hits(data, policy, fragments, taxid, list, &mut genomes);
     genomes
 }
 
@@ -1712,6 +1724,15 @@ fn takes_group(posteriors: &[(u32, f64)], taxid: u32, kept: &HashSet<u32>) -> bo
         }
     }
     own > 0.0 && own >= RESOLVE_POSTERIOR * with_kept
+}
+
+/// The number of fragments in each of `groups` read groups.
+fn group_sizes(group_of: &[Option<usize>], groups: usize) -> Vec<u64> {
+    let mut sizes = vec![0; groups];
+    for &group in group_of.iter().flatten() {
+        sizes[group] += 1;
+    }
+    sizes
 }
 
 /// The fragments of each read group.
@@ -1861,7 +1882,7 @@ fn unmatched_rows(
         reads,
         |&read| read,
         |&read, candidates| {
-            if best_match_kept(read, candidates, policy, level.kept) {
+            if !level.kept.is_empty() && best_match_kept(read, candidates, policy, level.kept) {
                 return None;
             }
             fragment_of(read, candidates, policy, unit_of)
@@ -1875,24 +1896,35 @@ fn unmatched_rows(
         profiler.cfg.max_em_iterations,
         EM_TOLERANCE,
     );
-    // Fragments listing each unit, those resolved to it, and its share of the
-    // fragments' bases.
+    // Fragments listing each unit and those resolved to it, counted per read
+    // group, the resolved fragments, and each unit's share of the fragments'
+    // bases.
+    let resolved_units = em
+        .posteriors
+        .iter()
+        .map(|posteriors| resolved_unit(posteriors))
+        .collect::<Vec<_>>();
     let mut listing: HashMap<u32, f64> = HashMap::new();
     let mut won: HashMap<u32, f64> = HashMap::new();
-    let mut resolved: Vec<(usize, u32)> = Vec::new();
-    for (fragment, group) in fragments.iter().zip(&shared.group_of) {
-        let Some(group) = *group else {
-            continue;
-        };
-        let posteriors = &em.posteriors[group];
+    let sizes = group_sizes(&shared.group_of, em.posteriors.len());
+    for ((posteriors, &resolved), size) in em.posteriors.iter().zip(&resolved_units).zip(sizes) {
+        let size = size as f64;
         for &(unit, _) in posteriors {
-            *listing.entry(unit).or_default() += 1.0;
+            *listing.entry(unit).or_default() += size;
         }
-        if let Some(unit) = resolved_unit(posteriors) {
-            resolved.push((fragment.read, unit));
-            *won.entry(unit).or_default() += 1.0;
+        if let Some(unit) = resolved {
+            *won.entry(unit).or_default() += size;
         }
     }
+    let resolved = fragments
+        .iter()
+        .zip(&shared.group_of)
+        .filter_map(|(fragment, group)| {
+            group
+                .and_then(|g| resolved_units[g])
+                .map(|unit| (fragment.read, unit))
+        })
+        .collect::<Vec<_>>();
     let bases = shared.unit_bases(&em);
     // Each resolved fragment on the best genome of its unit's best species.
     let mut genomes: HashMap<u32, GenomeEvidence> = HashMap::new();
@@ -2110,32 +2142,47 @@ fn orphan_genus_rows(
     decisions: &HashMap<u32, WitnessDecision>,
     accepted: &HashSet<u32>,
 ) -> Vec<GenusRow> {
+    // The roll-up takes only fragments whose candidate species all lie in one
+    // genus; the others need no candidates built.
+    let orphaned = fragments
+        .iter()
+        .zip(group_of)
+        .filter(|(fragment, group)| {
+            group.is_none()
+                && rollup
+                    .common_genus(fragment.candidates.iter().map(|c| c.0))
+                    .is_some()
+        })
+        .map(|(fragment, _)| fragment)
+        .collect::<Vec<_>>();
     let mut orphans = OrphanedFragments::new(rollup, false);
-    let mut scratch = CandidateScratch::default();
-    for (fragment, group) in fragments.iter().zip(group_of) {
-        if group.is_some() {
-            continue;
-        }
-        let bundle = &data.read_alignments[fragment.read];
+    fold_candidates(
+        data,
+        policy,
+        &orphaned,
+        |fragment| fragment.read,
         // Candidates are ordered by errors; the first is the best.
-        let taxids = fragment.candidates.iter().map(|c| c.0).collect::<Vec<_>>();
-        let candidates = scratch.build(&bundle.alignments, policy);
-        let Some(best) = candidates
-            .iter()
-            .find(|c| c.taxid == taxids[0])
-            .map(|c| c.best)
-        else {
-            continue;
-        };
-        orphans.offer(
-            &taxids,
-            0,
-            f64::from(best.r1_mapped) / best.asm_len.max(1.0),
-            f64::from(best.r1_mapped),
-            best.sampling_scale,
-            &bundle.read_name,
-        );
-    }
+        |fragment, candidates| {
+            candidates
+                .iter()
+                .find(|c| c.taxid == fragment.candidates[0].0)
+                .map(|c| c.best)
+        },
+        |fragment, best| {
+            let Some(best) = best else {
+                return;
+            };
+            let taxids = fragment.candidates.iter().map(|c| c.0).collect::<Vec<_>>();
+            orphans.offer(
+                &taxids,
+                0,
+                f64::from(best.r1_mapped) / best.asm_len.max(1.0),
+                f64::from(best.r1_mapped),
+                best.sampling_scale,
+                &data.read_alignments[fragment.read].read_name,
+            );
+        },
+    );
     orphans.into_genus_rows(decisions, accepted)
 }
 

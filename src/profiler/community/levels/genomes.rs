@@ -9,7 +9,7 @@
 //! identity cover it evenly. A genome represented by marker genes never is:
 //! its genes are conserved and too short to tell strains apart.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rayon::prelude::*;
 
@@ -181,25 +181,30 @@ pub(super) fn resolve(
         )
         .unwrap_or(baseline_identity),
     };
-    let mut diagnostics = Vec::new();
-    let species = shares
-        .into_iter()
+    // Species are independent; their results are taken in their order.
+    let found = shares
+        .into_par_iter()
         .map(|share| {
+            let mut diagnostics = Vec::new();
             let strains = if level.report_strains {
                 strain_genomes(data, &share, strain, level, &mut diagnostics)
             } else {
                 Vec::new()
             };
-            (
-                share.taxid,
-                SpeciesGenomes {
-                    best_fit: share.best_fit,
-                    mean_identity: identity.get(&share.taxid).map_or(f64::NAN, |m| m.0),
-                    strains,
-                },
-            )
+            let genomes = SpeciesGenomes {
+                best_fit: share.best_fit,
+                mean_identity: identity.get(&share.taxid).map_or(f64::NAN, |m| m.0),
+                strains,
+            };
+            (share.taxid, genomes, diagnostics)
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let mut species = HashMap::new();
+    let mut diagnostics = Vec::new();
+    for (taxid, genomes, rows) in found {
+        species.insert(taxid, genomes);
+        diagnostics.extend(rows);
+    }
     GenomeResult {
         species,
         baseline_identity,
@@ -335,7 +340,17 @@ fn identity_to_best_fit(
         collect_best_placements: false,
         ..policy
     };
-    let reads = (0..data.read_alignments.len()).collect::<Vec<_>>();
+    // Only reads that align to a best-fit genome can add an identity.
+    let genomes: HashSet<u32> = best_fit.values().copied().collect();
+    let reads = (0..data.read_alignments.len())
+        .into_par_iter()
+        .filter(|&read| {
+            data.read_alignments[read]
+                .alignments
+                .iter()
+                .any(|a| genomes.contains(&a.assembly_id))
+        })
+        .collect::<Vec<_>>();
     let mut sums: HashMap<u32, (f64, f64)> = HashMap::new();
     fold_candidates(
         data,

@@ -35,8 +35,8 @@ pub(crate) fn error_penalty(error_rate: f64) -> f64 {
     ((1.0 - e) / (e / 3.0)).ln()
 }
 
-/// One read's candidates: `(unit, errors)` with `errors` the estimated number
-/// of errors of the read's best alignment to the unit.
+/// One read's candidates: `(unit, errors)` with `errors` the read's errors on
+/// the unit as the caller counts them (see the module documentation).
 pub(crate) type Candidates = Vec<(u32, f64)>;
 
 /// Reads grouped by identical candidates and rounded error counts.
