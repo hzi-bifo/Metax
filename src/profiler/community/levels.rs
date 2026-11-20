@@ -76,6 +76,11 @@ const RESOLVE_POSTERIOR: f64 = 0.9;
 /// few of them, while a present species wins most of its reads even when its
 /// strain differs from every genome of it in the database.
 const MIN_WON_SHARE: f64 = 0.3;
+/// Lower bound of a species' base-level breadth ratio (OEBR), below the default
+/// engine's: amplified libraries cover a genome unevenly base by base while its
+/// chunks stay evenly covered, which the chunk-level ratio (COEBR) still tests
+/// at its own bound.
+const SPECIES_MIN_OEBR: f64 = 0.6;
 /// Share of the read groups' weight that may still change when the EM stops.
 const EM_TOLERANCE: f64 = 1e-7;
 /// The sample's error rate is measured on this share of the fragments that
@@ -195,10 +200,11 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     let (oebr_default, coebr_default) = standard_ratio_lower_bounds(ProfileRank::Species, mode);
     let min_oebr = cfg.min_oebr.unwrap_or(oebr_default);
     let min_coebr = cfg.min_coebr.unwrap_or(coebr_default);
+    let species_bounds = (cfg.min_oebr.unwrap_or(SPECIES_MIN_OEBR), min_coebr);
     let tests = SpeciesTests {
         multiple_tests: genomes.len().max(1),
         chunk_cutoff: data.min_chunk_breadth,
-        ratio_bounds: (min_oebr, min_coebr),
+        ratio_bounds: species_bounds,
         markers: data.marker_model.clone(),
         min_marker_genes: cfg.min_marker_genes,
     };
@@ -270,7 +276,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         removed_viruses.len()
     );
     if cfg.keep_raw {
-        write_genome_diagnostics(profiler, &data, &genomes, &counts, (min_oebr, min_coebr))?;
+        write_genome_diagnostics(profiler, &data, &genomes, &counts, species_bounds)?;
     }
     // Best-fit genome of each kept species: its kept genome where most of its
     // fragments fit best, then the one with most fragments.
