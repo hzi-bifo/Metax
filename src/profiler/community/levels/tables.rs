@@ -50,8 +50,8 @@
 //! - `decision`: `kept` when the taxon has rows of its own in the profile,
 //!   otherwise `removed`; the same on every row of a species;
 //! - `reason`: the taxon's outcome in words, the same on every row of a
-//!   species (`removed by --min-reads: …` or `removed by --min-breadth: …`
-//!   for a taxon those minimums dropped);
+//!   species (`removed by --min-reads: …`, `removed by --min-breadth: …` or
+//!   `removed by --host: …` for a taxon those options dropped);
 //! - `reported_as`: the rank of the profile rows holding the taxon's reads
 //!   (`species` for a species row and its strain rows), `none` when none;
 //! - `final_reads`, `final_abundance`: columns 4 and 6 of the taxon's profile
@@ -68,7 +68,7 @@ use anyhow::{Context, Result};
 
 use super::genomes::{SpeciesGenomes, StrainDiagnostic};
 use super::{
-    strain_label, wins_enough, within, BelowMinimum, FragmentCounts, GenomeEvidence, SpeciesTests,
+    strain_label, wins_enough, within, Dropped, FragmentCounts, GenomeEvidence, SpeciesTests,
     TaxonBlock, UnitCandidate, MIN_WON_SHARE,
 };
 use crate::db::DatabaseMetadata;
@@ -78,6 +78,9 @@ use crate::profiler::rollup::{GenusRow, MIN_CHUNK_RATIO, MIN_GENUS_FRAGMENTS, MI
 use crate::profiler::ProfilerConfig;
 use crate::sequencer::Sequencer;
 use crate::taxonomy::Taxonomy;
+
+/// Columns that `--host` appends to every row of the profile.
+pub(super) const HOST_COLUMNS: [&str; 3] = ["host_names", "host_taxids", "diseases"];
 
 /// Columns of the level-wise engine's profile. Every row has all of them, the
 /// unclassified row included.
@@ -143,10 +146,12 @@ pub(super) struct TableHeader {
     pub(super) fingerprint: Option<u128>,
     pub(super) sequencer: Sequencer,
     pub(super) paired: bool,
+    /// `--host`, named only when given.
+    pub(super) host: Option<u32>,
 }
 
 impl TableHeader {
-    pub(super) fn of(cfg: &ProfilerConfig) -> Self {
+    pub(super) fn of(cfg: &ProfilerConfig, host: Option<u32>) -> Self {
         Self {
             fingerprint: cfg
                 .db_metadata
@@ -154,6 +159,7 @@ impl TableHeader {
                 .map(DatabaseMetadata::fingerprint),
             sequencer: cfg.sequencer,
             paired: cfg.is_paired,
+            host,
         }
     }
 
@@ -163,8 +169,11 @@ impl TableHeader {
         let fingerprint = self
             .fingerprint
             .map_or_else(|| "NA".to_string(), |f| format!("{f:032x}"));
+        let host = self
+            .host
+            .map_or_else(String::new, |host| format!("\thost={host}"));
         format!(
-            "#metax_{table}\tversion={}\tengine=level\tdatabase_fingerprint={fingerprint}\tsequencer={}\tpaired={}\n#{}\n",
+            "#metax_{table}\tversion={}\tengine=level\tdatabase_fingerprint={fingerprint}\tsequencer={}\tpaired={}{host}\n#{}\n",
             env!("CARGO_PKG_VERSION"),
             self.sequencer,
             self.paired,
@@ -400,8 +409,9 @@ pub(super) struct Decisions<'a> {
     /// Species reported at their genus: (genus, species, reads).
     pub(super) genus_members: &'a [(u32, u32, f64)],
     pub(super) families: &'a [UnitCandidate],
-    /// Taxa dropped by `--min-reads` or `--min-breadth`.
-    pub(super) dropped: &'a HashMap<u32, BelowMinimum>,
+    /// Taxa and genome rows dropped by `--host`, `--min-reads` or
+    /// `--min-breadth`.
+    pub(super) dropped: &'a Dropped,
 }
 
 /// What a genus row of the profile is made of: the roll-up's row, and the
@@ -617,11 +627,11 @@ impl Decisions<'_> {
                 ids[..=position].rotate_right(1);
             }
             let decision = self.outcomes[&taxid];
-            let below = self.dropped.get(&taxid);
+            let below = self.dropped.taxa.get(&taxid);
             // A species reported at its genus whose genus row was dropped.
             let genus_dropped = genus_of
                 .get(&taxid)
-                .and_then(|genus| self.dropped.get(genus));
+                .and_then(|genus| self.dropped.taxa.get(genus));
             let reason = match below {
                 Some(below) => below.reason(),
                 None => {
@@ -706,9 +716,15 @@ impl Decisions<'_> {
             } else if passed {
                 (
                     "passed".to_string(),
-                    match self.dropped.get(&row.taxid) {
-                        Some(below) => format!("species not reported: {}", below.reason()),
-                        None => {
+                    match (
+                        self.dropped.genomes.get(accession),
+                        self.dropped.taxa.get(&row.taxid),
+                    ) {
+                        (Some(removal), _) => removal.reason(),
+                        (None, Some(removal)) => {
+                            format!("species not reported: {}", removal.reason())
+                        }
+                        (None, None) => {
                             "species not reported: its species is left out or reported at its genus"
                                 .to_string()
                         }
@@ -802,7 +818,7 @@ impl Decisions<'_> {
                 .fold(rollup.map_or(0.0, |row| row.fragments), |total, member| {
                     total + member.1
                 });
-            let below = self.dropped.get(&genus);
+            let below = self.dropped.taxa.get(&genus);
             let mut parts = Vec::new();
             if let Some(row) = rollup {
                 let donors = row.donors.iter().map(u32::to_string).collect::<Vec<_>>();
@@ -863,6 +879,7 @@ impl Decisions<'_> {
         for candidate in self.families {
             let below = self
                 .dropped
+                .taxa
                 .get(&candidate.unit)
                 .filter(|_| candidate.coverage.is_some());
             let kept = candidate.coverage.is_some() && below.is_none();
@@ -944,6 +961,7 @@ mod tests {
             fingerprint: None,
             sequencer: Sequencer::Illumina,
             paired: true,
+            host: None,
         }
     }
 
@@ -1028,7 +1046,7 @@ mod tests {
         genus_members: Vec<(u32, u32, f64)>,
         families: Vec<UnitCandidate>,
         blocks: Vec<TaxonBlock>,
-        dropped: HashMap<u32, BelowMinimum>,
+        dropped: Dropped,
     }
 
     fn fixture() -> Fixture {
@@ -1180,7 +1198,7 @@ mod tests {
             genus_members: vec![(100, 2, 12.0)],
             families,
             blocks,
-            dropped: HashMap::new(),
+            dropped: Dropped::default(),
         }
     }
 
@@ -1283,6 +1301,16 @@ mod tests {
         assert!(with_database
             .lines("profile", &PROFILE_COLUMNS)
             .contains("\tdatabase_fingerprint=00000000000000000000000000000abc\t"));
+        // With --host: the host on the first line, its three columns last.
+        let with_host = TableHeader {
+            host: Some(9606),
+            ..header()
+        };
+        let columns = [&PROFILE_COLUMNS[..], &HOST_COLUMNS[..]].concat();
+        let text = with_host.lines("profile", &columns);
+        let lines = text.lines().collect::<Vec<_>>();
+        assert!(lines[0].ends_with("\tpaired=true\thost=9606"));
+        assert!(lines[1].ends_with("\testimated_ani\thost_names\thost_taxids\tdiseases"));
         // Every row has a column per name: a species row and the unclassified row, also when no row precedes it.
         let mut writer = csv::WriterBuilder::new()
             .has_headers(false)
@@ -1609,14 +1637,17 @@ mod tests {
         // At least 20 reads: species 4 (8 reads, in its genome row) and family 1000 (10 reads) are dropped; species
         // 1 (120 in its species row, 150 with its genome row) and genus 100 (262) stay.
         let mut fixture = fixture();
-        fixture.dropped = super::super::drop_below_minimums(
+        fixture.dropped.taxa = super::super::drop_below_minimums(
             &mut fixture.blocks,
             &super::super::Minimums {
                 reads: Some(20),
                 breadth: None,
             },
-        );
-        let mut dropped = fixture.dropped.keys().copied().collect::<Vec<_>>();
+        )
+        .into_iter()
+        .map(|(taxid, below)| (taxid, super::super::Removal::BelowMinimum(below)))
+        .collect();
+        let mut dropped = fixture.dropped.taxa.keys().copied().collect::<Vec<_>>();
         dropped.sort_unstable();
         assert_eq!(dropped, [4, 1000]);
         let (_, rows) = decisions(&fixture);
@@ -1649,6 +1680,54 @@ mod tests {
                 "NA"
             ]
         );
+        assert_eq!(row("species", "GCF_10")[0], "kept");
+        assert_eq!(row("genus", "GCF_50")[0], "kept");
+    }
+
+    #[test]
+    fn taxa_that_are_no_pathogens_of_the_host_are_removed_with_the_reason() {
+        // Species 4 (in its genome row under strain 400) and family 1000 are listed for another host only; species 1,
+        // genus 100 are not listed and stay.
+        let table = HashMap::from([
+            (
+                4,
+                crate::profiler::pathogen::PathogenEntry {
+                    host_taxids: "10090".to_string(),
+                    host_names: "Mus musculus".to_string(),
+                    diseases: "unknown".to_string(),
+                },
+            ),
+            (
+                1000,
+                crate::profiler::pathogen::PathogenEntry {
+                    host_taxids: "10090".to_string(),
+                    host_names: "Mus musculus".to_string(),
+                    diseases: "unknown".to_string(),
+                },
+            ),
+        ]);
+        let mut fixture = fixture();
+        let taxonomy = taxonomy();
+        super::super::host::HostFilter {
+            host: 9606,
+            table: Some(&table),
+            taxonomy: &taxonomy,
+        }
+        .apply(&mut fixture.blocks, &mut fixture.dropped);
+        let (_, rows) = decisions(&fixture);
+        let row = |rank: &str, genome: &str| {
+            rows.iter()
+                .find(|row| row["rank"] == rank && row["genome"] == genome)
+                .map(|row| {
+                    ["decision", "reason", "reported_as", "final_reads"]
+                        .map(|column| row[column].clone())
+                })
+                .unwrap()
+        };
+        let removed = "removed by --host: not a pathogen of host 9606";
+        assert_eq!(row("species", "GCF_40"), ["removed", removed, "none", "NA"]);
+        assert_eq!(row("strain", "GCF_40"), ["removed", removed, "none", "NA"]);
+        assert_eq!(row("family", "GCF_80"), ["removed", removed, "none", "NA"]);
         assert_eq!(row("species", "GCF_10")[0], "kept");
         assert_eq!(row("genus", "GCF_50")[0], "kept");
     }

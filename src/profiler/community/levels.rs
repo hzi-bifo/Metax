@@ -29,11 +29,13 @@
 //! database) a species is left out beside a deeper congener whose reads are
 //! that much more identical ([`identity_relatives`]). A genome represented by
 //! marker genes is measured gene by gene ([`MarkerModel`]); the tests are the
-//! same. `--min-reads` and `--min-breadth` drop a taxon whose rows hold fewer
-//! reads (a species with its genome rows) or whose breadth is lower, before
-//! abundance is normalised ([`drop_below_minimums`]). The profile opens with
-//! two `#` lines: the run's metadata and the column names. With `--save-raw-profile` the engine also writes
-//! `<prefix>.decisions.tsv`: how every taxon it judged, at every rank, was
+//! same. `--host` drops the rows of taxa that the pathogen table lists for
+//! other hosts only and annotates the others ([`host`]), and `--min-reads` and
+//! `--min-breadth` drop a taxon whose rows hold fewer reads (a species with its
+//! genome rows) or whose breadth is lower ([`drop_below_minimums`]), both
+//! before abundance is normalised. The profile opens with two `#` lines: the
+//! run's metadata and the column names. With `--save-raw-profile` the engine
+//! also writes `<prefix>.decisions.tsv`: how every taxon it judged, at every rank, was
 //! decided, with the tests behind it ([`tables`]), and with
 //! `--save-classification` `<prefix>.classify.txt.gz`: each fragment's shares
 //! of the profile's rows ([`classify`]).
@@ -54,6 +56,7 @@ use crate::profiler::identity::MIN_JUDGED_SPECIES;
 use crate::profiler::likelihood_em::{self, ReadGroups};
 use crate::profiler::markers::MarkerModel;
 use crate::profiler::output::{BestFitReport, ProfileRow};
+use crate::profiler::pathogen::load_pathogen_table;
 use crate::profiler::rollup::{
     GenomeLayout, GenusRollup, GenusRow, OrphanedFragments, MIN_GENUS_FRAGMENTS, MIN_WINDOW_SPREAD,
 };
@@ -65,10 +68,12 @@ use crate::taxonomy::Taxonomy;
 
 mod classify;
 mod genomes;
+mod host;
 mod tables;
 
 use tables::{
-    Decisions, FinalRows, Names, SpeciesDecision, StrainLevel, TableHeader, PROFILE_COLUMNS,
+    Decisions, FinalRows, Names, SpeciesDecision, StrainLevel, TableHeader, HOST_COLUMNS,
+    PROFILE_COLUMNS,
 };
 
 /// Each base that a candidate aligns less than the read's longest alignment
@@ -750,33 +755,55 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             genomes: Vec::new(),
         });
     }
-    let dropped = drop_below_minimums(
+    // `--host` drops rows first, then `--min-reads` and `--min-breadth`.
+    let host = profiler.host_taxid();
+    let mut dropped = Dropped::default();
+    if let Some(host) = host {
+        let table = cfg
+            .pathogen_host
+            .as_deref()
+            .map(load_pathogen_table)
+            .transpose()?;
+        let rows = |blocks: &[TaxonBlock]| {
+            blocks
+                .iter()
+                .map(|b| usize::from(b.taxon.is_some()) + b.genomes.len())
+                .sum::<usize>()
+        };
+        let before = rows(&blocks);
+        host::HostFilter {
+            host,
+            table: table.as_ref(),
+            taxonomy: &profiler.taxonomy,
+        }
+        .apply(&mut blocks, &mut dropped);
+        log::info!(
+            target: "PROFILER",
+            "Level-wise engine: {} rows dropped by --host {host} ({} taxa entirely): not pathogens of the host.",
+            before - rows(&blocks),
+            dropped.taxa.len()
+        );
+    }
+    let below = drop_below_minimums(
         &mut blocks,
         &Minimums {
             reads: cfg.min_reads,
             breadth: cfg.breadth,
         },
     );
-    if !dropped.is_empty() {
+    if !below.is_empty() {
         log::info!(
             target: "PROFILER",
             "Level-wise engine: {} taxa dropped by --min-reads or --min-breadth; their reads go to no other taxon.",
-            dropped.len()
+            below.len()
         );
     }
-    let total_depth: f64 = blocks.iter().map(TaxonBlock::depth).sum();
-    let abundance = |depth: f64| {
-        if total_depth > 0.0 {
-            100.0 * depth / total_depth
-        } else {
-            0.0
-        }
-    };
-    for block in &mut blocks {
-        for row in block.taxon.iter_mut().chain(block.genomes.iter_mut()) {
-            row.abundance = abundance(row.depth);
-        }
-    }
+    dropped.taxa.extend(
+        below
+            .into_iter()
+            .map(|(taxid, below)| (taxid, Removal::BelowMinimum(below))),
+    );
+    set_abundance(&mut blocks);
     // By the taxon's total depth, then taxid.
     blocks.sort_by(|a, b| b.depth().total_cmp(&a.depth()).then(a.taxid.cmp(&b.taxid)));
     // With `--save-raw-profile`, what each taxon holds in the profile.
@@ -805,9 +832,14 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         .collect::<Vec<_>>();
 
     let unclassified = profiler.estimate_unclassified(&data, &rows, &genome_reads);
-    let header = TableHeader::of(cfg);
+    let header = TableHeader::of(cfg, host);
+    let columns = if host.is_some() {
+        [&PROFILE_COLUMNS[..], &HOST_COLUMNS[..]].concat()
+    } else {
+        PROFILE_COLUMNS.to_vec()
+    };
     profiler.write_profile(
-        &header.lines("profile", &PROFILE_COLUMNS),
+        &header.lines("profile", &columns),
         &rows,
         unclassified,
         true,
@@ -841,7 +873,8 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             taxonomy: &profiler.taxonomy,
             genomes: &data.assembly_names,
         };
-        tables::write_file(&format!("{}.decisions.tsv", cfg.outprefix), |out| {
+        let path = format!("{}.decisions.tsv", profiler.profile_prefix());
+        tables::write_file(&path, |out| {
             decisions_table.write(out, &header, &names, &finals)
         })?;
     }
@@ -1967,6 +2000,51 @@ impl BelowMinimum {
         }
         missed.join("; ")
     }
+}
+
+/// Set every row's abundance: its depth over the summed depth of the rows, in
+/// percent.
+fn set_abundance(blocks: &mut [TaxonBlock]) {
+    let total_depth: f64 = blocks.iter().map(TaxonBlock::depth).sum();
+    let abundance = |depth: f64| {
+        if total_depth > 0.0 {
+            100.0 * depth / total_depth
+        } else {
+            0.0
+        }
+    };
+    for block in blocks {
+        for row in block.taxon.iter_mut().chain(block.genomes.iter_mut()) {
+            row.abundance = abundance(row.depth);
+        }
+    }
+}
+
+/// Why rows that passed their tests were dropped from the profile.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Removal {
+    /// `--min-reads` or `--min-breadth`.
+    BelowMinimum(BelowMinimum),
+    /// `--host`: the pathogen table lists the taxon for other hosts only.
+    NotPathogen(u32),
+}
+
+impl Removal {
+    /// Why, in words.
+    fn reason(&self) -> String {
+        match self {
+            Self::BelowMinimum(below) => below.reason(),
+            Self::NotPathogen(host) => format!("removed by --host: not a pathogen of host {host}"),
+        }
+    }
+}
+
+/// The taxa whose rows were all dropped, and the genome (strain) rows dropped,
+/// by genome.
+#[derive(Default)]
+struct Dropped {
+    taxa: HashMap<u32, Removal>,
+    genomes: HashMap<Arc<str>, Removal>,
 }
 
 /// Drop the blocks of the taxa below `minimums`, before abundance is

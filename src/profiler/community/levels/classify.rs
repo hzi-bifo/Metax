@@ -12,8 +12,8 @@
 //!   `--strain`, a fragment that the genome EM shares among the genomes
 //!   reported on their own splits its species share among their strain rows
 //!   by that EM's posteriors. A species reported at its genus counts its share
-//!   in the genus row; a species left out, or dropped by `--min-reads` or
-//!   `--min-breadth`, counts it nowhere;
+//!   in the genus row; a species left out, or dropped by `--host`,
+//!   `--min-reads` or `--min-breadth`, counts it nowhere;
 //! - a fragment none of whose candidate species is kept goes whole to the
 //!   roll-up's genus row of its best candidate, when that species' reads were
 //!   rolled up;
