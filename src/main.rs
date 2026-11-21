@@ -1134,10 +1134,11 @@ impl TryFrom<ProfileArgs> for AppConfig {
                 (sequencer.is_illumina() && is_paired && !strain).then_some(DEFAULT_IDENTITY_MARGIN)
             })
         };
-        // Not for single-end short reads, where both add more false rows than
-        // they recover.
-        let removed_to_genus =
-            !args.strict_coverage && !strain && (is_paired || !sequencer.is_illumina());
+        // The old engine's roll-up is not for single-end short reads, where it
+        // adds more false rows than it recovers; the level-wise engine's is.
+        let removed_to_genus = !args.strict_coverage
+            && !strain
+            && (is_paired || !sequencer.is_illumina() || args.level_engine);
         Ok(AppConfig {
             level_engine: args.level_engine,
             db: args.db,
