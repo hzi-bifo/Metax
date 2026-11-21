@@ -226,6 +226,22 @@ fn identity_below_accuracy(accuracy: f64, mode: ProfileMode) -> f64 {
 }
 
 impl AppConfig {
+    /// Whether the mapper keeps strain-level candidates, the best mapping of
+    /// every genome: for the strain profiler and for the level-wise engine's
+    /// genome level. Mapping files record it as `strain=`.
+    fn strain_level_mapping(&self) -> bool {
+        self.strain || self.genome_level
+    }
+
+    /// Whether this run takes the read-level gates recorded in a reused
+    /// mapping file: one made in the same mode, for the same profiler. The
+    /// genome level uses the community gates, whether its mapping kept
+    /// strain-level candidates or not.
+    fn takes_recorded_gates(&self, metadata: &MappingRunMetadata) -> bool {
+        metadata.mapper_mode == self.mode.as_str()
+            && (self.genome_level || metadata.profiler.strain == self.strain)
+    }
+
     /// `--identity-margin` and `--relative-identity-gap` for this run. On a
     /// fractional database the reads of a genome's unindexed part land on
     /// indexed relatives; single-end short reads have no mate to tell them
@@ -301,7 +317,7 @@ impl MetaxApp {
         let mapping_metadata = self.mapping_metadata_for_thresholds()?;
         let thresholds = self.resolve_thresholds(mapping_metadata.as_ref());
         let prepared_mapping =
-            self.prepare_mapping(thresholds.mapping_metadata(self.config.strain))?;
+            self.prepare_mapping(thresholds.mapping_metadata(self.config.strain_level_mapping()))?;
         if self.config.sequencer.is_illumina() {
             log::info!(
                 target: "MAIN",
@@ -762,10 +778,7 @@ impl MetaxApp {
         let sequencer = self.config.sequencer;
         let mut batch_size = self.config.batch_size.unwrap_or(5000);
         let recorded = mapping_metadata
-            .filter(|metadata| {
-                metadata.mapper_mode == self.config.mode.as_str()
-                    && metadata.profiler.strain == self.config.strain
-            })
+            .filter(|metadata| self.config.takes_recorded_gates(metadata))
             .map(|metadata| metadata.profiler);
         let mut identity = self
             .config
@@ -996,6 +1009,12 @@ impl MetaxApp {
                         "Reprofiling in {} mode from mappings generated in {} mode. Profiler thresholds will change, but the saved mapper candidate set cannot be expanded or regenerated.",
                         self.config.mode.as_str(),
                         metadata.mapper_mode
+                    );
+                }
+                if self.config.genome_level && !metadata.profiler.strain {
+                    log::warn!(
+                        target: "PROFILER",
+                        "The mappings were not made for --strain (strain=false): the mapper kept the best mappings of each species, not of every genome, so the genome level works on species-level candidates. Map again with --strain to give it every genome's best mapping."
                     );
                 }
                 (Some(output.mappings_tsv.clone()), None, Some(database))
@@ -1436,6 +1455,41 @@ mod tests {
             resolved.sampled_mean_base_accuracy.map(f64::to_bits),
             Some(0.90321_f64.to_bits())
         );
+    }
+
+    #[test]
+    fn the_genome_level_records_strain_level_mappings_and_takes_their_gates() {
+        let mut cfg = test_app_config();
+        cfg.sequencer = Sequencer::Nanopore;
+        cfg.mode = ProfileMode::Default;
+        let community = recorded_long_read_metadata(ProfileMode::Default, 0.87, 417, 0.23, None);
+        let mut strain_level = community.clone();
+        strain_level.profiler.strain = true;
+        // Community profiling: species-level mappings, and only their gates.
+        assert!(!cfg.strain_level_mapping());
+        assert!(cfg.takes_recorded_gates(&community));
+        assert!(!cfg.takes_recorded_gates(&strain_level));
+        // The genome level records strain-level mappings and takes the gates of both kinds.
+        cfg.level_engine = true;
+        cfg.genome_level = true;
+        assert!(cfg.strain_level_mapping());
+        assert!(cfg.takes_recorded_gates(&community));
+        assert!(cfg.takes_recorded_gates(&strain_level));
+        let resolved = MetaxApp {
+            config: cfg.clone(),
+        }
+        .resolve_thresholds(Some(&strain_level));
+        assert_eq!(resolved.mapped_len, 417);
+        // The strain profiler: strain-level mappings, and only their gates.
+        cfg.level_engine = false;
+        cfg.genome_level = false;
+        cfg.strain = true;
+        assert!(cfg.strain_level_mapping());
+        assert!(!cfg.takes_recorded_gates(&community));
+        assert!(cfg.takes_recorded_gates(&strain_level));
+        // Another mode: no recorded gates.
+        cfg.mode = ProfileMode::Recall;
+        assert!(!cfg.takes_recorded_gates(&strain_level));
     }
 
     #[test]
