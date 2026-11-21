@@ -1108,6 +1108,18 @@ impl TryFrom<ProfileArgs> for AppConfig {
         if strain && args.identity_margin.is_some() {
             bail!("--identity-margin cannot be used with --strain");
         }
+        // A host filters nothing without the pathogen table, and the table
+        // nothing without a host: they are given together, the host as a taxid.
+        match (args.host.as_deref(), args.pathogen_host.is_some()) {
+            (Some(_), false) => {
+                bail!("--host needs --pathogen-table: without the table no row is filtered")
+            }
+            (None, true) => bail!("--pathogen-table needs --host"),
+            (Some(host), true) if host.parse::<u32>().is_err() => {
+                bail!("--host takes an NCBI taxid, not '{host}'")
+            }
+            _ => {}
+        }
         let requested_exact_ties = args.exact_ties;
         let chunk_guard_available =
             !args.lowbiomass && !args.chunk_breadth.is_some_and(|value| value <= 0.0);
@@ -1552,6 +1564,24 @@ mod tests {
             "--no-identity-margin",
         ];
         assert!(Cli::try_parse_from(both).is_err());
+    }
+
+    #[test]
+    fn host_and_pathogen_table_go_together() {
+        let config = |extra: &[&str]| {
+            let argv = ["metax", "profile", "-d", "db", "-o", "out", "-i", "r1.fq"];
+            let cli = Cli::try_parse_from(argv.iter().chain(extra)).unwrap();
+            let Commands::Profile(args) = cli.command else {
+                panic!("expected profile command");
+            };
+            AppConfig::try_from(args)
+        };
+        let error = |extra: &[&str]| config(extra).unwrap_err().to_string();
+        assert!(error(&["--host", "9606"]).contains("--host needs --pathogen-table"));
+        assert!(error(&["--pathogen-table", "t.tsv"]).contains("--pathogen-table needs --host"));
+        assert!(error(&["--host", "human", "--pathogen-table", "t.tsv"]).contains("NCBI taxid"));
+        assert!(config(&["--host", "9606", "--pathogen-table", "t.tsv"]).is_ok());
+        assert!(config(&[]).is_ok());
     }
 
     #[test]
