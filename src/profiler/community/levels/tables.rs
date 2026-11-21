@@ -932,7 +932,7 @@ impl Decisions<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::genomes::StrainGenome;
+    use super::super::genomes::{StrainGenome, StrainShares};
     use super::super::profile_row;
     use super::*;
     use crate::profiler::evidence::{PremapChunkGuard, PresenceAssembly, RescueKinds};
@@ -1094,6 +1094,7 @@ mod tests {
             best_fit,
             mean_identity: 1.0,
             strains: vec![strain(best_fit)],
+            shares: StrainShares::default(),
         };
         let species = HashMap::from([(1, genomes_of(10)), (4, genomes_of(40))]);
         let witness = coverage(0.1, 0.9);

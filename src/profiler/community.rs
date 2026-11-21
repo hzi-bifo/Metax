@@ -5674,6 +5674,30 @@ mod tests {
     }
 
     #[test]
+    fn the_level_engine_writes_no_classifications_for_a_fractional_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let taxonomy = test_taxonomy(directory.path());
+        for fractional in [false, true] {
+            let prefix = directory.path().join(format!("fractional-{fractional}"));
+            let mut cfg = make_cfg(Sequencer::Illumina, None);
+            cfg.level_engine = true;
+            cfg.save_classifications = true;
+            cfg.outprefix = prefix.to_string_lossy().into_owned();
+            cfg.db_metadata = Some(Arc::new(DatabaseMetadata {
+                metam_index: std::path::PathBuf::from("metax_db.mxi"),
+                references: Vec::new(),
+                is_fractional: fractional,
+            }));
+            let profiler = CommunityProfiler::new(cfg, Arc::clone(&taxonomy)).unwrap();
+            let (mapping_data, _) = raw_output_fixture();
+            profiler.profile(mapping_data).unwrap();
+            let written =
+                Path::new(&format!("{}.classify.txt.gz", prefix.to_string_lossy())).exists();
+            assert_eq!(written, !fractional);
+        }
+    }
+
+    #[test]
     fn enabling_raw_profile_does_not_change_production_outputs() {
         let directory = tempfile::tempdir().unwrap();
         let taxonomy = test_taxonomy(directory.path());

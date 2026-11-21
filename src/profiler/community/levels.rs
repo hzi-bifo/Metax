@@ -34,7 +34,9 @@
 //! abundance is normalised ([`drop_below_minimums`]). The profile opens with
 //! two `#` lines: the run's metadata and the column names. With `--save-raw-profile` the engine also writes
 //! `<prefix>.decisions.tsv`: how every taxon it judged, at every rank, was
-//! decided, with the tests behind it ([`tables`]).
+//! decided, with the tests behind it ([`tables`]), and with
+//! `--save-classification` `<prefix>.classify.txt.gz`: each fragment's shares
+//! of the profile's rows ([`classify`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -61,6 +63,7 @@ use crate::profiler::{
 };
 use crate::taxonomy::Taxonomy;
 
+mod classify;
 mod genomes;
 mod tables;
 
@@ -181,6 +184,10 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             "the level-wise engine takes Illumina reads or long reads without --strain for now"
         )
     })?;
+    // With `--save-classification` (not on a database of sampled genomes),
+    // each level keeps how it shares the fragments.
+    let classify_path = profiler.classification_path(&data);
+    let keep_shares = classify_path.is_some();
     let (fragments, unmatched, error_rate) = collect_fragments(&data, policy);
     let penalty = likelihood_em::error_penalty(error_rate);
     log::info!(
@@ -351,17 +358,17 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         em.iterations,
         without_kept
     );
-    let genus_rows = match rollup {
+    let (genus_rows, orphans) = match rollup {
         Some(rollup) => {
             let accepted: HashSet<u32> = best_fit.keys().copied().collect();
-            let rows = orphan_genus_rows(
+            let (rows, orphans) = orphan_genus_rows(
                 &data,
                 &fragments,
                 &kept.group_of,
                 policy,
                 rollup,
-                &decision_metrics,
-                &accepted,
+                (&decision_metrics, &accepted),
+                keep_shares,
             );
             log::info!(
                 target: "PROFILER",
@@ -371,9 +378,9 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                 // A float sum of no rows is -0.0, printed "-0".
                 rows.iter().fold(0.0, |total, row| total + row.fragments)
             );
-            rows
+            (rows, orphans)
         }
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
     // Fragments with no candidate at the species identity are built again with
     // the default engine's genus fallback gates.
@@ -396,7 +403,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     };
     // Family rows from those fragments: they come from genomes missing from
     // the database, which their reads cannot place in a genus.
-    let (family_level, family_candidates) = match rollup {
+    let (family_level, family_candidates, family_shares) = match rollup {
         Some(rollup) => {
             let family_of = family_map(&profiler.taxonomy, &data.genus_of_species);
             // On a fractional database, reads from the unindexed parts of a kept
@@ -411,7 +418,11 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             } else {
                 HashSet::new()
             };
-            let (rows, candidates) = unmatched_rows(
+            let UnmatchedResult {
+                rows,
+                candidates,
+                shares,
+            } = unmatched_rows(
                 profiler,
                 &data,
                 &unmatched,
@@ -424,6 +435,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                     excluded: &excluded,
                     kept: &noisy_kept,
                     rank: "family",
+                    keep_shares,
                 },
             );
             log::info!(
@@ -434,9 +446,9 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                 rows.iter()
                     .fold(0.0, |total, (_, row)| total + row.equivalent_mapcount)
             );
-            (rows, candidates)
+            (rows, candidates, shares)
         }
-        None => (Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new(), None),
     };
     // Each species' share of the fragments' bases.
     let mut bases = kept.unit_bases(&em);
@@ -452,6 +464,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         policy,
         error_rate,
         report_strains: cfg.genome_level,
+        keep_shares,
         chunk_cutoff: data.min_chunk_breadth,
         ratio_bounds: genome_bounds,
         max_iterations: cfg.max_em_iterations,
@@ -545,7 +558,13 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     // The fragments that the family level leaves to a kept species, too noisy
     // for the species gates, count for it.
     let credited = if rollup.is_some() && cfg.noisy_long_reads {
-        let credited = credited_reads(&data, genus_policy, &unmatched, (&em.weight, &reported));
+        let credited = credited_reads(
+            &data,
+            genus_policy,
+            &unmatched,
+            (&em.weight, &reported),
+            keep_shares,
+        );
         log::info!(
             target: "PROFILER",
             "Level-wise engine: {:.0} fragments without a species-level candidate credited to the kept species that match them best.",
@@ -571,7 +590,8 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     // genome holds and is left out when less than one read is left.
     let mut blocks: Vec<TaxonBlock> = Vec::new();
     // Species reported at their genus: (genus, species, row); for the
-    // decisions table, (genus, species, reads).
+    // decisions table and the per-read classifications, (genus, species,
+    // reads).
     let mut genus_parts: Vec<(u32, u32, ProfileRow)> = Vec::new();
     let mut genus_members: Vec<(u32, u32, f64)> = Vec::new();
     for (&taxid, &assembly_id) in &reported {
@@ -618,7 +638,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                 }
             });
             let reads = reads_of(taxid);
-            if cfg.keep_raw {
+            if cfg.keep_raw || keep_shares {
                 genus_members.push((genus, taxid, reads));
             }
             let species_bases = bases.get(&taxid).copied().unwrap_or(0.0);
@@ -755,6 +775,24 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     blocks.sort_by(|a, b| b.depth().total_cmp(&a.depth()).then(a.taxid.cmp(&b.taxid)));
     // With `--save-raw-profile`, what each taxon holds in the profile.
     let finals = cfg.keep_raw.then(|| FinalRows::of(&blocks));
+    if let Some(path) = &classify_path {
+        let written = classify::Classifications {
+            fragments: &fragments,
+            group_of: &kept.group_of,
+            posteriors: &em.posteriors,
+            genome_level: species_genomes,
+            genus_members: &genus_members,
+            rollup_rows: &genus_rows,
+            orphans: &orphans,
+            credited: &credited.fragments,
+            families: family_shares.as_ref(),
+        }
+        .write(path, &blocks, &data)?;
+        log::info!(
+            target: "PROFILER",
+            "Level-wise engine: {written} fragments written to the per-read classifications."
+        );
+    }
     let rows = blocks
         .into_iter()
         .flat_map(|block| block.taxon.into_iter().chain(block.genomes))
@@ -1985,7 +2023,8 @@ fn species_decisions(
 /// unit each candidate species counts for (`unit_of`), the units that get no
 /// row (`excluded`), the kept species whose best-matched reads stay with them
 /// (`kept`; noisy long reads only, else empty) and the `rank` of its rows,
-/// with the EM penalty, the species tests and the genome layout.
+/// with the EM penalty, the species tests and the genome layout; with
+/// `keep_shares`, the EM's shares of each fragment are kept.
 struct UnmatchedLevel<'a> {
     policy: EvidencePolicy,
     penalty: f64,
@@ -1995,6 +2034,24 @@ struct UnmatchedLevel<'a> {
     excluded: &'a HashSet<u32>,
     kept: &'a HashSet<u32>,
     rank: &'static str,
+    keep_shares: bool,
+}
+
+/// Fragments that an EM shares among units: each fragment's read and read
+/// group, and each group's posteriors.
+struct UnitShares {
+    reads: Vec<usize>,
+    group_of: Vec<Option<usize>>,
+    posteriors: Vec<Vec<(u32, f64)>>,
+}
+
+/// What the level for fragments without a species-level candidate finds: its
+/// rows in unit order, every unit with resolved fragments as a candidate,
+/// kept or not, and with `keep_shares` how its EM shares the fragments.
+struct UnmatchedResult {
+    rows: Vec<(u32, ProfileRow)>,
+    candidates: Vec<UnitCandidate>,
+    shares: Option<UnitShares>,
 }
 
 /// A unit of the level for fragments without a species-level candidate, with
@@ -2025,14 +2082,13 @@ struct UnitCandidate {
 /// of the genome that holds most of them (the reads of a genome missing from
 /// the database spread over the genome of a relative; reads of conserved genes
 /// from elsewhere stay in a few places), and are at least [`MIN_WON_SHARE`] of
-/// the fragments listing the unit. Returns the rows in unit order, and every
-/// unit with resolved fragments as a candidate, kept or not.
+/// the fragments listing the unit.
 fn unmatched_rows(
     profiler: &CommunityProfiler,
     data: &MappingData,
     reads: &[usize],
     level: &UnmatchedLevel,
-) -> (Vec<(u32, ProfileRow)>, Vec<UnitCandidate>) {
+) -> UnmatchedResult {
     let unit_of = |taxid: u32| level.unit_of.get(&taxid).copied();
     let policy = level.policy;
     let mut fragments = Vec::new();
@@ -2180,7 +2236,15 @@ fn unmatched_rows(
     }
     rows.sort_by_key(|row| row.0);
     candidates.sort_by_key(|candidate| candidate.unit);
-    (rows, candidates)
+    UnmatchedResult {
+        rows,
+        candidates,
+        shares: level.keep_shares.then(|| UnitShares {
+            reads: fragments.iter().map(|fragment| fragment.read).collect(),
+            group_of: shared.group_of,
+            posteriors: em.posteriors,
+        }),
+    }
 }
 
 /// Whether the best match of a fragment's `candidates` under `policy` (fewest
@@ -2201,12 +2265,14 @@ fn best_match_kept(
 }
 
 /// What the fragments credited to kept species add to each: reads, bases,
-/// and depth for a species reported on a marker genome.
+/// and depth for a species reported on a marker genome; and when kept, each
+/// credited fragment's read with its shares.
 #[derive(Default)]
 struct Credited {
     reads: HashMap<u32, f64>,
     bases: HashMap<u32, f64>,
     marker_depth: HashMap<u32, f64>,
+    fragments: Vec<(usize, Vec<(u32, f64)>)>,
 }
 
 /// The fragments `reads` without a species-level candidate whose best match
@@ -2214,12 +2280,13 @@ struct Credited {
 /// (with an EM `weight` and a `reported` genome): each counts for the tied kept
 /// species, shared by their weights, as the final EM would share it. Its bases
 /// add to a species' depth, or on a marker genome the depth it adds there
-/// ([`fragment_depth`]).
+/// ([`fragment_depth`]). With `keep_shares`, each fragment's shares are kept.
 fn credited_reads(
     data: &MappingData,
     policy: EvidencePolicy,
     reads: &[usize],
     (weight, reported): (&HashMap<u32, f64>, &HashMap<u32, u32>),
+    keep_shares: bool,
 ) -> Credited {
     let markers = data.marker_model.as_deref();
     let mut credited = Credited::default();
@@ -2262,8 +2329,16 @@ fn credited_reads(
                     .collect::<Vec<_>>()
             })
         },
-        |_, found| {
-            for (taxid, share, bases, on_marker) in found.into_iter().flatten() {
+        |&read, found| {
+            let Some(found) = found else {
+                return;
+            };
+            if keep_shares {
+                credited
+                    .fragments
+                    .push((read, found.iter().map(|f| (f.0, f.1)).collect()));
+            }
+            for (taxid, share, bases, on_marker) in found {
                 *credited.reads.entry(taxid).or_insert(0.0) += share;
                 match on_marker {
                     Some(depth) => *credited.marker_depth.entry(taxid).or_insert(0.0) += depth,
@@ -2317,9 +2392,9 @@ fn orphan_genus_rows(
     group_of: &[Option<usize>],
     policy: EvidencePolicy,
     rollup: &GenusRollup,
-    decisions: &HashMap<u32, WitnessDecision>,
-    accepted: &HashSet<u32>,
-) -> Vec<GenusRow> {
+    (decisions, accepted): (&HashMap<u32, WitnessDecision>, &HashSet<u32>),
+    keep_offered: bool,
+) -> (Vec<GenusRow>, Vec<(usize, u32)>) {
     // The roll-up takes only fragments whose candidate species all lie in one
     // genus; the others need no candidates built.
     let orphaned = fragments
@@ -2334,6 +2409,7 @@ fn orphan_genus_rows(
         .map(|(fragment, _)| fragment)
         .collect::<Vec<_>>();
     let mut orphans = OrphanedFragments::new(rollup, false);
+    let mut offered = Vec::new();
     fold_candidates(
         data,
         policy,
@@ -2351,6 +2427,9 @@ fn orphan_genus_rows(
                 return;
             };
             let taxids = fragment.candidates.iter().map(|c| c.0).collect::<Vec<_>>();
+            if keep_offered {
+                offered.push((fragment.read, taxids[0]));
+            }
             orphans.offer(
                 &taxids,
                 0,
@@ -2361,7 +2440,7 @@ fn orphan_genus_rows(
             );
         },
     );
-    orphans.into_genus_rows(decisions, accepted)
+    (orphans.into_genus_rows(decisions, accepted), offered)
 }
 
 /// One profile row; `amount` is `(reads, depth)`.
@@ -2636,31 +2715,39 @@ mod tests {
             required_premap_guard: PremapChunkGuard::default(),
         };
         let rollup = rollup();
-        let rows = orphan_genus_rows(
+        let (rows, offered) = orphan_genus_rows(
             &data,
             &fragments,
             &group_of,
             policy,
             &rollup,
-            &HashMap::from([(1, decision(0.8)), (3, decision(0.8))]),
-            &HashSet::new(),
+            (
+                &HashMap::from([(1, decision(0.8)), (3, decision(0.8))]),
+                &HashSet::new(),
+            ),
+            true,
         );
+        // Every fragment of one genus is offered, with its best candidate as donor.
+        assert_eq!(offered.len(), 250);
+        assert!(offered
+            .iter()
+            .all(|&(read, donor)| read < 250 && donor == 1));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].genus, 100);
         assert_eq!(rows[0].fragments, 250.0);
         // Read-1 bases over the genome's length, per fragment.
         assert!((rows[0].depth - 250.0 * 100.0 / 1_000_000.0).abs() < 1e-12);
         // A donor whose reads do not spread over its genome gives no row.
-        let rows = orphan_genus_rows(
+        let (rows, offered) = orphan_genus_rows(
             &data,
             &fragments,
             &group_of,
             policy,
             &rollup,
-            &HashMap::from([(1, decision(0.2))]),
-            &HashSet::new(),
+            (&HashMap::from([(1, decision(0.2))]), &HashSet::new()),
+            false,
         );
-        assert!(rows.is_empty());
+        assert!(rows.is_empty() && offered.is_empty());
     }
 
     #[test]
@@ -3361,7 +3448,7 @@ mod tests {
         };
         let weight = HashMap::from([(2, 30.0), (3, 10.0)]);
         let reported = HashMap::from([(2, 20), (3, 30)]);
-        let credited = credited_reads(&data, policy, &[0, 1], (&weight, &reported));
+        let credited = credited_reads(&data, policy, &[0, 1], (&weight, &reported), true);
         assert!((credited.reads[&2] - 0.75).abs() < 1e-12);
         assert!((credited.reads[&3] - 0.25).abs() < 1e-12);
         assert!((credited.bases[&2] - 75.0).abs() < 1e-9);

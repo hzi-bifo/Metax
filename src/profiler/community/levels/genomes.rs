@@ -66,6 +66,18 @@ pub(super) struct SpeciesGenomes {
     /// match is this species, at any identity the mapper reports.
     pub(super) mean_identity: f64,
     pub(super) strains: Vec<StrainGenome>,
+    /// With [`GenomeLevel::keep_shares`], each fragment's shares of the
+    /// genomes reported on their own.
+    pub(super) shares: StrainShares,
+}
+
+/// The fragments that the genome EM over the genomes reported on their own
+/// shares among them: each fragment's read and read group, and each group's
+/// posteriors over those genomes.
+#[derive(Default)]
+pub(super) struct StrainShares {
+    pub(super) members: Vec<(usize, usize)>,
+    pub(super) posteriors: Vec<Vec<(u32, f64)>>,
 }
 
 /// One genome's genome-level tests (development diagnostics).
@@ -118,6 +130,9 @@ pub(super) struct GenomeLevel {
     pub(super) error_rate: f64,
     /// Report genomes on their own (`--strain`).
     pub(super) report_strains: bool,
+    /// Keep each fragment's shares of the genomes reported on their own, for
+    /// the per-read classifications.
+    pub(super) keep_shares: bool,
     pub(super) chunk_cutoff: f64,
     pub(super) ratio_bounds: (f64, f64),
     pub(super) max_iterations: usize,
@@ -186,15 +201,16 @@ pub(super) fn resolve(
         .into_par_iter()
         .map(|share| {
             let mut diagnostics = Vec::new();
-            let strains = if level.report_strains {
+            let (strains, shares) = if level.report_strains {
                 strain_genomes(data, &share, strain, level, &mut diagnostics)
             } else {
-                Vec::new()
+                (Vec::new(), StrainShares::default())
             };
             let genomes = SpeciesGenomes {
                 best_fit: share.best_fit,
                 mean_identity: identity.get(&share.taxid).map_or(f64::NAN, |m| m.0),
                 strains,
+                shares,
             };
             (share.taxid, genomes, diagnostics)
         })
@@ -406,14 +422,15 @@ fn best_fit_identities(
 /// Genomes of one species reported on their own: strain-level coverage from
 /// fragments that resolve to a genome (posterior >= RESOLVE_POSTERIOR) at
 /// strain-level identity, the chunk-breadth cutoff and breadth ratios, and a
-/// second genome EM over the kept genomes for their reads and depth.
+/// second genome EM over the kept genomes for their reads and depth, with each
+/// fragment's shares of them when [`GenomeLevel::keep_shares`].
 fn strain_genomes(
     data: &MappingData,
     share: &SpeciesShare,
     strain: StrainLevel,
     level: &GenomeLevel,
     diagnostics: &mut Vec<StrainDiagnostic>,
-) -> Vec<StrainGenome> {
+) -> (Vec<StrainGenome>, StrainShares) {
     let (taxid, members, group_of, posteriors) = (
         share.taxid,
         &share.members,
@@ -515,10 +532,11 @@ fn strain_genomes(
         .collect();
     loop {
         if kept.is_empty() {
-            return Vec::new();
+            return (Vec::new(), StrainShares::default());
         }
         let KeptShares {
             em,
+            slots,
             bases,
             identity,
         } = share_among_kept(members, &kept, strain_identity, level);
@@ -558,16 +576,29 @@ fn strain_genomes(
                 .total_cmp(&a.reads)
                 .then(a.assembly_id.cmp(&b.assembly_id))
         });
-        return strains;
+        let shares = if level.keep_shares {
+            StrainShares {
+                members: members
+                    .iter()
+                    .zip(slots)
+                    .filter_map(|(member, slot)| slot.map(|group| (member.read, group)))
+                    .collect(),
+                posteriors: em.posteriors,
+            }
+        } else {
+            StrainShares::default()
+        };
+        return (strains, shares);
     }
 }
 
 /// The genome EM over the kept genomes of a species, sharing each fragment
-/// among the kept genomes it matches at strain-level identity, with each
-/// genome's fragment bases and the posterior-weighted sum and weight of its
-/// fragments' identity to it.
+/// among the kept genomes it matches at strain-level identity (each member's
+/// read group, if any), with each genome's fragment bases and the
+/// posterior-weighted sum and weight of its fragments' identity to it.
 struct KeptShares {
     em: likelihood_em::EmResult,
+    slots: Vec<Option<usize>>,
     bases: HashMap<u32, f64>,
     identity: HashMap<u32, (f64, f64)>,
 }
@@ -614,6 +645,7 @@ fn share_among_kept(
     }
     KeptShares {
         em,
+        slots,
         bases,
         identity,
     }
@@ -638,6 +670,7 @@ mod tests {
             },
             error_rate: 0.003,
             report_strains: false,
+            keep_shares: false,
             chunk_cutoff: 0.5,
             ratio_bounds: (0.75, 0.75),
             max_iterations: 200,
