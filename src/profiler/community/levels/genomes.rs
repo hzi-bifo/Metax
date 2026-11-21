@@ -7,7 +7,11 @@
 //! At the genome level (`--strain`) a genome is also reported on its own when
 //! the fragments that clearly belong to it and match it at strain-level
 //! identity cover it evenly. A genome represented by marker genes never is:
-//! its genes are conserved and too short to tell strains apart.
+//! its genes are conserved and too short to tell strains apart. A genome
+//! reported on its own counts each of its fragments by the species' share of
+//! the fragment in the species-level EM times the genome EM's posterior, so
+//! that a fragment counts once within its species' rows: the species row
+//! keeps the rest of the species' reads.
 
 use std::collections::{HashMap, HashSet};
 
@@ -41,15 +45,19 @@ const STRAIN_MARGIN: f64 = 0.005;
 /// within this of 1.
 const GENOME_ROW_ANI: f64 = 0.999;
 
-/// One fragment of a species: its read, mapped bases for depth, and per
-/// genome of the species `(assembly, errors, identity)`.
+/// One fragment of a species: its read, mapped bases for depth, the
+/// species' share of it in the species-level EM, and per genome of the
+/// species `(assembly, errors, identity)`.
 struct GenomeFragment {
     read: usize,
     bases: f64,
+    share: f64,
     genomes: Vec<(u32, f64, f64)>,
 }
 
-/// A genome reported on its own.
+/// A genome reported on its own, with its reads and their bases: each
+/// fragment counted by the species' share of it times the genome EM's
+/// posterior.
 pub(super) struct StrainGenome {
     pub(super) assembly_id: u32,
     pub(super) reads: f64,
@@ -146,13 +154,14 @@ impl GenomeLevel {
     }
 }
 
-/// For each species of `species_of`, share its fragments among its genomes;
-/// then measure the sample's baseline identity and, with `report_strains`,
-/// find the genomes reported on their own.
+/// For each species of `species_of` (each fragment's species and its share of
+/// the fragment), share its fragments among its genomes; then measure the
+/// sample's baseline identity and, with `report_strains`, find the genomes
+/// reported on their own.
 pub(super) fn resolve(
     data: &MappingData,
     fragments: &[Fragment],
-    species_of: &[Option<u32>],
+    species_of: &[Option<(u32, f64)>],
     level: &GenomeLevel,
 ) -> GenomeResult {
     let penalty = level.penalty();
@@ -269,13 +278,13 @@ fn weighted_median(values: impl Iterator<Item = (f64, f64)>) -> Option<f64> {
 fn genome_fragments(
     data: &MappingData,
     fragments: &[Fragment],
-    species_of: &[Option<u32>],
+    species_of: &[Option<(u32, f64)>],
     policy: EvidencePolicy,
 ) -> HashMap<u32, Vec<GenomeFragment>> {
     let resolved = fragments
         .iter()
         .zip(species_of)
-        .filter_map(|(fragment, species)| species.map(|taxid| (fragment, taxid)))
+        .filter_map(|(fragment, species)| species.map(|(taxid, share)| (fragment, taxid, share)))
         .collect::<Vec<_>>();
     let mut out: HashMap<u32, Vec<GenomeFragment>> = HashMap::new();
     fold_candidates(
@@ -287,11 +296,12 @@ fn genome_fragments(
             let candidate = candidates.iter().find(|c| c.taxid == r.1)?;
             Some(candidate_genomes(candidate, policy))
         },
-        |&(fragment, taxid), genomes| {
+        |&(fragment, taxid, share), genomes| {
             if let Some(genomes) = genomes {
                 out.entry(taxid).or_default().push(GenomeFragment {
                     read: fragment.read,
                     bases: fragment.bases,
+                    share,
                     genomes,
                 });
             }
@@ -537,6 +547,7 @@ fn strain_genomes(
         let KeptShares {
             em,
             slots,
+            reads,
             bases,
             identity,
         } = share_among_kept(members, &kept, strain_identity, level);
@@ -564,7 +575,7 @@ fn strain_genomes(
             .iter()
             .map(|(&assembly_id, &(coverage, asm_len))| StrainGenome {
                 assembly_id,
-                reads: em.weight.get(&assembly_id).copied().unwrap_or(0.0),
+                reads: reads.get(&assembly_id).copied().unwrap_or(0.0),
                 bases: bases.get(&assembly_id).copied().unwrap_or(0.0),
                 mean_identity: mean_identity(&assembly_id),
                 coverage,
@@ -594,11 +605,13 @@ fn strain_genomes(
 
 /// The genome EM over the kept genomes of a species, sharing each fragment
 /// among the kept genomes it matches at strain-level identity (each member's
-/// read group, if any), with each genome's fragment bases and the
+/// read group, if any), with each genome's reads and their bases (each
+/// fragment counted by the species' share of it times its posterior) and the
 /// posterior-weighted sum and weight of its fragments' identity to it.
 struct KeptShares {
     em: likelihood_em::EmResult,
     slots: Vec<Option<usize>>,
+    reads: HashMap<u32, f64>,
     bases: HashMap<u32, f64>,
     identity: HashMap<u32, (f64, f64)>,
 }
@@ -628,6 +641,7 @@ fn share_among_kept(
         level.max_iterations,
         level.tolerance,
     );
+    let mut reads: HashMap<u32, f64> = HashMap::new();
     let mut bases: HashMap<u32, f64> = HashMap::new();
     let mut identity: HashMap<u32, (f64, f64)> = HashMap::new();
     for (member, slot) in members.iter().zip(&slots) {
@@ -635,7 +649,9 @@ fn share_among_kept(
             continue;
         };
         for &(assembly, posterior) in &em.posteriors[slot] {
-            *bases.entry(assembly).or_insert(0.0) += member.bases * posterior;
+            let count = member.share * posterior;
+            *reads.entry(assembly).or_insert(0.0) += count;
+            *bases.entry(assembly).or_insert(0.0) += member.bases * count;
             if let Some(g) = member.genomes.iter().find(|g| g.0 == assembly) {
                 let entry = identity.entry(assembly).or_insert((0.0, 0.0));
                 entry.0 += posterior * g.2;
@@ -646,6 +662,7 @@ fn share_among_kept(
     KeptShares {
         em,
         slots,
+        reads,
         bases,
         identity,
     }
@@ -678,8 +695,9 @@ mod tests {
         }
     }
 
-    /// Every read gets the species-level candidate of its first row's species.
-    fn fragments(data: &MappingData) -> (Vec<Fragment>, Vec<Option<u32>>) {
+    /// Every read gets the species-level candidate of its first row's species,
+    /// which the species-level EM gives it whole.
+    fn fragments(data: &MappingData) -> (Vec<Fragment>, Vec<Option<(u32, f64)>>) {
         data.read_alignments
             .iter()
             .enumerate()
@@ -691,7 +709,7 @@ mod tests {
                         candidates: vec![(taxid, 0.0)],
                         bases: 100.0,
                     },
-                    Some(taxid),
+                    Some((taxid, 1.0)),
                 )
             })
             .unzip()
@@ -857,5 +875,43 @@ mod tests {
         assert_eq!(strains.len(), 1);
         assert!((strains[0].mean_identity - 0.999).abs() < 1e-9);
         assert!((strains[0].reads - 300.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_genome_row_counts_its_fragments_by_their_species_share() {
+        // Species 1 is an exact strain of genome 10. The species-level EM gives it 0.8 of the first 150 of its 300
+        // fragments (another species holds the rest of them) and the other 150 whole.
+        let reads = (0..300)
+            .map(|i| vec![tiled(1, 10, 0.999, i)])
+            .collect::<Vec<_>>();
+        let data = data(reads);
+        let (fragments, mut species_of) = fragments(&data);
+        for species in &mut species_of[..150] {
+            *species = Some((1, 0.8));
+        }
+        let level = GenomeLevel {
+            report_strains: true,
+            chunk_cutoff: 0.1,
+            ratio_bounds: (0.5, 0.5),
+            ..level()
+        };
+        let result = resolve(&data, &fragments, &species_of, &level);
+        let strains = &result.species[&1].strains;
+        assert_eq!(strains.len(), 1);
+        // The genome row counts each fragment by the species' share of it.
+        assert!((strains[0].reads - 270.0).abs() < 1e-9);
+        assert!((strains[0].bases - 27_000.0).abs() < 1e-6);
+        // The species also holds half of ten fragments that the genome level does not resolve: its species row keeps
+        // those 5 reads, and its rows together hold its 275 reads. The other species keep their shares of the
+        // fragments, which the genome level does not touch.
+        let species_reads = 270.0 + 10.0 * 0.5;
+        let (species_row, _) = super::super::species_remainder(
+            species_reads,
+            27_500.0,
+            strains.iter().map(|s| (s.reads, s.bases)),
+        )
+        .unwrap();
+        assert!((species_row - 5.0).abs() < 1e-9);
+        assert!((species_row + strains[0].reads - species_reads).abs() < 1e-9);
     }
 }

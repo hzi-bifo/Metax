@@ -155,10 +155,15 @@ impl SharedReads {
 /// The unit a read group resolves to: the first of its `posteriors` at
 /// [`RESOLVE_POSTERIOR`] or above.
 fn resolved_unit(posteriors: &[(u32, f64)]) -> Option<u32> {
+    resolved_share(posteriors).map(|p| p.0)
+}
+
+/// The unit a read group resolves to, with its posterior.
+fn resolved_share(posteriors: &[(u32, f64)]) -> Option<(u32, f64)> {
     posteriors
         .iter()
         .find(|p| p.1 >= RESOLVE_POSTERIOR)
-        .map(|p| p.0)
+        .copied()
 }
 
 /// Coverage of one genome from the fragments that resolve to its species.
@@ -454,11 +459,11 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     let mut bases = kept.unit_bases(&em);
 
     // Genomes within each kept species, for the fragments the species-level EM
-    // gives to one species.
+    // gives to one species, with that species' share of each.
     let species_of = kept
         .group_of
         .iter()
-        .map(|group| group.and_then(|g| resolved_unit(&em.posteriors[g])))
+        .map(|group| group.and_then(|g| resolved_share(&em.posteriors[g])))
         .collect::<Vec<_>>();
     let genome_level = genomes::GenomeLevel {
         policy,
@@ -586,8 +591,9 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     };
 
     // Species rows, each followed by the genomes reported on their own. The
-    // rows of a species are exclusive: the species row keeps what no reported
-    // genome holds and is left out when less than one read is left.
+    // rows of a species are exclusive: a genome row counts each fragment by the
+    // species' share of it, the species row keeps what no reported genome
+    // holds and is left out when less than one read is left.
     let mut blocks: Vec<TaxonBlock> = Vec::new();
     // Species reported at their genus: (genus, species, row); for the
     // decisions table and the per-read classifications, (genus, species,

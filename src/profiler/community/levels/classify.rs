@@ -28,10 +28,9 @@
 //! file's read order.
 //!
 //! Summed over the file, a taxon's shares equal its reads in the profile
-//! (column 4) except where shares were renormalised, where a species row is
-//! left out for holding less than one read, and between a species row and its
-//! strain rows: the genome EM counts each fragment it resolves whole, while
-//! here the fragment's species share is split.
+//! (column 4), as the profile counts each fragment the same way, except where
+//! shares were renormalised and where a species row is left out for holding
+//! less than one read.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
