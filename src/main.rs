@@ -343,7 +343,7 @@ struct ProfileArgs {
     #[arg(
         long = "estimate-unclassified",
         action = ArgAction::SetTrue,
-        conflicts_with_all = ["strain", "host"],
+        conflicts_with = "host",
         help_heading = "Genus fallback and low-map behavior",
         help = "Estimate the share of input reads or fragments that the profile does not explain and append it as an 'unclassified' row (taxid 0; column 4 the unexplained fragments, column 6 their share in percent). Species represented by marker genes count as their whole genome, from the genome size declared in the reference FASTA. Community profiling. Off by default."
     )]
@@ -355,7 +355,6 @@ struct ProfileArgs {
         num_args = 0..=1,
         default_missing_value = "0.025",
         value_parser = parse_probability,
-        conflicts_with = "strain",
         help_heading = "Genus fallback and low-map behavior",
         help = "Report a species at its genus when the reads placed best on it are, on average, more than FRACTION less identical than those of the sample's typical species (the median over the reported species, weighted by their fragments). Such a species is mostly a relative that receives the reads of an organism missing from the database. Needs at least 3 reported species. On by default with 0.025 for paired-end Illumina community profiling and for single-end Illumina reads on a fractional database; other inputs use it only when it is given (without a value: 0.025)."
     )]
@@ -1101,6 +1100,14 @@ impl TryFrom<ProfileArgs> for AppConfig {
         // experimental strain profiler and its presets are not used.
         let strain = args.strain && !args.level_engine;
         let genome_level = args.strain && args.level_engine;
+        // The strain profiler estimates no unclassified share and has no
+        // identity margin; the level-wise engine's genome level has both.
+        if strain && args.estimate_unclassified {
+            bail!("--estimate-unclassified cannot be used with --strain");
+        }
+        if strain && args.identity_margin.is_some() {
+            bail!("--identity-margin cannot be used with --strain");
+        }
         let requested_exact_ties = args.exact_ties;
         let chunk_guard_available =
             !args.lowbiomass && !args.chunk_breadth.is_some_and(|value| value <= 0.0);
@@ -1545,6 +1552,39 @@ mod tests {
             "--no-identity-margin",
         ];
         assert!(Cli::try_parse_from(both).is_err());
+    }
+
+    #[test]
+    fn the_genome_level_takes_the_unclassified_estimate_and_identity_margin() {
+        let config = |extra: &[&str]| {
+            let argv = ["metax", "profile", "-d", "db", "-o", "out", "-i", "r1.fq"];
+            let cli = Cli::try_parse_from(argv.iter().chain(extra)).unwrap();
+            let Commands::Profile(args) = cli.command else {
+                panic!("expected profile command");
+            };
+            AppConfig::try_from(args)
+        };
+        for option in ["--estimate-unclassified", "--identity-margin"] {
+            // The strain profiler refuses them ...
+            let error = config(&["--strain", option]).unwrap_err().to_string();
+            assert!(
+                error.contains(option) && error.contains("--strain"),
+                "{error}"
+            );
+            // ... the level-wise engine's genome level takes them.
+            let level = config(&["--strain", "--level-engine", option]).unwrap();
+            assert!(level.genome_level && !level.strain);
+        }
+        let level = config(&[
+            "--strain",
+            "--level-engine",
+            "--estimate-unclassified",
+            "--identity-margin",
+            "0.04",
+        ])
+        .unwrap();
+        assert!(level.estimate_unclassified);
+        assert_eq!(level.identity_margin, Some(0.04));
     }
 
     #[test]

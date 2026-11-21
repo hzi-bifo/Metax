@@ -2664,6 +2664,41 @@ mod tests {
     }
 
     #[test]
+    fn the_unclassified_estimate_counts_a_species_and_its_genome_rows_once() {
+        // A species with 100 reads, 70 of them in two genome rows (one under a strain taxid, one under the
+        // species'): its species row keeps the other 30, so its rows hold its 100 reads once.
+        let (remainder, _) = species_remainder(
+            100.0,
+            15_000.0,
+            [(50.0, 7_500.0), (20.0, 3_000.0)].into_iter(),
+        )
+        .unwrap();
+        let row = |taxid: u32, rank: &str, reads: f64| {
+            profile_row(
+                rank.to_string(),
+                taxid,
+                rank,
+                (reads, 1.0),
+                &EvidenceCoverage::default(),
+                Arc::from("GCF_1"),
+                Some((f64::NAN, f64::NAN)),
+            )
+        };
+        let rows = [
+            row(1, "species", remainder),
+            row(11, "strain", 50.0),
+            row(1, "strain", 20.0),
+            row(100, "genus", 40.0),
+            row(1000, "family", 10.0),
+        ];
+        let estimate =
+            crate::profiler::unclassified::estimate(&rows, &HashMap::new(), 200).unwrap();
+        // 200 input fragments, 150 explained.
+        assert!((estimate.fragments - 50.0).abs() < 1e-9);
+        assert!((estimate.share - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
     fn taxa_below_a_minimum_are_dropped_with_their_genome_rows() {
         let row = |rank: &str, reads: f64| {
             profile_row(
