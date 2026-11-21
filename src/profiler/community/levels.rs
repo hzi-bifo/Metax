@@ -29,8 +29,10 @@
 //! database) a species is left out beside a deeper congener whose reads are
 //! that much more identical ([`identity_relatives`]). A genome represented by
 //! marker genes is measured gene by gene ([`MarkerModel`]); the tests are the
-//! same. The profile opens with two `#` lines: the run's metadata and the
-//! column names. With `--save-raw-profile` the engine also writes
+//! same. `--min-reads` and `--min-breadth` drop a taxon whose rows hold fewer
+//! reads (a species with its genome rows) or whose breadth is lower, before
+//! abundance is normalised ([`drop_below_minimums`]). The profile opens with
+//! two `#` lines: the run's metadata and the column names. With `--save-raw-profile` the engine also writes
 //! `<prefix>.decisions.tsv`: how every taxon it judged, at every rank, was
 //! decided, with the tests behind it ([`tables`]).
 
@@ -54,7 +56,9 @@ use crate::profiler::rollup::{
     GenomeLayout, GenusRollup, GenusRow, OrphanedFragments, MIN_GENUS_FRAGMENTS, MIN_WINDOW_SPREAD,
 };
 use crate::profiler::unclassified::GenomeReads;
-use crate::profiler::{parse_reference_taxonomy, ProfileRank};
+use crate::profiler::{
+    equivalent_read_count_passes_minimum, parse_reference_taxonomy, ProfileRank,
+};
 use crate::taxonomy::Taxonomy;
 
 mod genomes;
@@ -676,6 +680,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             taxid,
             taxon: species,
             genomes: strains,
+            breadth: coverage.breadth,
         });
     }
     // One genus row per genus: the roll-up's, then the species reported at
@@ -714,9 +719,24 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     for (taxid, row) in genus_blocks.into_iter().chain(family_level) {
         blocks.push(TaxonBlock {
             taxid,
+            breadth: row.breadth,
             taxon: Some(row),
             genomes: Vec::new(),
         });
+    }
+    let dropped = drop_below_minimums(
+        &mut blocks,
+        &Minimums {
+            reads: cfg.min_reads,
+            breadth: cfg.breadth,
+        },
+    );
+    if !dropped.is_empty() {
+        log::info!(
+            target: "PROFILER",
+            "Level-wise engine: {} taxa dropped by --min-reads or --min-breadth; their reads go to no other taxon.",
+            dropped.len()
+        );
     }
     let total_depth: f64 = blocks.iter().map(TaxonBlock::depth).sum();
     let abundance = |depth: f64| {
@@ -771,6 +791,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             rollup_genomes: &decisions,
             genus_members: &genus_members,
             families: &family_candidates,
+            dropped: &dropped,
         };
         let names = Names {
             taxonomy: &profiler.taxonomy,
@@ -1828,11 +1849,14 @@ fn species_remainder(
 }
 
 /// The rows of one taxon: a species row (unless every read is in a genome
-/// row) with its genome rows, or a genus or family row.
+/// row) with its genome rows, or a genus or family row; with the taxon's
+/// breadth (a species' on the genome it is reported on, which its species row
+/// shows).
 struct TaxonBlock {
     taxid: u32,
     taxon: Option<ProfileRow>,
     genomes: Vec<ProfileRow>,
+    breadth: f64,
 }
 
 impl TaxonBlock {
@@ -1840,6 +1864,86 @@ impl TaxonBlock {
         self.taxon.as_ref().map_or(0.0, |s| s.depth)
             + self.genomes.iter().map(|s| s.depth).sum::<f64>()
     }
+
+    /// Full-index-equivalent reads of the taxon's rows.
+    fn reads(&self) -> f64 {
+        self.taxon
+            .iter()
+            .chain(&self.genomes)
+            .fold(0.0, |total, row| total + row.equivalent_mapcount)
+    }
+}
+
+/// `--min-reads` and `--min-breadth`, as the default engine applies them to
+/// its rows: a taxon is dropped from the profile when its rows hold fewer
+/// full-index-equivalent reads (a species counting with its genome rows), or
+/// when its breadth is lower.
+struct Minimums {
+    reads: Option<usize>,
+    breadth: Option<f64>,
+}
+
+/// What a dropped taxon missed: its reads and the minimum, its breadth and the
+/// minimum.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BelowMinimum {
+    reads: Option<(f64, usize)>,
+    breadth: Option<(f64, f64)>,
+}
+
+impl Minimums {
+    fn check(&self, reads: f64, breadth: f64) -> Option<BelowMinimum> {
+        let below = BelowMinimum {
+            reads: self
+                .reads
+                .filter(|_| !equivalent_read_count_passes_minimum(reads, self.reads))
+                .map(|minimum| (reads, minimum)),
+            breadth: self
+                .breadth
+                .filter(|&minimum| breadth.is_nan() || breadth < minimum)
+                .map(|minimum| (breadth, minimum)),
+        };
+        (below.reads.is_some() || below.breadth.is_some()).then_some(below)
+    }
+}
+
+impl BelowMinimum {
+    /// The minimums missed, in words.
+    fn reason(&self) -> String {
+        let mut missed = Vec::new();
+        if let Some((reads, minimum)) = self.reads {
+            missed.push(format!(
+                "removed by --min-reads: {reads:.2} reads < {minimum}"
+            ));
+        }
+        if let Some((breadth, minimum)) = self.breadth {
+            missed.push(format!(
+                "removed by --min-breadth: breadth {breadth:.4} < {minimum:.4}"
+            ));
+        }
+        missed.join("; ")
+    }
+}
+
+/// Drop the blocks of the taxa below `minimums`, before abundance is
+/// normalised; their reads go to no other taxon. Returns what each dropped
+/// taxon missed.
+fn drop_below_minimums(
+    blocks: &mut Vec<TaxonBlock>,
+    minimums: &Minimums,
+) -> HashMap<u32, BelowMinimum> {
+    let mut dropped = HashMap::new();
+    if minimums.reads.is_none() && minimums.breadth.is_none() {
+        return dropped;
+    }
+    blocks.retain(|block| match minimums.check(block.reads(), block.breadth) {
+        Some(below) => {
+            dropped.insert(block.taxid, below);
+            false
+        }
+        None => true,
+    });
+    dropped
 }
 
 /// Each measured species' decision for the genus level: its strongest genome
@@ -2557,6 +2661,91 @@ mod tests {
             &HashSet::new(),
         );
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn taxa_below_a_minimum_are_dropped_with_their_genome_rows() {
+        let row = |rank: &str, reads: f64| {
+            profile_row(
+                rank.to_string(),
+                1,
+                rank,
+                (reads, 1.0),
+                &EvidenceCoverage::default(),
+                Arc::from("GCF_1"),
+                Some((f64::NAN, f64::NAN)),
+            )
+        };
+        let blocks = || {
+            vec![
+                // A species with 120 reads in its species row and 30 in a genome row.
+                TaxonBlock {
+                    taxid: 1,
+                    taxon: Some(row("species", 120.0)),
+                    genomes: vec![row("strain", 30.0)],
+                    breadth: 0.9,
+                },
+                TaxonBlock {
+                    taxid: 100,
+                    taxon: Some(row("genus", 10.0)),
+                    genomes: Vec::new(),
+                    breadth: 0.03,
+                },
+                TaxonBlock {
+                    taxid: 1000,
+                    taxon: Some(row("family", 300.0)),
+                    genomes: Vec::new(),
+                    breadth: f64::NAN,
+                },
+            ]
+        };
+        let taxids = |blocks: &[TaxonBlock]| blocks.iter().map(|b| b.taxid).collect::<Vec<_>>();
+        // Without minimums nothing is dropped.
+        let mut kept = blocks();
+        let none = Minimums {
+            reads: None,
+            breadth: None,
+        };
+        assert!(drop_below_minimums(&mut kept, &none).is_empty());
+        assert_eq!(taxids(&kept), [1, 100, 1000]);
+        // A species counts with its genome rows: 150 reads pass 130.
+        let mut kept = blocks();
+        let reads = Minimums {
+            reads: Some(130),
+            breadth: None,
+        };
+        let dropped = drop_below_minimums(&mut kept, &reads);
+        assert_eq!(taxids(&kept), [1, 1000]);
+        assert_eq!(
+            dropped[&100].reason(),
+            "removed by --min-reads: 10.00 reads < 130"
+        );
+        // Breadth: below the minimum, or unknown.
+        let mut kept = blocks();
+        let breadth = Minimums {
+            reads: Some(5),
+            breadth: Some(0.05),
+        };
+        let dropped = drop_below_minimums(&mut kept, &breadth);
+        assert_eq!(taxids(&kept), [1]);
+        assert_eq!(
+            dropped[&100].reason(),
+            "removed by --min-breadth: breadth 0.0300 < 0.0500"
+        );
+        assert_eq!(
+            dropped[&1000].reason(),
+            "removed by --min-breadth: breadth NaN < 0.0500"
+        );
+        // Both minimums missed.
+        let both = Minimums {
+            reads: Some(20),
+            breadth: Some(0.05),
+        };
+        assert_eq!(
+            both.check(12.0, 0.031).unwrap().reason(),
+            "removed by --min-reads: 12.00 reads < 20; removed by --min-breadth: breadth 0.0310 < 0.0500"
+        );
+        assert_eq!(both.check(20.0, 0.05), None);
     }
 
     #[test]

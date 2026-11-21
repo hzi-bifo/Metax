@@ -50,7 +50,8 @@
 //! - `decision`: `kept` when the taxon has rows of its own in the profile,
 //!   otherwise `removed`; the same on every row of a species;
 //! - `reason`: the taxon's outcome in words, the same on every row of a
-//!   species;
+//!   species (`removed by --min-reads: …` or `removed by --min-breadth: …`
+//!   for a taxon those minimums dropped);
 //! - `reported_as`: the rank of the profile rows holding the taxon's reads
 //!   (`species` for a species row and its strain rows), `none` when none;
 //! - `final_reads`, `final_abundance`: columns 4 and 6 of the taxon's profile
@@ -67,8 +68,8 @@ use anyhow::{Context, Result};
 
 use super::genomes::{SpeciesGenomes, StrainDiagnostic};
 use super::{
-    strain_label, wins_enough, within, FragmentCounts, GenomeEvidence, SpeciesTests, TaxonBlock,
-    UnitCandidate, MIN_WON_SHARE,
+    strain_label, wins_enough, within, BelowMinimum, FragmentCounts, GenomeEvidence, SpeciesTests,
+    TaxonBlock, UnitCandidate, MIN_WON_SHARE,
 };
 use crate::db::DatabaseMetadata;
 use crate::profiler::evidence::{EvidenceCoverage, WitnessDecision, STANDARD_RATIO_UPPER};
@@ -399,6 +400,8 @@ pub(super) struct Decisions<'a> {
     /// Species reported at their genus: (genus, species, reads).
     pub(super) genus_members: &'a [(u32, u32, f64)],
     pub(super) families: &'a [UnitCandidate],
+    /// Taxa dropped by `--min-reads` or `--min-breadth`.
+    pub(super) dropped: &'a HashMap<u32, BelowMinimum>,
 }
 
 /// What a genus row of the profile is made of: the roll-up's row, and the
@@ -582,6 +585,11 @@ impl Decisions<'_> {
     }
 
     fn species_rows<'n>(&self, names: &'n Names, finals: &FinalRows) -> Vec<DecisionRow<'n>> {
+        let genus_of: HashMap<u32, u32> = self
+            .genus_members
+            .iter()
+            .map(|&(genus, taxid, _)| (taxid, genus))
+            .collect();
         let mut by_species: HashMap<u32, Vec<u32>> = HashMap::new();
         for (&id, genome) in self.genomes {
             by_species.entry(genome.taxid).or_default().push(id);
@@ -609,11 +617,26 @@ impl Decisions<'_> {
                 ids[..=position].rotate_right(1);
             }
             let decision = self.outcomes[&taxid];
-            let reason = decision.reason(&self.species_genome_tests(&self.genomes[&decided]));
+            let below = self.dropped.get(&taxid);
+            // A species reported at its genus whose genus row was dropped.
+            let genus_dropped = genus_of
+                .get(&taxid)
+                .and_then(|genus| self.dropped.get(genus));
+            let reason = match below {
+                Some(below) => below.reason(),
+                None => {
+                    let reason =
+                        decision.reason(&self.species_genome_tests(&self.genomes[&decided]));
+                    match genus_dropped {
+                        Some(genus) => format!("{reason}; its genus row {}", genus.reason()),
+                        None => reason,
+                    }
+                }
+            };
             let total = finals.species.get(&taxid).copied();
             let reported_as = match total {
                 Some(_) => "species",
-                None if decision.at_genus() => "genus",
+                None if decision.at_genus() && genus_dropped.is_none() => "genus",
                 None => "none",
             };
             let count =
@@ -640,7 +663,7 @@ impl Decisions<'_> {
                     strain_identity_reads: None,
                     window_spread: None,
                     genome_tests: self.species_genome_tests(genome),
-                    kept: decision.kept(),
+                    kept: decision.kept() && below.is_none(),
                     reason: reason.clone(),
                     reported_as,
                     finals: total.filter(|_| id == decided),
@@ -677,33 +700,41 @@ impl Decisions<'_> {
             let (genome_tests, reason) = if strain_row.is_some() {
                 (
                     "passed".to_string(),
-                    "same strain: its reads match it within sequencing error and cover it evenly",
+                    "same strain: its reads match it within sequencing error and cover it evenly"
+                        .to_string(),
                 )
             } else if passed {
                 (
                     "passed".to_string(),
-                    "species not reported: its species is left out or reported at its genus",
+                    match self.dropped.get(&row.taxid) {
+                        Some(below) => format!("species not reported: {}", below.reason()),
+                        None => {
+                            "species not reported: its species is left out or reported at its genus"
+                                .to_string()
+                        }
+                    },
                 )
             } else if row.kept {
                 (
                     "failed identity: its reads do not match it within sequencing error"
                         .to_string(),
-                    "relative only: its reads match it as a relative's, not its own strain's",
+                    "relative only: its reads match it as a relative's, not its own strain's"
+                        .to_string(),
                 )
             } else if let Some(coverage) = &row.coverage {
                 (
                     tests_in_words(&coverage_failures(&level.tests, coverage)),
-                    "coverage failed: its reads at strain-level identity do not cover it evenly enough",
+                    "coverage failed: its reads at strain-level identity do not cover it evenly enough".to_string(),
                 )
             } else if row.resolved > 0 && row.gated == 0 {
                 (
                     "failed identity: no read matches it at strain-level identity".to_string(),
-                    "low identity: its reads match it below strain-level identity",
+                    "low identity: its reads match it below strain-level identity".to_string(),
                 )
             } else {
                 (
                     "not measured: no read resolves to it".to_string(),
-                    "not measured: no read resolves to it at strain-level identity",
+                    "not measured: no read resolves to it at strain-level identity".to_string(),
                 )
             };
             rows.push(DecisionRow {
@@ -722,7 +753,7 @@ impl Decisions<'_> {
                 window_spread: None,
                 genome_tests,
                 kept: strain_row.is_some(),
-                reason: reason.to_string(),
+                reason,
                 reported_as: if strain_row.is_some() {
                     "strain"
                 } else {
@@ -771,6 +802,7 @@ impl Decisions<'_> {
                 .fold(rollup.map_or(0.0, |row| row.fragments), |total, member| {
                     total + member.1
                 });
+            let below = self.dropped.get(&genus);
             let mut parts = Vec::new();
             if let Some(row) = rollup {
                 let donors = row.donors.iter().map(u32::to_string).collect::<Vec<_>>();
@@ -814,9 +846,12 @@ impl Decisions<'_> {
                         )
                     },
                 ),
-                kept: true,
-                reason: format!("kept: {}", parts.join(" + ")),
-                reported_as: "genus",
+                kept: below.is_none(),
+                reason: match below {
+                    Some(below) => format!("{}; made of {}", below.reason(), parts.join(" + ")),
+                    None => format!("kept: {}", parts.join(" + ")),
+                },
+                reported_as: if below.is_none() { "genus" } else { "none" },
                 finals: finals.taxa.get(&genus).copied(),
             });
         }
@@ -826,7 +861,11 @@ impl Decisions<'_> {
     fn family_rows<'n>(&self, names: &'n Names, finals: &FinalRows) -> Vec<DecisionRow<'n>> {
         let mut rows = Vec::new();
         for candidate in self.families {
-            let kept = candidate.coverage.is_some();
+            let below = self
+                .dropped
+                .get(&candidate.unit)
+                .filter(|_| candidate.coverage.is_some());
+            let kept = candidate.coverage.is_some() && below.is_none();
             let (genome_tests, reason) = if candidate.excluded {
                 (
                     "excluded: the family of a kept species, on a database of sampled genomes"
@@ -856,11 +895,13 @@ impl Decisions<'_> {
                     Some(_) => {}
                 }
                 let tests = tests_in_words(&failed);
-                let reason = if kept {
-                    "kept: reads without a species match spread over a relative's genome"
-                        .to_string()
-                } else {
-                    format!("removed: {tests}")
+                let reason = match below {
+                    Some(below) => below.reason(),
+                    None if kept => {
+                        "kept: reads without a species match spread over a relative's genome"
+                            .to_string()
+                    }
+                    None => format!("removed: {tests}"),
                 };
                 (tests, reason)
             };
@@ -987,6 +1028,7 @@ mod tests {
         genus_members: Vec<(u32, u32, f64)>,
         families: Vec<UnitCandidate>,
         blocks: Vec<TaxonBlock>,
+        dropped: HashMap<u32, BelowMinimum>,
     }
 
     fn fixture() -> Fixture {
@@ -1103,6 +1145,7 @@ mod tests {
             taxid,
             taxon,
             genomes,
+            breadth: 0.5,
         };
         let blocks = vec![
             block(
@@ -1136,6 +1179,7 @@ mod tests {
             genus_members: vec![(100, 2, 12.0)],
             families,
             blocks,
+            dropped: HashMap::new(),
         }
     }
 
@@ -1163,6 +1207,7 @@ mod tests {
             rollup_genomes: &fixture.rollup_genomes,
             genus_members: &fixture.genus_members,
             families: &fixture.families,
+            dropped: &fixture.dropped,
         };
         let mut out = Vec::new();
         table
@@ -1556,5 +1601,54 @@ mod tests {
             .filter(|row| row["decision"] == "kept" && row["final_reads"] != "NA")
             .count();
         assert_eq!(kept, matched);
+    }
+
+    #[test]
+    fn taxa_dropped_by_a_minimum_are_removed_with_the_reason() {
+        // At least 20 reads: species 4 (8 reads, in its genome row) and family 1000 (10 reads) are dropped; species
+        // 1 (120 in its species row, 150 with its genome row) and genus 100 (262) stay.
+        let mut fixture = fixture();
+        fixture.dropped = super::super::drop_below_minimums(
+            &mut fixture.blocks,
+            &super::super::Minimums {
+                reads: Some(20),
+                breadth: None,
+            },
+        );
+        let mut dropped = fixture.dropped.keys().copied().collect::<Vec<_>>();
+        dropped.sort_unstable();
+        assert_eq!(dropped, [4, 1000]);
+        let (_, rows) = decisions(&fixture);
+        let row = |rank: &str, genome: &str| {
+            rows.iter()
+                .find(|row| row["rank"] == rank && row["genome"] == genome)
+                .map(|row| {
+                    ["decision", "reason", "reported_as", "final_reads"]
+                        .map(|column| row[column].clone())
+                })
+                .unwrap()
+        };
+        let removed = "removed by --min-reads: 8.00 reads < 20";
+        assert_eq!(row("species", "GCF_40"), ["removed", removed, "none", "NA"]);
+        assert_eq!(
+            row("strain", "GCF_40"),
+            [
+                "removed",
+                &format!("species not reported: {removed}"),
+                "none",
+                "NA"
+            ]
+        );
+        assert_eq!(
+            row("family", "GCF_80"),
+            [
+                "removed",
+                "removed by --min-reads: 10.00 reads < 20",
+                "none",
+                "NA"
+            ]
+        );
+        assert_eq!(row("species", "GCF_10")[0], "kept");
+        assert_eq!(row("genus", "GCF_50")[0], "kept");
     }
 }
