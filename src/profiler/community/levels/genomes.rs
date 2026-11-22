@@ -156,12 +156,14 @@ impl GenomeLevel {
 
 /// For each species of `species_of` (each fragment's species and its share of
 /// the fragment), share its fragments among its genomes; then measure the
-/// sample's baseline identity and, with `report_strains`, find the genomes
-/// reported on their own.
+/// sample's baseline identity on the species (not on the units labelled above
+/// species, `labels`) and, with `report_strains`, find the genomes reported
+/// on their own.
 pub(super) fn resolve(
     data: &MappingData,
     fragments: &[Fragment],
     species_of: &[Option<(u32, f64)>],
+    labels: &HashMap<u32, ProfileRank>,
     level: &GenomeLevel,
 ) -> GenomeResult {
     let penalty = level.penalty();
@@ -193,14 +195,20 @@ pub(super) fn resolve(
         .collect::<Vec<_>>();
     let best_fit = shares.iter().map(|s| (s.taxid, s.best_fit)).collect();
     let identity = identity_to_best_fit(data, &best_fit, level.policy);
-    let baseline_identity =
-        weighted_median(identity.values().copied()).unwrap_or(1.0 - level.error_rate);
+    let baseline_identity = weighted_median(
+        identity
+            .iter()
+            .filter(|(taxid, _)| !labels.contains_key(taxid))
+            .map(|(_, &value)| value),
+    )
+    .unwrap_or(1.0 - level.error_rate);
     let strain_identity = baseline_identity - STRAIN_MARGIN;
     let strain = StrainLevel {
         identity: strain_identity,
         baseline: weighted_median(
             shares
                 .iter()
+                .filter(|s| !labels.contains_key(&s.taxid))
                 .map(|s| strain_level_identity(&s.members, s.best_fit, strain_identity)),
         )
         .unwrap_or(baseline_identity),
@@ -397,9 +405,9 @@ fn identity_to_best_fit(
         .collect()
 }
 
-/// A fragment's identity to the best-fit genome of each species in
-/// `best_fit` that is its best species match (fewest errors, within the
-/// species-level tie margin), in candidate order.
+/// A fragment's identity to the best-fit genome of each unit in `best_fit`
+/// that is its best match among its candidate units (fewest errors, within
+/// the species-level tie margin), in candidate order.
 fn best_fit_identities(
     candidates: &[TerminalCandidate],
     best_fit: &HashMap<u32, u32>,
@@ -408,7 +416,6 @@ fn best_fit_identities(
     let longest = longest_alignment(candidates);
     let species = candidates
         .iter()
-        .filter(|c| c.profile_rank == ProfileRank::Species)
         .map(|c| (c, candidate_errors(&c.best, longest)))
         .collect::<Vec<_>>();
     let Some(&(best, fewest)) = species.iter().min_by(|a, b| a.1.total_cmp(&b.1)) else {
@@ -745,7 +752,7 @@ mod tests {
         reads.push(vec![row(1, 12, 0.99)]);
         let data = data(reads);
         let (fragments, species_of) = fragments(&data);
-        let result = resolve(&data, &fragments, &species_of, &level());
+        let result = resolve(&data, &fragments, &species_of, &HashMap::new(), &level());
         let species = &result.species[&1];
         assert_eq!(species.best_fit, 10);
         // Fragments whose best species is species 1 and that align to the best-fit genome: the six exact ones.
@@ -801,7 +808,7 @@ mod tests {
             ratio_bounds: (0.5, 0.5),
             ..level()
         };
-        let result = resolve(&data, &fragments, &species_of, &level);
+        let result = resolve(&data, &fragments, &species_of, &HashMap::new(), &level);
         let strains = &result.species[&1].strains;
         // Genome 11 passes the coverage tests but its fragments read about 99.8 % to it: dropped. Strain B's reads
         // do not match genome 10 at strain-level identity, so they stay with the species instead of going to 10.
@@ -842,7 +849,7 @@ mod tests {
             ratio_bounds: (0.5, 0.5),
             ..level()
         };
-        let result = resolve(&data, &fragments, &species_of, &level);
+        let result = resolve(&data, &fragments, &species_of, &HashMap::new(), &level);
         assert!((result.baseline_identity - 0.9981).abs() < 1e-9);
         assert!((result.strain_baseline_identity - 0.999).abs() < 1e-9);
         // Genome 10's strain-level fragments read 0.9975: within 0.001 of the all-read baseline, but 0.0015 below
@@ -870,7 +877,7 @@ mod tests {
             ..level()
         };
         level.policy.mode = EvidenceMode::Long;
-        let result = resolve(&data, &fragments, &species_of, &level);
+        let result = resolve(&data, &fragments, &species_of, &HashMap::new(), &level);
         let strains = &result.species[&1].strains;
         assert_eq!(strains.len(), 1);
         assert!((strains[0].mean_identity - 0.999).abs() < 1e-9);
@@ -895,7 +902,7 @@ mod tests {
             ratio_bounds: (0.5, 0.5),
             ..level()
         };
-        let result = resolve(&data, &fragments, &species_of, &level);
+        let result = resolve(&data, &fragments, &species_of, &HashMap::new(), &level);
         let strains = &result.species[&1].strains;
         assert_eq!(strains.len(), 1);
         // The genome row counts each fragment by the species' share of it.

@@ -199,6 +199,7 @@ mod tests {
     fn block(taxid: u32, taxon: Option<ProfileRow>, genomes: Vec<ProfileRow>) -> TaxonBlock {
         TaxonBlock {
             taxid,
+            unit: taxon.as_ref().is_none_or(|row| row.rank == "species"),
             taxon,
             genomes,
             breadth: 1.0,

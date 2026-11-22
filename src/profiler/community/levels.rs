@@ -29,14 +29,22 @@
 //! database) a species is left out beside a deeper congener whose reads are
 //! that much more identical ([`identity_relatives`]). A genome represented by
 //! marker genes is measured gene by gene ([`MarkerModel`]); the tests are the
-//! same. `--host` drops the rows of taxa that the pathogen table lists for
+//! same. The genomes whose references are labelled only above species (a
+//! genus, a family or higher) form one unit per labelled taxon, judged and
+//! reported like a species at that rank, without the identity rules. Named
+//! units come first: on the second look they are judged before the labelled
+//! unit of their taxon and do not lose to it the reads they share with it
+//! ([`named_units_first`]); after the looks, a kept labelled unit must cover
+//! its genome beyond the part that the kept named units of its taxon explain,
+//! or it is removed and its reads go to them ([`named_first_look`]). Its row
+//! counts the taxon's genus or family row as well. `--host` drops the rows of taxa that the pathogen table lists for
 //! other hosts only and annotates the others ([`host`]), and `--min-reads` and
 //! `--min-breadth` drop a taxon whose rows hold fewer reads (a species with its
 //! genome rows) or whose breadth is lower ([`drop_below_minimums`]), both
 //! before abundance is normalised. The profile opens with two `#` lines: the
 //! run's metadata and the column names. With `--save-raw-profile` the engine
-//! also writes `<prefix>.decisions.tsv`: how every taxon it judged, at every rank, was
-//! decided, with the tests behind it ([`tables`]), and with
+//! also writes `<prefix>.decisions.tsv`: how every taxon it judged, at every
+//! rank, was decided, with the tests behind it ([`tables`]), and with
 //! `--save-classification` `<prefix>.classify.txt.gz`: each fragment's shares
 //! of the profile's rows ([`classify`]).
 
@@ -198,6 +206,15 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     // each level keeps how it shares the fragments.
     let classify_path = profiler.classification_path(&data);
     let keep_shares = classify_path.is_some();
+    // Units labelled above species: the taxa of references whose most
+    // specific label is a genus, family or higher taxon. Their genomes form
+    // one unit per taxon, judged like a species.
+    let labels: HashMap<u32, ProfileRank> = data
+        .terminal_ranks
+        .iter()
+        .filter(|(_, &rank)| rank != ProfileRank::Species)
+        .map(|(&taxid, &rank)| (taxid, rank))
+        .collect();
     let (fragments, unmatched, error_rate) = collect_fragments(&data, policy);
     let penalty = likelihood_em::error_penalty(error_rate);
     log::info!(
@@ -257,7 +274,23 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         let candidates = counts.candidates.get(&genome.taxid).copied().unwrap_or(0);
         tests.judge(id, genome, won, candidates);
     });
-    let taken = second_look(&data, policy, &first, &tests, &mut counts, &mut genomes);
+    let ancestors = |taxid: u32| {
+        profiler
+            .taxonomy
+            .get_parents(taxid)
+            .into_iter()
+            .map(|(ancestor, _, _)| ancestor)
+            .collect::<Vec<_>>()
+    };
+    let taken = second_look(
+        &data,
+        policy,
+        &first,
+        &tests,
+        &mut counts,
+        &mut genomes,
+        (&labels, &ancestors),
+    );
     log::info!(
         target: "PROFILER",
         "Level-wise engine: second look kept {} removed species on {} fragments their removed sisters tied on.",
@@ -284,7 +317,10 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         &taken,
         &tests,
         &mut genomes,
-        |taxid| domain(&profiler.taxonomy, taxid),
+        (
+            |taxid| domain(&profiler.taxonomy, taxid),
+            (&labels, &ancestors),
+        ),
         |taxid, list| evidence_of(&data, policy, &fragments, taxid, list),
     );
     log::info!(
@@ -293,6 +329,25 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
          genome, beyond the part that kept cellular species explain.",
         removed_viruses.len()
     );
+    let named_first = if labels.is_empty() {
+        HashMap::new()
+    } else {
+        let named_first = named_first_look(
+            &first,
+            &taken,
+            &tests,
+            &mut genomes,
+            (&labels, &ancestors),
+            |taxid, list| evidence_of(&data, policy, &fragments, taxid, list),
+        );
+        log::info!(
+            target: "PROFILER",
+            "Level-wise engine: {} kept units labelled above species removed: their own fragments do not cover the \
+             rest of their genome, beyond the part that kept named units of their taxon explain.",
+            named_first.len()
+        );
+        named_first
+    };
     // The first EM is not read again.
     let first_iterations = first_em.iterations;
     drop((all, first_em, resolved_taxid));
@@ -348,6 +403,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                 second_look: &taken,
                 own_evidence: &rescued,
                 prophage: &removed_viruses,
+                named_first: &named_first,
                 even_coverage: &even,
             },
         )
@@ -376,7 +432,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                 &fragments,
                 &kept.group_of,
                 policy,
-                rollup,
+                (rollup, &labels),
                 (&decision_metrics, &accepted),
                 keep_shares,
             );
@@ -415,7 +471,14 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     // the database, which their reads cannot place in a genus.
     let (family_level, family_candidates, family_shares) = match rollup {
         Some(rollup) => {
-            let family_of = family_map(&profiler.taxonomy, &data.genus_of_species);
+            let mut family_of = family_map(&profiler.taxonomy, &data.genus_of_species);
+            // A unit labelled at a family counts for itself.
+            family_of.extend(
+                labels
+                    .iter()
+                    .filter(|(_, &rank)| rank == ProfileRank::Family)
+                    .map(|(&taxid, _)| (taxid, taxid)),
+            );
             // On a fractional database, reads from the unindexed parts of a kept
             // genome land on the sampled segments of its relatives, while the kept
             // species' reads already stand for its whole genome: its family gets
@@ -480,7 +543,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         max_iterations: cfg.max_em_iterations,
         tolerance: EM_TOLERANCE,
     };
-    let genome_result = genomes::resolve(&data, &fragments, &species_of, &genome_level);
+    let genome_result = genomes::resolve(&data, &fragments, &species_of, &labels, &genome_level);
     let strain_taxids = if cfg.genome_level {
         strain_taxids(cfg)
     } else {
@@ -537,6 +600,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     let (left_out, low_at_genus) = if margin.is_some() || gap.is_some() {
         let species = reported
             .iter()
+            .filter(|(taxid, _)| !labels.contains_key(taxid))
             .filter_map(|(&taxid, &id)| {
                 let identity = species_genomes.get(&taxid)?.mean_identity;
                 let depth = marker_depth.get(&taxid).copied().unwrap_or_else(|| {
@@ -635,7 +699,10 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                 estimated_ani(baseline_identity, g.mean_identity),
             )
         }));
-        let reported_at_genus = at_genus.contains(&taxid) || low_at_genus.contains(&taxid);
+        // A unit labelled above species stays at its own rank.
+        let rank = labels.get(&taxid).map_or("species", |rank| rank.as_str());
+        let reported_at_genus = !labels.contains_key(&taxid)
+            && (at_genus.contains(&taxid) || low_at_genus.contains(&taxid));
         if let Some(&genus) = data
             .genus_of_species
             .get(&taxid)
@@ -678,7 +745,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             profile_row(
                 species_name.to_string(),
                 taxid,
-                "species",
+                rank,
                 (reads * scale, depth(species_bases)),
                 coverage,
                 data.assembly_names[assembly_id as usize].clone(),
@@ -712,6 +779,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             taxon: species,
             genomes: strains,
             breadth: coverage.breadth,
+            unit: true,
         });
     }
     // One genus row per genus: the roll-up's, then the species reported at
@@ -747,13 +815,22 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             None => genus_blocks.push((genus, part)),
         }
     }
+    // A genus or family row of a taxon that a kept unit is labelled with is
+    // counted in that unit's row.
     for (taxid, row) in genus_blocks.into_iter().chain(family_level) {
-        blocks.push(TaxonBlock {
-            taxid,
-            breadth: row.breadth,
-            taxon: Some(row),
-            genomes: Vec::new(),
-        });
+        match blocks
+            .iter_mut()
+            .find(|block| block.unit && block.taxid == taxid)
+        {
+            Some(block) => block.count(row),
+            None => blocks.push(TaxonBlock {
+                taxid,
+                breadth: row.breadth,
+                taxon: Some(row),
+                genomes: Vec::new(),
+                unit: false,
+            }),
+        }
     }
     // `--host` drops rows first, then `--min-reads` and `--min-breadth`.
     let host = profiler.host_taxid();
@@ -868,6 +945,8 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             genus_members: &genus_members,
             families: &family_candidates,
             dropped: &dropped,
+            labels: &labels,
+            named_first: &named_first,
         };
         let names = Names {
             taxonomy: &profiler.taxonomy,
@@ -933,9 +1012,10 @@ fn longest_alignment(candidates: &[TerminalCandidate]) -> f64 {
 }
 
 /// Read `read` as a fragment with its candidate units and their errors, with
-/// the errors and aligned bases of its best candidate; `None` without one.
-/// `unit` gives the unit a candidate species counts for (the species itself,
-/// or its family); a unit keeps the fewest errors of its species.
+/// the errors and aligned bases of its best candidate; `None` without one. A
+/// candidate is a species, or the taxon above species that its references are
+/// labelled with. `unit` gives the unit a candidate counts for (the candidate
+/// itself, or its family); a unit keeps the fewest errors of its candidates.
 fn fragment_of(
     read: usize,
     candidates: &[TerminalCandidate],
@@ -945,7 +1025,6 @@ fn fragment_of(
     let longest = longest_alignment(candidates);
     let mut units = candidates
         .iter()
-        .filter(|c| c.profile_rank == ProfileRank::Species)
         .filter_map(|c| {
             let errors = candidate_errors(&c.best, longest);
             Some((unit(c.taxid)?, errors, c.best.both_mapped, c.best.r1_mapped))
@@ -1457,7 +1536,11 @@ fn kept_species(genomes: &HashMap<u32, GenomeEvidence>) -> HashSet<u32> {
 /// competes with the species judged after it. A species that still fails is
 /// left as the first judgment measured it, so the second look only adds
 /// species. Every group it won before is still won, as its posterior against
-/// fewer rivals only rises. Returns the fragments each species it kept took.
+/// fewer rivals only rises. Named units first: a removed unit labelled above
+/// species (`labels`) is judged after the removed units of its taxon
+/// (`ancestors` gives a unit's lineage), which do not lose to it the groups
+/// they share with it ([`named_units_first`]). Returns the fragments each
+/// species it kept took.
 fn second_look(
     data: &MappingData,
     policy: EvidencePolicy,
@@ -1465,6 +1548,7 @@ fn second_look(
     tests: &SpeciesTests,
     counts: &mut FragmentCounts,
     genomes: &mut HashMap<u32, GenomeEvidence>,
+    (labels, ancestors): (&HashMap<u32, ProfileRank>, impl Fn(u32) -> Vec<u32>),
 ) -> HashMap<u32, Vec<usize>> {
     let mut kept = kept_species(genomes);
     let order = first.by_weight(
@@ -1476,6 +1560,24 @@ fn second_look(
             .map(|(&taxid, _)| taxid),
     );
     let removed: HashSet<u32> = order.iter().copied().collect();
+    let labelled_above = if labels.is_empty() {
+        HashMap::new()
+    } else {
+        order
+            .iter()
+            .filter_map(|&unit| {
+                let above = ancestors(unit)
+                    .into_iter()
+                    .filter(|&taxon| {
+                        taxon != unit && labels.contains_key(&taxon) && removed.contains(&taxon)
+                    })
+                    .collect::<HashSet<_>>();
+                (!above.is_empty()).then_some((unit, above))
+            })
+            .collect()
+    };
+    let order = named_units_first(order, &labelled_above);
+    let none = HashSet::new();
     let mut open_groups: HashMap<u32, Vec<usize>> = HashMap::new();
     for (group, posteriors) in first.em.posteriors.iter().enumerate() {
         for &(taxid, _) in posteriors {
@@ -1498,7 +1600,14 @@ fn second_look(
         };
         let taken_fragments = groups
             .iter()
-            .filter(|&&group| takes_group(&first.em.posteriors[group], taxid, &kept))
+            .filter(|&&group| {
+                takes_group(
+                    &first.em.posteriors[group],
+                    taxid,
+                    &kept,
+                    labelled_above.get(&taxid).unwrap_or(&none),
+                )
+            })
             .flat_map(|&group| members.of(group))
             .copied()
             .collect::<Vec<_>>();
@@ -1650,24 +1759,22 @@ fn own_evidence_look(
 /// (a prophage) collects the reads of that region of a host strain in the
 /// sample whose copy matches the virus better than the copies in the indexed
 /// genomes of its species, which align the same reads a little worse. The
-/// hosts are the kept bacteria and archaea. The fragments that list a kept
-/// virus together with a host, whichever of them won each, mark the part of
-/// the virus' genomes that a host explains. The virus' own fragments, those it
-/// holds (won in the first EM or took on the second look) that list no host,
-/// must pass the
-/// coverage tests over the rest of one of its genomes alone
-/// ([`without_bases`]). A free virus whose host carries a related prophage
-/// covers the rest evenly; reads of a prophage leave it bare or patchy. A virus
-/// that fails is removed, its reads going to the kept species in the second
-/// EM; one that no fragment lists together with a host is left as it is.
-/// Returns the species removed, in taxid order.
+/// hosts are the kept bacteria and archaea (`domain` gives a unit's domain),
+/// with the taxa labelled above species of their lineage ([`with_labelled`]);
+/// each kept virus is judged on its own reads beside them
+/// ([`own_reads_look`]). A free virus whose host carries a related prophage
+/// covers the rest of its genome evenly; reads of a prophage leave it bare or
+/// patchy. Returns the species removed, in taxid order.
 fn prophage_look(
     first: &FirstEm,
     taken: &HashMap<u32, Vec<usize>>,
     tests: &SpeciesTests,
     genomes: &mut HashMap<u32, GenomeEvidence>,
-    domain: impl Fn(u32) -> Option<u32>,
-    mut evidence: impl FnMut(u32, &[usize]) -> HashMap<u32, GenomeEvidence>,
+    (domain, labelled): (
+        impl Fn(u32) -> Option<u32>,
+        (&HashMap<u32, ProfileRank>, impl Fn(u32) -> Vec<u32>),
+    ),
+    evidence: impl FnMut(u32, &[usize]) -> HashMap<u32, GenomeEvidence>,
 ) -> Vec<u32> {
     let (mut viruses, mut hosts) = (HashSet::new(), HashSet::new());
     for genome in genomes.values().filter(|g| g.kept) {
@@ -1680,30 +1787,123 @@ fn prophage_look(
     if viruses.is_empty() || hosts.is_empty() {
         return Vec::new();
     }
+    let hosts = with_labelled(hosts, labelled);
+    let explainers = viruses
+        .into_iter()
+        .map(|virus| (virus, hosts.clone()))
+        .collect::<HashMap<_, _>>();
+    own_reads_look(first, taken, tests, genomes, &explainers, evidence)
+        .into_iter()
+        .map(|(taxid, _)| taxid)
+        .collect()
+}
+
+/// `units` with the taxa of their lineage (`ancestors`) that references are
+/// labelled with above species (`labels`), kept or not: the unnamed genomes
+/// of a taxon stand for its kept named units, and carry their prophages.
+fn with_labelled(
+    mut units: HashSet<u32>,
+    (labels, ancestors): (&HashMap<u32, ProfileRank>, impl Fn(u32) -> Vec<u32>),
+) -> HashSet<u32> {
+    if labels.is_empty() {
+        return units;
+    }
+    let taxa = units
+        .iter()
+        .flat_map(|&unit| ancestors(unit))
+        .filter(|taxon| labels.contains_key(taxon))
+        .collect::<Vec<_>>();
+    units.extend(taxa);
+    units
+}
+
+/// Named units first: a kept unit labelled above species (`labels`) is
+/// judged on its own reads beside the kept, more specific units of its own
+/// lineage (`ancestors` gives a unit's lineage): the named species inside a
+/// labelled genus, or the species and genera inside a labelled family
+/// ([`own_reads_look`]). A new species of the taxon, with only unnamed
+/// genomes, covers the rest of its genome and stays; an unnamed copy of a
+/// named species is removed, and its reads go to that species in the second
+/// EM. Returns the units removed, each with the units listed by the fragments
+/// it shares with them.
+fn named_first_look(
+    first: &FirstEm,
+    taken: &HashMap<u32, Vec<usize>>,
+    tests: &SpeciesTests,
+    genomes: &mut HashMap<u32, GenomeEvidence>,
+    (labels, ancestors): (&HashMap<u32, ProfileRank>, impl Fn(u32) -> Vec<u32>),
+    evidence: impl FnMut(u32, &[usize]) -> HashMap<u32, GenomeEvidence>,
+) -> HashMap<u32, Vec<u32>> {
+    let kept = kept_species(genomes);
+    if !kept.iter().any(|unit| labels.contains_key(unit)) {
+        return HashMap::new();
+    }
+    let lineage: HashMap<u32, Vec<u32>> =
+        kept.iter().map(|&unit| (unit, ancestors(unit))).collect();
+    let explainers = kept
+        .iter()
+        .filter(|unit| labels.contains_key(unit))
+        .filter_map(|&label| {
+            let inside = kept
+                .iter()
+                .copied()
+                .filter(|&unit| unit != label && lineage[&unit].contains(&label))
+                .collect::<HashSet<_>>();
+            (!inside.is_empty()).then_some((label, inside))
+        })
+        .collect::<HashMap<_, _>>();
+    if explainers.is_empty() {
+        return HashMap::new();
+    }
+    own_reads_look(first, taken, tests, genomes, &explainers, evidence)
+        .into_iter()
+        .collect()
+}
+
+/// Kept units judged on their own reads beside the kept units that may
+/// explain them (`explainers`, per unit). The fragments that list a unit
+/// together with one of its explainers, whichever of them won each, mark the
+/// part of the unit's genomes that the explainers account for. The unit's own
+/// fragments, those it holds (won in the first EM or took on the second look)
+/// that list none of its explainers, must pass the coverage tests over the
+/// rest of one of its genomes alone ([`without_bases`]). A unit that fails is
+/// removed, its reads going to the kept units in the second EM; one that no
+/// fragment lists together with an explainer is left as it is. Returns the
+/// units removed, in taxid order, each with the explainers its shared
+/// fragments list.
+fn own_reads_look(
+    first: &FirstEm,
+    taken: &HashMap<u32, Vec<usize>>,
+    tests: &SpeciesTests,
+    genomes: &mut HashMap<u32, GenomeEvidence>,
+    explainers: &HashMap<u32, HashSet<u32>>,
+    mut evidence: impl FnMut(u32, &[usize]) -> HashMap<u32, GenomeEvidence>,
+) -> Vec<(u32, Vec<u32>)> {
     let mut held: HashMap<u32, Vec<usize>> = HashMap::new();
     for (index, taxid) in first.won() {
-        if viruses.contains(&taxid) {
+        if explainers.contains_key(&taxid) {
             held.entry(taxid).or_default().push(index);
         }
     }
     for (taxid, list) in taken {
-        if viruses.contains(taxid) {
+        if explainers.contains_key(taxid) {
             held.entry(*taxid).or_default().extend(list);
         }
     }
-    let lists_host = |f: usize| {
+    let lists_any = |f: usize, units: &HashSet<u32>| {
         first.fragments[f]
             .candidates
             .iter()
-            .any(|c| hosts.contains(&c.0))
+            .any(|c| units.contains(&c.0))
     };
     let mut shared: HashMap<u32, Vec<usize>> = HashMap::new();
     for (index, fragment) in first.fragments.iter().enumerate() {
-        if lists_host(index) {
-            for c in &fragment.candidates {
-                if viruses.contains(&c.0) {
-                    shared.entry(c.0).or_default().push(index);
-                }
+        for c in &fragment.candidates {
+            if explainers
+                .get(&c.0)
+                .is_some_and(|units| lists_any(index, units))
+            {
+                shared.entry(c.0).or_default().push(index);
             }
         }
     }
@@ -1711,17 +1911,18 @@ fn prophage_look(
     shared.sort_unstable_by_key(|entry| entry.0);
     let mut removed = Vec::new();
     for (taxid, shared) in shared {
+        let units = &explainers[&taxid];
         let list = held.remove(&taxid).unwrap_or_default();
         let own = list
             .iter()
             .copied()
-            .filter(|&f| !lists_host(f))
+            .filter(|&f| !lists_any(f, units))
             .collect::<Vec<_>>();
         let covered = !own.is_empty() && {
-            let hosts = evidence(taxid, &shared);
+            let explained = evidence(taxid, &shared);
             evidence(taxid, &own).into_iter().any(|(id, genome)| {
-                let mut rest = match hosts.get(&id) {
-                    Some(host) => without_bases(&genome.assembly, &host.assembly),
+                let mut rest = match explained.get(&id) {
+                    Some(other) => without_bases(&genome.assembly, &other.assembly),
                     None => genome.assembly,
                 };
                 tests.covers(&tests.measure(id, &mut rest))
@@ -1735,7 +1936,14 @@ fn prophage_look(
                 genome.kept = false;
             }
         }
-        removed.push(taxid);
+        let mut listed = shared
+            .iter()
+            .flat_map(|&f| first.fragments[f].candidates.iter().map(|c| c.0))
+            .filter(|unit| units.contains(unit))
+            .collect::<Vec<_>>();
+        listed.sort_unstable();
+        listed.dedup();
+        removed.push((taxid, listed));
     }
     removed
 }
@@ -1840,18 +2048,51 @@ fn evidence_of(
     genomes
 }
 
+/// `order` with each removed unit labelled above species moved after the
+/// last of the removed units whose lineage lists it (`labelled_above`, per
+/// unit): named units are judged first.
+fn named_units_first(order: Vec<u32>, labelled_above: &HashMap<u32, HashSet<u32>>) -> Vec<u32> {
+    if labelled_above.is_empty() {
+        return order;
+    }
+    let mut after: HashMap<u32, usize> = HashMap::new();
+    for (position, unit) in order.iter().enumerate() {
+        for &label in labelled_above.get(unit).into_iter().flatten() {
+            after.insert(label, position);
+        }
+    }
+    let mut keyed = order
+        .into_iter()
+        .enumerate()
+        .map(|(position, unit)| {
+            let target = after
+                .get(&unit)
+                .map_or(position, |&last| last.max(position));
+            ((target, target > position, position), unit)
+        })
+        .collect::<Vec<_>>();
+    keyed.sort_unstable_by_key(|&(key, _)| key);
+    keyed.into_iter().map(|(_, unit)| unit).collect()
+}
+
 /// Whether removed species `taxid` takes a read group with first-EM
 /// `posteriors` on the second look: no other removed species is more likely
 /// there, and it holds at least the resolving posterior against the `kept`
-/// species.
-fn takes_group(posteriors: &[(u32, f64)], taxid: u32, kept: &HashSet<u32>) -> bool {
+/// species; the removed units labelled above species of its taxon (`above`)
+/// are not its rivals.
+fn takes_group(
+    posteriors: &[(u32, f64)],
+    taxid: u32,
+    kept: &HashSet<u32>,
+    above: &HashSet<u32>,
+) -> bool {
     let own = posteriors
         .iter()
         .find(|p| p.0 == taxid)
         .map_or(0.0, |p| p.1);
     let mut with_kept = own;
     for &(other, posterior) in posteriors {
-        if other == taxid {
+        if other == taxid || above.contains(&other) {
             continue;
         }
         if kept.contains(&other) {
@@ -1925,18 +2166,33 @@ fn species_remainder(
     (!any || reads >= 1.0).then(|| (reads, (bases - held_bases).max(0.0)))
 }
 
-/// The rows of one taxon: a species row (unless every read is in a genome
+/// The rows of one taxon: a unit's row (a species row, or the row of a taxon
+/// its references are labelled with; none when every read is in a genome
 /// row) with its genome rows, or a genus or family row; with the taxon's
-/// breadth (a species' on the genome it is reported on, which its species row
-/// shows).
+/// breadth (a unit's on the genome it is reported on, which its row shows).
 struct TaxonBlock {
     taxid: u32,
     taxon: Option<ProfileRow>,
     genomes: Vec<ProfileRow>,
     breadth: f64,
+    /// The block of a kept unit.
+    unit: bool,
 }
 
 impl TaxonBlock {
+    /// Count a genus or family `row` of the unit's own taxon in the unit's row:
+    /// reads and depth add, while coverage, best-fit genome and identity stay
+    /// the unit's. A unit without a row of its own takes `row`.
+    fn count(&mut self, row: ProfileRow) {
+        match &mut self.taxon {
+            Some(own) => {
+                own.equivalent_mapcount += row.equivalent_mapcount;
+                own.depth += row.depth;
+            }
+            None => self.taxon = Some(row),
+        }
+    }
+
     fn depth(&self) -> f64 {
         self.taxon.as_ref().map_or(0.0, |s| s.depth)
             + self.genomes.iter().map(|s| s.depth).sum::<f64>()
@@ -2237,9 +2493,7 @@ fn unmatched_rows(
             let longest = longest_alignment(candidates);
             candidates
                 .iter()
-                .filter(|c| {
-                    c.profile_rank == ProfileRank::Species && unit_of(c.taxid) == Some(unit)
-                })
+                .filter(|c| unit_of(c.taxid) == Some(unit))
                 .min_by(|a, b| {
                     candidate_errors(&a.best, longest)
                         .total_cmp(&candidate_errors(&b.best, longest))
@@ -2469,13 +2723,16 @@ fn family_map(taxonomy: &Taxonomy, species_to_genus: &HashMap<u32, u32>) -> Hash
 }
 
 /// Genus rows from the fragments with no kept candidate species, offered to the
-/// roll-up with all their candidate species and their best one's placement.
+/// roll-up with all their candidate species and their best one's placement. A
+/// fragment whose best candidate is a unit labelled above species (`labels`)
+/// is not offered: a removed genus unit's reads do not make a row for that
+/// genus.
 fn orphan_genus_rows(
     data: &MappingData,
     fragments: &[Fragment],
     group_of: &[Option<usize>],
     policy: EvidencePolicy,
-    rollup: &GenusRollup,
+    (rollup, labels): (&GenusRollup, &HashMap<u32, ProfileRank>),
     (decisions, accepted): (&HashMap<u32, WitnessDecision>, &HashSet<u32>),
     keep_offered: bool,
 ) -> (Vec<GenusRow>, Vec<(usize, u32)>) {
@@ -2486,6 +2743,7 @@ fn orphan_genus_rows(
         .zip(group_of)
         .filter(|(fragment, group)| {
             group.is_none()
+                && !labels.contains_key(&fragment.candidates[0].0)
                 && rollup
                     .common_genus(fragment.candidates.iter().map(|c| c.0))
                     .is_some()
@@ -2804,7 +3062,7 @@ mod tests {
             &fragments,
             &group_of,
             policy,
-            &rollup,
+            (&rollup, &HashMap::new()),
             (
                 &HashMap::from([(1, decision(0.8)), (3, decision(0.8))]),
                 &HashSet::new(),
@@ -2827,7 +3085,7 @@ mod tests {
             &fragments,
             &group_of,
             policy,
-            &rollup,
+            (&rollup, &HashMap::new()),
             (&HashMap::from([(1, decision(0.2))]), &HashSet::new()),
             false,
         );
@@ -2890,18 +3148,21 @@ mod tests {
                     taxon: Some(row("species", 120.0)),
                     genomes: vec![row("strain", 30.0)],
                     breadth: 0.9,
+                    unit: true,
                 },
                 TaxonBlock {
                     taxid: 100,
                     taxon: Some(row("genus", 10.0)),
                     genomes: Vec::new(),
                     breadth: 0.03,
+                    unit: false,
                 },
                 TaxonBlock {
                     taxid: 1000,
                     taxon: Some(row("family", 300.0)),
                     genomes: Vec::new(),
                     breadth: f64::NAN,
+                    unit: false,
                 },
             ]
         };
@@ -2988,18 +3249,67 @@ mod tests {
     fn a_removed_species_takes_the_fragments_it_ties_on_with_a_weaker_removed_sister() {
         let none = HashSet::new();
         // Tied with a removed sister that the first EM gives less weight.
-        assert!(takes_group(&[(1, 0.82), (2, 0.18)], 1, &none));
+        assert!(takes_group(&[(1, 0.82), (2, 0.18)], 1, &none, &none));
         // The weaker sister does not take them.
-        assert!(!takes_group(&[(1, 0.82), (2, 0.18)], 2, &none));
+        assert!(!takes_group(&[(1, 0.82), (2, 0.18)], 2, &none, &none));
         // Nor fragments that another removed species fits better.
-        assert!(!takes_group(&[(1, 0.05), (2, 0.95)], 1, &none));
+        assert!(!takes_group(&[(1, 0.05), (2, 0.95)], 1, &none, &none));
         // Against a kept species it needs the resolving posterior.
         let kept = HashSet::from([3]);
-        assert!(!takes_group(&[(1, 0.82), (3, 0.18)], 1, &kept));
-        assert!(takes_group(&[(1, 0.82), (2, 0.1), (3, 0.08)], 1, &kept));
+        assert!(!takes_group(&[(1, 0.82), (3, 0.18)], 1, &kept, &none));
+        assert!(takes_group(
+            &[(1, 0.82), (2, 0.1), (3, 0.08)],
+            1,
+            &kept,
+            &none
+        ));
         // The sister judged after a kept species keeps losing the ties.
         let after = HashSet::from([1]);
-        assert!(!takes_group(&[(1, 0.82), (2, 0.18)], 2, &after));
+        assert!(!takes_group(&[(1, 0.82), (2, 0.18)], 2, &after, &none));
+        // A removed unit labelled above species (100) of its taxon is no
+        // rival; kept units still are.
+        let above = HashSet::from([100]);
+        assert!(!takes_group(&[(100, 0.7), (1, 0.3)], 1, &none, &none));
+        assert!(takes_group(&[(100, 0.7), (1, 0.3)], 1, &none, &above));
+        assert!(!takes_group(
+            &[(100, 0.6), (1, 0.3), (3, 0.1)],
+            1,
+            &kept,
+            &above
+        ));
+    }
+
+    #[test]
+    fn the_taxa_labelled_above_species_of_a_host_are_hosts_too() {
+        let labels = HashMap::from([(100, ProfileRank::Genus), (200, ProfileRank::Family)]);
+        let ancestors = |taxid: u32| match taxid {
+            1 => vec![1, 100, 200, 2],
+            3 => vec![3, 300],
+            _ => Vec::new(),
+        };
+        let hosts = with_labelled(HashSet::from([1, 3]), (&labels, ancestors));
+        assert_eq!(hosts, HashSet::from([1, 3, 100, 200]));
+        // Without labelled references the hosts stay.
+        let hosts = with_labelled(HashSet::from([1, 3]), (&HashMap::new(), ancestors));
+        assert_eq!(hosts, HashSet::from([1, 3]));
+    }
+
+    #[test]
+    fn named_units_are_judged_before_the_labelled_units_of_their_taxon() {
+        // By weight: genus unit 100, unrelated 7, species 1 of genus 100,
+        // family unit 200 above both, species 2 of genus 100.
+        let order = vec![100, 7, 1, 200, 2];
+        let above = HashMap::from([
+            (1, HashSet::from([100, 200])),
+            (2, HashSet::from([100, 200])),
+            (100, HashSet::from([200])),
+        ]);
+        assert_eq!(
+            named_units_first(order.clone(), &above),
+            vec![7, 1, 2, 100, 200]
+        );
+        // Without labelled units the order stays.
+        assert_eq!(named_units_first(order.clone(), &HashMap::new()), order);
     }
 
     #[test]
@@ -3140,11 +3450,14 @@ mod tests {
                 &taken,
                 &tests,
                 &mut genomes,
-                |taxid| match taxid {
-                    1 => Some(BACTERIA),
-                    2 => None,
-                    _ => Some(VIRUSES),
-                },
+                (
+                    |taxid| match taxid {
+                        1 => Some(BACTERIA),
+                        2 => None,
+                        _ => Some(VIRUSES),
+                    },
+                    (&HashMap::new(), |_| Vec::new()),
+                ),
                 |taxid, list| {
                     assert_eq!(taxid, 7);
                     let reads = match list.len() {
@@ -3265,6 +3578,225 @@ mod tests {
         assert_eq!(look(0.0, 0.0, 0.0).0, HashMap::new());
         // Ties along the genome: kept, reported at its genus.
         assert_eq!(look(0.0, 1.0, 1.0).0, HashMap::from([(2, true)]));
+    }
+
+    #[test]
+    fn references_labelled_above_species_are_candidate_units() {
+        // A read on a genome of species 2 and, better, on a genome labelled only at genus 100.
+        let data = data(vec![vec![
+            row(2, 20, 0.97),
+            crate::profiler::evidence::EvidenceAlignment {
+                profile_rank: ProfileRank::Genus,
+                ..row(100, 30, 0.99)
+            },
+        ]]);
+        let policy = EvidencePolicy {
+            mode: EvidenceMode::Single,
+            identity: 0.95,
+            mapped_len: 50,
+            fraction: 0.6,
+            collect_exact_ties: false,
+            collect_identities: false,
+            collect_best_placements: false,
+        };
+        let mut scratch = CandidateScratch::default();
+        let candidates = scratch.build(&data.read_alignments[0].alignments, policy);
+        let (fragment, _) = fragment_of(0, candidates, policy, Some).unwrap();
+        let units = fragment.candidates.iter().map(|c| c.0).collect::<Vec<_>>();
+        assert_eq!(units, vec![100, 2]);
+    }
+
+    #[test]
+    fn a_labelled_unit_must_cover_what_the_named_units_of_its_taxon_do_not_explain() {
+        // Genus unit 100 and its named species 1 are kept, as is species 2 of another genus. Unit 100 won 12
+        // fragments, 4 of them listing species 1; unit 200 (labelled at another genus) won 4 listing species 2 only.
+        let fragment = |candidates: &[(u32, f64)]| Fragment {
+            read: 0,
+            candidates: candidates.to_vec(),
+            bases: 100.0,
+        };
+        let mut fragments = Vec::new();
+        let mut resolved = Vec::new();
+        for i in 0..12 {
+            fragments.push(fragment(if i < 4 {
+                &[(100, 0.0), (1, 1.0)]
+            } else {
+                &[(100, 0.0)]
+            }));
+            resolved.push(Some(100));
+        }
+        for _ in 0..4 {
+            fragments.push(fragment(&[(200, 0.0), (2, 0.0)]));
+            resolved.push(Some(200));
+        }
+        let group_of = (0..fragments.len()).map(Some).collect::<Vec<_>>();
+        let em = likelihood_em::EmResult {
+            weight: HashMap::new(),
+            posteriors: Vec::new(),
+            iterations: 0,
+        };
+        let first = FirstEm {
+            fragments: &fragments,
+            group_of: &group_of,
+            em: &em,
+            resolved: &resolved,
+        };
+        let tests = SpeciesTests {
+            multiple_tests: 1,
+            chunk_cutoff: 0.3,
+            ratio_bounds: (0.5, 0.5),
+            markers: None,
+            min_marker_genes: 0,
+        };
+        let genome = |taxid, intervals: Vec<PresenceInterval>| GenomeEvidence {
+            taxid,
+            assembly: PresenceAssembly {
+                asm_len: 1000.0,
+                count: intervals.len() as u64,
+                reference_span_bases: intervals
+                    .iter()
+                    .map(|r| u64::from(r.span.1 - r.span.0))
+                    .sum(),
+                intervals,
+                ..PresenceAssembly::default()
+            },
+            coverage: None,
+            kept: true,
+        };
+        let start = HashMap::from([
+            (10, genome(1, Vec::new())),
+            (20, genome(2, Vec::new())),
+            (1000, genome(100, Vec::new())),
+            (2000, genome(200, Vec::new())),
+        ]);
+        let labels = HashMap::from([(100, ProfileRank::Genus), (200, ProfileRank::Genus)]);
+        // Species 1 lies in genus 100, species 2 in genus 300.
+        let ancestors = |taxid: u32| match taxid {
+            1 => vec![1, 100, 1000],
+            2 => vec![2, 300, 1000],
+            100 => vec![100, 1000],
+            _ => vec![taxid],
+        };
+        // The 4 fragments shared with species 1 cover the first 600 bases of unit 100's genome; its 8 own ones lie
+        // every 50 bases over the other 400 (a new species of the genus), or all in one place (an unnamed copy of
+        // species 1 that collects a few reads of its own).
+        let look = |spread: bool| {
+            let mut genomes = start.clone();
+            let removed = named_first_look(
+                &first,
+                &HashMap::new(),
+                &tests,
+                &mut genomes,
+                (&labels, ancestors),
+                |taxid, list| {
+                    assert_eq!(taxid, 100);
+                    let reads = match list.len() {
+                        4 => (0..4)
+                            .map(|i| read_at(0, (150 * i, 150 * i + 150)))
+                            .collect(),
+                        8 => (0..8)
+                            .map(|i| {
+                                let start = if spread { 600 + 50 * i } else { 600 };
+                                read_at(0, (start, start + 25))
+                            })
+                            .collect(),
+                        n => panic!("unexpected list of {n}"),
+                    };
+                    HashMap::from([(1000, genome(100, reads))])
+                },
+            );
+            let kept = [10, 20, 1000, 2000].map(|id| genomes[&id].kept);
+            (removed, kept)
+        };
+        // A new species of the genus stays; unit 200 has no named unit of its genus kept and is not judged.
+        assert_eq!(look(true), (HashMap::new(), [true, true, true, true]));
+        assert_eq!(
+            look(false),
+            (HashMap::from([(100, vec![1])]), [true, true, false, true])
+        );
+        // Without labelled units nothing is judged.
+        let mut genomes = start.clone();
+        let removed = named_first_look(
+            &first,
+            &HashMap::new(),
+            &tests,
+            &mut genomes,
+            (&HashMap::new(), ancestors),
+            |_, _| panic!("no unit to judge"),
+        );
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn a_genus_row_of_a_labelled_unit_s_taxon_is_counted_in_the_unit_s_row() {
+        let coverage = EvidenceCoverage {
+            breadth: 0.8,
+            ..EvidenceCoverage::default()
+        };
+        let row = |rank: &str, reads: f64, genome: &str, coverage: &EvidenceCoverage| {
+            profile_row(
+                "Genus".to_string(),
+                100,
+                rank,
+                (reads, reads / 100.0),
+                coverage,
+                Arc::from(genome),
+                Some((0.99, 0.995)),
+            )
+        };
+        let rollup = row("genus", 40.0, "GCF_2", &EvidenceCoverage::default());
+        let mut block = TaxonBlock {
+            taxid: 100,
+            taxon: Some(row("genus", 60.0, "GCF_1", &coverage)),
+            genomes: Vec::new(),
+            breadth: 0.8,
+            unit: true,
+        };
+        block.count(rollup.clone());
+        let merged = block.taxon.as_ref().unwrap();
+        assert_eq!(merged.equivalent_mapcount, 100.0);
+        assert!((merged.depth - 1.0).abs() < 1e-12);
+        // The unit's coverage, genome and identity stay.
+        assert_eq!(merged.breadth, 0.8);
+        assert_eq!(&*merged.best_fit.as_ref().unwrap().genome, "GCF_1");
+        // A unit whose reads all sit in genome rows takes the row.
+        let mut block = TaxonBlock {
+            taxid: 100,
+            taxon: None,
+            genomes: vec![row("strain", 60.0, "GCF_1", &coverage)],
+            breadth: 0.8,
+            unit: true,
+        };
+        block.count(rollup);
+        assert_eq!(block.taxon.as_ref().unwrap().equivalent_mapcount, 40.0);
+    }
+
+    #[test]
+    fn a_genome_of_a_labelled_unit_is_named_after_the_label() {
+        let taxonomy = Taxonomy::from_parts(
+            HashMap::from([
+                (1, (1, "no rank".to_string())),
+                (561, (1, "genus".to_string())),
+                (562, (561, "species".to_string())),
+                (83333, (562, "strain".to_string())),
+            ]),
+            HashMap::from([
+                (561, "Escherichia".to_string()),
+                (562, "Escherichia coli".to_string()),
+                (83333, "Escherichia coli K-12".to_string()),
+            ]),
+            HashMap::new(),
+            HashSet::new(),
+        );
+        let strain_taxids = HashMap::from([(Arc::from("GCF_K12"), 83333)]);
+        assert_eq!(
+            strain_label(&taxonomy, &strain_taxids, 561, "GCF_1"),
+            ("Escherichia GCF_1".to_string(), 561)
+        );
+        assert_eq!(
+            strain_label(&taxonomy, &strain_taxids, 562, "GCF_K12"),
+            ("Escherichia coli K-12".to_string(), 83333)
+        );
     }
 
     #[test]

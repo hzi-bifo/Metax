@@ -7,12 +7,16 @@
 //! kept or not:
 //!
 //! - `species`: one row per measured genome of every candidate species, its
-//!   coverage from the reads that resolve to the species;
+//!   coverage from the reads that resolve to the species; a unit whose
+//!   references are labelled only above species has these rows at its rank
+//!   (`genus`, `family`, ...);
 //! - `strain` (with `--strain`): one row per genome the genome level considered;
 //! - `genus`: one row per genus row of the profile: the roll-up of removed
 //!   species' reads and the species reported at their genus, merged as in the
-//!   profile (roll-up candidates that fail are not listed);
-//! - `family`: one row per unit of the family level, kept or not.
+//!   profile (roll-up candidates that fail are not listed); counted in the row
+//!   of a kept unit labelled at that genus when there is one;
+//! - `family`: one row per unit of the family level, kept or not; counted in
+//!   the row of a kept unit labelled at that family when there is one.
 //!
 //! Species rows come first, by the species' abundance in the profile (largest
 //! first, then taxid; species not in the profile last), each species' decided
@@ -23,8 +27,8 @@
 //!
 //! - `rank`, `taxid`, `name`: the taxon (a strain row is named and numbered as
 //!   its row in the profile);
-//! - `parent_taxid`: the species of a strain, the genus of a species, the
-//!   family of a genus; `NA` for a family;
+//! - `parent_taxid`: the species (unit) of a strain, the genus of a species,
+//!   the family of a genus; `NA` for a family and higher;
 //! - `genome`: the genome the row's evidence is measured on;
 //! - `decided`: species rows: the genome the species' decision rests on (the
 //!   genome it is reported on when kept, otherwise its genome with most
@@ -51,9 +55,11 @@
 //!   otherwise `removed`; the same on every row of a species;
 //! - `reason`: the taxon's outcome in words, the same on every row of a
 //!   species (`removed by --min-reads: …`, `removed by --min-breadth: …` or
-//!   `removed by --host: …` for a taxon those options dropped);
+//!   `removed by --host: …` for a taxon those options dropped; a labelled unit
+//!   says that its references are labelled only at its rank, and, when named
+//!   units of its taxon explain its reads, which ones);
 //! - `reported_as`: the rank of the profile rows holding the taxon's reads
-//!   (`species` for a species row and its strain rows), `none` when none;
+//!   (the unit's rank for its row and its strain rows), `none` when none;
 //! - `final_reads`, `final_abundance`: columns 4 and 6 of the taxon's profile
 //!   row; for a species its species row plus its strain rows; on species rows
 //!   only on the decided genome; `NA` when the taxon has no row of its own.
@@ -75,7 +81,7 @@ use crate::db::DatabaseMetadata;
 use crate::profiler::evidence::{EvidenceCoverage, WitnessDecision, STANDARD_RATIO_UPPER};
 use crate::profiler::output::format_five;
 use crate::profiler::rollup::{GenusRow, MIN_CHUNK_RATIO, MIN_GENUS_FRAGMENTS, MIN_WINDOW_SPREAD};
-use crate::profiler::ProfilerConfig;
+use crate::profiler::{ProfileRank, ProfilerConfig};
 use crate::sequencer::Sequencer;
 use crate::taxonomy::Taxonomy;
 
@@ -232,15 +238,14 @@ impl FinalRows {
         let amount =
             |row: &crate::profiler::output::ProfileRow| [row.equivalent_mapcount, row.abundance];
         for block in blocks {
-            let species_row = block.taxon.as_ref().filter(|row| row.rank == "species");
-            if species_row.is_none() && block.genomes.is_empty() {
+            if !block.unit {
                 if let Some(row) = &block.taxon {
                     finals.taxa.insert(block.taxid, amount(row));
                 }
                 continue;
             }
             let mut total = [0.0; 2];
-            for row in species_row.into_iter().chain(&block.genomes) {
+            for row in block.taxon.iter().chain(&block.genomes) {
                 total[0] += row.equivalent_mapcount;
                 total[1] += row.abundance;
             }
@@ -289,6 +294,9 @@ pub(super) enum SpeciesDecision {
     LeftOut,
     /// Kept, then removed by the prophage check.
     RemovedProphage,
+    /// A unit labelled above species, kept, then removed because the kept
+    /// named units of its taxon explain its reads.
+    RemovedNamedFirst,
     /// Never kept.
     Removed,
 }
@@ -321,6 +329,7 @@ impl SpeciesDecision {
             Self::AtGenusTie | Self::AtGenusIdentity => format!("reported at genus: {}", self.why_at_genus()),
             Self::LeftOut => "left out: a relative with more identical reads is kept".to_string(),
             Self::RemovedProphage => "removed by the prophage check: its own reads do not cover the genome outside the part a kept host explains".to_string(),
+            Self::RemovedNamedFirst => "removed: its reads are explained by named units of its taxon".to_string(),
             Self::Removed => format!("removed: {tests}"),
         }
     }
@@ -342,6 +351,9 @@ pub(super) struct Looks<'a> {
     pub(super) own_evidence: &'a HashMap<u32, bool>,
     /// Kept viruses removed by the prophage check.
     pub(super) prophage: &'a [u32],
+    /// Kept units labelled above species removed as the kept named units of
+    /// their taxon explain their reads.
+    pub(super) named_first: &'a HashMap<u32, Vec<u32>>,
     /// Kept by the genus roll-up for even coverage.
     pub(super) even_coverage: &'a [u32],
 }
@@ -361,6 +373,8 @@ pub(super) fn judged_species(
         if !kept.contains_key(&taxid) {
             if prophage.contains(&taxid) {
                 SpeciesDecision::RemovedProphage
+            } else if looks.named_first.contains_key(&taxid) {
+                SpeciesDecision::RemovedNamedFirst
             } else {
                 SpeciesDecision::Removed
             }
@@ -412,6 +426,11 @@ pub(super) struct Decisions<'a> {
     /// Taxa and genome rows dropped by `--host`, `--min-reads` or
     /// `--min-breadth`.
     pub(super) dropped: &'a Dropped,
+    /// Units labelled above species, with their rank.
+    pub(super) labels: &'a HashMap<u32, ProfileRank>,
+    /// Labelled units removed as named units of their taxon explain their
+    /// reads, with those units.
+    pub(super) named_first: &'a HashMap<u32, Vec<u32>>,
 }
 
 /// What a genus row of the profile is made of: the roll-up's row, and the
@@ -632,7 +651,9 @@ impl Decisions<'_> {
             let genus_dropped = genus_of
                 .get(&taxid)
                 .and_then(|genus| self.dropped.taxa.get(genus));
-            let reason = match below {
+            let label = self.labels.get(&taxid).copied();
+            let rank = label.map_or("species", ProfileRank::as_str);
+            let mut reason = match below {
                 Some(below) => below.reason(),
                 None => {
                     let reason =
@@ -643,21 +664,36 @@ impl Decisions<'_> {
                     }
                 }
             };
+            if let Some(named) = self.named_first.get(&taxid) {
+                let named = named
+                    .iter()
+                    .map(|&unit| format!("{} ({unit})", names.taxon(unit)))
+                    .collect::<Vec<_>>();
+                reason = format!("{reason}: {}", named.join(", "));
+            }
+            if label.is_some() {
+                reason = format!("{reason}; its references are labelled only at {rank}");
+            }
             let total = finals.species.get(&taxid).copied();
             let reported_as = match total {
-                Some(_) => "species",
+                Some(_) => rank,
                 None if decision.at_genus() && genus_dropped.is_none() => "genus",
                 None => "none",
+            };
+            let parent = match label {
+                None => names.ancestor(taxid, "genus"),
+                Some(ProfileRank::Genus) => names.ancestor(taxid, "family"),
+                Some(_) => None,
             };
             let count =
                 |map: &HashMap<u32, u64>| Some(map.get(&taxid).copied().unwrap_or(0) as f64);
             for id in ids {
                 let genome = &self.genomes[&id];
                 rows.push(DecisionRow {
-                    rank: "species",
+                    rank,
                     taxid,
                     name: names.taxon(taxid),
-                    parent: names.ancestor(taxid, "genus"),
+                    parent,
                     genome: Some(names.genome(id)),
                     decided: id == decided,
                     reads: genome.assembly.count.to_string(),
@@ -865,6 +901,10 @@ impl Decisions<'_> {
                 kept: below.is_none(),
                 reason: match below {
                     Some(below) => format!("{}; made of {}", below.reason(), parts.join(" + ")),
+                    None if finals.species.contains_key(&genus) => format!(
+                        "kept: {}; counted in the row of the unit labelled at this genus",
+                        parts.join(" + ")
+                    ),
                     None => format!("kept: {}", parts.join(" + ")),
                 },
                 reported_as: if below.is_none() { "genus" } else { "none" },
@@ -914,6 +954,11 @@ impl Decisions<'_> {
                 let tests = tests_in_words(&failed);
                 let reason = match below {
                     Some(below) => below.reason(),
+                    None if kept && finals.species.contains_key(&candidate.unit) => {
+                        "kept: reads without a species match spread over a relative's genome; \
+                         counted in the row of the unit labelled at this family"
+                            .to_string()
+                    }
                     None if kept => {
                         "kept: reads without a species match spread over a relative's genome"
                             .to_string()
@@ -1047,6 +1092,8 @@ mod tests {
         families: Vec<UnitCandidate>,
         blocks: Vec<TaxonBlock>,
         dropped: Dropped,
+        labels: HashMap<u32, ProfileRank>,
+        named_first: HashMap<u32, Vec<u32>>,
     }
 
     fn fixture() -> Fixture {
@@ -1079,6 +1126,7 @@ mod tests {
                 second_look: &HashMap::from([(4, vec![0])]),
                 own_evidence: &HashMap::from([(2, true)]),
                 prophage: &[],
+                named_first: &HashMap::new(),
                 even_coverage: &[],
             },
         );
@@ -1160,8 +1208,9 @@ mod tests {
                 Some(coverage(0.2, 0.9)),
             ),
         ];
-        let block = |taxid, taxon, genomes| TaxonBlock {
+        let block = |taxid, taxon: Option<ProfileRow>, genomes| TaxonBlock {
             taxid,
+            unit: taxon.as_ref().is_none_or(|row| row.rank == "species"),
             taxon,
             genomes,
             breadth: 0.5,
@@ -1199,6 +1248,8 @@ mod tests {
             families,
             blocks,
             dropped: Dropped::default(),
+            labels: HashMap::new(),
+            named_first: HashMap::new(),
         }
     }
 
@@ -1227,6 +1278,8 @@ mod tests {
             genus_members: &fixture.genus_members,
             families: &fixture.families,
             dropped: &fixture.dropped,
+            labels: &fixture.labels,
+            named_first: &fixture.named_first,
         };
         let mut out = Vec::new();
         table
@@ -1730,5 +1783,60 @@ mod tests {
         assert_eq!(row("family", "GCF_80"), ["removed", removed, "none", "NA"]);
         assert_eq!(row("species", "GCF_10")[0], "kept");
         assert_eq!(row("genus", "GCF_50")[0], "kept");
+    }
+
+    #[test]
+    fn units_labelled_above_species_are_reported_at_their_rank() {
+        // Unit 4 (in its genome row under strain 400) is labelled at genus; unit 3, labelled at genus too, was
+        // removed as named species 1 explains its reads.
+        let mut fixture = fixture();
+        fixture.labels = HashMap::from([(4, ProfileRank::Genus), (3, ProfileRank::Genus)]);
+        fixture.named_first = HashMap::from([(3, vec![1])]);
+        fixture
+            .outcomes
+            .insert(3, SpeciesDecision::RemovedNamedFirst);
+        let (_, rows) = decisions(&fixture);
+        let row = |genome: &str| {
+            rows.iter()
+                .find(|row| row["genome"] == genome && row["rank"] != "strain")
+                .map(|row| {
+                    [
+                        "rank",
+                        "parent_taxid",
+                        "decision",
+                        "reason",
+                        "reported_as",
+                        "final_reads",
+                    ]
+                    .map(|column| row[column].clone())
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            row("GCF_40"),
+            [
+                "genus",
+                "1000",
+                "kept",
+                "kept on the second look: a removed sister no longer splits its reads; its references are labelled \
+                 only at genus",
+                "genus",
+                "8.00000",
+            ]
+        );
+        assert_eq!(
+            row("GCF_30"),
+            [
+                "genus",
+                "1000",
+                "removed",
+                "removed: its reads are explained by named units of its taxon: Species 1 (1); its references are \
+                 labelled only at genus",
+                "none",
+                "NA",
+            ]
+        );
+        // A species keeps its rank and parent.
+        assert_eq!(row("GCF_10")[..2], ["species", "100"]);
     }
 }

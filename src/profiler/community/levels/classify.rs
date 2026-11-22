@@ -1,17 +1,18 @@
 //! Per-read classifications of the level-wise engine (`--save-classification`,
-//! `<prefix>.classify.txt.gz`), in the default engine's format: one row per
-//! fragment (a read pair counts once) with its read id, the taxid and rank of
-//! its largest share, the taxids of its shares and the shares, largest first
-//! (equal shares by taxid); a fragment with a single share has share `1`.
+//! `<prefix>.classify.txt.gz`): one row per fragment (a read pair counts once)
+//! with its read id, the taxid and rank of its largest share, the taxids of its
+//! shares and the shares, largest first (equal shares by taxid); a fragment
+//! with a single share has share `1`.
 //!
 //! A fragment's shares are the ones the profile's rows count it with:
 //!
 //! - a fragment with candidate species at the species identity is shared
 //!   among the kept species by the second EM (its read group's posteriors). A
-//!   species reported at species counts its share in its species row; with
-//!   `--strain`, a fragment that the genome EM shares among the genomes
-//!   reported on their own splits its species share among their strain rows
-//!   by that EM's posteriors. A species reported at its genus counts its share
+//!   species reported at species counts its share in its species row, and a
+//!   unit whose references are labelled above species in its row at that
+//!   rank; with `--strain`, a fragment that the genome EM shares among the
+//!   genomes reported on their own splits its species share among their strain
+//!   rows by that EM's posteriors. A species reported at its genus counts its share
 //!   in the genus row; a species left out, or dropped by `--host`,
 //!   `--min-reads` or `--min-breadth`, counts it nowhere;
 //! - a fragment none of whose candidate species is kept goes whole to the
@@ -32,7 +33,7 @@
 //! shares were renormalised and where a species row is left out for holding
 //! less than one read.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -44,87 +45,54 @@ use crate::profiler::community::MappingData;
 use crate::profiler::output::{create_classification_writer, finish_classification_writer};
 use crate::profiler::rollup::GenusRow;
 
-/// The rank of a profile row a share goes to.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-enum Rank {
-    Species,
-    Strain,
-    Genus,
-    Family,
-}
-
-impl Rank {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Species => "species",
-            Self::Strain => "strain",
-            Self::Genus => "genus",
-            Self::Family => "family",
-        }
-    }
-}
-
 /// A fragment's shares: taxid and rank of a profile row, and the share.
-type Shares = Vec<(u32, Rank, f64)>;
+type Shares<'r> = Vec<(u32, &'r str, f64)>;
 
 /// A read group's posteriors over units.
 type Posteriors = [(u32, f64)];
 
 /// The profile's rows a share can go to.
-struct ProfileTaxa {
-    /// Species with a species row.
-    species_rows: HashSet<u32>,
+struct ProfileTaxa<'r> {
+    /// The rank of each taxon's row: a unit's row (species, or the taxon its
+    /// references are labelled with), a genus or a family row.
+    rows: HashMap<u32, &'r str>,
     /// Taxid of each genome's strain row, by assembly id.
     strain_rows: HashMap<u32, u32>,
     /// Genus row of each species reported at its genus.
     at_genus: HashMap<u32, u32>,
-    genera: HashSet<u32>,
-    families: HashSet<u32>,
 }
 
-impl ProfileTaxa {
+impl<'r> ProfileTaxa<'r> {
     fn of(
-        blocks: &[TaxonBlock],
+        blocks: &'r [TaxonBlock],
         genome_level: &HashMap<u32, SpeciesGenomes>,
         genus_members: &[(u32, u32, f64)],
         assembly_names: &[Arc<str>],
     ) -> Self {
         let mut taxa = Self {
-            species_rows: HashSet::new(),
+            rows: HashMap::new(),
             strain_rows: HashMap::new(),
             at_genus: HashMap::new(),
-            genera: HashSet::new(),
-            families: HashSet::new(),
         };
         for block in blocks {
-            match block.taxon.as_ref().map(|row| row.rank.as_str()) {
-                Some("genus") => {
-                    taxa.genera.insert(block.taxid);
-                }
-                Some("family") => {
-                    taxa.families.insert(block.taxid);
-                }
-                taxon => {
-                    if taxon == Some("species") {
-                        taxa.species_rows.insert(block.taxid);
-                    }
-                    let strains = genome_level
-                        .get(&block.taxid)
-                        .map_or(&[][..], |g| &g.strains);
-                    for row in &block.genomes {
-                        let genome = row.best_fit.as_ref().map(|b| &*b.genome);
-                        if let Some(strain) = strains
-                            .iter()
-                            .find(|s| Some(&*assembly_names[s.assembly_id as usize]) == genome)
-                        {
-                            taxa.strain_rows.insert(strain.assembly_id, row.taxid);
-                        }
-                    }
+            if let Some(row) = &block.taxon {
+                taxa.rows.insert(block.taxid, row.rank.as_str());
+            }
+            let strains = genome_level
+                .get(&block.taxid)
+                .map_or(&[][..], |g| &g.strains);
+            for row in &block.genomes {
+                let genome = row.best_fit.as_ref().map(|b| &*b.genome);
+                if let Some(strain) = strains
+                    .iter()
+                    .find(|s| Some(&*assembly_names[s.assembly_id as usize]) == genome)
+                {
+                    taxa.strain_rows.insert(strain.assembly_id, row.taxid);
                 }
             }
         }
         for &(genus, species, _) in genus_members {
-            if taxa.genera.contains(&genus) {
+            if taxa.rows.contains_key(&genus) {
                 taxa.at_genus.insert(species, genus);
             }
         }
@@ -174,7 +142,11 @@ impl Classifications<'_> {
 
     /// Each written fragment's read and its shares on the profile's rows,
     /// renormalised, in read order.
-    fn shares(&self, blocks: &[TaxonBlock], assembly_names: &[Arc<str>]) -> Vec<(usize, Shares)> {
+    fn shares<'r>(
+        &self,
+        blocks: &'r [TaxonBlock],
+        assembly_names: &[Arc<str>],
+    ) -> Vec<(usize, Shares<'r>)> {
         let taxa = ProfileTaxa::of(
             blocks,
             self.genome_level,
@@ -188,19 +160,19 @@ impl Classifications<'_> {
                 genome_shares.insert(read, (species, &genomes.shares.posteriors[group]));
             }
         }
-        let species_share = |shares: &mut Shares, read: usize, species: u32, share: f64| {
+        let species_share = |shares: &mut Shares<'r>, read: usize, species: u32, share: f64| {
             if let Some(&genus) = taxa.at_genus.get(&species) {
-                shares.push((genus, Rank::Genus, share));
+                shares.push((genus, "genus", share));
             } else if let Some(&(_, posteriors)) =
                 genome_shares.get(&read).filter(|(of, _)| *of == species)
             {
                 for &(genome, posterior) in posteriors {
                     if let Some(&taxid) = taxa.strain_rows.get(&genome) {
-                        shares.push((taxid, Rank::Strain, share * posterior));
+                        shares.push((taxid, "strain", share * posterior));
                     }
                 }
-            } else if taxa.species_rows.contains(&species) {
-                shares.push((species, Rank::Species, share));
+            } else if let Some(&rank) = taxa.rows.get(&species) {
+                shares.push((species, rank, share));
             }
         };
         let mut rows = Vec::new();
@@ -229,9 +201,9 @@ impl Classifications<'_> {
         for &(read, donor) in self.orphans {
             if let Some(&genus) = genus_of_donor
                 .get(&donor)
-                .filter(|genus| taxa.genera.contains(genus))
+                .filter(|genus| taxa.rows.contains_key(genus))
             {
-                rows.push((read, vec![(genus, Rank::Genus, 1.0)]));
+                rows.push((read, vec![(genus, "genus", 1.0)]));
             }
         }
         if let Some(families) = self.families {
@@ -241,8 +213,8 @@ impl Classifications<'_> {
                 };
                 let shares = families.posteriors[*group]
                     .iter()
-                    .filter(|(family, _)| taxa.families.contains(family))
-                    .map(|&(family, posterior)| (family, Rank::Family, posterior))
+                    .filter(|(family, _)| taxa.rows.contains_key(family))
+                    .map(|&(family, posterior)| (family, "family", posterior))
                     .collect();
                 rows.extend(renormalised(shares).map(|shares| (read, shares)));
             }
@@ -271,7 +243,7 @@ fn renormalised(mut shares: Shares) -> Option<Shares> {
     for share in &mut shares {
         share.2 /= total;
     }
-    shares.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+    shares.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(b.1)));
     Some(shares)
 }
 
@@ -293,7 +265,7 @@ fn classification_row(read: &str, shares: &Shares) -> String {
             .collect::<Vec<_>>()
             .join(";")
     };
-    format!("{read}\t{taxid}\t{}\t{taxids}\t{fractions}", rank.as_str())
+    format!("{read}\t{taxid}\t{rank}\t{taxids}\t{fractions}")
 }
 
 #[cfg(test)]
@@ -323,6 +295,7 @@ mod tests {
     ) -> TaxonBlock {
         TaxonBlock {
             taxid,
+            unit: taxon.as_ref().is_none_or(|row| row.rank == "species"),
             taxon,
             genomes,
             breadth: 1.0,
@@ -444,30 +417,62 @@ mod tests {
             ]
         );
         // The genome row on genome 41, under the species' taxid, keeps its rank.
-        let shares = classifications.shares(&blocks(), &accessions());
+        let blocks = blocks();
+        let shares = classifications.shares(&blocks, &accessions());
         let read3 = &shares.iter().find(|row| row.0 == 3).unwrap().1;
-        assert_eq!((read3[1].0, read3[1].1), (4, Rank::Strain));
+        assert_eq!((read3[1].0, read3[1].1), (4, "strain"));
         assert!((read3[1].2 - 0.225).abs() < 1e-12);
     }
 
     #[test]
     fn shares_on_one_row_are_summed_and_renormalised() {
         let shares = vec![
-            (100, Rank::Genus, 0.25),
-            (7, Rank::Species, 0.5),
-            (100, Rank::Genus, 0.25),
-            (8, Rank::Species, 0.0),
+            (100, "genus", 0.25),
+            (7, "species", 0.5),
+            (100, "genus", 0.25),
+            (8, "species", 0.0),
         ];
         let shares = renormalised(shares).unwrap();
         assert_eq!(shares.len(), 2);
-        assert_eq!((shares[0].0, shares[0].1), (7, Rank::Species));
+        assert_eq!((shares[0].0, shares[0].1), (7, "species"));
         assert!((shares[0].2 - 0.5).abs() < 1e-12 && (shares[1].2 - 0.5).abs() < 1e-12);
         // Equal shares come by taxid.
         assert_eq!(shares[1].0, 100);
-        assert!(renormalised(vec![(1, Rank::Species, 0.0)]).is_none());
+        assert!(renormalised(vec![(1, "species", 0.0)]).is_none());
         assert_eq!(
             classification_row("r", &shares),
             "r\t7\tspecies\t7;100\t0.50000;0.50000"
         );
+    }
+
+    #[test]
+    fn a_fragment_counted_in_a_labelled_unit_s_row_carries_its_rank() {
+        // Unit 100 is labelled at genus; read 0 is shared between it and species 1.
+        let fragments = vec![fragment(0)];
+        let posteriors = vec![vec![(100, 0.7), (1, 0.3)]];
+        let blocks = vec![
+            block(1, Some(row(1, "species", 10)), Vec::new()),
+            TaxonBlock {
+                unit: true,
+                ..block(100, Some(row(100, "genus", 20)), Vec::new())
+            },
+        ];
+        let classifications = Classifications {
+            fragments: &fragments,
+            group_of: &[Some(0)],
+            posteriors: &posteriors,
+            genome_level: &HashMap::new(),
+            genus_members: &[],
+            rollup_rows: &[],
+            orphans: &[],
+            credited: &[],
+            families: None,
+        };
+        let rows = classifications
+            .shares(&blocks, &accessions())
+            .into_iter()
+            .map(|(read, shares)| classification_row(&format!("read{read}"), &shares))
+            .collect::<Vec<_>>();
+        assert_eq!(rows, ["read0\t100\tgenus\t100;1\t0.70000;0.30000"]);
     }
 }
