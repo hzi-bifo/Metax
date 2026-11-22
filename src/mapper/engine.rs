@@ -1418,8 +1418,8 @@ Long-read mapping:
 
 Performance and cache:
   --batch-size <RECORDS>
-      Mapper input batch size. This is distinct from the profiler --batch-size
-      before '--'; reducing it can lower transient read-batch memory.
+      Mapper input batch size; reducing it can lower transient read-batch
+      memory.
   --index-cache [PATH]
       Use the automatic memory-mapped cache, or place it at PATH. The default is
       <INDEX>.metamcache beside the mapping index.

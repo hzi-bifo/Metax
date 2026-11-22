@@ -110,8 +110,8 @@ enum Commands {
     #[command(
         display_order = 1,
         override_usage = "metax profile [OPTIONS] --output <PREFIX> [-- <MAPPER_ARG>...]\n       metax profile --mapper-help",
-        long_about = "Map metagenomic reads, evaluate taxonomic and coverage evidence, and estimate relative abundance.\n\nPipeline stages:\n  1. Generate candidate mappings\n  2. Evaluate species/strain evidence\n  3. Consider genus fallback for otherwise unassigned reads\n  4. Apply coverage-based report filters",
-        after_help = "Examples:\n  Single-end: metax profile -d DB -i reads.fq.gz -o sample -t 20\n  Paired-end: metax profile -d DB -i R1.fq.gz -I R2.fq.gz -o sample -t 20\n  Nanopore:   metax profile -d DB -i reads.fq.gz -o sample -s Nanopore -t 20\n\nSpecies at >=0.95 identity, with genus fallback at >=0.80:\n  metax profile ... --min-identity 0.95 --genus-fallback --genus-identity 0.80\n\nMapper-only candidate-generation overrides must follow '--':\n  metax profile ... -- --top-n 20 --score-ratio 0.85 --min-identity 0.80"
+        long_about = "Map metagenomic reads, evaluate taxonomic and coverage evidence, and estimate relative abundance.\n\nPipeline stages:\n  1. Generate candidate mappings\n  2. Share the reads among the candidate species and keep the species whose coverage is enough, even, and won\n  3. Report the reads of removed species at their genus and reads without a species-level match at their family\n  4. With --strain, report genomes within each kept species\n  5. Apply the report filters",
+        after_help = "Examples:\n  Single-end: metax profile -d DB -i reads.fq.gz -o sample -t 20\n  Paired-end: metax profile -d DB -i R1.fq.gz -I R2.fq.gz -o sample -t 20\n  Nanopore:   metax profile -d DB -i reads.fq.gz -o sample -s Nanopore -t 20\n\nSpecies at >=0.95 identity, family-level reads at >=0.80:\n  metax profile ... --min-identity 0.95 --genus-identity 0.80\n\nMapper-only candidate-generation overrides must follow '--':\n  metax profile ... -- --top-n 20 --score-ratio 0.85 --min-identity 0.80"
     )]
     Profile(ProfileArgs),
 
@@ -242,7 +242,7 @@ struct ProfileArgs {
         long = "strain",
         action = ArgAction::SetTrue,
         help_heading = "Analysis mode and resources",
-        help = "[EXPERIMENTAL] Enable strain-aware profiling when strain taxids are present in the database. Strain evidence keeps its own established presets and does not use the validated community evidence policy, so its calls are less well characterised than community output."
+        help = "Also profile the genomes within each kept species: a genome whose own reads match it at strain-level identity and cover it evenly gets a strain row, named by its strain taxid or accession. The mapper then keeps the best mapping of every genome, and a saved mapping records strain=true."
     )]
     strain: bool,
 
@@ -252,7 +252,7 @@ struct ProfileArgs {
         alias = "lowbiomass",
         action = ArgAction::SetTrue,
         help_heading = "Analysis mode and resources",
-        help = "Use low-biomass reporting heuristics and disable the automatic chunk-breadth filter. An explicit --min-chunk-breadth remains authoritative."
+        help = "Disable the automatic chunk-breadth cutoff of the species amount test, for samples with few reads. An explicit --min-chunk-breadth remains authoritative."
     )]
     lowbiomass: bool,
 
@@ -290,7 +290,7 @@ struct ProfileArgs {
         long = "mapped-len",
         value_name = "BASES",
         help_heading = "Species and strain evidence",
-        help = "Minimum mapped bases for species/strain assignment. A preset default is used when omitted. On long reads this value also sets the genus-fallback length floor; short reads use a fixed genus floor."
+        help = "Minimum mapped bases for species/strain assignment. A preset default is used when omitted. On long reads this value also sets the length floor for reads without a species-level match, counted at their family; short reads use a fixed 50-base floor there."
     )]
     mapped_len: Option<usize>,
 
@@ -301,51 +301,24 @@ struct ProfileArgs {
         value_name = "FRACTION",
         value_parser = parse_probability,
         help_heading = "Species and strain evidence",
-        help = "Minimum mapped read fraction for species/strain assignment (0-1). A preset default is used when omitted. Genus fallback uses its own platform-aware coverage gate."
+        help = "Minimum mapped read fraction for species/strain assignment (0-1). A preset default is used when omitted. Reads without a species-level match, counted at their family, need a fraction of at least 0.60 (long reads: that or the length floor)."
     )]
     fraction: Option<f64>,
 
     #[arg(
-        long = "exact-ties",
-        alias = "pe-exact-ties",
-        value_name = "POLICY",
-        value_enum,
-        help_heading = "Species and strain evidence",
-        help = "Treatment of exact equal-score cross-species short-read ties: guarded-map or ambiguous. Guarded MAP is the default for native Illumina community profiling when its coverage safeguard is active."
-    )]
-    exact_ties: Option<ExactTiePolicy>,
-
-    #[arg(
-        short = 'g',
-        long = "genus-fallback",
-        action = ArgAction::SetTrue,
-        help_heading = "Genus fallback and low-map behavior",
-        help = "Enable genus assignment in community profiles when a read has no qualifying species mapping. Eligible low-map runs on full databases enable this automatically."
-    )]
-    genus_fallback: bool,
-
-    #[arg(
         long = "strict-coverage",
         action = ArgAction::SetTrue,
-        help_heading = "Genus fallback and low-map behavior",
-        help = "Report only the species kept by the coverage evidence; the reads of removed species are dropped. Single-end short reads are always profiled this way. By default for paired-end short reads and long reads, a removed species whose reads cover its whole genome evenly (at least 200 fragments, both coverage ratios 0.9-1.1, reads in at least 90 % of its windows) is reported at species when no taxon of its genus is kept, and the reads of other removed species are reported at their genus when they spread over the species' genome (chunk ratio of at least 0.40 and reads in at least half of the genome's windows) and the genus collects at least 200 fragments. These recover large genomes at low depth, divergent strains and new species of a genus in the database; a reference that consists mostly of foreign DNA can still produce a false genus row. Community profiling; species represented by marker genes do not take part, and a fractional database gets no even-coverage species and no genus row for a genus with a kept species."
+        help_heading = "Genus, family and low-map behavior",
+        help = "Report only the species kept by the species tests; the reads of removed species, and reads without a species-level match, are dropped. By default a removed species whose reads cover its whole genome evenly (at least 200 fragments, both coverage ratios 0.9-1.1, reads in at least 90 % of its windows, both coverage p-values at least 1e-5) is reported at species when no taxon of its genus is kept; the reads of other removed species are reported at their genus when they spread over the species' genome (chunk ratio of at least 0.40 and reads in at least half of the genome's windows) and the genus collects at least 200 fragments; and reads without a species-level match are reported at their family when at least 200 of them go to it, spread over at least half of a genome's windows, and make up at least 30 % of the reads that list the family. These recover large genomes at low depth, divergent strains, and new species of a genus or new genera of a family in the database; a reference that consists mostly of foreign DNA can still produce a false genus row. Species represented by marker genes do not take part, and a fractional database gets no even-coverage species and no genus or family row for a taxon with a kept species."
     )]
     strict_coverage: bool,
-
-    #[arg(
-        long = "level-engine",
-        action = ArgAction::SetTrue,
-        hide = true,
-        help = "Development: profile with the level-wise engine."
-    )]
-    level_engine: bool,
 
     #[arg(
         long = "estimate-unclassified",
         action = ArgAction::SetTrue,
         conflicts_with = "host",
-        help_heading = "Genus fallback and low-map behavior",
-        help = "Estimate the share of input reads or fragments that the profile does not explain and append it as an 'unclassified' row (taxid 0; column 4 the unexplained fragments, column 6 their share in percent). Species represented by marker genes count as their whole genome, from the genome size declared in the reference FASTA. Community profiling. Off by default."
+        help_heading = "Genus, family and low-map behavior",
+        help = "Estimate the share of input reads or fragments that the profile does not explain and append it as an 'unclassified' row (taxid 0; column 4 the unexplained fragments, column 6 their share in percent). Species represented by marker genes count as their whole genome, from the genome size declared in the reference FASTA. Off by default."
     )]
     estimate_unclassified: bool,
 
@@ -355,8 +328,8 @@ struct ProfileArgs {
         num_args = 0..=1,
         default_missing_value = "0.025",
         value_parser = parse_probability,
-        help_heading = "Genus fallback and low-map behavior",
-        help = "Report a species at its genus when the reads placed best on it are, on average, more than FRACTION less identical than those of the sample's typical species (the median over the reported species, weighted by their fragments). Such a species is mostly a relative that receives the reads of an organism missing from the database. Needs at least 3 reported species. On by default with 0.025 for paired-end Illumina community profiling and for single-end Illumina reads on a fractional database; other inputs use it only when it is given (without a value: 0.025)."
+        help_heading = "Genus, family and low-map behavior",
+        help = "Report a species at its genus when the reads placed best on it are, on average, more than FRACTION less identical than those of the sample's typical species (the median over the reported species, weighted by their fragments). Such a species is mostly a relative that receives the reads of an organism missing from the database. Needs at least 3 reported species. On by default with 0.025 for paired-end Illumina reads and for single-end Illumina reads on a fractional database; other inputs use it only when it is given (without a value: 0.025)."
     )]
     identity_margin: Option<f64>,
 
@@ -364,7 +337,7 @@ struct ProfileArgs {
         long = "no-identity-margin",
         action = ArgAction::SetTrue,
         conflicts_with = "identity_margin",
-        help_heading = "Genus fallback and low-map behavior",
+        help_heading = "Genus, family and low-map behavior",
         help = "Do not report species at genus by --identity-margin."
     )]
     no_identity_margin: bool,
@@ -374,8 +347,8 @@ struct ProfileArgs {
         value_name = "FRACTION",
         default_value_t = 0.80,
         value_parser = parse_probability,
-        help_heading = "Genus fallback and low-map behavior",
-        help = "Minimum identity for community genus-fallback evidence (0-1), independent of --min-identity."
+        help_heading = "Genus, family and low-map behavior",
+        help = "Minimum identity (0-1) of reads without a species-level match for their family's row, independent of --min-identity."
     )]
     genus_identity: f64,
 
@@ -384,8 +357,8 @@ struct ProfileArgs {
         value_name = "FRACTION",
         default_value_t = 0.30,
         value_parser = parse_probability,
-        help_heading = "Genus fallback and low-map behavior",
-        help = "Pre-assignment mapping rate below which low-map behavior activates (0-1). This can enable automatic genus fallback and mapped-read coverage estimation."
+        help_heading = "Genus, family and low-map behavior",
+        help = "Mapping rate below which the automatic chunk-breadth cutoff is estimated from the mapped reads or fragments instead of all input (0-1), from 1.5 times their number on a full database. Not with --host."
     )]
     low_map_rate_threshold: f64,
 
@@ -425,7 +398,7 @@ struct ProfileArgs {
         alias = "by-aligned",
         action = ArgAction::SetTrue,
         help_heading = "Coverage evidence and filters",
-        help = "Estimate the automatic chunk-breadth cutoff from mapped reads/fragments instead of all input. Auto-applied on low-map runs (see --low-map-rate-threshold); on a subsampled database, community --genus-fallback estimates an unset cutoff from total reads."
+        help = "Estimate the automatic chunk-breadth cutoff from mapped reads/fragments instead of all input. Auto-applied on low-map runs (see --low-map-rate-threshold)."
     )]
     by_aligned: bool,
 
@@ -443,7 +416,7 @@ struct ProfileArgs {
         value_name = "RATIO",
         value_parser = parse_nonnegative_float,
         help_heading = "Coverage evidence and filters",
-        help = "Minimum observed/expected genome-breadth ratio (default 0.70 for species, 0.65 above species). Amplified libraries, such as those made with PCR-based kits, cover genomes unevenly; for long reads from such libraries, try 0.6."
+        help = "Minimum observed/expected genome-breadth ratio (default 0.60 for species, 0.70 for genomes with --strain). Amplified libraries, such as those made with PCR-based kits, cover genomes unevenly; for long reads from such libraries, try 0.6."
     )]
     min_oebr: Option<f64>,
 
@@ -452,7 +425,7 @@ struct ProfileArgs {
         value_name = "RATIO",
         value_parser = parse_nonnegative_float,
         help_heading = "Coverage evidence and filters",
-        help = "Minimum observed/expected chunk-breadth ratio (default 0.75 for short-read species, 0.70 for long-read species, 0.65 above species)."
+        help = "Minimum observed/expected chunk-breadth ratio (default 0.75 for short reads, 0.70 for long reads; species and genomes)."
     )]
     min_coebr: Option<f64>,
 
@@ -482,14 +455,6 @@ struct ProfileArgs {
         help = "Do not drop species by --relative-identity-gap, also where it is on by default."
     )]
     no_relative_identity_gap: bool,
-
-    #[arg(
-        long = "strict",
-        action = ArgAction::SetTrue,
-        help_heading = "Coverage evidence and filters",
-        help = "Require both coverage p-values to pass when both are available."
-    )]
-    strict: bool,
 
     #[arg(
         long = "host",
@@ -574,7 +539,7 @@ struct ProfileArgs {
         alias = "keep-raw",
         action = ArgAction::SetTrue,
         help_heading = "Saved and reused data",
-        help = "Also write a post-EM <PREFIX>.rprofile.txt table before taxon-level coverage, evidence-ratio, p-value, and minimum-support filters."
+        help = "Also write <PREFIX>.decisions.tsv: how every taxon judged at every rank was decided, with the coverage measurements and tests behind each decision."
     )]
     keep_raw: bool,
 
@@ -586,14 +551,6 @@ struct ProfileArgs {
         help = "Write per-read taxonomic assignments to <PREFIX>.classify.txt.gz (gzip-compressed). Disabled by default; not written for fractional databases. For species represented by marker genes, only the reads placed on those genes are listed (a warning says so)."
     )]
     save_classifications: bool,
-
-    #[arg(
-        long = "batch-size",
-        value_name = "RECORDS",
-        help_heading = "Performance and robustness",
-        help = "Profiler work-batch size for file-backed input. Larger batches may use more memory."
-    )]
-    batch_size: Option<usize>,
 
     #[arg(
         long = "max-em-iterations",
@@ -670,6 +627,23 @@ struct ProfileArgs {
         help = "Show every supported mapper-only override, its effect, and platform-specific defaults, then exit."
     )]
     mapper_help: bool,
+
+    // Removed options, kept only to say what to do instead
+    // (`reject_removed_options`).
+    #[arg(long = "level-engine", action = ArgAction::SetTrue, hide = true)]
+    level_engine: bool,
+
+    #[arg(long = "exact-ties", alias = "pe-exact-ties", num_args = 0..=1, hide = true)]
+    exact_ties: Option<Option<String>>,
+
+    #[arg(short = 'g', long = "genus-fallback", action = ArgAction::SetTrue, hide = true)]
+    genus_fallback: bool,
+
+    #[arg(long = "strict", action = ArgAction::SetTrue, hide = true)]
+    strict: bool,
+
+    #[arg(long = "batch-size", num_args = 0..=1, hide = true)]
+    batch_size: Option<Option<String>>,
 
     #[arg(
         last = true,
@@ -1045,6 +1019,42 @@ fn resolve_index_match_both_strobes(
     Ok(is_randstrobe && !first_strobe_only)
 }
 
+/// Stop a run that gives an option the profiler no longer has, saying what to
+/// do instead.
+fn reject_removed_options(args: &ProfileArgs) -> Result<()> {
+    let removed = [
+        (
+            args.level_engine,
+            "--level-engine is no longer an option: the level-wise engine always runs. Drop it.",
+        ),
+        (
+            args.exact_ties.is_some(),
+            "--exact-ties is no longer an option: reads that align equally well to several species are shared among them by the EM, and add to the coverage of a species only when they go to it with a posterior of at least 0.9. Drop it.",
+        ),
+        (
+            args.genus_fallback,
+            "--genus-fallback is no longer an option: the reads of removed species are reported at their genus when they spread over the species' genome, and reads without a species-level match at their family; --genus-identity sets the identity those need, and --strict-coverage switches both off. Drop it.",
+        ),
+        (
+            args.strict,
+            "--strict is no longer an option: the species tests (chunk breadth, OEBR and COEBR, won share) use no p-value, and a removed species kept for even coverage needs both coverage p-values of at least 1e-5. Drop it.",
+        ),
+        (
+            args.batch_size.is_some(),
+            "--batch-size is no longer an option: the profiler takes no batch size, and the mapper's input batch size is set after '--' (see 'metax profile --mapper-help'). Drop it.",
+        ),
+    ];
+    let given = removed
+        .iter()
+        .filter(|(given, _)| *given)
+        .map(|(_, instead)| *instead)
+        .collect::<Vec<_>>();
+    if !given.is_empty() {
+        bail!("{}", given.join("\n"));
+    }
+    Ok(())
+}
+
 fn parse_profile_mode_name(value: &str) -> Result<ProfileMode> {
     match value {
         "default" => Ok(ProfileMode::Default),
@@ -1065,6 +1075,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
         if args.reuse_sam.is_some() {
             bail!("SAM/BAM input is no longer supported. Save the Metax mappings of a run with --save-mapping and profile them again with --reuse-mapping.");
         }
+        reject_removed_options(&args)?;
         let outprefix = args
             .outprefix
             .context("--output is required for profiling")?;
@@ -1096,18 +1107,8 @@ impl TryFrom<ProfileArgs> for AppConfig {
         let mode = args
             .mode
             .unwrap_or_else(|| recorded_mode.unwrap_or(ProfileMode::Default));
-        // With the level-wise engine, --strain adds its genome level; the
-        // experimental strain profiler and its presets are not used.
-        let strain = args.strain && !args.level_engine;
-        let genome_level = args.strain && args.level_engine;
-        // The strain profiler estimates no unclassified share and has no
-        // identity margin; the level-wise engine's genome level has both.
-        if strain && args.estimate_unclassified {
-            bail!("--estimate-unclassified cannot be used with --strain");
-        }
-        if strain && args.identity_margin.is_some() {
-            bail!("--identity-margin cannot be used with --strain");
-        }
+        // --strain adds the genome level.
+        let genome_level = args.strain;
         // A host filters nothing without the pathogen table, and the table
         // nothing without a host: they are given together, the host as a taxid.
         match (args.host.as_deref(), args.pathogen_host.is_some()) {
@@ -1120,46 +1121,23 @@ impl TryFrom<ProfileArgs> for AppConfig {
             }
             _ => {}
         }
-        let requested_exact_ties = args.exact_ties;
         let chunk_guard_available =
             !args.lowbiomass && !args.chunk_breadth.is_some_and(|value| value <= 0.0);
-        if requested_exact_ties == Some(ExactTiePolicy::GuardedMap) {
-            if !sequencer.is_illumina() {
-                bail!("--exact-ties guarded-map requires Illumina short-read input");
-            }
-            if strain {
-                bail!("--exact-ties guarded-map is supported only by community profiling, not --strain");
-            }
-            if args.lowbiomass {
-                bail!("--exact-ties guarded-map requires an active positive chunk-breadth safeguard and cannot be used with --low-biomass");
-            }
-            if args.chunk_breadth.is_some_and(|value| value <= 0.0) {
-                bail!(
-                    "--exact-ties guarded-map requires --min-chunk-breadth to be greater than zero"
-                );
-            }
-        }
-        let exact_ties = requested_exact_ties.unwrap_or_else(|| {
-            if sequencer.is_illumina() && !strain && chunk_guard_available {
-                ExactTiePolicy::GuardedMap
-            } else {
-                ExactTiePolicy::Ambiguous
-            }
-        });
+        let exact_ties = if sequencer.is_illumina() && chunk_guard_available {
+            ExactTiePolicy::GuardedMap
+        } else {
+            ExactTiePolicy::Ambiguous
+        };
         let identity_margin = if args.no_identity_margin {
             None
         } else {
             args.identity_margin.or_else(|| {
-                (sequencer.is_illumina() && is_paired && !strain).then_some(DEFAULT_IDENTITY_MARGIN)
+                (sequencer.is_illumina() && is_paired).then_some(DEFAULT_IDENTITY_MARGIN)
             })
         };
-        // The old engine's roll-up is not for single-end short reads, where it
-        // adds more false rows than it recovers; the level-wise engine's is.
-        let removed_to_genus = !args.strict_coverage
-            && !strain
-            && (is_paired || !sequencer.is_illumina() || args.level_engine);
+        let removed_to_genus = !args.strict_coverage;
         Ok(AppConfig {
-            level_engine: args.level_engine,
+            level_engine: true,
             db: args.db,
             dmp_dir: args.dmp_dir,
             skip_missing_taxa: args.skip_missing_taxa,
@@ -1171,10 +1149,10 @@ impl TryFrom<ProfileArgs> for AppConfig {
             sequencer,
             is_paired,
             exact_ties,
-            strain,
+            strain: false,
             genome_level,
             mode,
-            batch_size: args.batch_size,
+            batch_size: None,
             max_em_iterations: args.max_em_iterations,
             lenient_mapping_input: args.lenient_mapping_input,
             identity: args.identity,
@@ -1200,8 +1178,8 @@ impl TryFrom<ProfileArgs> for AppConfig {
             by_aligned: args.by_aligned,
             genus_identity: args.genus_identity,
             low_map_rate_threshold: args.low_map_rate_threshold,
-            genus_fallback: args.genus_fallback,
-            strict: args.strict,
+            genus_fallback: false,
+            strict: false,
             keep_mapping_output: args.keep_mapping_output,
             stream_mappings: args.stream_mappings,
             temp_dir: args.temp_dir,
@@ -1548,7 +1526,7 @@ mod tests {
         assert_eq!(margin(&paired), Some(DEFAULT_IDENTITY_MARGIN));
         assert_eq!(margin(&with(&["--identity-margin", "0.04"])), Some(0.04));
         assert_eq!(margin(&with(&["--no-identity-margin"])), None);
-        assert_eq!(margin(&with(&["--strain"])), None);
+        assert_eq!(margin(&with(&["--strain"])), Some(DEFAULT_IDENTITY_MARGIN));
         assert_eq!(margin(&with(&["--sequencer", "Nanopore"])), None);
         assert_eq!(margin(&["-i", "r1.fq"]), None);
         assert_eq!(
@@ -1595,19 +1573,11 @@ mod tests {
             AppConfig::try_from(args)
         };
         for option in ["--estimate-unclassified", "--identity-margin"] {
-            // The strain profiler refuses them ...
-            let error = config(&["--strain", option]).unwrap_err().to_string();
-            assert!(
-                error.contains(option) && error.contains("--strain"),
-                "{error}"
-            );
-            // ... the level-wise engine's genome level takes them.
-            let level = config(&["--strain", "--level-engine", option]).unwrap();
-            assert!(level.genome_level && !level.strain);
+            let level = config(&["--strain", option]).unwrap();
+            assert!(level.genome_level && !level.strain && level.level_engine);
         }
         let level = config(&[
             "--strain",
-            "--level-engine",
             "--estimate-unclassified",
             "--identity-margin",
             "0.04",
@@ -1631,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn removed_species_are_reported_for_pairs_and_long_reads_unless_strict_coverage_or_strain() {
+    fn removed_species_are_reported_unless_strict_coverage() {
         let rollup = |extra: &[&str]| {
             let argv = ["metax", "profile", "-d", "db", "-o", "out", "-i", "r1.fq"];
             let cli = Cli::try_parse_from(argv.iter().chain(extra)).unwrap();
@@ -1640,12 +1610,13 @@ mod tests {
             };
             AppConfig::try_from(args).unwrap().removed_to_genus
         };
-        assert!(!rollup(&[]));
+        assert!(rollup(&[]));
         assert!(rollup(&["-I", "r2.fq"]));
         assert!(rollup(&["--sequencer", "Nanopore"]));
         assert!(rollup(&["--sequencer", "PacBio"]));
+        assert!(rollup(&["-I", "r2.fq", "--strain"]));
+        assert!(!rollup(&["--strict-coverage"]));
         assert!(!rollup(&["-I", "r2.fq", "--strict-coverage"]));
-        assert!(!rollup(&["-I", "r2.fq", "--strain"]));
         assert!(!rollup(&["--sequencer", "Nanopore", "--strict-coverage"]));
     }
 
@@ -1777,7 +1748,6 @@ mod tests {
             "100",
             "--min-mapped-fraction",
             "0.60",
-            "--genus-fallback",
             "--min-breadth",
             "0.10",
             "--min-chunk-breadth",
@@ -1804,7 +1774,6 @@ mod tests {
         assert_eq!(args.chunk_breadth, Some(0.20));
         assert_eq!(args.chunk_breadth_scale, None);
         assert_eq!(args.min_reads, Some(10));
-        assert!(args.genus_fallback);
         assert!(args.keep_mapping_output);
         assert!(args.save_classifications);
         assert!(args.keep_raw);
@@ -1912,7 +1881,6 @@ mod tests {
         let Commands::Profile(args) = cli.command else {
             panic!("expected profile command");
         };
-        assert_eq!(args.exact_ties, None);
         let config: AppConfig = args.try_into().unwrap();
         assert_eq!(config.exact_ties, ExactTiePolicy::GuardedMap);
         assert!(!config.is_paired);
@@ -1927,23 +1895,6 @@ mod tests {
         let config: AppConfig = args.try_into().unwrap();
         assert_eq!(config.exact_ties, ExactTiePolicy::GuardedMap);
         assert!(config.is_paired);
-
-        let cli = Cli::try_parse_from([
-            "metax",
-            "profile",
-            "-i",
-            "reads.fq.gz",
-            "-o",
-            "sample",
-            "--exact-ties",
-            "ambiguous",
-        ])
-        .unwrap();
-        let Commands::Profile(args) = cli.command else {
-            panic!("expected profile command");
-        };
-        let config: AppConfig = args.try_into().unwrap();
-        assert_eq!(config.exact_ties, ExactTiePolicy::Ambiguous);
     }
 
     #[test]
@@ -1965,84 +1916,53 @@ mod tests {
     }
 
     #[test]
-    fn guarded_map_accepts_se_but_rejects_nonillumina_and_strain_inputs() {
-        let cli = Cli::try_parse_from([
-            "metax",
-            "profile",
-            "-i",
-            "reads.fq.gz",
-            "-o",
-            "sample",
-            "--exact-ties",
-            "guarded-map",
-        ])
-        .unwrap();
-        let Commands::Profile(args) = cli.command else {
-            panic!("expected profile command");
-        };
-        let config = AppConfig::try_from(args).unwrap();
-        assert!(!config.is_paired);
-        assert_eq!(config.exact_ties, ExactTiePolicy::GuardedMap);
-
-        let cli = Cli::try_parse_from([
-            "metax",
-            "profile",
-            "-i",
-            "reads.fq.gz",
-            "-o",
-            "sample",
-            "--sequencer",
-            "Nanopore",
-            "--exact-ties",
-            "guarded-map",
-        ])
-        .unwrap();
-        let Commands::Profile(args) = cli.command else {
-            panic!("expected profile command");
-        };
-        assert!(AppConfig::try_from(args)
-            .unwrap_err()
-            .to_string()
-            .contains("Illumina short-read"));
-
-        let cli = Cli::try_parse_from([
-            "metax",
-            "profile",
-            "-i",
-            "reads.fq.gz",
-            "-o",
-            "sample",
-            "--strain",
-            "--exact-ties",
-            "guarded-map",
-        ])
-        .unwrap();
-        let Commands::Profile(args) = cli.command else {
-            panic!("expected profile command");
-        };
-        assert!(AppConfig::try_from(args)
-            .unwrap_err()
-            .to_string()
-            .contains("community profiling"));
-    }
-
-    #[test]
-    fn guarded_map_requires_an_independent_chunk_breadth_guard() {
-        let parse = |extra: [&str; 2]| {
-            let mut argv = vec!["metax", "profile", "-i", "r1.fq.gz", "-I", "r2.fq.gz"];
-            argv.extend(["-o", "sample", "--exact-ties", "guarded-map"]);
-            argv.extend(extra);
-            let Commands::Profile(args) = Cli::try_parse_from(argv).unwrap().command else {
+    fn removed_options_say_what_to_do_instead() {
+        let error = |extra: &[&str]| {
+            let argv = ["metax", "profile", "-d", "db", "-o", "out", "-i", "r1.fq"];
+            let cli = Cli::try_parse_from(argv.iter().chain(extra)).unwrap();
+            let Commands::Profile(args) = cli.command else {
                 panic!("expected profile command");
             };
-            AppConfig::try_from(args)
+            AppConfig::try_from(args).unwrap_err().to_string()
         };
-        assert!(parse(["--min-chunk-breadth", "0"])
-            .unwrap_err()
-            .to_string()
-            .contains("greater than zero"));
-        // A read minimum keeps the automatic chunk-breadth cutoff as the guard.
-        assert!(parse(["--min-reads", "5"]).is_ok());
+        for (given, named, instead) in [
+            (&["--level-engine"][..], "--level-engine", "always runs"),
+            (
+                &["--exact-ties", "guarded-map"][..],
+                "--exact-ties",
+                "shared among them by the EM",
+            ),
+            (
+                &["--exact-ties"][..],
+                "--exact-ties",
+                "shared among them by the EM",
+            ),
+            (
+                &["--pe-exact-ties", "ambiguous"][..],
+                "--exact-ties",
+                "by the EM",
+            ),
+            (
+                &["--genus-fallback"][..],
+                "--genus-fallback",
+                "at their family",
+            ),
+            (&["-g"][..], "--genus-fallback", "at their family"),
+            (&["--strict"][..], "--strict", "use no p-value"),
+            (&["--batch-size", "100"][..], "--batch-size", "after '--'"),
+            (&["--batch-size"][..], "--batch-size", "after '--'"),
+        ] {
+            let message = error(given);
+            assert!(
+                message.starts_with(&format!("{named} is no longer an option"))
+                    && message.contains(instead)
+                    && message.ends_with("Drop it."),
+                "{message}"
+            );
+        }
+        // Every removed option given is named.
+        let message = error(&["--strict", "--level-engine"]);
+        assert!(message.contains("--strict ") && message.contains("--level-engine "));
     }
 
     #[test]
@@ -2154,7 +2074,7 @@ mod tests {
                 "Input and output:",
                 "Analysis mode and resources:",
                 "Species and strain evidence:",
-                "Genus fallback and low-map behavior:",
+                "Genus, family and low-map behavior:",
                 "Coverage evidence and filters:",
                 "Pathogen-focused analysis:",
                 "Saved and reused data:",
@@ -2168,7 +2088,6 @@ mod tests {
             "--reads2 <READS2>",
             "--min-identity <FRACTION>",
             "--min-mapped-fraction <FRACTION>",
-            "--exact-ties <POLICY>",
             "--min-chunk-breadth <FRACTION>",
             "--chunk-breadth-scale <FACTOR>",
             "--reuse-mapping <MAPPING_TSV>",
@@ -2184,6 +2103,15 @@ mod tests {
             );
         }
         assert!(!help.contains("--taxonomy-dir"));
+        for removed in [
+            "--level-engine",
+            "--exact-ties",
+            "--genus-fallback",
+            "--strict ",
+            "--batch-size",
+        ] {
+            assert!(!help.contains(removed), "{removed:?} in help\n{help}");
+        }
         assert!(!help.contains("--keep-mapping-output"));
         assert!(!help.contains("Mapping-stage acceptance:"));
         assert!(help.contains("~/.metax/taxdmp"));
