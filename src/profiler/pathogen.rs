@@ -1,4 +1,4 @@
-//! Pathogen-host annotation table shared by both profilers.
+//! Pathogen-host annotation table (`--pathogen-table`), read for `--host`.
 
 use std::collections::HashMap;
 use std::fs::File;

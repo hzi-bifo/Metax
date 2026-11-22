@@ -1,27 +1,11 @@
 //! Profiler Module - Taxonomic abundance estimation from mapping data
 //!
-//! This module contains the core profiling logic for Metax. It provides two
-//! profiling strategies:
-//!
-//! - **Community Profiler** (`community.rs`): Terminal-rank profiling that
-//!   reports each reference at its lowest confidently known taxonomy rank.
-//!   Best for typical metagenomic samples.
-//!
-//! - **Strain Profiler** (`strain.rs`): Strain-level profiling that can
-//!   distinguish between closely related strains within a species. More
-//!   computationally intensive but provides finer-grained resolution.
-//!   Experimental: it runs its own filter chain with its own presets rather
-//!   than the community evidence policy.
-//!
-//! # Profiling Pipeline
-//!
-//! Both profilers follow a similar pipeline:
-//!
-//! 1. **Load mappings**: Parse Metam mappings and extract reference metadata
-//! 2. **Compute coverage**: Calculate breadth and depth for each reference
-//! 3. **Assign taxonomy**: Map read mappings to taxonomic units
-//! 4. **Resolve ambiguity**: Use EM algorithm for multi-mapping reads
-//! 5. **Filter and output**: Apply coverage filters and write results
+//! The mappings of a sample are loaded with the reference metadata
+//! (`community.rs`) and profiled by the level-wise engine
+//! (`community/levels.rs`): species first, then the genomes within each kept
+//! species (`--strain`), the genera of removed species and the families of
+//! reads without a species-level match. Each reference is reported at the most
+//! specific rank its taxonomy label supports.
 //!
 //! # Coverage Metrics
 //!
@@ -46,7 +30,6 @@ use crate::progress::ProgressOptions;
 use crate::sequencer::Sequencer;
 use crate::taxonomy::Taxonomy;
 
-// Sub-modules for different profiling strategies
 pub(crate) mod community;
 pub(crate) mod evidence;
 mod likelihood_em;
@@ -114,11 +97,6 @@ impl ProfileRank {
             "kingdom" | "superkingdom" => Some(Self::Kingdom),
             _ => None,
         }
-    }
-
-    #[inline]
-    pub(crate) fn is_species(self) -> bool {
-        self == Self::Species
     }
 }
 
@@ -599,8 +577,7 @@ impl ProfileMode {
 /// - `min_coebr`: Minimum observed/expected chunk breadth ratio
 #[derive(Debug, Clone)]
 pub struct ProfilerConfig {
-    /// Development: with the level-wise engine, also profile genomes within
-    /// each species (`--strain` with `--level-engine`).
+    /// Also profile the genomes within each kept species (`--strain`).
     pub genome_level: bool,
 
     /// Path to a Metax mapping TSV. Unset when mappings are streamed from the
@@ -673,10 +650,10 @@ pub struct ProfilerConfig {
     /// read identity at least this much higher. Off when `None`.
     pub relative_identity_gap: Option<f64>,
 
-    /// Report species removed by the coverage evidence whose reads cover their
-    /// genome evenly, and the fragments of other removed species at their
-    /// genus when the species' reads spread over its genome. On unless
-    /// `--strict-coverage` or `--strain`.
+    /// Report species removed by the species tests whose reads cover their
+    /// genome evenly, the fragments of other removed species at their genus
+    /// when the species' reads spread over its genome, and fragments without a
+    /// species-level candidate at their family. On unless `--strict-coverage`.
     pub removed_to_genus: bool,
 
     /// Estimate the share of the input that the profile does not explain and
@@ -704,14 +681,15 @@ pub struct ProfilerConfig {
     /// Force mapped-read basis for the chunk-breadth estimate.
     pub by_aligned: bool,
 
-    /// Minimum identity accepted for the genus-level fallback path.
-    /// Comparison is inclusive (`identity >= genus_identity`). Default 0.80.
+    /// Minimum identity of a read without a species-level candidate for the
+    /// family level. Comparison is inclusive (`identity >= genus_identity`).
+    /// Default 0.80.
     pub genus_identity: f64,
 
     /// Mapping-rate cut-off for the low-map path. A run is considered
-    /// low-map (genus-fallback gate active, auto `--by-mapped` forced on)
-    /// when `mapped_reads / total_reads < low_map_rate_threshold`. The
-    /// comparison is strict. Default 0.30.
+    /// low-map (auto `--by-mapped` forced on) when
+    /// `mapped_reads / total_reads < low_map_rate_threshold`. The comparison
+    /// is strict. Default 0.30.
     pub low_map_rate_threshold: f64,
 
     /// Path to pathogen-host mapping TSV (optional)
@@ -775,7 +753,7 @@ impl ProfilerConfig {
     }
 
     /// Return whether the current run should be treated as "low-map" for
-    /// the chunk-breadth basis / genus-fallback gate.
+    /// the chunk-breadth basis.
     ///
     /// Requires all of:
     /// 1. pathogen-detection mode is off (`host` is `None`),
@@ -963,10 +941,8 @@ fn display_option<T: ToString>(value: Option<T>) -> String {
         .unwrap_or_else(|| "None".to_string())
 }
 
-/// Main profiler that dispatches to the appropriate profiling strategy.
-///
-/// This is a facade that delegates to either `CommunityProfiler` or
-/// `StrainProfiler` based on the `strain` configuration option.
+/// Main profiler: loads a sample's mappings and profiles them
+/// ([`community::CommunityProfiler`]).
 ///
 /// # Usage
 ///
@@ -1002,10 +978,7 @@ impl Profiler {
         })
     }
 
-    /// Run the profiling pipeline.
-    ///
-    /// Dispatches to either StrainProfiler or CommunityProfiler based on
-    /// the `strain` configuration option.
+    /// Run the profiling pipeline on the mapping file.
     ///
     /// # Returns
     ///

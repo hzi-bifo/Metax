@@ -1,4 +1,4 @@
-//! Tables of the level-wise engine: the lines that open its profile and, with
+//! Tables of the profile: the lines that open it and, with
 //! `--save-raw-profile`, the decisions table (`<prefix>.decisions.tsv`). Each
 //! opens with two lines starting with `#`: the run's metadata, in the style of
 //! the mapping file's header, then the column names.
@@ -88,7 +88,7 @@ use crate::taxonomy::Taxonomy;
 /// Columns that `--host` appends to every row of the profile.
 pub(super) const HOST_COLUMNS: [&str; 3] = ["host_names", "host_taxids", "diseases"];
 
-/// Columns of the level-wise engine's profile. Every row has all of them, the
+/// Columns of the profile. Every row has all of them, the
 /// unclassified row included.
 pub(super) const PROFILE_COLUMNS: [&str; 17] = [
     "name",

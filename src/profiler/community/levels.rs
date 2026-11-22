@@ -1,4 +1,4 @@
-//! Level-wise profiling engine (development; selected with `--level-engine`).
+//! The level-wise profiling engine: species, then the levels below and above.
 //!
 //! Each fragment's candidates are the species whose genomes it aligns to
 //! within the read-level gates; candidates whose estimated errors exceed the
@@ -56,9 +56,9 @@ use rayon::prelude::*;
 
 use super::{add_marker_genome_reads, fragment_depth, CommunityProfiler, MappingData};
 use crate::profiler::evidence::{
-    calculate_coverage, standard_ratio_lower_bounds, CandidatePlacement, CandidateScratch,
-    EvidenceCoverage, EvidenceMode, EvidencePolicy, GeneHit, PresenceAssembly, PresenceInterval,
-    TerminalCandidate, WitnessDecision, STANDARD_RATIO_UPPER,
+    calculate_coverage, CandidatePlacement, CandidateScratch, EvidenceCoverage, EvidenceMode,
+    EvidencePolicy, GeneHit, PresenceAssembly, PresenceInterval, TerminalCandidate,
+    WitnessDecision, STANDARD_RATIO_UPPER,
 };
 use crate::profiler::likelihood_em::{self, ReadGroups};
 use crate::profiler::markers::MarkerModel;
@@ -106,11 +106,25 @@ const RESOLVE_POSTERIOR: f64 = 0.9;
 /// few of them, while a present species wins most of its reads even when its
 /// strain differs from every genome of it in the database.
 const MIN_WON_SHARE: f64 = 0.3;
-/// Lower bound of a species' base-level breadth ratio (OEBR), below the default
-/// engine's: amplified libraries cover a genome unevenly base by base while its
-/// chunks stay evenly covered, which the chunk-level ratio (COEBR) still tests
-/// at its own bound.
+/// Lower bound of a species' base-level breadth ratio (OEBR), below its
+/// chunk-level one: amplified libraries cover a genome unevenly base by base
+/// while its chunks stay evenly covered, which the chunk-level ratio (COEBR)
+/// still tests at its own bound.
 const SPECIES_MIN_OEBR: f64 = 0.6;
+/// Lower bound of a species' chunk-level breadth ratio (COEBR) for short
+/// reads.
+const SPECIES_MIN_COEBR_SHORT_READS: f64 = 0.75;
+/// Lower bound of a species' chunk-level breadth ratio (COEBR) for long reads.
+const SPECIES_MIN_COEBR_LONG_READS: f64 = 0.70;
+/// Lower bound of a genome's base-level breadth ratio (OEBR) at the genome
+/// level (`--strain`).
+const GENOME_MIN_OEBR: f64 = 0.70;
+/// Lower bound of a genome's chunk-level breadth ratio (COEBR) at the genome
+/// level, for short reads.
+const GENOME_MIN_COEBR_SHORT_READS: f64 = 0.75;
+/// Lower bound of a genome's chunk-level breadth ratio (COEBR) at the genome
+/// level, for long reads.
+const GENOME_MIN_COEBR_LONG_READS: f64 = 0.70;
 /// Fewest species with best placements for an identity baseline to be taken.
 const MIN_JUDGED_SPECIES: usize = 3;
 /// Share of the read groups' weight that may still change when the EM stops.
@@ -200,7 +214,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     let cfg = &profiler.cfg;
     let policy = EvidencePolicy::from_config(cfg).ok_or_else(|| {
         anyhow::anyhow!(
-            "the level-wise engine takes Illumina reads or long reads without --strain for now"
+            "the profiler takes Illumina reads, single-end or paired, or single-end long reads"
         )
     })?;
     // With `--save-classification` (not on a database of sampled genomes),
@@ -258,15 +272,24 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     );
     drop(resolved_fragments);
 
-    let (oebr_default, coebr_default) =
-        standard_ratio_lower_bounds(ProfileRank::Species, policy.mode);
-    let min_coebr = cfg.min_coebr.unwrap_or(coebr_default);
-    // The genome level keeps the default engine's bounds.
-    let genome_bounds = (cfg.min_oebr.unwrap_or(oebr_default), min_coebr);
+    // --min-oebr and --min-coebr set the bounds of both levels.
+    let long_reads = policy.mode == EvidenceMode::Long;
+    let (species_min_coebr, genome_min_coebr) = if long_reads {
+        (SPECIES_MIN_COEBR_LONG_READS, GENOME_MIN_COEBR_LONG_READS)
+    } else {
+        (SPECIES_MIN_COEBR_SHORT_READS, GENOME_MIN_COEBR_SHORT_READS)
+    };
+    let genome_bounds = (
+        cfg.min_oebr.unwrap_or(GENOME_MIN_OEBR),
+        cfg.min_coebr.unwrap_or(genome_min_coebr),
+    );
     let tests = SpeciesTests {
         multiple_tests: genomes.len().max(1),
         chunk_cutoff: data.min_chunk_breadth,
-        ratio_bounds: (cfg.min_oebr.unwrap_or(SPECIES_MIN_OEBR), min_coebr),
+        ratio_bounds: (
+            cfg.min_oebr.unwrap_or(SPECIES_MIN_OEBR),
+            cfg.min_coebr.unwrap_or(species_min_coebr),
+        ),
         markers: data.marker_model.clone(),
         min_marker_genes: cfg.min_marker_genes,
     };
@@ -450,11 +473,12 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         None => (Vec::new(), Vec::new()),
     };
     // Fragments with no candidate at the species identity are built again with
-    // the default engine's genus fallback gates.
+    // the family level's gates: `--genus-identity`, and a fixed mapped length
+    // and aligned fraction.
     let genus_policy = EvidencePolicy {
         identity: cfg.genus_identity,
-        mapped_len: super::genus_fallback_min_mapped_len(cfg),
-        fraction: super::GENUS_FALLBACK_MIN_FRACTION,
+        mapped_len: super::family_level_min_mapped_len(cfg),
+        fraction: super::FAMILY_LEVEL_MIN_FRACTION,
         ..policy
     };
     // On noisy long reads many reads of a present species align below the
@@ -689,7 +713,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         let coverage = genome.coverage.as_ref().expect("measured above");
         let reported = found.map_or(&[][..], |g| &g.strains[..]);
         let species_name = profiler.taxonomy.get_name(taxid).unwrap_or("unknown");
-        // Every row of the level-wise engine has the identity columns, NA when
+        // Every row of the profile has the identity columns, NA when
         // the species has no fragments of its own.
         let identity = Some(found.map_or((f64::NAN, f64::NAN), |g| {
             (
@@ -1194,9 +1218,8 @@ struct MarkerEvidence {
 /// genes it hits over the placements that the genome's genes offer a read of
 /// its length. With `unclassified` (`--estimate-unclassified`; `Some(true)` for
 /// long reads), each fragment resolved to such a species
-/// ([`RESOLVE_POSTERIOR`]) also records its placements on marker genomes, as in
-/// the default engine. Only the fragments whose read group lists such a
-/// species are read again.
+/// ([`RESOLVE_POSTERIOR`]) also records its placements on marker genomes. Only
+/// the fragments whose read group lists such a species are read again.
 fn marker_evidence(
     data: &MappingData,
     policy: EvidencePolicy,
@@ -2200,10 +2223,9 @@ impl TaxonBlock {
     }
 }
 
-/// `--min-reads` and `--min-breadth`, as the default engine applies them to
-/// its rows: a taxon is dropped from the profile when its rows hold fewer
-/// full-index-equivalent reads (a species counting with its genome rows), or
-/// when its breadth is lower.
+/// `--min-reads` and `--min-breadth`: a taxon is dropped from the profile when
+/// its rows hold fewer full-index-equivalent reads (a species counting with its
+/// genome rows), or when its breadth is lower.
 struct Minimums {
     reads: Option<usize>,
     breadth: Option<f64>,
@@ -2318,8 +2340,9 @@ fn drop_below_minimums(
 }
 
 /// Each measured species' decision for the genus level: its strongest genome
-/// in the default engine's witness order (lowest assembly id on a tie), with
-/// the window spread of its reads, and that genome.
+/// (a kept genome first, then the larger fixed-chunk breadth, breadth, depth
+/// and read count; the lowest assembly id on a tie), with the window spread of
+/// its reads, and that genome.
 fn species_decisions(
     genomes: &HashMap<u32, GenomeEvidence>,
     rollup: &GenusRollup,
@@ -2350,7 +2373,7 @@ fn species_decisions(
 }
 
 /// Where fragments without a species-level candidate go: the build `policy`
-/// (the genus fallback identity, mapped length and aligned fraction), the
+/// (the family level's identity, mapped length and aligned fraction), the
 /// unit each candidate species counts for (`unit_of`), the units that get no
 /// row (`excluded`), the kept species whose best-matched reads stay with them
 /// (`kept`; noisy long reads only, else empty) and the `rank` of its rows,

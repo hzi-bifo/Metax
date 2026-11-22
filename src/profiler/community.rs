@@ -1,41 +1,20 @@
-//! Community Profiler - terminal-rank taxonomic abundance estimation
+//! Community profiling: loading the mappings for the level-wise engine.
 //!
-//! This module implements the default profiling mode. It reports each
-//! reference at the lowest taxonomy rank that reference's metadata
-//! confidently supports, rather than rolling every assignment up to species.
+//! 1. **Reference metadata**: genome, taxonomy, size and reference type of
+//!    every reference come from the database metadata. MANUAL.md describes
+//!    the reference format.
 //!
-//! # Algorithm Overview
+//! 2. **Mappings**: Metam coordinate mappings, streamed from the mapper or
+//!    replayed from a saved mapping file, are grouped by read (or pair), each
+//!    alignment with its coverage spans: the read, a fixed chunk around it, and
+//!    a chunk scaled to the genome's size.
 //!
-//! 1. **Load mappings**: Read Metam coordinate mappings, either streamed from
-//!    the mapper or replayed from a saved mapping file.
+//! 3. **Run-level settings**: the mapping rate, the automatic chunk-breadth
+//!    cutoff of the species amount test, the inputs of the genus roll-up and
+//!    of `--estimate-unclassified`, and the marker-gene model.
 //!
-//! 2. **Reference Metadata**: Take genome, taxonomy, size, and reference type
-//!    of every reference from the database metadata. MANUAL.md describes the
-//!    reference format.
-//!
-//! 3. **Coverage Calculation**: Compute coverage metrics:
-//!    - Breadth: Fraction of genome covered by at least one read
-//!    - Fixed and flex chunk: Coverage of genome chunks by at least one read;
-//!      for marker genomes the genes are the chunks
-//!
-//! 4. **Taxonomy Assignment**: Assign reads to taxa based on alignment
-//!    quality, filtering by identity, mapped length, and fraction thresholds.
-//!
-//! 5. **Ambiguity Resolution**: Multi-mapping reads are resolved using an
-//!    Expectation-Maximization (EM) algorithm that iteratively redistributes
-//!    reads based on relative taxon abundances.
-//!
-//! 6. **Statistical Filtering**: Final taxa are filtered based on:
-//!    - Breadth/expected breadth ratio
-//!    - Chunk breadth/expected ratio
-//!    - P-values from coverage distribution tests
-//!
-//! # Key Data Structures
-//!
-//! - `ReadBundle`: Groups all alignments for a single read
-//! - `AlignmentEntry`: Information about a single read-to-reference alignment
-//! - `TaxonCoverage`: Coverage metrics aggregated at the terminal taxon
-//! - `ReadAssignment`: Final taxonomic assignment for a read
+//! 4. **Profiling**: the level-wise engine ([`levels`]) judges species, the
+//!    genomes within them and the levels above, and writes the outputs.
 
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::fs::File;
@@ -105,9 +84,7 @@ mod levels;
 ///
 /// Derived fields are computed once where the alignment enters the profiler --
 /// in [`CommunityProfiler::entry_from_metam_mapping`] -- and stored here ready
-/// to use. They
-/// are invariant for a given alignment, so the taxonomy-assignment loop is
-/// purely arithmetic and touches no `HashMap` or `String::split` per
+/// to use, so the profiler touches no `HashMap` or `String::split` per
 /// alignment.
 type AlignmentEntry = EvidenceAlignment;
 
@@ -174,19 +151,8 @@ impl<'a> MetamReferences<'a> {
     }
 }
 
-/// Community-level taxonomy profiler.
-///
-/// Implements terminal-rank profiling by grouping native mappings at each
-/// reference-supported endpoint and resolving ambiguous assignments with EM.
-///
-/// # Pipeline
-///
-/// 1. Load coordinate mappings and extract reference metadata
-/// 2. Compute coverage intervals for each reference sequence
-/// 3. Assign reads to taxa based on alignment quality
-/// 4. Resolve multi-mapping reads with EM algorithm
-/// 5. Filter taxa based on coverage statistics
-/// 6. Output abundance profile and classification files
+/// The profiler of a sample: loads its mappings and profiles them with the
+/// level-wise engine.
 pub struct CommunityProfiler {
     cfg: ProfilerConfig,
 
@@ -195,7 +161,7 @@ pub struct CommunityProfiler {
 }
 
 impl CommunityProfiler {
-    /// Create a new community profiler with the given configuration.
+    /// Create a profiler with the given configuration.
     ///
     /// # Arguments
     /// * `cfg` - Profiler configuration
@@ -204,13 +170,7 @@ impl CommunityProfiler {
         Ok(Self { cfg, taxonomy })
     }
 
-    /// Run the community profiling pipeline.
-    ///
-    /// This is the main entry point that orchestrates the full pipeline:
-    /// 1. Load and parse alignments
-    /// 2. Compute coverage metrics
-    /// 3. Assign taxonomy
-    /// 4. Write output files
+    /// Load the saved or staged mapping file and profile it.
     pub fn run(mut self) -> Result<()> {
         log::info!(target: "PROFILER", "Initializing the profiler!");
 
@@ -433,11 +393,10 @@ impl CommunityProfiler {
         let normalize = |taxid: u32| species_normalize_raw.get(&taxid).copied().unwrap_or(taxid);
         let mut marker_only_species: HashMap<u32, Option<u32>> = HashMap::new();
         if has_marker_genomes {
-            // Genus fallback places reads that no species explains at the genus
-            // of their best hit. A marker gene holds too little of a genome for
-            // that: reads failing every species there come mostly from the
-            // homologous genes of relatives. Only species with genome-type
-            // references take part.
+            // A marker gene holds too little of a genome for its reads to
+            // stand for a genus or family: reads failing every species there
+            // come mostly from the homologous genes of relatives. Only species
+            // with genome-type references have a genus here.
             let species_with_genomes: HashSet<u32> = taxids_with_genomes
                 .iter()
                 .map(|&taxid| normalize(taxid))
@@ -452,8 +411,7 @@ impl CommunityProfiler {
             }
             species_to_genus_raw.retain(|species, _| species_with_genomes.contains(species));
         }
-        // The roll-up needs every genus, also on a fractional database, where
-        // genus fallback is off.
+        // The roll-up needs every genus, also on a fractional database.
         let rollup_genus_of = self
             .cfg
             .removed_to_genus
@@ -635,7 +593,7 @@ impl CommunityProfiler {
                 gate_rate
             );
         }
-        let gate_active = fallback_gate_active(&self.cfg, gate_rate);
+        let gate_active = low_map_gate_active(&self.cfg, gate_rate);
         let chunk_plan = plan_chunk_breadth(
             &self.cfg,
             gate_rate,
@@ -789,12 +747,12 @@ impl CommunityProfiler {
     ///   to the same species into a single species-level assignment.
     ///
     /// - `species_to_genus`: `species -> genus` map, keyed by the
-    ///   **post-normalization** species taxid so that the genus
-    ///   fallback path looks up the genus once per species regardless
-    ///   of how many sub-taxon flavours share that species.
+    ///   **post-normalization** species taxid so that the genus is looked
+    ///   up once per species regardless of how many sub-taxon flavours
+    ///   share that species.
     ///
     /// Taxids without a resolvable genus are simply absent from
-    /// `species_to_genus`; the genus fallback silently skips them.
+    /// `species_to_genus`.
     fn build_taxonomy_lookups(
         &self,
         raw_taxids: &HashSet<u32>,
@@ -1058,34 +1016,32 @@ fn add_marker_genome_reads(
 }
 
 // ============================================================================
-// Genus-level fallback helpers
+// Family-level gates and the chunk-breadth cutoff
 // ============================================================================
-//
-// Genus fallback can assign a read at genus rank when no species hit qualifies.
-// Automatic activation is limited to low-map, non-pathogen Illumina runs on
-// full databases; `--genus-fallback` enables it explicitly.
 
-/// Minimum mapped length (inclusive) for a genus-fallback candidate on
-/// **Illumina** (short-read) data. Long-read platforms use `cfg.mapped_len`
-/// instead (see [`genus_fallback_min_mapped_len`]).
-const GENUS_FALLBACK_MIN_MAPPED_LEN: usize = 50;
-/// Minimum aligned fraction (inclusive) for a genus-fallback candidate.
-const GENUS_FALLBACK_MIN_FRACTION: f64 = 0.60;
+/// Minimum mapped length (inclusive) of a short read without a species-level
+/// candidate for the family level; long reads use `cfg.mapped_len` (see
+/// [`family_level_min_mapped_len`]).
+const FAMILY_LEVEL_MIN_MAPPED_LEN: usize = 50;
+/// Minimum aligned fraction (inclusive) of a read without a species-level
+/// candidate for the family level.
+const FAMILY_LEVEL_MIN_FRACTION: f64 = 0.60;
 
-/// Mapped-length floor for genus-fallback candidates: Illumina uses a fixed
-/// 50 bp minimum; all other sequencers use the same cutoff as species
-/// (`cfg.mapped_len`, from defaults or `-m`).
+/// Mapped-length floor of the family level: a fixed 50 bases for Illumina
+/// reads; for long reads the species cutoff (`cfg.mapped_len`, from defaults
+/// or `-m`).
 #[inline]
-fn genus_fallback_min_mapped_len(cfg: &ProfilerConfig) -> usize {
+fn family_level_min_mapped_len(cfg: &ProfilerConfig) -> usize {
     if cfg.sequencer.is_illumina() {
-        GENUS_FALLBACK_MIN_MAPPED_LEN
+        FAMILY_LEVEL_MIN_MAPPED_LEN
     } else {
         cfg.mapped_len
     }
 }
 
-/// Return `true` when the automatic genus-fallback gate is active.
-fn fallback_gate_active(cfg: &ProfilerConfig, mapping_rate: f64) -> bool {
+/// Whether the low-map gate is active: the chunk-breadth cutoff is then
+/// estimated from the mapped reads ([`plan_chunk_breadth`]).
+fn low_map_gate_active(cfg: &ProfilerConfig, mapping_rate: f64) -> bool {
     cfg.is_low_map_run(mapping_rate)
 }
 
@@ -1101,7 +1057,7 @@ struct ChunkBreadthPlan {
     basis_reads: usize,
     /// Read count actually passed to the automatic chunk-breadth curve.
     estimate_reads: usize,
-    /// Whether `basis_reads` was multiplied by `FALLBACK_CHUNK_BASIS_SCALE`.
+    /// Whether `basis_reads` was multiplied by `LOW_MAP_CHUNK_BASIS_SCALE`.
     scaled: bool,
 }
 
@@ -1123,9 +1079,9 @@ fn plan_chunk_breadth(
         total_reads
     };
 
-    let low_map_fallback_active = low_map_gate_active && !db_is_subsampled;
-    let scaled = !chunk_breadth_pinned && by_aligned_effective && low_map_fallback_active;
-    let estimate_reads = fallback_scale_chunk_basis(basis_reads, scaled);
+    let low_map_full_database = low_map_gate_active && !db_is_subsampled;
+    let scaled = !chunk_breadth_pinned && by_aligned_effective && low_map_full_database;
+    let estimate_reads = scale_low_map_chunk_basis(basis_reads, scaled);
 
     ChunkBreadthPlan {
         use_aligned_basis: by_aligned_effective,
@@ -1136,8 +1092,9 @@ fn plan_chunk_breadth(
     }
 }
 
-/// Multiplier used for automatic low-map genus fallback.
-const FALLBACK_CHUNK_BASIS_SCALE: f64 = 1.5;
+/// Multiplier of the mapped reads that a low-map run on a full database
+/// estimates its chunk-breadth cutoff from.
+const LOW_MAP_CHUNK_BASIS_SCALE: f64 = 1.5;
 
 /// Recall-mode scaling starts only once the automatic cutoff is based on more
 /// than one million effective reads/fragments. This leaves shallow samples on
@@ -1147,16 +1104,16 @@ const RECALL_CHUNK_SCALE_MIN_BASIS: usize = 1_000_000;
 const SHORT_RECALL_CHUNK_SCALE_FLOOR: f64 = 0.70;
 const LONG_RECALL_CHUNK_SCALE: f64 = 0.80;
 
-/// Standard and safeguard cutoffs are deliberately distinct. A user scale
-/// first adjusts the shared automatic safeguard; recall mode may then lower
-/// only the ordinary standard-evidence gate.
+/// The automatic chunk-breadth cutoff, after a user scale (`safeguard`) and
+/// then recall mode (`standard`, the cutoff the species amount test uses).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CommunityChunkBreadthThresholds {
     /// Calibrated read-count curve before any user or mode adjustment.
     automatic: f64,
-    /// Automatic cutoff after the explicit user scale. Rescue and guarded-MAP
-    /// safeguards use this value.
+    /// The cutoff of the species amount test: `safeguard` times the recall
+    /// scale.
     standard: f64,
+    /// Automatic cutoff after the explicit user scale.
     safeguard: f64,
     user_scale: f64,
     recall_scale: f64,
@@ -1179,7 +1136,7 @@ impl CommunityChunkBreadthThresholds {
     }
 }
 
-/// Resolve community chunk-breadth thresholds once.
+/// Resolve the chunk-breadth cutoffs once.
 fn resolve_community_chunk_breadth(
     cfg: &ProfilerConfig,
     basis_reads: usize,
@@ -1225,7 +1182,7 @@ fn resolve_community_chunk_breadth(
     }
 }
 
-/// Scale only an automatic community cutoff in recall mode. The short-read
+/// Scale only an automatic cutoff in recall mode. The short-read
 /// curve is continuous at one million reads and approaches 0.70 smoothly:
 /// `scale = 0.70 + 0.30 / m`, where `m = basis_reads / 1e6`. Long reads use
 /// a fixed 0.80 multiplier above the same depth gate.
@@ -1275,7 +1232,7 @@ fn log_chunk_breadth_scaling(thresholds: CommunityChunkBreadthThresholds) {
         if uncapped > 1.0 {
             log::info!(
                 target: "PROFILER",
-                "User chunk-breadth scale adjusted the automatic safeguard: {:.6} x {} = {:.6}, capped at 1.000000. Rescue and guarded-MAP safeguards use the adjusted value.",
+                "User chunk-breadth scale adjusted the automatic cutoff: {:.6} x {} = {:.6}, capped at 1.000000.",
                 thresholds.automatic,
                 thresholds.user_scale,
                 thresholds.safeguard,
@@ -1283,7 +1240,7 @@ fn log_chunk_breadth_scaling(thresholds: CommunityChunkBreadthThresholds) {
         } else {
             log::info!(
                 target: "PROFILER",
-                "User chunk-breadth scale adjusted the automatic safeguard: {:.6} x {} = {:.6}. Rescue and guarded-MAP safeguards use the adjusted value.",
+                "User chunk-breadth scale adjusted the automatic cutoff: {:.6} x {} = {:.6}.",
                 thresholds.automatic,
                 thresholds.user_scale,
                 thresholds.safeguard,
@@ -1293,20 +1250,19 @@ fn log_chunk_breadth_scaling(thresholds: CommunityChunkBreadthThresholds) {
     if thresholds.is_recall_scaled() {
         log::info!(
             target: "PROFILER",
-            "Recall mode scaled only the automatic standard chunk-breadth threshold: {:.6} x {:.4} = {:.6}; rescue and guarded-MAP safeguards retain {:.6}, and OEBR/COEBR thresholds are unchanged.",
+            "Recall mode scaled the automatic chunk-breadth cutoff: {:.6} x {:.4} = {:.6}; OEBR/COEBR thresholds are unchanged.",
             thresholds.safeguard,
             thresholds.recall_scale,
             thresholds.standard,
-            thresholds.safeguard,
         );
     }
 }
 
 /// Scale the read count used as input to the automatic chunk-breadth curve.
 #[inline]
-fn fallback_scale_chunk_basis(chunk_basis_reads: usize, scale: bool) -> usize {
+fn scale_low_map_chunk_basis(chunk_basis_reads: usize, scale: bool) -> usize {
     if scale {
-        ((chunk_basis_reads as f64) * FALLBACK_CHUNK_BASIS_SCALE).round() as usize
+        ((chunk_basis_reads as f64) * LOW_MAP_CHUNK_BASIS_SCALE).round() as usize
     } else {
         chunk_basis_reads
     }
@@ -1336,8 +1292,7 @@ fn resolve_species_taxid(taxonomy: &Taxonomy, taxid: u32) -> Option<u32> {
         .map(|(id, _, _)| id)
 }
 
-/// Depth-scaled minimum chunk-breadth cutoff calibrated for community
-/// profiling.
+/// Depth-scaled minimum chunk-breadth cutoff of the species amount test.
 ///
 /// Both platforms use a bounded, saturating Michaelis-Menten form in
 /// `m = num_reads / 1e6`:
@@ -1368,8 +1323,8 @@ struct MappingData {
     /// Per-read alignment bundles
     read_alignments: Vec<ReadBundle>,
 
-    /// Effective standard chunk-breadth threshold. In deep recall-mode
-    /// community runs this may be lower than the original automatic cutoff.
+    /// Chunk-breadth cutoff of the species amount test. In deep recall-mode
+    /// runs this may be lower than the original automatic cutoff.
     min_chunk_breadth: f64,
 
     /// Whether at least one genome has a full/effective size multiplier > 1.
@@ -1384,7 +1339,7 @@ struct MappingData {
     genus_of_species: Arc<HashMap<u32, u32>>,
 
     /// Most-specific reference-supported rank for every terminal taxid. Other
-    /// rows (genus fallback, LCA) take their rank from the taxonomy.
+    /// rows (genus roll-up, family level) take their rank from the taxonomy.
     terminal_ranks: Arc<HashMap<u32, ProfileRank>>,
 
     /// Marker genes and fragment geometry when the database has marker genomes.
@@ -1487,7 +1442,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Helpers for fallback / rank-aware tests.
+    // Test helpers.
     // ------------------------------------------------------------------
 
     /// Minimal `ProfilerConfig` for unit tests. Callers mutate only the
@@ -1685,7 +1640,7 @@ mod tests {
     }
 
     #[test]
-    fn evidence_policy_is_limited_to_validated_community_inputs() {
+    fn evidence_policy_is_limited_to_supported_inputs() {
         let mut cfg = make_cfg(Sequencer::Illumina, None);
         assert_eq!(
             EvidencePolicy::from_config(&cfg).map(|policy| policy.mode),
@@ -1749,61 +1704,60 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Fallback gate tests
+    // Low-map gate tests
     // ------------------------------------------------------------------
 
     #[test]
-    fn fallback_gate_activates_only_below_mapping_rate_threshold() {
+    fn low_map_gate_activates_only_below_mapping_rate_threshold() {
         let cfg = make_cfg(Sequencer::Illumina, None);
-        assert!(fallback_gate_active(&cfg, 0.0));
-        assert!(fallback_gate_active(&cfg, 0.29));
-        assert!(fallback_gate_active(&cfg, 0.2999999));
+        assert!(low_map_gate_active(&cfg, 0.0));
+        assert!(low_map_gate_active(&cfg, 0.29));
+        assert!(low_map_gate_active(&cfg, 0.2999999));
         // Exactly at the 0.30 threshold is NOT active (strict `<`).
-        assert!(!fallback_gate_active(&cfg, 0.30));
-        assert!(!fallback_gate_active(&cfg, 0.50));
-        assert!(!fallback_gate_active(&cfg, 1.0));
+        assert!(!low_map_gate_active(&cfg, 0.30));
+        assert!(!low_map_gate_active(&cfg, 0.50));
+        assert!(!low_map_gate_active(&cfg, 1.0));
     }
 
     #[test]
-    fn fallback_gate_disabled_when_host_is_set() {
-        // Any host string (e.g. human 9606) disables fallback regardless
+    fn low_map_gate_disabled_when_host_is_set() {
+        // Any host string (e.g. human 9606) disables the low-map gate regardless
         // of sequencer or mapping rate.
         let cfg_host = make_cfg(Sequencer::Illumina, Some("9606"));
-        assert!(!fallback_gate_active(&cfg_host, 0.0));
-        assert!(!fallback_gate_active(&cfg_host, 0.1));
+        assert!(!low_map_gate_active(&cfg_host, 0.0));
+        assert!(!low_map_gate_active(&cfg_host, 0.1));
     }
 
     #[test]
-    fn fallback_gate_covers_long_reads_but_not_assembly() {
-        // Nanopore and PacBio honour the low-map auto-trigger, so a low
-        // mapping rate enables genus fallback for them too.
+    fn low_map_gate_covers_long_reads_but_not_assembly() {
+        // Nanopore and PacBio honour the low-map auto-trigger too.
         for seq in [Sequencer::Nanopore, Sequencer::PacBio] {
             let cfg = make_cfg(seq, None);
             assert!(
-                fallback_gate_active(&cfg, 0.0),
-                "expected fallback enabled for low-map {seq}"
+                low_map_gate_active(&cfg, 0.0),
+                "expected the gate active for low-map {seq}"
             );
             assert!(
-                !fallback_gate_active(&cfg, 0.99),
-                "expected fallback disabled for high-map {seq}"
+                !low_map_gate_active(&cfg, 0.99),
+                "expected the gate inactive for high-map {seq}"
             );
         }
     }
 
     #[test]
-    fn fallback_gate_respects_custom_low_map_rate_threshold() {
+    fn low_map_gate_respects_custom_low_map_rate_threshold() {
         // With the default 0.30 threshold, 0.40 is NOT low-map.
         let mut cfg = make_cfg(Sequencer::Illumina, None);
-        assert!(!fallback_gate_active(&cfg, 0.40));
+        assert!(!low_map_gate_active(&cfg, 0.40));
         // Raise the threshold: now 0.40 IS low-map (strict `<`).
         cfg.low_map_rate_threshold = 0.50;
-        assert!(fallback_gate_active(&cfg, 0.40));
-        assert!(fallback_gate_active(&cfg, 0.4999));
-        assert!(!fallback_gate_active(&cfg, 0.50));
+        assert!(low_map_gate_active(&cfg, 0.40));
+        assert!(low_map_gate_active(&cfg, 0.4999));
+        assert!(!low_map_gate_active(&cfg, 0.50));
         // Lower the threshold: even 0.05 no longer triggers when = threshold.
         cfg.low_map_rate_threshold = 0.05;
-        assert!(!fallback_gate_active(&cfg, 0.05));
-        assert!(fallback_gate_active(&cfg, 0.0499));
+        assert!(!low_map_gate_active(&cfg, 0.05));
+        assert!(low_map_gate_active(&cfg, 0.0499));
     }
 
     #[test]
@@ -1838,27 +1792,27 @@ mod tests {
     }
 
     #[test]
-    fn fallback_scale_chunk_basis_applies_only_when_scale_true() {
+    fn scale_low_map_chunk_basis_applies_only_when_scale_true() {
         // Pass-through when scaling is off.
-        assert_eq!(fallback_scale_chunk_basis(0, false), 0);
-        assert_eq!(fallback_scale_chunk_basis(1, false), 1);
-        assert_eq!(fallback_scale_chunk_basis(100_000, false), 100_000);
+        assert_eq!(scale_low_map_chunk_basis(0, false), 0);
+        assert_eq!(scale_low_map_chunk_basis(1, false), 1);
+        assert_eq!(scale_low_map_chunk_basis(100_000, false), 100_000);
 
-        // When scaling is on, count is multiplied by FALLBACK_CHUNK_BASIS_SCALE
+        // When scaling is on, count is multiplied by LOW_MAP_CHUNK_BASIS_SCALE
         // and rounded to the nearest integer.
-        assert_eq!(fallback_scale_chunk_basis(0, true), 0);
-        assert_eq!(fallback_scale_chunk_basis(1, true), 2); // 1.5 -> 2
-        assert_eq!(fallback_scale_chunk_basis(2, true), 3);
-        assert_eq!(fallback_scale_chunk_basis(10, true), 15);
-        assert_eq!(fallback_scale_chunk_basis(100, true), 150);
-        assert_eq!(fallback_scale_chunk_basis(100_000, true), 150_000);
+        assert_eq!(scale_low_map_chunk_basis(0, true), 0);
+        assert_eq!(scale_low_map_chunk_basis(1, true), 2); // 1.5 -> 2
+        assert_eq!(scale_low_map_chunk_basis(2, true), 3);
+        assert_eq!(scale_low_map_chunk_basis(10, true), 15);
+        assert_eq!(scale_low_map_chunk_basis(100, true), 150);
+        assert_eq!(scale_low_map_chunk_basis(100_000, true), 150_000);
         // Round-half-to-even-ish: 3 * 1.5 = 4.5 => rounds to 5.
-        assert_eq!(fallback_scale_chunk_basis(3, true), 5);
+        assert_eq!(scale_low_map_chunk_basis(3, true), 5);
     }
 
     #[test]
-    fn fallback_chunk_basis_scale_constant_is_one_and_a_half() {
-        assert!((FALLBACK_CHUNK_BASIS_SCALE - 1.5).abs() < 1e-12);
+    fn low_map_chunk_basis_scale_constant_is_one_and_a_half() {
+        assert!((LOW_MAP_CHUNK_BASIS_SCALE - 1.5).abs() < 1e-12);
     }
 
     #[test]
@@ -1876,10 +1830,10 @@ mod tests {
         assert_eq!(plan.basis_reads, aligned_reads);
         assert_eq!(plan.estimate_reads, aligned_reads);
 
-        // Automatic low-map fallback on a full DB: aligned basis with 1.5x.
+        // Automatic low-map gate on a full DB: aligned basis with 1.5x.
         let mut cfg = make_cfg(Sequencer::Illumina, None);
         cfg.chunk_breadth = None;
-        let gate = fallback_gate_active(&cfg, 0.10);
+        let gate = low_map_gate_active(&cfg, 0.10);
         let plan = plan_chunk_breadth(&cfg, 0.10, total_reads, aligned_reads, false, gate);
         assert!(plan.use_aligned_basis);
         assert!(plan.by_aligned_auto);
@@ -1897,7 +1851,7 @@ mod tests {
         // A low-map subsampled run takes the mapped basis without scaling.
         let mut cfg = make_cfg(Sequencer::Illumina, None);
         cfg.chunk_breadth = None;
-        let gate = fallback_gate_active(&cfg, 0.10);
+        let gate = low_map_gate_active(&cfg, 0.10);
         let plan = plan_chunk_breadth(&cfg, 0.10, total_reads, aligned_reads, true, gate);
         assert!(plan.use_aligned_basis);
         assert!(!plan.scaled);
@@ -1912,19 +1866,15 @@ mod tests {
     }
 
     #[test]
-    fn fallback_gate_active_for_illumina_single_and_paired() {
+    fn low_map_gate_active_for_illumina_single_and_paired() {
         // Single-end
         let mut cfg = make_cfg(Sequencer::Illumina, None);
         cfg.is_paired = false;
-        assert!(fallback_gate_active(&cfg, 0.1));
+        assert!(low_map_gate_active(&cfg, 0.1));
         // Paired-end
         cfg.is_paired = true;
-        assert!(fallback_gate_active(&cfg, 0.1));
+        assert!(low_map_gate_active(&cfg, 0.1));
     }
-
-    // ------------------------------------------------------------------
-    // Legacy non-LCA rank filter bounds
-    // ------------------------------------------------------------------
 
     #[test]
     fn community_chunk_breadth_curve_matches_spec() {

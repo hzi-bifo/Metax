@@ -1,5 +1,4 @@
-//! `--host` in the level-wise engine: a profile row is judged by its own
-//! taxid in the pathogen table
+//! `--host`: a profile row is judged by its own taxid in the pathogen table
 //! (`--pathogen-table`). A taxon the table lists is kept when one of its hosts
 //! is the given host or lies below it in the taxonomy, and is annotated with
 //! the entry's host names, host taxids and diseases; a taxon the table lists

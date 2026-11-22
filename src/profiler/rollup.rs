@@ -24,8 +24,7 @@ use super::ProfileRank;
 pub(crate) const MIN_CHUNK_RATIO: f64 = 0.40;
 /// Lowest share of genome windows that its reads must reach.
 pub(crate) const MIN_WINDOW_SPREAD: f64 = 0.50;
-/// Fewest fragments a genus row needs; the level-wise engine asks as many of
-/// a family row.
+/// Fewest fragments a genus row needs, and a family row.
 pub(crate) const MIN_GENUS_FRAGMENTS: f64 = 200.0;
 
 /// Fewest fragments of a removed species reported at species for its even
@@ -192,7 +191,7 @@ pub(crate) struct GenusRow {
     pub(crate) depth: f64,
     pub(crate) mapped_len: f64,
     /// Coverage of the donor species with the most fragments; reported in the
-    /// profile row, as the coherent witness is for a majority-LCA row.
+    /// profile row.
     pub(crate) witness: EvidenceCoverage,
     /// Removed species whose fragments make up the row, by taxid.
     pub(crate) donors: Vec<u32>,

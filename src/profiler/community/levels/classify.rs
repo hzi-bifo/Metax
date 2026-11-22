@@ -1,4 +1,4 @@
-//! Per-read classifications of the level-wise engine (`--save-classification`,
+//! Per-read classifications (`--save-classification`,
 //! `<prefix>.classify.txt.gz`): one row per fragment (a read pair counts once)
 //! with its read id, the taxid and rank of its largest share, the taxids of its
 //! shares and the shares, largest first (equal shares by taxid); a fragment

@@ -87,7 +87,7 @@ pub(super) struct StrainShares {
     pub(super) posteriors: Vec<Vec<(u32, f64)>>,
 }
 
-/// One genome's genome-level tests (development diagnostics).
+/// One genome's genome-level tests, for the decisions table.
 pub(super) struct StrainDiagnostic {
     pub(super) taxid: u32,
     pub(super) assembly_id: u32,

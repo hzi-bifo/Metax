@@ -74,8 +74,7 @@ impl ResolvedProfilerThresholds {
 // CLI-facing configuration that gets resolved into profiler settings.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
-    /// Development: the level-wise engine's genome level (`--strain` with
-    /// `--level-engine`).
+    /// Also profile the genomes within each kept species (`--strain`).
     pub genome_level: bool,
     // Input database and taxonomy locations.
     pub db: Option<String>,
@@ -123,13 +122,12 @@ pub struct AppConfig {
     pub save_classifications: bool,
     /// Force mapped-read basis for the chunk-breadth estimate.
     ///
-    /// `false` = auto (mapped basis auto-forced for low-map Illumina
-    /// non-pathogen runs, else total-read basis).
-    /// `true` = use mapped-read basis regardless of mapping rate, except
-    /// community `--genus-fallback` on subsampled DBs estimates an unset
-    /// chunk-breadth threshold from total reads.
+    /// `false` = auto (mapped basis auto-forced for low-map runs without
+    /// `--host`, else total-read basis).
+    /// `true` = use mapped-read basis regardless of mapping rate.
     pub by_aligned: bool,
-    /// Lower-bound identity for genus-fallback candidates (default 0.80).
+    /// Lower-bound identity of reads without a species-level candidate for
+    /// the family level (default 0.80).
     pub genus_identity: f64,
     /// Strict upper bound on mapping rate for the low-map path (default 0.30).
     pub low_map_rate_threshold: f64,
@@ -827,7 +825,7 @@ impl MetaxApp {
             Sequencer::Nanopore | Sequencer::PacBio => {
                 // One sample of base accuracy serves the run: it tells the
                 // mapper whether the reads are noisy and self-calibrates the
-                // community identity cutoff. Reused mappings carry it, so
+                // identity cutoff. Reused mappings carry it, so
                 // same-mode reuse is exact and a deliberately changed mode can
                 // apply its own margin without the FASTQ.
                 let accuracy_source = if sampled_mean_base_accuracy.is_some() {
@@ -1368,17 +1366,18 @@ mod tests {
         let mut cfg = test_app_config();
         cfg.sequencer = Sequencer::Nanopore;
         cfg.mode = ProfileMode::Default;
-        let community = recorded_long_read_metadata(ProfileMode::Default, 0.87, 417, 0.23, None);
-        let mut strain_level = community.clone();
+        let species_level =
+            recorded_long_read_metadata(ProfileMode::Default, 0.87, 417, 0.23, None);
+        let mut strain_level = species_level.clone();
         strain_level.profiler.strain = true;
         // Without the genome level: species-level mappings, and only their gates.
         assert!(!cfg.strain_level_mapping());
-        assert!(cfg.takes_recorded_gates(&community));
+        assert!(cfg.takes_recorded_gates(&species_level));
         assert!(!cfg.takes_recorded_gates(&strain_level));
         // The genome level records strain-level mappings and takes the gates of both kinds.
         cfg.genome_level = true;
         assert!(cfg.strain_level_mapping());
-        assert!(cfg.takes_recorded_gates(&community));
+        assert!(cfg.takes_recorded_gates(&species_level));
         assert!(cfg.takes_recorded_gates(&strain_level));
         let resolved = MetaxApp {
             config: cfg.clone(),
@@ -1514,11 +1513,11 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Illumina + non-strain + Default mode => identity 0.97 / fraction 0.7
+    // Illumina + Default mode => identity 0.97 / fraction 0.7
     // ------------------------------------------------------------------
 
     #[test]
-    fn illumina_default_non_strain_uses_new_community_defaults() {
+    fn illumina_default_uses_its_read_gates() {
         let mut cfg = test_app_config();
         cfg.sequencer = Sequencer::Illumina;
         cfg.mode = ProfileMode::Default;
@@ -1529,8 +1528,8 @@ mod tests {
     }
 
     #[test]
-    fn illumina_default_paired_non_strain_also_uses_new_community_defaults() {
-        // Paired-end must follow the same non-strain branch as single-end.
+    fn illumina_default_paired_uses_the_same_read_gates() {
+        // Paired-end must follow the same branch as single-end.
         let mut cfg = test_app_config();
         cfg.sequencer = Sequencer::Illumina;
         cfg.is_paired = true;
@@ -1541,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn illumina_community_precision_and_recall_use_community_defaults() {
+    fn illumina_precision_and_recall_use_their_read_gates() {
         let mut cfg = test_app_config();
         cfg.sequencer = Sequencer::Illumina;
         cfg.mode = ProfileMode::Precision;
@@ -1561,7 +1560,7 @@ mod tests {
     #[test]
     fn user_overrides_beat_any_default() {
         // Explicit CLI values must pass through untouched regardless of
-        // the Illumina-non-strain-Default tightening.
+        // the Illumina Default tightening.
         let mut cfg = test_app_config();
         cfg.sequencer = Sequencer::Illumina;
         cfg.mode = ProfileMode::Default;
@@ -1576,7 +1575,7 @@ mod tests {
 
     #[test]
     fn long_read_defaults_use_length_or_fraction_gate() {
-        // Community long-read defaults are identity 0.92 with mapped_len >= 500
+        // Long-read defaults are identity 0.92 with mapped_len >= 500
         // OR mapped fraction >= 0.20.
         for seq in [Sequencer::Nanopore, Sequencer::PacBio] {
             let mut cfg = test_app_config();
@@ -1590,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn long_read_community_precision_and_recall_use_community_defaults() {
+    fn long_read_precision_and_recall_use_their_read_gates() {
         for seq in [Sequencer::Nanopore, Sequencer::PacBio] {
             let mut cfg = test_app_config();
             cfg.sequencer = seq;

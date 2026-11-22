@@ -1,11 +1,7 @@
-//! Deterministic coordinate-evidence resolution for native Metam mappings.
-//!
-//! Presence and abundance deliberately use different views of a fragment:
-//! every valid terminal-taxon candidate remains available to abundance EM,
-//! while only a clearly separated best endpoint, or an exact short-read tie
-//! that clears the guarded-MAP posterior threshold, may contribute coordinate
-//! coverage. This keeps unresolved conserved mappings ambiguous instead of
-//! allowing them to manufacture breadth.
+//! Coordinate evidence of native Metam mappings: each fragment's candidate
+//! taxa, with one placement per genome within the read-level gates
+//! ([`CandidateScratch`]), and the coverage measurements of a genome's
+//! intervals ([`calculate_coverage`]).
 
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
@@ -30,7 +26,7 @@ pub(crate) enum MappingRole {
     Mate2,
 }
 
-/// Compact mapping representation shared by legacy and native community paths.
+/// Compact representation of one mapping of a read.
 #[derive(Clone, Debug)]
 pub(crate) struct EvidenceAlignment {
     pub(crate) profile_taxid: u32,
@@ -214,37 +210,8 @@ impl WitnessDecision {
     }
 }
 
-/// Species-level OEBR floor. Long-read COEBR uses the same floor; short reads
-/// use a more conservative COEBR floor.
-const SPECIES_RATIO_LOWER: f64 = 0.70;
-const SHORT_READ_SPECIES_COEBR_LOWER: f64 = 0.75;
-/// OEBR/COEBR floor for genus and every higher rank (0.65). Higher ranks
-/// aggregate reads across several genomes, so their coverage is inherently more
-/// diffuse and a lower shape floor is appropriate; this is the established genus
-/// fallback bound, now shared by all ranks above species.
-const HIGHER_RANK_RATIO_LOWER: f64 = 0.65;
+/// Upper bound of both breadth ratios (OEBR and COEBR).
 pub(crate) const STANDARD_RATIO_UPPER: f64 = 1.50;
-
-/// Default lower OEBR/COEBR bounds used by the standard evidence tier.
-///
-/// This is the single source of truth for direct terminal witnesses and
-/// majority-LCA output filtering. LCA rows use only these standard bounds;
-/// they do not inherit any species rescue policy.
-#[inline]
-pub(crate) fn standard_ratio_lower_bounds(rank: ProfileRank, mode: EvidenceMode) -> (f64, f64) {
-    let oebr = if rank.is_species() {
-        SPECIES_RATIO_LOWER
-    } else {
-        HIGHER_RANK_RATIO_LOWER
-    };
-    let coebr = if rank.is_species() && matches!(mode, EvidenceMode::Paired | EvidenceMode::Single)
-    {
-        SHORT_READ_SPECIES_COEBR_LOWER
-    } else {
-        oebr
-    };
-    (oebr, coebr)
-}
 
 /// Reduce one assembly in-place. Reusing the same interval vector for the
 /// three sorts avoids three full-size temporary vectors and keeps peak memory
@@ -372,8 +339,7 @@ where
 
 /// Expected fraction of a reference covered by `count` reads under the
 /// Lander-Waterman uniform-placement occupancy model, given mean coverage
-/// `depth` (mapped bases / reference length). Shared by the community and
-/// strain profilers so the occupancy formula lives in exactly one place.
+/// `depth` (mapped bases / reference length).
 #[inline]
 pub(crate) fn expected_breadth(depth: f64, count: f64) -> f64 {
     if count <= f64::EPSILON {
@@ -1374,38 +1340,6 @@ mod tests {
         assert!((coverage.fixed_chunk - 0.40).abs() < 1e-12);
         assert!((coverage.flex_chunk - 0.50).abs() < 1e-12);
         assert!((coverage.depth - 0.25).abs() < 1e-12);
-    }
-
-    #[test]
-    fn standard_ratio_defaults_are_rank_and_platform_aware() {
-        assert_eq!(
-            standard_ratio_lower_bounds(ProfileRank::Species, EvidenceMode::Paired),
-            (0.70, 0.75)
-        );
-        assert_eq!(
-            standard_ratio_lower_bounds(ProfileRank::Species, EvidenceMode::Single),
-            (0.70, 0.75)
-        );
-        assert_eq!(
-            standard_ratio_lower_bounds(ProfileRank::Species, EvidenceMode::Long),
-            (0.70, 0.70)
-        );
-        for rank in [
-            ProfileRank::Genus,
-            ProfileRank::Family,
-            ProfileRank::Order,
-            ProfileRank::Class,
-            ProfileRank::Phylum,
-            ProfileRank::Kingdom,
-        ] {
-            for mode in [
-                EvidenceMode::Paired,
-                EvidenceMode::Single,
-                EvidenceMode::Long,
-            ] {
-                assert_eq!(standard_ratio_lower_bounds(rank, mode), (0.65, 0.65));
-            }
-        }
     }
 
     #[test]

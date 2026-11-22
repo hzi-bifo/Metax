@@ -233,7 +233,7 @@ struct ProfileArgs {
         long = "mode",
         value_name = "MODE",
         help_heading = "Analysis mode and resources",
-        help = "Evidence preset: default (validated balance), recall, or precision. For deep community samples, recall also relaxes only the automatic standard chunk-breadth gate; explicit coverage thresholds remain authoritative. Reused mappings default to their recorded mapper mode; an explicit override changes profiler thresholds only."
+        help = "Evidence preset: default (validated balance), recall, or precision. For deep samples (over one million reads or fragments), recall also lowers the automatic chunk-breadth cutoff; explicit coverage thresholds remain authoritative. Reused mappings default to their recorded mapper mode; an explicit override changes profiler thresholds only."
     )]
     mode: Option<ProfileMode>,
 
@@ -416,7 +416,7 @@ struct ProfileArgs {
         value_name = "RATIO",
         value_parser = parse_nonnegative_float,
         help_heading = "Coverage evidence and filters",
-        help = "Minimum observed/expected genome-breadth ratio (default 0.60 for species, 0.70 for genomes with --strain). Amplified libraries, such as those made with PCR-based kits, cover genomes unevenly; for long reads from such libraries, try 0.6."
+        help = "Minimum observed/expected genome-breadth ratio (default 0.60 for species, which allows for the uneven base-by-base coverage of amplified libraries, such as those made with PCR-based kits; 0.70 for genomes with --strain)."
     )]
     min_oebr: Option<f64>,
 
@@ -1498,7 +1498,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_margin_is_on_by_default_for_paired_illumina_community_profiling() {
+    fn identity_margin_is_on_by_default_for_paired_illumina_reads() {
         let margin = |extra: &[&str]| {
             let argv = ["metax", "profile", "-d", "db", "-o", "out"];
             let cli = Cli::try_parse_from(argv.iter().chain(extra)).unwrap();

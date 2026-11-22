@@ -1,4 +1,4 @@
-//! Shared coverage-distribution statistics for community and strain profiles.
+//! Coverage-distribution statistics of the species tests.
 
 use statrs::function::beta::beta_reg;
 use statrs::function::erf::erf;
