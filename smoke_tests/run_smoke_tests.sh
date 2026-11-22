@@ -75,11 +75,36 @@ assert_not_exists() {
   }
 }
 
-assert_single_species_profile() {
+PROFILE_COLUMNS=$'name\ttaxid\trank\treads\tdepth\tabundance\tbreadth\texpected_breadth\tbreadth_pvalue\tfixed_chunk_breadth\tflex_chunk_breadth\texpected_flex_chunk_breadth\tchunk_pvalue\tevidence_depth\tbest_fit_genome\tmean_identity\testimated_ani'
+HOST_COLUMNS=$'host_names\thost_taxids\tdiseases'
+
+# A profile opens with its metadata line and its column names (by default the
+# 17 columns of a profile without --host); every row below them has one field
+# per column.
+assert_profile_format() {
   local profile="$1"
-  awk -F '\t' '
-    $1 == "SpeciesA" && $2 == "100" && $3 == "species" { matched++ }
-    END { exit !(NR == 1 && matched == 1) }
+  local columns="${2:-$PROFILE_COLUMNS}"
+  awk -F '\t' -v columns="$columns" '
+    NR == 1 { ok = $1 == "#metax_profile" && $2 ~ /^version=/ && /\tsequencer=/; next }
+    NR == 2 { ok = ok && $0 == "#" columns; width = split(columns, names, "\t"); next }
+    /^#/ || NF != width { ok = 0 }
+    END { exit !(NR >= 2 && ok) }
+  ' "$profile" || {
+    echo "malformed profile $profile" >&2
+    cat "$profile" >&2
+    exit 1
+  }
+}
+
+# A well-formed profile whose only row is the given taxon.
+assert_single_row_profile() {
+  local profile="$1" name="$2" taxid="$3" rank="$4"
+  assert_profile_format "$profile"
+  awk -F '\t' -v name="$name" -v taxid="$taxid" -v rank="$rank" '
+    /^#/ { next }
+    { rows++ }
+    $1 == name && $2 == taxid && $3 == rank { matched++ }
+    END { exit !(rows == 1 && matched == 1) }
   ' "$profile" || {
     echo "unexpected profile contents in $profile" >&2
     cat "$profile" >&2
@@ -87,28 +112,56 @@ assert_single_species_profile() {
   }
 }
 
+assert_single_species_profile() {
+  assert_single_row_profile "$1" SpeciesA 100 species
+}
+
 assert_single_genus_profile() {
-  local profile="$1"
+  assert_single_row_profile "$1" GenusOnly 300 genus
+}
+
+# The decisions table opens with its metadata line and column names, and every
+# row of the profile has a decided row of the same rank and taxid that was
+# kept.
+assert_decisions_cover_profile() {
+  local decisions="$1" profile="$2"
   awk -F '\t' '
-    $1 == "GenusOnly" && $2 == "300" && $3 == "genus" { matched++ }
-    END { exit !(NR == 1 && matched == 1) }
-  ' "$profile" || {
-    echo "unexpected genus profile contents in $profile" >&2
-    cat "$profile" >&2
+    FILENAME == ARGV[1] && FNR == 1 { ok = $1 == "#metax_decisions" && $2 ~ /^version=/; next }
+    FILENAME == ARGV[1] && FNR == 2 {
+      for (i = 1; i <= NF; i++) column[$i] = i
+      ok = ok && column["#rank"] == 1 && column["taxid"] == 2 && ("decided" in column) && ("decision" in column)
+      next
+    }
+    FILENAME == ARGV[1] {
+      if ($(column["decided"]) == "true" && $(column["decision"]) == "kept") kept[$1 SUBSEP $2] = 1
+      next
+    }
+    /^#/ { next }
+    { rows++; if (!(($3 SUBSEP $2) in kept)) ok = 0 }
+    END { exit !(ok && rows > 0) }
+  ' "$decisions" "$profile" || {
+    echo "the decisions table $decisions does not cover the rows of $profile" >&2
+    cat "$decisions" "$profile" >&2
     exit 1
   }
 }
 
-assert_single_strain_raw_profile() {
-  local profile="$1"
-  awk -F '\t' '
-    $1 == "StrainA" && $2 == "101" && $3 == "no rank" { matched++ }
-    END { exit !(NR == 1 && matched == 1) }
-  ' "$profile" || {
-    echo "unexpected raw strain profile contents in $profile" >&2
-    cat "$profile" >&2
+# A run with the given profile options fails, and its error output contains
+# the given text.
+assert_profile_error() {
+  local name="$1" expected="$2"
+  shift 2
+  if run_metax profile --db "$WORK/db_one" --dmp-dir "$WORK/tax" -i "$WORK/se.fq" \
+    -o "$WORK/$name" -t 2 "$@" 2>"$WORK/$name.err"; then
+    echo "profile with $* unexpectedly succeeded" >&2
+    exit 1
+  fi
+  grep -q -F -- "$expected" "$WORK/$name.err" || {
+    echo "unexpected error for $*:" >&2
+    cat "$WORK/$name.err" >&2
     exit 1
   }
+  assert_not_exists "$WORK/$name.profile.txt"
 }
 
 mkdir -p "$WORK"
@@ -332,6 +385,7 @@ run_metax profile \
   -t 2 \
   --save-mapping \
   --save-classification \
+  --save-decisions \
   --min-identity 0.90 \
   --mapped-len 50 \
   --min-mapped-fraction 0.50
@@ -339,6 +393,7 @@ assert_exists "$WORK/keep.mapping.tsv.gz"
 assert_exists "$WORK/keep.classify.txt.gz"
 [[ -n "$(gzip -dc "$WORK/keep.classify.txt.gz")" ]]
 assert_single_species_profile "$WORK/keep.profile.txt"
+assert_decisions_cover_profile "$WORK/keep.decisions.tsv" "$WORK/keep.profile.txt"
 assert_not_exists "$WORK/keep.mapping.profile.json"
 if ! gzip -cd "$WORK/keep.mapping.tsv.gz" | awk -F '\t' '
   $1 == "#metax_mapping" && $2 == "version=5" && $3 == "sequencer=Illumina" && $4 == "paired=false" && $5 == "mapper_mode=default" && $6 == "strain=false" && $7 == "profiler_identity=0.9" && $8 == "profiler_mapped_len=50" && $9 == "profiler_fraction=0.5" && $10 == "sampled_mean_base_accuracy=NA" { file_meta = 1 }
@@ -367,6 +422,7 @@ run_metax profile \
 assert_exists "$WORK/reused.profile.txt"
 assert_single_species_profile "$WORK/reused.profile.txt"
 assert_not_exists "$WORK/reused.classify.txt.gz"
+assert_not_exists "$WORK/reused.decisions.tsv"
 cmp "$WORK/keep.profile.txt" "$WORK/reused.profile.txt"
 
 if find "$WORK" -maxdepth 1 -name '.metax-mapping-*.partial.tsv.gz' -print -quit | grep -q .; then
@@ -418,16 +474,67 @@ run_metax profile \
   -o "$WORK/pe_strain" \
   -t 2 \
   --strain \
-  --save-raw-profile \
+  --save-decisions \
   --very-verbose \
   --min-identity 0.90 \
   --mapped-len 50 \
   --min-mapped-fraction 0.50
+# The genome level reports the read pair on the species' genome, a strain row
+# named after its strain taxid, and the species keeps no reads of its own.
 assert_exists "$WORK/pe_strain.profile.txt"
-[[ ! -s "$WORK/pe_strain.profile.txt" ]]
-assert_exists "$WORK/pe_strain.rprofile.txt"
-assert_single_strain_raw_profile "$WORK/pe_strain.rprofile.txt"
+assert_single_row_profile "$WORK/pe_strain.profile.txt" StrainA 101 strain
+assert_exists "$WORK/pe_strain.decisions.tsv"
+assert_decisions_cover_profile "$WORK/pe_strain.decisions.tsv" "$WORK/pe_strain.profile.txt"
+awk -F '\t' '$1 == "species" && $2 == "100" && $6 == "true" { found = 1 } END { exit !found }' \
+  "$WORK/pe_strain.decisions.tsv"
+assert_not_exists "$WORK/pe_strain.rprofile.txt"
 assert_not_exists "$WORK/pe_strain.classify.txt.gz"
+
+# Options that no longer exist stop the run and say what to use instead.
+assert_profile_error removed_engine "the level-wise engine always runs" --level-engine
+assert_profile_error renamed_decisions "Use --save-decisions instead." --save-raw-profile
+
+# --host filters the profile by the pathogen table, which it needs.
+assert_profile_error host_alone "--host needs --pathogen-table" --host 9606
+printf 'pathogen_taxid\thost_taxids\thost_names\tdiseases\n100\t9606\tHomo sapiens\tdisease A\n200\t9913\tBos taurus\tdisease B\n' \
+  >"$WORK/pathogens.tsv"
+run_metax profile \
+  --db "$WORK/db_one" \
+  --dmp-dir "$WORK/tax" \
+  -i "$WORK/se.fq" \
+  -o "$WORK/host" \
+  -t 2 \
+  --host 9606 \
+  --pathogen-table "$WORK/pathogens.tsv" \
+  --save-decisions \
+  --min-identity 0.90 \
+  --mapped-len 50 \
+  --min-mapped-fraction 0.50
+# A pathogen of the host is kept and annotated; the files take the prefix
+# <prefix>.pathogen and the profile has 20 columns.
+assert_not_exists "$WORK/host.profile.txt"
+assert_profile_format "$WORK/host.pathogen.profile.txt" "$PROFILE_COLUMNS"$'\t'"$HOST_COLUMNS"
+head -n 1 "$WORK/host.pathogen.profile.txt" | grep -q $'\thost=9606$'
+awk -F '\t' '
+  /^#/ { next }
+  { rows++ }
+  $1 == "SpeciesA" && $2 == "100" && $18 == "Homo sapiens" && $19 == "9606" && $20 == "disease A" { matched++ }
+  END { exit !(rows == 1 && matched == 1) }
+' "$WORK/host.pathogen.profile.txt" || {
+  echo "unexpected host profile contents" >&2
+  cat "$WORK/host.pathogen.profile.txt" >&2
+  exit 1
+}
+assert_decisions_cover_profile "$WORK/host.pathogen.decisions.tsv" "$WORK/host.pathogen.profile.txt"
+# A species the table lists for another host only is dropped.
+run_metax profile --db "$WORK/db_multi" --dmp-dir "$WORK/tax" -i "$WORK/se.fq" -o "$WORK/multi" -t 2 \
+  --min-identity 0.90 --mapped-len 50 --min-mapped-fraction 0.50
+assert_single_row_profile "$WORK/multi.profile.txt" SpeciesB 200 species
+run_metax profile --db "$WORK/db_multi" --dmp-dir "$WORK/tax" -i "$WORK/se.fq" -o "$WORK/multi_host" -t 2 \
+  --host 9606 --pathogen-table "$WORK/pathogens.tsv" \
+  --min-identity 0.90 --mapped-len 50 --min-mapped-fraction 0.50
+assert_profile_format "$WORK/multi_host.pathogen.profile.txt" "$PROFILE_COLUMNS"$'\t'"$HOST_COLUMNS"
+[[ "$(grep -vc '^#' "$WORK/multi_host.pathogen.profile.txt")" == 0 ]]
 
 run_metax profile \
   --db "$WORK/db_one" \
