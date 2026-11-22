@@ -3,7 +3,6 @@ mod record;
 
 use anyhow::{bail, Context, Result};
 use flate2::read::MultiGzDecoder;
-use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -259,48 +258,6 @@ impl Taxonomy {
             merged,
             del_nodes,
         }
-    }
-
-    pub fn get_majority_lca(
-        &self,
-        tax_ids: &HashSet<u32>,
-        cutoff_fraction: f64,
-    ) -> Option<(u32, String, String)> {
-        // Find the deepest node shared by at least cutoff_fraction of paths.
-        if tax_ids.is_empty() {
-            return None;
-        }
-        // Build root-to-leaf paths for each taxid, then scan for consensus.
-        let paths: Vec<Vec<(u32, String, String)>> = tax_ids
-            .iter()
-            .map(|tax_id| {
-                let mut parents = self.get_parents(*tax_id);
-                parents.reverse();
-                parents
-            })
-            .collect();
-        let min_count = (cutoff_fraction * paths.len() as f64).ceil() as usize;
-        let mut lca: Option<(u32, String, String)> = None;
-        let mut level = 0;
-        loop {
-            let mut counter: IndexMap<u32, usize> = IndexMap::new();
-            let mut exhausted = true;
-            for path in &paths {
-                if level < path.len() {
-                    exhausted = false;
-                    let (taxid, name, rank) = &path[level];
-                    *counter.entry(*taxid).or_insert(0) += 1;
-                    if counter[taxid] >= min_count {
-                        lca = Some((*taxid, name.clone(), rank.clone()));
-                    }
-                }
-            }
-            if exhausted {
-                break;
-            }
-            level += 1;
-        }
-        lca
     }
 }
 

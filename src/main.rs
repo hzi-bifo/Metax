@@ -75,7 +75,7 @@ fn parse_positive_float(s: &str) -> Result<f64, String> {
 use metax::db::{MetamIndexOptions, ReferenceType, ReferenceTypes, DEFAULT_SEED_CHUNK_MIB};
 use metax::mapper::mapper_options_help;
 use metax::mapper::tsv::load_mapping_run_metadata;
-use metax::profiler::{ExactTiePolicy, ProfileMode};
+use metax::profiler::ProfileMode;
 use metax::sequencer::Sequencer;
 use metax::{
     attach_taxonomy, build_index, info::run_info, report_genera_with_both_types, AppConfig,
@@ -1121,13 +1121,6 @@ impl TryFrom<ProfileArgs> for AppConfig {
             }
             _ => {}
         }
-        let chunk_guard_available =
-            !args.lowbiomass && !args.chunk_breadth.is_some_and(|value| value <= 0.0);
-        let exact_ties = if sequencer.is_illumina() && chunk_guard_available {
-            ExactTiePolicy::GuardedMap
-        } else {
-            ExactTiePolicy::Ambiguous
-        };
         let identity_margin = if args.no_identity_margin {
             None
         } else {
@@ -1137,7 +1130,6 @@ impl TryFrom<ProfileArgs> for AppConfig {
         };
         let removed_to_genus = !args.strict_coverage;
         Ok(AppConfig {
-            level_engine: true,
             db: args.db,
             dmp_dir: args.dmp_dir,
             skip_missing_taxa: args.skip_missing_taxa,
@@ -1148,11 +1140,8 @@ impl TryFrom<ProfileArgs> for AppConfig {
             reuse_mappings: args.reuse_mappings,
             sequencer,
             is_paired,
-            exact_ties,
-            strain: false,
             genome_level,
             mode,
-            batch_size: None,
             max_em_iterations: args.max_em_iterations,
             lenient_mapping_input: args.lenient_mapping_input,
             identity: args.identity,
@@ -1178,8 +1167,6 @@ impl TryFrom<ProfileArgs> for AppConfig {
             by_aligned: args.by_aligned,
             genus_identity: args.genus_identity,
             low_map_rate_threshold: args.low_map_rate_threshold,
-            genus_fallback: false,
-            strict: false,
             keep_mapping_output: args.keep_mapping_output,
             stream_mappings: args.stream_mappings,
             temp_dir: args.temp_dir,
@@ -1296,7 +1283,7 @@ mod tests {
 
     use super::{
         mapper_options_help, resolve_index_match_both_strobes, resolve_profile_inputs, AppConfig,
-        Cli, Commands, ExactTiePolicy, ProfileMode, Sequencer, DEFAULT_IDENTITY_MARGIN,
+        Cli, Commands, ProfileMode, Sequencer, DEFAULT_IDENTITY_MARGIN,
     };
 
     fn clean_mapping(sequencer: Sequencer, paired: bool, mode: ProfileMode) -> NamedTempFile {
@@ -1464,7 +1451,6 @@ mod tests {
         assert_eq!(config.sequencer, Sequencer::Illumina);
         assert!(config.is_paired);
         assert_eq!(config.mode, ProfileMode::Recall);
-        assert_eq!(config.exact_ties, ExactTiePolicy::GuardedMap);
         assert_eq!(config.reuse_mappings.as_deref(), file.path().to_str());
     }
 
@@ -1574,7 +1560,7 @@ mod tests {
         };
         for option in ["--estimate-unclassified", "--identity-margin"] {
             let level = config(&["--strain", option]).unwrap();
-            assert!(level.genome_level && !level.strain && level.level_engine);
+            assert!(level.genome_level);
         }
         let level = config(&[
             "--strain",
@@ -1640,7 +1626,6 @@ mod tests {
         let config = AppConfig::try_from(args).unwrap();
         assert_eq!(config.sequencer, Sequencer::Nanopore);
         assert!(!config.is_paired);
-        assert_eq!(config.exact_ties, ExactTiePolicy::Ambiguous);
     }
 
     #[test]
@@ -1872,47 +1857,6 @@ mod tests {
             panic!("expected profile command");
         };
         assert!(enabled_args.save_classifications);
-    }
-
-    #[test]
-    fn guarded_map_is_the_default_for_single_and_paired_illumina() {
-        let cli =
-            Cli::try_parse_from(["metax", "profile", "-i", "reads.fq.gz", "-o", "sample"]).unwrap();
-        let Commands::Profile(args) = cli.command else {
-            panic!("expected profile command");
-        };
-        let config: AppConfig = args.try_into().unwrap();
-        assert_eq!(config.exact_ties, ExactTiePolicy::GuardedMap);
-        assert!(!config.is_paired);
-
-        let cli = Cli::try_parse_from([
-            "metax", "profile", "-i", "r1.fq.gz", "-I", "r2.fq.gz", "-o", "sample",
-        ])
-        .unwrap();
-        let Commands::Profile(args) = cli.command else {
-            panic!("expected profile command");
-        };
-        let config: AppConfig = args.try_into().unwrap();
-        assert_eq!(config.exact_ties, ExactTiePolicy::GuardedMap);
-        assert!(config.is_paired);
-    }
-
-    #[test]
-    fn automatic_exact_tie_policy_falls_back_safely_when_map_is_inapplicable() {
-        for extra in [
-            vec!["--sequencer", "Nanopore"],
-            vec!["--low-biomass"],
-            vec!["--min-chunk-breadth", "0"],
-        ] {
-            let mut argv = vec!["metax", "profile", "-i", "reads.fq.gz", "-o", "sample"];
-            argv.extend(extra);
-            let cli = Cli::try_parse_from(argv).unwrap();
-            let Commands::Profile(args) = cli.command else {
-                panic!("expected profile command");
-            };
-            let config: AppConfig = args.try_into().unwrap();
-            assert_eq!(config.exact_ties, ExactTiePolicy::Ambiguous);
-        }
     }
 
     #[test]

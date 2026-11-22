@@ -19,13 +19,12 @@ use rayon::prelude::*;
 
 use super::{
     add_placement, candidate_errors, fold_candidates, longest_alignment, resolved_unit, tie_margin,
-    Fragment, GenomeEvidence, SpeciesTests, LONG_TIE_SHARE,
+    Fragment, GenomeEvidence, SpeciesTests, LONG_TIE_SHARE, MIN_JUDGED_SPECIES,
 };
 use crate::profiler::community::MappingData;
 use crate::profiler::evidence::{
     CandidatePlacement, EvidenceCoverage, EvidenceMode, EvidencePolicy, TerminalCandidate,
 };
-use crate::profiler::identity::MIN_JUDGED_SPECIES;
 use crate::profiler::likelihood_em::{self, ReadGroups};
 use crate::profiler::ProfileRank;
 
@@ -369,9 +368,6 @@ fn identity_to_best_fit(
 ) -> HashMap<u32, (f64, f64)> {
     let ungated = EvidencePolicy {
         identity: 0.0,
-        collect_exact_ties: false,
-        collect_identities: false,
-        collect_best_placements: false,
         ..policy
     };
     // Only reads that align to a best-fit genome can add an identity.
@@ -688,9 +684,6 @@ mod tests {
                 identity: 0.97,
                 mapped_len: 50,
                 fraction: 0.5,
-                collect_exact_ties: false,
-                collect_identities: false,
-                collect_best_placements: false,
             },
             error_rate: 0.003,
             report_strains: false,

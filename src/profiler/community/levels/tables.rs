@@ -997,7 +997,7 @@ mod tests {
     use super::super::genomes::{StrainGenome, StrainShares};
     use super::super::profile_row;
     use super::*;
-    use crate::profiler::evidence::{PremapChunkGuard, PresenceAssembly, RescueKinds};
+    use crate::profiler::evidence::PresenceAssembly;
     use crate::profiler::output::ProfileRow;
     use crate::profiler::unclassified;
 
@@ -1180,8 +1180,6 @@ mod tests {
                 WitnessDecision {
                     metrics: witness,
                     standard: false,
-                    rescues: RescueKinds::default(),
-                    required_premap_guard: PremapChunkGuard::None,
                 },
                 50,
             ),
@@ -1372,7 +1370,7 @@ mod tests {
         final_row(1, "species", 10, 5.0, 100.0)
             .write(&mut writer)
             .unwrap();
-        unclassified::write_row(&mut writer, None, true).unwrap();
+        unclassified::write_row(&mut writer, None).unwrap();
         let text = String::from_utf8(writer.into_inner().unwrap()).unwrap();
         let rows = text.lines().collect::<Vec<_>>();
         assert_eq!(rows.len(), 2);

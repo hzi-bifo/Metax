@@ -49,14 +49,12 @@ use crate::taxonomy::Taxonomy;
 // Sub-modules for different profiling strategies
 pub(crate) mod community;
 pub(crate) mod evidence;
-mod identity;
 mod likelihood_em;
 mod markers;
 mod output;
 mod pathogen;
 mod rollup;
 mod statistics;
-pub(crate) mod strain;
 mod unclassified;
 
 /// Read-name aggregation map with a stable, high-throughput hash builder.
@@ -515,19 +513,6 @@ pub(crate) fn record_genome_sampling_scale(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct ReadSupport {
-    pub observed: f64,
-    pub equivalent: f64,
-}
-
-impl ReadSupport {
-    pub fn add_weighted(&mut self, observed: f64, equivalent_sum: f64, weight: f64) {
-        self.observed += observed * weight;
-        self.equivalent += equivalent_sum * weight;
-    }
-}
-
 pub(crate) fn equivalent_read_count_passes_minimum(
     equivalent_read_count: f64,
     minimum: Option<usize>,
@@ -594,30 +579,6 @@ impl ProfileMode {
     }
 }
 
-/// Policy for exact, equal-score cross-species ties in short-read evidence.
-///
-/// `GuardedMap` uses a seeded EM prior only for exact ties, requires a
-/// uniquely dominant posterior, and cannot create the independent coverage
-/// needed for a new species call. It is the default for native single-end and
-/// paired-end Illumina community profiling.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
-pub enum ExactTiePolicy {
-    /// Keep exact cross-species ties ambiguous for coordinate evidence.
-    Ambiguous,
-    /// Resolve only strongly supported exact ties with the guarded MAP rule.
-    #[default]
-    GuardedMap,
-}
-
-impl std::fmt::Display for ExactTiePolicy {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Ambiguous => formatter.write_str("ambiguous"),
-            Self::GuardedMap => formatter.write_str("guarded-map"),
-        }
-    }
-}
-
 /// Configuration for the taxonomy profiler.
 ///
 /// This structure holds all parameters that control profiling behavior,
@@ -638,9 +599,6 @@ impl std::fmt::Display for ExactTiePolicy {
 /// - `min_coebr`: Minimum observed/expected chunk breadth ratio
 #[derive(Debug, Clone)]
 pub struct ProfilerConfig {
-    /// Development: profile with the level-wise engine (`community/levels.rs`).
-    pub level_engine: bool,
-
     /// Development: with the level-wise engine, also profile genomes within
     /// each species (`--strain` with `--level-engine`).
     pub genome_level: bool,
@@ -660,10 +618,6 @@ pub struct ProfilerConfig {
     /// Affects default threshold selection
     pub sequencer: Sequencer,
 
-    /// Number of reads to process per batch
-    /// Larger batches improve throughput but use more memory
-    pub batch_size: usize,
-
     /// Maximum EM iterations for ambiguous-read redistribution.
     pub max_em_iterations: usize,
 
@@ -673,10 +627,6 @@ pub struct ProfilerConfig {
     /// Whether input is paired-end Illumina data
     /// Affects read name parsing and coverage calculation
     pub is_paired: bool,
-
-    /// How exact cross-species short-read score ties contribute coordinate
-    /// evidence.
-    pub exact_ties: ExactTiePolicy,
 
     /// Minimum mapping identity threshold (0.0-1.0), against the mapper's
     /// canonical per-base identity.
@@ -764,12 +714,6 @@ pub struct ProfilerConfig {
     /// comparison is strict. Default 0.30.
     pub low_map_rate_threshold: f64,
 
-    /// Enable genus-level assignment for mappings that miss species cutoffs.
-    pub genus_fallback: bool,
-
-    /// Require both p-value columns to meet the cutoff when both are available.
-    pub strict: bool,
-
     /// Path to pathogen-host mapping TSV (optional)
     pub pathogen_host: Option<String>,
 
@@ -805,9 +749,6 @@ pub struct ProfilerConfig {
     /// Skip references whose taxids the taxonomy dump cannot resolve instead
     /// of failing (--skip-missing-taxa).
     pub ignore_unresolved_references: bool,
-
-    /// Enable strain-level profiling
-    pub strain: bool,
 }
 
 /// Combine the mapped-length and mapped-fraction coverage checks per the
@@ -865,26 +806,6 @@ impl ProfilerConfig {
     /// - Fall back to total-read basis in all other cases.
     pub fn resolve_by_aligned(&self, mapping_rate: f64) -> bool {
         self.by_aligned || self.is_low_map_run(mapping_rate)
-    }
-
-    /// Read count passed into community chunk-breadth estimation when
-    /// `--min-chunk-breadth` is unset.
-    ///
-    /// Uses mapped vs total reads according to [`Self::resolve_by_aligned`].
-    /// Community-specific fallback/scaling rules that depend on reference DB
-    /// layout are applied by the community profiler, not by this generic
-    /// config helper.
-    pub fn chunk_breadth_basis_reads(
-        &self,
-        mapping_rate: f64,
-        num_reads: usize,
-        aligned_reads: usize,
-    ) -> usize {
-        if self.resolve_by_aligned(mapping_rate) {
-            aligned_reads
-        } else {
-            num_reads
-        }
     }
 
     /// Whether `classify.txt.gz` is written: when requested, for any database
@@ -964,10 +885,7 @@ pub(crate) fn log_resolved_profiler_parameters(
          \tsequencer                    {}\n\
          \tmode                         {:?}\n\
          \tis_paired                    {}\n\
-         \texact_ties                  {}\n\
-         \tstrain                       {}\n\
          \tthreads                      {}\n\
-         \tbatch_size                   {}\n\
          \tmax_em_iterations            {}\n\
          \tidentity                     {:.3}\n\
          \tmapped_len                   {}\n\
@@ -986,11 +904,9 @@ pub(crate) fn log_resolved_profiler_parameters(
          \testimate_unclassified        {}\n\
          \tidentity_margin              {}\n\
          \tby_mapped                    {}\n\
-         \tgenus_fallback               {}\n\
          \tgenus_identity               {:.3}\n\
          \tlow_map_rate_threshold       {:.3}\n\
          \tlowbiomass                   {}\n\
-         \tstrict                       {}\n\
          \tkeep_raw                     {}\n\
          \tsave_classifications         {}\n\
          \tlenient_mapping_input        {}\n\
@@ -1005,10 +921,7 @@ pub(crate) fn log_resolved_profiler_parameters(
         cfg.sequencer,
         cfg.mode,
         cfg.is_paired,
-        cfg.exact_ties,
-        cfg.strain,
         cfg.threads,
-        cfg.batch_size,
         cfg.max_em_iterations,
         cfg.identity,
         cfg.mapped_len,
@@ -1027,11 +940,9 @@ pub(crate) fn log_resolved_profiler_parameters(
         cfg.estimate_unclassified,
         display_option(cfg.identity_margin),
         cfg.by_aligned,
-        cfg.genus_fallback,
         cfg.genus_identity,
         cfg.low_map_rate_threshold,
         cfg.lowbiomass,
-        cfg.strict,
         cfg.keep_raw,
         cfg.save_classifications,
         cfg.lenient_mapping_input,
@@ -1100,13 +1011,7 @@ impl Profiler {
     ///
     /// Ok(()) on success, or an error if profiling fails.
     pub fn run(&self) -> Result<()> {
-        if self.cfg.strain {
-            // Strain-level profiling for higher resolution
-            strain::StrainProfiler::new(self.cfg.clone(), self.taxonomy.clone())?.run()
-        } else {
-            // Species-level community profiling (default)
-            community::CommunityProfiler::new(self.cfg.clone(), self.taxonomy.clone())?.run()
-        }
+        community::CommunityProfiler::new(self.cfg.clone(), self.taxonomy.clone())?.run()
     }
 
     /// Run profiling from structured in-process Metam mappings, avoiding
@@ -1116,13 +1021,8 @@ impl Profiler {
         receiver: MetamMappingReceiver,
         source: &str,
     ) -> Result<()> {
-        if self.cfg.strain {
-            strain::StrainProfiler::new(self.cfg.clone(), self.taxonomy.clone())?
-                .run_with_metam_mappings(receiver, source)
-        } else {
-            community::CommunityProfiler::new(self.cfg.clone(), self.taxonomy.clone())?
-                .run_with_metam_mappings(receiver, source)
-        }
+        community::CommunityProfiler::new(self.cfg.clone(), self.taxonomy.clone())?
+            .run_with_metam_mappings(receiver, source)
     }
 }
 
@@ -1307,8 +1207,8 @@ mod reference_taxonomy_tests {
 #[cfg(test)]
 mod subsample_scaling_tests {
     use super::{
-        equivalent_read_count_passes_minimum, push_string_keyed_value,
-        record_genome_sampling_scale, sampling_scale_from_sizes, strip_pair_suffix, ReadSupport,
+        push_string_keyed_value, record_genome_sampling_scale, sampling_scale_from_sizes,
+        strip_pair_suffix,
     };
     use std::collections::HashMap;
 
@@ -1343,35 +1243,6 @@ mod subsample_scaling_tests {
     }
 
     #[test]
-    fn mixed_full_and_fractional_support_is_scaled_before_taxon_aggregation() {
-        let mut support = ReadSupport::default();
-        support.add_weighted(1.0, 1.0, 1.0);
-        support.add_weighted(1.0, 10.0, 1.0);
-
-        assert_close(support.observed, 2.0);
-        assert_close(support.equivalent, 11.0);
-        assert!(equivalent_read_count_passes_minimum(
-            support.equivalent,
-            Some(10)
-        ));
-        assert!(!equivalent_read_count_passes_minimum(
-            support.equivalent,
-            Some(12)
-        ));
-    }
-
-    #[test]
-    fn em_weight_is_applied_to_observed_and_equivalent_support() {
-        let mut support = ReadSupport::default();
-        // Two ambiguous reads: one from a full genome (1x) and one from a
-        // 10%-indexed genome (10x), assigned to this taxon at 25%.
-        support.add_weighted(2.0, 11.0, 0.25);
-
-        assert_close(support.observed, 0.5);
-        assert_close(support.equivalent, 2.75);
-    }
-
-    #[test]
     fn borrowed_mapping_keys_are_owned_only_once() {
         let mut values = HashMap::new();
         push_string_keyed_value(&mut values, "read", 1usize);
@@ -1394,21 +1265,18 @@ mod chunk_basis_tests {
     use crate::progress::ProgressOptions;
     use crate::sequencer::Sequencer;
 
-    use super::{scale_automatic_chunk_breadth, ExactTiePolicy, ProfileMode, ProfilerConfig};
+    use super::{scale_automatic_chunk_breadth, ProfileMode, ProfilerConfig};
 
     fn minimal_cfg() -> ProfilerConfig {
         ProfilerConfig {
-            level_engine: false,
             genome_level: false,
             mapper_mappings: None,
             mapping_profile_memory: None,
             db_metadata: None,
             sequencer: Sequencer::Illumina,
-            batch_size: 1,
             max_em_iterations: 200,
             lenient_mapping_input: false,
             is_paired: false,
-            exact_ties: ExactTiePolicy::GuardedMap,
             identity: 0.97,
             noisy_long_reads: false,
             identity_check_accuracy: None,
@@ -1431,8 +1299,6 @@ mod chunk_basis_tests {
             by_aligned: false,
             genus_identity: 0.80,
             low_map_rate_threshold: 0.30,
-            genus_fallback: false,
-            strict: false,
             pathogen_host: None,
             host: None,
             threads: 1,
@@ -1444,7 +1310,6 @@ mod chunk_basis_tests {
             mode: ProfileMode::Default,
             dmp_dir: None,
             ignore_unresolved_references: false,
-            strain: false,
         }
     }
 
@@ -1460,54 +1325,25 @@ mod chunk_basis_tests {
     }
 
     #[test]
-    fn chunk_basis_genus_fallback_non_low_map_uses_total_reads_without_by_aligned() {
+    fn mapped_reads_are_the_chunk_basis_on_low_map_runs_or_when_asked() {
         let mut cfg = minimal_cfg();
-        cfg.genus_fallback = true;
-        // High mapping rate => not low-map; no --by-mapped flag.
-        let basis = cfg.chunk_breadth_basis_reads(0.99, 1_000_000, 500_000);
-        assert_eq!(
-            basis, 1_000_000,
-            "explicit genus-fallback alone must not force mapped-read basis on non-low-map runs"
-        );
-    }
-
-    #[test]
-    fn chunk_basis_genus_fallback_non_low_map_honours_by_aligned() {
-        let mut cfg = minimal_cfg();
-        cfg.genus_fallback = true;
+        assert!(!cfg.resolve_by_aligned(0.99));
+        assert!(cfg.resolve_by_aligned(0.10));
         cfg.by_aligned = true;
-        let basis = cfg.chunk_breadth_basis_reads(0.99, 1_000_000, 500_000);
-        assert_eq!(
-            basis, 500_000,
-            "--genus-fallback must not override an explicit --by-mapped basis"
-        );
-    }
-
-    #[test]
-    fn chunk_basis_low_map_unaffected_by_genus_fallback_flag_for_basis_rule() {
-        let mut cfg = minimal_cfg();
-        cfg.genus_fallback = true;
-        // Low-map Illumina: auto by-mapped => mapped basis unless user overrode.
-        let basis = cfg.chunk_breadth_basis_reads(0.10, 1_000_000, 100_000);
-        assert_eq!(basis, 100_000);
+        assert!(cfg.resolve_by_aligned(0.99));
     }
 
     #[test]
     fn low_map_run_covers_read_platforms_but_not_assembly() {
         let mut cfg = minimal_cfg();
-        // Every read platform honours the low-map auto-trigger, so genus
-        // fallback and the mapped-read basis reach long reads without an
-        // explicit flag.
+        // Every read platform honours the low-map auto-trigger, so the
+        // mapped-read basis reaches long reads without an explicit flag.
         for seq in [Sequencer::Illumina, Sequencer::Nanopore, Sequencer::PacBio] {
             cfg.sequencer = seq;
             assert!(cfg.is_low_map_run(0.10), "{seq}: low rate must be low-map");
             assert!(!cfg.is_low_map_run(0.99), "{seq}: high rate is not low-map");
             // Low-map runs flip the chunk-breadth basis to aligned reads.
-            assert_eq!(
-                cfg.chunk_breadth_basis_reads(0.10, 1_000_000, 100_000),
-                100_000,
-                "{seq}"
-            );
+            assert!(cfg.resolve_by_aligned(0.10), "{seq}");
         }
         // Pathogen-detection mode (host set) suppresses it on any platform.
         cfg.sequencer = Sequencer::Nanopore;

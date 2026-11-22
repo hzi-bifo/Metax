@@ -57,10 +57,9 @@ use rayon::prelude::*;
 use super::{add_marker_genome_reads, fragment_depth, CommunityProfiler, MappingData};
 use crate::profiler::evidence::{
     calculate_coverage, standard_ratio_lower_bounds, CandidatePlacement, CandidateScratch,
-    EvidenceCoverage, EvidenceMode, EvidencePolicy, GeneHit, PremapChunkGuard, PresenceAssembly,
-    PresenceInterval, RescueKinds, TerminalCandidate, WitnessDecision, STANDARD_RATIO_UPPER,
+    EvidenceCoverage, EvidenceMode, EvidencePolicy, GeneHit, PresenceAssembly, PresenceInterval,
+    TerminalCandidate, WitnessDecision, STANDARD_RATIO_UPPER,
 };
-use crate::profiler::identity::MIN_JUDGED_SPECIES;
 use crate::profiler::likelihood_em::{self, ReadGroups};
 use crate::profiler::markers::MarkerModel;
 use crate::profiler::output::{BestFitReport, ProfileRow};
@@ -112,6 +111,8 @@ const MIN_WON_SHARE: f64 = 0.3;
 /// chunks stay evenly covered, which the chunk-level ratio (COEBR) still tests
 /// at its own bound.
 const SPECIES_MIN_OEBR: f64 = 0.6;
+/// Fewest species with best placements for an identity baseline to be taken.
+const MIN_JUDGED_SPECIES: usize = 3;
 /// Share of the read groups' weight that may still change when the EM stops.
 const EM_TOLERANCE: f64 = 1e-7;
 /// The sample's error rate is measured on this share of the fragments that
@@ -454,9 +455,6 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         identity: cfg.genus_identity,
         mapped_len: super::genus_fallback_min_mapped_len(cfg),
         fraction: super::GENUS_FALLBACK_MIN_FRACTION,
-        collect_exact_ties: false,
-        collect_identities: false,
-        collect_best_placements: false,
         ..policy
     };
     // On noisy long reads many reads of a present species align below the
@@ -915,12 +913,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     } else {
         PROFILE_COLUMNS.to_vec()
     };
-    profiler.write_profile(
-        &header.lines("profile", &columns),
-        &rows,
-        unclassified,
-        true,
-    )?;
+    profiler.write_profile(&header.lines("profile", &columns), &rows, unclassified)?;
     if let Some(finals) = finals {
         let decisions_table = Decisions {
             genomes: &genomes,
@@ -2344,8 +2337,6 @@ fn species_decisions(
                 ..coverage
             },
             standard: genome.kept,
-            rescues: RescueKinds::default(),
-            required_premap_guard: PremapChunkGuard::default(),
         };
         let (id, decision) = match decisions.get(&genome.taxid) {
             Some(&(current, current_id)) => {
@@ -2868,8 +2859,6 @@ mod test_fixtures {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use metam::mapper::CandidateBoundary;
-
     use crate::profiler::community::{MappingData, ReadBundle};
     use crate::profiler::evidence::{EvidenceAlignment, MappingRole};
     use crate::profiler::ProfileRank;
@@ -2877,15 +2866,12 @@ mod test_fixtures {
     /// A single-end read of 100 bases aligned over its whole length.
     pub(super) fn row(taxid: u32, assembly: u32, identity: f32) -> EvidenceAlignment {
         EvidenceAlignment {
-            asm: Arc::from(format!("asm{assembly}")),
-            acc: Arc::from(format!("ref{assembly}")),
             profile_taxid: taxid,
             profile_rank: ProfileRank::Species,
             reference_id: assembly,
             assembly_id: assembly,
             role: MappingRole::Unpaired,
             pair_id: 0,
-            candidate_boundary: CandidateBoundary::COMPLETE,
             sampling_scale: 1.0,
             asm_len: 1_000_000.0,
             identity,
@@ -2909,19 +2895,11 @@ mod test_fixtures {
                     alignments,
                 })
                 .collect(),
-            asm_lengths: Arc::new(HashMap::new()),
-            min_breadth: 0.0,
             min_chunk_breadth: 0.0,
-            safeguard_min_chunk_breadth: 0.0,
             has_scaled_genomes: false,
             total_reads: 0,
-            aligned_reads: 0,
-            mapping_rate: 1.0,
-            fallback_mode: false,
-            species_to_genus: Arc::new(HashMap::new()),
             genus_of_species: Arc::new(HashMap::new()),
             terminal_ranks: Arc::new(HashMap::new()),
-            skipped_reference_at_load: 0,
             marker_model: None,
             genus_rollup: None,
             unclassified_species: None,
@@ -3042,9 +3020,6 @@ mod tests {
             identity: 0.97,
             mapped_len: 50,
             fraction: 0.5,
-            collect_exact_ties: false,
-            collect_identities: false,
-            collect_best_placements: false,
         };
         let decision = |coebr: f64| WitnessDecision {
             metrics: EvidenceCoverage {
@@ -3053,8 +3028,6 @@ mod tests {
                 ..EvidenceCoverage::default()
             },
             standard: false,
-            rescues: RescueKinds::default(),
-            required_premap_guard: PremapChunkGuard::default(),
         };
         let rollup = rollup();
         let (rows, offered) = orphan_genus_rows(
@@ -3595,9 +3568,6 @@ mod tests {
             identity: 0.95,
             mapped_len: 50,
             fraction: 0.6,
-            collect_exact_ties: false,
-            collect_identities: false,
-            collect_best_placements: false,
         };
         let mut scratch = CandidateScratch::default();
         let candidates = scratch.build(&data.read_alignments[0].alignments, policy);
@@ -3813,9 +3783,6 @@ mod tests {
             identity,
             mapped_len: 50,
             fraction: 0.6,
-            collect_exact_ties: false,
-            collect_identities: false,
-            collect_best_placements: false,
         };
         let genus_of = HashMap::from([(2, 100), (3, 100), (4, 200)]);
         let mut scratch = CandidateScratch::default();
@@ -3932,9 +3899,6 @@ mod tests {
             identity: 0.8,
             mapped_len: 50,
             fraction: 0.5,
-            collect_exact_ties: false,
-            collect_identities: false,
-            collect_best_placements: false,
         };
         let fragments = (0..3)
             .map(|read| Fragment {
@@ -4028,9 +3992,6 @@ mod tests {
             identity: 0.80,
             mapped_len: 50,
             fraction: 0.6,
-            collect_exact_ties: false,
-            collect_identities: false,
-            collect_best_placements: false,
         };
         let mut scratch = CandidateScratch::default();
         let candidates = scratch.build(&data.read_alignments[0].alignments, policy);
@@ -4058,9 +4019,6 @@ mod tests {
             identity: 0.80,
             mapped_len: 50,
             fraction: 0.6,
-            collect_exact_ties: false,
-            collect_identities: false,
-            collect_best_placements: false,
         };
         let weight = HashMap::from([(2, 30.0), (3, 10.0)]);
         let reported = HashMap::from([(2, 20), (3, 30)]);

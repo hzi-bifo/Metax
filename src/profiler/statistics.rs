@@ -402,65 +402,15 @@ pub(crate) fn calc_breadth_pvalue(
     pvalue_binomial_approx(read_count, depth, breadth, p, side)
 }
 
-/// Round to the five decimal places the profile outputs carry.
-pub(crate) fn round5(value: f64) -> f64 {
-    (value * 100000.0).round() / 100000.0
-}
-
 /// Observed-to-expected coverage ratios that agree with the model. A coverage
 /// p-value inside this window is 1.0 without testing: with many reads any small
 /// deviation would test as significant, so a p-value would only measure
 /// sampling depth.
 pub(crate) const NEUTRAL_RATIO: std::ops::RangeInclusive<f64> = 0.9..=1.2;
 
-/// Significance of a coverage observation against its expectation, corrected
-/// for the number of taxa tested.
-///
-/// Ratios inside [`NEUTRAL_RATIO`] are reported as 1.0 without testing.
-/// Outside it, the deviation is tested one-sided towards whichever direction
-/// it fell.
-///
-/// `depth` is supplied for breadth, where it identifies the genome length the
-/// occupancy model needs, and omitted for chunk coverage, which infers its own.
-pub(crate) fn coverage_deviation_pvalue(
-    observed: f64,
-    expected: f64,
-    depth: Option<f64>,
-    mapcount: f64,
-    tests: usize,
-) -> Option<f64> {
-    if expected <= 0.0 {
-        return None;
-    }
-    let ratio = observed / expected;
-    if !ratio.is_finite() {
-        return None;
-    }
-    if NEUTRAL_RATIO.contains(&ratio) {
-        return Some(1.0);
-    }
-    let side = if observed < expected {
-        Tail::Lower
-    } else {
-        Tail::Upper
-    };
-    let pvalue = if (observed - expected).abs() <= f64::EPSILON {
-        Some(1.0)
-    } else {
-        calc_breadth_pvalue(
-            mapcount.round() as usize,
-            depth,
-            observed,
-            Some(expected),
-            side,
-        )
-    };
-    pvalue.map(|value| (value * tests as f64).min(1.0))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{calc_breadth_pvalue, coverage_deviation_pvalue, Tail};
+    use super::{calc_breadth_pvalue, Tail};
 
     #[test]
     fn handles_expected_breadth_near_one() {
@@ -468,97 +418,5 @@ mod tests {
             .expect("expected a numeric p-value");
         assert!(value.is_finite());
         assert!((0.0..=1.0).contains(&value));
-    }
-
-    /// The open-coded form this helper replaced, kept verbatim as an oracle.
-    /// Its redundant branches are the point of the comparison, so they stay.
-    #[allow(clippy::if_same_then_else, clippy::manual_range_contains)]
-    fn inline_oracle(
-        observed: f64,
-        expected: f64,
-        depth: Option<f64>,
-        mapcount: f64,
-        tests: usize,
-    ) -> Option<f64> {
-        if expected > 0.0 {
-            let ratio = observed / expected;
-            if ratio.is_finite() {
-                let read_count = mapcount.round() as usize;
-                if ratio < 0.9 || ratio > 1.2 {
-                    let side = if observed < expected {
-                        Tail::Lower
-                    } else if observed > expected {
-                        Tail::Upper
-                    } else {
-                        Tail::Upper
-                    };
-                    let pvalue = if (observed - expected).abs() <= f64::EPSILON {
-                        Some(1.0)
-                    } else {
-                        calc_breadth_pvalue(read_count, depth, observed, Some(expected), side)
-                    };
-                    pvalue.map(|p| (p * tests as f64).min(1.0))
-                } else {
-                    Some(1.0)
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
-    #[test]
-    fn helper_matches_the_open_coded_form_it_replaced() {
-        let mut state = 0x243f_6a88_85a3_08d3u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        // Boundary values of every branch: the neutral window edges, zero and
-        // negative expectations, equality, and non-finite ratios.
-        let edges = [
-            0.0, f64::MIN_POSITIVE, 1e-16, 0.9, 1.2, 1.0, 0.5, -1.0, f64::NAN, f64::INFINITY,
-        ];
-        let mut checked = 0;
-        for &observed in &edges {
-            for &expected in &edges {
-                for depth in [None, Some(0.0), Some(12.5)] {
-                    for mapcount in [0.0, 0.5, 1.0, 4096.0] {
-                        for tests in [0, 1, 5000] {
-                            let (a, b) = (
-                                coverage_deviation_pvalue(
-                                    observed, expected, depth, mapcount, tests,
-                                ),
-                                inline_oracle(observed, expected, depth, mapcount, tests),
-                            );
-                            assert_eq!(a, b, "{observed} {expected} {depth:?} {mapcount} {tests}");
-                            checked += 1;
-                        }
-                    }
-                }
-            }
-        }
-        for _ in 0..20_000 {
-            let observed = (next() >> 11) as f64 / (1u64 << 53) as f64 * 1.5;
-            let expected = (next() >> 11) as f64 / (1u64 << 53) as f64 * 1.5;
-            let depth = if next() & 1 == 0 {
-                None
-            } else {
-                Some((next() >> 11) as f64 / (1u64 << 53) as f64 * 50.0)
-            };
-            let mapcount = (next() % 100_000) as f64 / 10.0;
-            let tests = (next() % 10_000) as usize;
-            let (a, b) = (
-                coverage_deviation_pvalue(observed, expected, depth, mapcount, tests),
-                inline_oracle(observed, expected, depth, mapcount, tests),
-            );
-            assert_eq!(a, b, "{observed} {expected} {depth:?} {mapcount} {tests}");
-            checked += 1;
-        }
-        assert!(checked > 20_000);
     }
 }

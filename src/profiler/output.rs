@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
@@ -52,35 +51,6 @@ pub(crate) struct ProfileRow {
     pub(crate) annotations: Option<ProfileAnnotations>,
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum ClassificationSource {
-    Direct,
-    Candidates(Vec<u32>),
-}
-
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ResolvedClassificationKey {
-    pub(crate) taxid: u32,
-    pub(crate) source: ClassificationSource,
-}
-
-#[derive(Debug)]
-pub(crate) struct ResolvedClassificationGroup {
-    pub(crate) key: ResolvedClassificationKey,
-    pub(crate) count: usize,
-    pub(crate) reads: Vec<String>,
-}
-
-impl ResolvedClassificationGroup {
-    /// Borrow read names in deterministic lexical order without cloning their
-    /// strings. Called only when optional classification output is requested.
-    pub(crate) fn sorted_reads(&self) -> Vec<&str> {
-        let mut reads = self.reads.iter().map(String::as_str).collect::<Vec<_>>();
-        reads.sort_unstable();
-        reads
-    }
-}
-
 /// Gzip writer of the per-read classifications, `<prefix>.classify.txt.gz`.
 pub(crate) type ClassificationWriter = BufWriter<GzEncoder<File>>;
 
@@ -102,128 +72,7 @@ pub(crate) fn finish_classification_writer(writer: ClassificationWriter) -> Resu
     Ok(())
 }
 
-/// Grouped classifications retained until final taxon filtering.
-///
-/// Read names are held only when classification output was explicitly
-/// requested. Counts are always kept so progress summaries can describe the
-/// same retained assignments as `profile.txt` without imposing per-read
-/// memory on normal runs.
-#[derive(Debug, Default)]
-pub(crate) struct ResolvedClassifications {
-    indices: HashMap<ResolvedClassificationKey, usize>,
-    pub(crate) groups: Vec<ResolvedClassificationGroup>,
-    retain_read_names: bool,
-}
-
-impl ResolvedClassifications {
-    pub(crate) fn new(retain_read_names: bool) -> Self {
-        Self {
-            retain_read_names,
-            ..Self::default()
-        }
-    }
-
-    /// Borrow classification groups in a stable output order. The temporary
-    /// vector contains pointers only and is allocated solely for `classify.txt.gz`.
-    pub(crate) fn sorted_groups(&self) -> Vec<&ResolvedClassificationGroup> {
-        let mut groups = self.groups.iter().collect::<Vec<_>>();
-        groups.sort_unstable_by(|left, right| left.key.cmp(&right.key));
-        groups
-    }
-
-    /// Move the groups of the taxa in `relabel` to their new taxid, naming the
-    /// old taxid as their source.
-    pub(crate) fn relabel(&mut self, relabel: &HashMap<u32, u32>) {
-        if relabel.is_empty() {
-            return;
-        }
-        self.indices.clear();
-        for group in std::mem::take(&mut self.groups) {
-            let ResolvedClassificationKey { taxid, source } = group.key;
-            let (taxid, source) = match (relabel.get(&taxid), source) {
-                (Some(&to), ClassificationSource::Direct) => {
-                    (to, ClassificationSource::Candidates(vec![taxid]))
-                }
-                (Some(&to), source) => (to, source),
-                (None, source) => (taxid, source),
-            };
-            self.record(taxid, source, group.count, Some(group.reads));
-        }
-    }
-
-    pub(crate) fn record_read(&mut self, taxid: u32, read: &str) {
-        let reads = self.retain_read_names.then(|| vec![read.to_string()]);
-        self.record(taxid, ClassificationSource::Direct, 1, reads);
-    }
-
-    pub(crate) fn record_direct_group(
-        &mut self,
-        taxid: u32,
-        count: usize,
-        reads: Option<Vec<String>>,
-    ) {
-        self.record(taxid, ClassificationSource::Direct, count, reads);
-    }
-
-    pub(crate) fn record_group(
-        &mut self,
-        taxid: u32,
-        source_taxids: Vec<u32>,
-        count: usize,
-        reads: Option<Vec<String>>,
-    ) {
-        self.record(
-            taxid,
-            ClassificationSource::Candidates(source_taxids),
-            count,
-            reads,
-        );
-    }
-
-    fn record(
-        &mut self,
-        taxid: u32,
-        source: ClassificationSource,
-        count: usize,
-        reads: Option<Vec<String>>,
-    ) {
-        if count == 0 {
-            return;
-        }
-        let key = ResolvedClassificationKey { taxid, source };
-        if let Some(&index) = self.indices.get(&key) {
-            let group = &mut self.groups[index];
-            group.count = group.count.saturating_add(count);
-            if self.retain_read_names {
-                if let Some(mut reads) = reads {
-                    group.reads.append(&mut reads);
-                }
-            }
-            return;
-        }
-        let index = self.groups.len();
-        self.indices.insert(key.clone(), index);
-        self.groups.push(ResolvedClassificationGroup {
-            key,
-            count,
-            reads: if self.retain_read_names {
-                reads.unwrap_or_default()
-            } else {
-                Vec::new()
-            },
-        });
-    }
-}
-
 impl ProfileRow {
-    pub(crate) fn normalize_abundance(&mut self, total_abundance: f64) {
-        self.abundance = if total_abundance > 0.0 && total_abundance.is_finite() {
-            self.abundance / total_abundance * 100.0
-        } else {
-            0.0
-        };
-    }
-
     pub(crate) fn write<W: Write>(&self, writer: &mut Writer<W>) -> csv::Result<()> {
         let mut fields = Vec::with_capacity(if self.annotations.is_some() { 18 } else { 15 });
         fields.push(self.taxname.clone());
@@ -290,10 +139,7 @@ fn format_known(value: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BestFitReport, ClassificationSource, ProfileAnnotations, ProfileRow,
-        ResolvedClassifications,
-    };
+    use super::{BestFitReport, ProfileAnnotations, ProfileRow};
     use std::sync::Arc;
 
     fn row() -> ProfileRow {
@@ -314,13 +160,6 @@ mod tests {
             best_fit: None,
             annotations: None,
         }
-    }
-
-    #[test]
-    fn normalization_uses_unrounded_abundance() {
-        let mut row = row();
-        row.normalize_abundance(0.5);
-        assert_eq!(row.abundance, 50.0);
     }
 
     #[test]
@@ -389,33 +228,5 @@ mod tests {
         row.write(&mut writer).unwrap();
         let text = String::from_utf8(writer.into_inner().unwrap()).unwrap();
         assert_eq!(text.trim_end().split('\t').nth(8), Some("1.000000e-5"));
-    }
-
-    #[test]
-    fn count_only_classifications_do_not_retain_read_names() {
-        let mut classifications = ResolvedClassifications::new(false);
-        classifications.record_read(101, "read-one");
-        classifications.record_read(101, "read-two");
-        assert_eq!(classifications.groups.len(), 1);
-        assert_eq!(classifications.groups[0].count, 2);
-        assert!(classifications.groups[0].reads.is_empty());
-    }
-
-    #[test]
-    fn classification_views_are_sorted_without_mutating_storage() {
-        let mut classifications = ResolvedClassifications::new(true);
-        classifications.record(
-            202,
-            ClassificationSource::Candidates(vec![202, 303]),
-            1,
-            Some(vec!["read-z".to_string(), "read-a".to_string()]),
-        );
-        classifications.record_read(101, "read-c");
-
-        let groups = classifications.sorted_groups();
-        assert_eq!(groups[0].key.taxid, 101);
-        assert_eq!(groups[1].key.taxid, 202);
-        assert_eq!(groups[1].sorted_reads(), vec!["read-a", "read-z"]);
-        assert_eq!(classifications.groups[0].reads[0], "read-z");
     }
 }

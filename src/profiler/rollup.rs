@@ -331,7 +331,6 @@ impl<'a> OrphanedFragments<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profiler::evidence::{PremapChunkGuard, RescueKinds};
 
     fn interval(reference_id: u32, start: u32) -> PresenceInterval {
         PresenceInterval {
@@ -351,8 +350,6 @@ mod tests {
                 ..EvidenceCoverage::default()
             },
             standard: false,
-            rescues: RescueKinds::default(),
-            required_premap_guard: PremapChunkGuard::None,
         }
     }
 
@@ -370,8 +367,6 @@ mod tests {
                 ..EvidenceCoverage::default()
             },
             standard: accepted,
-            rescues: RescueKinds::default(),
-            required_premap_guard: PremapChunkGuard::None,
         }
     }
 

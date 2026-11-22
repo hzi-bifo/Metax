@@ -15,7 +15,7 @@ use mapper::{
     existing_mapping_output, is_mapping_consumer_closed, Mapper, MappingOutput, MappingProgressLog,
     StreamingStructuredMappingOutput,
 };
-use profiler::{ExactTiePolicy, Profiler, ProfilerConfig};
+use profiler::{Profiler, ProfilerConfig};
 use taxonomy::{Taxonomy, TaxonomyRecord};
 
 use crate::db::{
@@ -50,7 +50,6 @@ enum PreparedMapping {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ResolvedProfilerThresholds {
-    batch_size: usize,
     identity: f64,
     mapped_len: usize,
     fraction: f64,
@@ -75,8 +74,6 @@ impl ResolvedProfilerThresholds {
 // CLI-facing configuration that gets resolved into profiler settings.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
-    /// Development: profile with the level-wise engine.
-    pub level_engine: bool,
     /// Development: the level-wise engine's genome level (`--strain` with
     /// `--level-engine`).
     pub genome_level: bool,
@@ -93,11 +90,8 @@ pub struct AppConfig {
     pub reuse_mappings: Option<String>,
     pub sequencer: Sequencer,
     pub is_paired: bool,
-    pub exact_ties: ExactTiePolicy,
-    pub strain: bool,
     pub mode: ProfileMode,
     // Optional overrides for profiling thresholds.
-    pub batch_size: Option<usize>,
     pub max_em_iterations: usize,
     pub lenient_mapping_input: bool,
     pub identity: Option<f64>,
@@ -139,12 +133,6 @@ pub struct AppConfig {
     pub genus_identity: f64,
     /// Strict upper bound on mapping rate for the low-map path (default 0.30).
     pub low_map_rate_threshold: f64,
-    /// Enable genus-level fallback regardless of mapping rate (community profiler).
-    /// Does not by itself apply the 1.5x low-map chunk-basis scaling.
-    pub genus_fallback: bool,
-    /// Require BOTH `cov_prob` and `chunk_prob` to pass the cutoff when
-    /// filtering the final taxa list (AND instead of OR).
-    pub strict: bool,
     pub keep_mapping_output: bool,
     /// Use the direct mapper-to-profiler channel instead of disk staging.
     pub stream_mappings: bool,
@@ -227,19 +215,18 @@ fn identity_below_accuracy(accuracy: f64, mode: ProfileMode) -> f64 {
 
 impl AppConfig {
     /// Whether the mapper keeps strain-level candidates, the best mapping of
-    /// every genome: for the strain profiler and for the level-wise engine's
-    /// genome level. Mapping files record it as `strain=`.
+    /// every genome: for the genome level. Mapping files record it as
+    /// `strain=`.
     fn strain_level_mapping(&self) -> bool {
-        self.strain || self.genome_level
+        self.genome_level
     }
 
     /// Whether this run takes the read-level gates recorded in a reused
-    /// mapping file: one made in the same mode, for the same profiler. The
-    /// genome level uses the community gates, whether its mapping kept
-    /// strain-level candidates or not.
+    /// mapping file: one made in the same mode, and, without the genome level,
+    /// one made without strain-level candidates.
     fn takes_recorded_gates(&self, metadata: &MappingRunMetadata) -> bool {
         metadata.mapper_mode == self.mode.as_str()
-            && (self.genome_level || metadata.profiler.strain == self.strain)
+            && (self.genome_level || !metadata.profiler.strain)
     }
 
     /// `--identity-margin` and `--relative-identity-gap` for this run. On a
@@ -247,8 +234,7 @@ impl AppConfig {
     /// indexed relatives; single-end short reads have no mate to tell them
     /// apart, so both guards are on there unless given or switched off.
     fn identity_guards(&self, fractional: bool) -> (Option<f64>, Option<f64>) {
-        let fractional_single_end =
-            fractional && self.sequencer.is_illumina() && !self.is_paired && !self.strain;
+        let fractional_single_end = fractional && self.sequencer.is_illumina() && !self.is_paired;
         let margin = self.identity_margin.or_else(|| {
             (fractional_single_end && !self.no_identity_margin).then_some(DEFAULT_IDENTITY_MARGIN)
         });
@@ -622,7 +608,7 @@ impl MetaxApp {
             if self.config.is_paired {
                 flags.push("--is-paired".to_string());
             }
-            if self.config.strain {
+            if self.config.genome_level {
                 flags.push("--strain".to_string());
             }
             if self.config.lowbiomass {
@@ -637,13 +623,7 @@ impl MetaxApp {
             if self.config.by_aligned {
                 flags.push("--by-mapped".to_string());
             }
-            if self.config.strict {
-                flags.push("--strict".to_string());
-            }
-            if self.config.genus_fallback {
-                flags.push("--genus-fallback".to_string());
-            }
-            if !self.config.removed_to_genus && !self.config.strain {
+            if !self.config.removed_to_genus {
                 flags.push("--strict-coverage".to_string());
             }
             if self.config.estimate_unclassified {
@@ -691,8 +671,6 @@ impl MetaxApp {
                 "    --temp-dir {} \\\n",
                 "    --sequencer {} \\\n",
                 "    --mode {} \\\n",
-                "    --exact-ties {} \\\n",
-                "    --batch-size {} \\\n",
                 "    --max-em-iterations {} \\\n",
                 "    --min-identity {} \\\n",
                 "    -m {} \\\n",
@@ -720,8 +698,6 @@ impl MetaxApp {
             fmt_option(&self.config.temp_dir),
             self.config.sequencer,
             mode,
-            self.config.exact_ties,
-            fmt_option(&self.config.batch_size),
             self.config.max_em_iterations,
             fmt_option(&self.config.identity),
             fmt_option(&self.config.mapped_len),
@@ -776,7 +752,6 @@ impl MetaxApp {
     ) -> ResolvedProfilerThresholds {
         // Fill in default thresholds based on sequencer and profile mode.
         let sequencer = self.config.sequencer;
-        let mut batch_size = self.config.batch_size.unwrap_or(5000);
         let recorded = mapping_metadata
             .filter(|metadata| self.config.takes_recorded_gates(metadata))
             .map(|metadata| metadata.profiler);
@@ -805,53 +780,21 @@ impl MetaxApp {
 
         match sequencer {
             Sequencer::Illumina => {
-                if batch_size == 0 {
-                    batch_size = 5000;
-                }
-                match self.config.mode {
-                    ProfileMode::Recall => {
-                        if self.config.strain {
-                            identity.get_or_insert(0.96);
-                            mapped_len.get_or_insert(50);
-                            fraction.get_or_insert(0.65);
-                        } else {
-                            identity.get_or_insert(0.96);
-                            mapped_len.get_or_insert(50);
-                            fraction.get_or_insert(0.6);
-                        }
-                    }
-                    ProfileMode::Precision => {
-                        if self.config.strain {
-                            identity.get_or_insert(0.98);
-                            mapped_len.get_or_insert(60);
-                            fraction.get_or_insert(0.8);
-                        } else {
-                            identity.get_or_insert(0.98);
-                            mapped_len.get_or_insert(50);
-                            fraction.get_or_insert(0.8);
-                        }
-                    }
-                    ProfileMode::Default => {
-                        // Strain profiling uses a stricter mapped-fraction
-                        // threshold than community profiling.
-                        if self.config.strain {
-                            identity.get_or_insert(0.97);
-                            mapped_len.get_or_insert(50);
-                            fraction.get_or_insert(0.8);
-                        } else {
-                            identity.get_or_insert(0.97);
-                            mapped_len.get_or_insert(50);
-                            fraction.get_or_insert(0.7);
-                        }
-                    }
-                }
+                let (default_identity, default_mapped, default_fraction) = match self.config.mode {
+                    ProfileMode::Recall => (0.96, 50, 0.6),
+                    ProfileMode::Precision => (0.98, 50, 0.8),
+                    ProfileMode::Default => (0.97, 50, 0.7),
+                };
+                identity.get_or_insert(default_identity);
+                mapped_len.get_or_insert(default_mapped);
+                fraction.get_or_insert(default_fraction);
                 // The cutoff leaves the profile mode's room for divergence below
                 // the reads' own base accuracy, averaged over both mates' files
                 // for pairs, so second reads, which carry more sequencing
                 // errors, and lower-quality runs are not held to the error-free
                 // standard. A cutoff the user sets, now or when the mapping was
                 // saved (which then records no accuracy), stays fixed.
-                if !self.config.strain && self.config.identity.is_none() {
+                if self.config.identity.is_none() {
                     let accuracy_source = if sampled_mean_base_accuracy.is_some() {
                         "saved mapping metadata"
                     } else if mapping_metadata.is_some() {
@@ -882,9 +825,6 @@ impl MetaxApp {
                 }
             }
             Sequencer::Nanopore | Sequencer::PacBio => {
-                if batch_size == 0 {
-                    batch_size = 5000;
-                }
                 // One sample of base accuracy serves the run: it tells the
                 // mapper whether the reads are noisy and self-calibrates the
                 // community identity cutoff. Reused mappings carry it, so
@@ -896,61 +836,48 @@ impl MetaxApp {
                     sampled_mean_base_accuracy = self.sample_base_accuracy(0);
                     "input base qualities"
                 };
-                // Strain profiling keeps its own long-read presets. Length and
-                // fraction are combined with OR for long reads.
-                if self.config.strain {
-                    mapped_len.get_or_insert(500);
-                    fraction.get_or_insert(0.30);
-                    identity.get_or_insert(match self.config.mode {
-                        ProfileMode::Recall => 0.90,
-                        ProfileMode::Default => 0.92,
-                        ProfileMode::Precision => 0.94,
-                    });
-                } else {
-                    let (default_identity, default_mapped, default_fraction) =
-                        match self.config.mode {
-                            // Recall relaxes both identity and the
-                            // absolute-length gate.
-                            ProfileMode::Recall => (0.90, 300, 0.20),
-                            ProfileMode::Default => (0.92, 500, 0.20),
-                            ProfileMode::Precision => (0.94, 500, 0.30),
-                        };
-                    // Noisy long-read samples self-calibrate the identity cutoff
-                    // from mean predicted base accuracy.
-                    let calibrated = sampled_mean_base_accuracy.and_then(|accuracy| {
-                        adaptive_identity_from_accuracy(accuracy, self.config.mode)
-                    });
-                    let automatic_identity = calibrated.unwrap_or(default_identity);
-                    if identity.is_none() {
-                        match (calibrated, sampled_mean_base_accuracy) {
-                            (Some(cutoff), Some(accuracy)) => log::info!(
+                // Length and fraction are combined with OR for long reads.
+                let (default_identity, default_mapped, default_fraction) = match self.config.mode {
+                    // Recall relaxes both identity and the
+                    // absolute-length gate.
+                    ProfileMode::Recall => (0.90, 300, 0.20),
+                    ProfileMode::Default => (0.92, 500, 0.20),
+                    ProfileMode::Precision => (0.94, 500, 0.30),
+                };
+                // Noisy long-read samples self-calibrate the identity cutoff
+                // from mean predicted base accuracy.
+                let calibrated = sampled_mean_base_accuracy.and_then(|accuracy| {
+                    adaptive_identity_from_accuracy(accuracy, self.config.mode)
+                });
+                let automatic_identity = calibrated.unwrap_or(default_identity);
+                if identity.is_none() {
+                    match (calibrated, sampled_mean_base_accuracy) {
+                        (Some(cutoff), Some(accuracy)) => log::info!(
+                            target: "PROFILER",
+                            "Long-read identity threshold: {cutoff:.4} (auto-calibrated from {accuracy_source}: mean predicted accuracy {accuracy:.4} < {NOISY_LONG_READ_ACCURACY:.2}, floor {ADAPTIVE_IDENTITY_FLOOR:.2}).",
+                        ),
+                        (None, Some(accuracy)) if accuracy >= NOISY_LONG_READ_ACCURACY => {
+                            log::info!(
                                 target: "PROFILER",
-                                "Long-read identity threshold: {cutoff:.4} (auto-calibrated from {accuracy_source}: mean predicted accuracy {accuracy:.4} < {NOISY_LONG_READ_ACCURACY:.2}, floor {ADAPTIVE_IDENTITY_FLOOR:.2}).",
-                            ),
-                            (None, Some(accuracy)) if accuracy >= NOISY_LONG_READ_ACCURACY => {
-                                log::info!(
-                                    target: "PROFILER",
-                                    "Long-read identity: mean predicted base accuracy {accuracy:.4} from {accuracy_source} >= {NOISY_LONG_READ_ACCURACY:.2}; keeping the preset identity cutoff.",
-                                )
-                            }
-                            _ => {}
+                                "Long-read identity: mean predicted base accuracy {accuracy:.4} from {accuracy_source} >= {NOISY_LONG_READ_ACCURACY:.2}; keeping the preset identity cutoff.",
+                            )
                         }
-                        identity = Some(automatic_identity);
+                        _ => {}
                     }
-                    // The profiler lowers an automatic cutoff, also one saved by
-                    // an earlier automatic run, when the reads align worse than
-                    // their base qualities claim.
-                    if self.config.identity.is_none() && identity == Some(automatic_identity) {
-                        identity_check_accuracy = sampled_mean_base_accuracy;
-                    }
-                    mapped_len.get_or_insert(default_mapped);
-                    fraction.get_or_insert(default_fraction);
+                    identity = Some(automatic_identity);
                 }
+                // The profiler lowers an automatic cutoff, also one saved by
+                // an earlier automatic run, when the reads align worse than
+                // their base qualities claim.
+                if self.config.identity.is_none() && identity == Some(automatic_identity) {
+                    identity_check_accuracy = sampled_mean_base_accuracy;
+                }
+                mapped_len.get_or_insert(default_mapped);
+                fraction.get_or_insert(default_fraction);
             }
         }
 
         ResolvedProfilerThresholds {
-            batch_size,
             identity: identity.unwrap_or(0.0),
             mapped_len: mapped_len.unwrap_or(0),
             fraction: fraction.unwrap_or(0.0),
@@ -965,7 +892,6 @@ impl MetaxApp {
         thresholds: ResolvedProfilerThresholds,
     ) -> Result<ProfilerConfig> {
         let ResolvedProfilerThresholds {
-            batch_size,
             identity,
             mapped_len,
             fraction,
@@ -1038,17 +964,14 @@ impl MetaxApp {
             );
         }
         Ok(ProfilerConfig {
-            level_engine: self.config.level_engine,
             genome_level: self.config.genome_level,
             mapper_mappings,
             mapping_profile_memory,
             db_metadata,
             sequencer: self.config.sequencer,
-            batch_size,
             max_em_iterations: self.config.max_em_iterations.max(1),
             lenient_mapping_input: self.config.lenient_mapping_input,
             is_paired: self.config.is_paired,
-            exact_ties: self.config.exact_ties,
             identity,
             identity_check_accuracy,
             noisy_long_reads: noisy_long_reads(self.config.sequencer, sampled_mean_base_accuracy),
@@ -1071,8 +994,6 @@ impl MetaxApp {
             by_aligned: self.config.by_aligned,
             genus_identity: self.config.genus_identity,
             low_map_rate_threshold: self.config.low_map_rate_threshold,
-            genus_fallback: self.config.genus_fallback,
-            strict: self.config.strict,
             pathogen_host: self.config.pathogen_host.clone(),
             host: self.config.host.clone(),
             threads: self.config.threads,
@@ -1082,7 +1003,6 @@ impl MetaxApp {
             mode: self.config.mode,
             dmp_dir: self.config.dmp_dir.clone(),
             ignore_unresolved_references: self.config.skip_missing_taxa,
-            strain: self.config.strain,
             progress: self.profile_progress_options(),
             suppress_mapping_load_progress,
         })
@@ -1192,7 +1112,6 @@ mod tests {
     fn test_app_config() -> AppConfig {
         AppConfig {
             genome_level: false,
-            level_engine: false,
             db: None,
             dmp_dir: None,
             skip_missing_taxa: false,
@@ -1203,10 +1122,7 @@ mod tests {
             reuse_mappings: None,
             sequencer: Sequencer::Illumina,
             is_paired: false,
-            exact_ties: ExactTiePolicy::GuardedMap,
-            strain: false,
             mode: ProfileMode::Default,
-            batch_size: None,
             max_em_iterations: 200,
             lenient_mapping_input: false,
             identity: None,
@@ -1232,8 +1148,6 @@ mod tests {
             by_aligned: false,
             genus_identity: 0.80,
             low_map_rate_threshold: 0.30,
-            genus_fallback: false,
-            strict: false,
             keep_mapping_output: false,
             stream_mappings: false,
             temp_dir: None,
@@ -1268,9 +1182,6 @@ mod tests {
         assert_eq!(config.identity_guards(true), (None, None));
         config.no_identity_margin = false;
         config.no_relative_identity_gap = false;
-        config.strain = true;
-        assert_eq!(config.identity_guards(true), (None, None));
-        config.strain = false;
         config.is_paired = true;
         assert_eq!(config.identity_guards(true), (None, None));
         config.is_paired = false;
@@ -1321,14 +1232,9 @@ mod tests {
         .is_err());
     }
 
-    fn resolve(cfg: AppConfig) -> (usize, f64, usize, f64) {
+    fn resolve(cfg: AppConfig) -> (f64, usize, f64) {
         let resolved = MetaxApp { config: cfg }.resolve_thresholds(None);
-        (
-            resolved.batch_size,
-            resolved.identity,
-            resolved.mapped_len,
-            resolved.fraction,
-        )
+        (resolved.identity, resolved.mapped_len, resolved.fraction)
     }
 
     fn recorded_long_read_metadata(
@@ -1407,7 +1313,7 @@ mod tests {
         cfg.sequencer = Sequencer::Nanopore;
         cfg.mode = ProfileMode::Default;
         cfg.input_sequences = Some(path.to_str().unwrap().to_string());
-        let (_, identity, _, _) = resolve(cfg);
+        let (identity, _, _) = resolve(cfg);
         assert!((identity - 0.87).abs() < 1e-9, "identity={identity}");
     }
 
@@ -1421,7 +1327,7 @@ mod tests {
         cfg.sequencer = Sequencer::Nanopore;
         cfg.mode = ProfileMode::Default;
         cfg.input_sequences = Some(path.to_str().unwrap().to_string());
-        let (_, identity, _, _) = resolve(cfg);
+        let (identity, _, _) = resolve(cfg);
         assert!((identity - 0.92).abs() < 1e-12, "identity={identity}");
     }
 
@@ -1435,7 +1341,7 @@ mod tests {
         cfg.mode = ProfileMode::Default;
         cfg.input_sequences = Some(path.to_str().unwrap().to_string());
         cfg.identity = Some(0.91); // explicit --min-identity wins over adaptive
-        let (_, identity, _, _) = resolve(cfg);
+        let (identity, _, _) = resolve(cfg);
         assert!((identity - 0.91).abs() < 1e-12, "identity={identity}");
     }
 
@@ -1465,12 +1371,11 @@ mod tests {
         let community = recorded_long_read_metadata(ProfileMode::Default, 0.87, 417, 0.23, None);
         let mut strain_level = community.clone();
         strain_level.profiler.strain = true;
-        // Community profiling: species-level mappings, and only their gates.
+        // Without the genome level: species-level mappings, and only their gates.
         assert!(!cfg.strain_level_mapping());
         assert!(cfg.takes_recorded_gates(&community));
         assert!(!cfg.takes_recorded_gates(&strain_level));
         // The genome level records strain-level mappings and takes the gates of both kinds.
-        cfg.level_engine = true;
         cfg.genome_level = true;
         assert!(cfg.strain_level_mapping());
         assert!(cfg.takes_recorded_gates(&community));
@@ -1480,13 +1385,6 @@ mod tests {
         }
         .resolve_thresholds(Some(&strain_level));
         assert_eq!(resolved.mapped_len, 417);
-        // The strain profiler: strain-level mappings, and only their gates.
-        cfg.level_engine = false;
-        cfg.genome_level = false;
-        cfg.strain = true;
-        assert!(cfg.strain_level_mapping());
-        assert!(!cfg.takes_recorded_gates(&community));
-        assert!(cfg.takes_recorded_gates(&strain_level));
         // Another mode: no recorded gates.
         cfg.mode = ProfileMode::Recall;
         assert!(!cfg.takes_recorded_gates(&strain_level));
@@ -1623,9 +1521,8 @@ mod tests {
     fn illumina_default_non_strain_uses_new_community_defaults() {
         let mut cfg = test_app_config();
         cfg.sequencer = Sequencer::Illumina;
-        cfg.strain = false;
         cfg.mode = ProfileMode::Default;
-        let (_, identity, mapped_len, fraction) = resolve(cfg);
+        let (identity, mapped_len, fraction) = resolve(cfg);
         assert!((identity - 0.97).abs() < 1e-12);
         assert_eq!(mapped_len, 50);
         assert!((fraction - 0.70).abs() < 1e-12);
@@ -1637,93 +1534,28 @@ mod tests {
         let mut cfg = test_app_config();
         cfg.sequencer = Sequencer::Illumina;
         cfg.is_paired = true;
-        cfg.strain = false;
         cfg.mode = ProfileMode::Default;
-        let (_, identity, _, fraction) = resolve(cfg);
+        let (identity, _, fraction) = resolve(cfg);
         assert!((identity - 0.97).abs() < 1e-12);
         assert!((fraction - 0.70).abs() < 1e-12);
-    }
-
-    #[test]
-    fn illumina_default_strain_uses_strain_specific_defaults() {
-        // Strain mode on the Default preset uses identity 0.97 and
-        // fraction 0.8 (mapped_len 50).
-        let mut cfg = test_app_config();
-        cfg.sequencer = Sequencer::Illumina;
-        cfg.strain = true;
-        cfg.mode = ProfileMode::Default;
-        let (_, identity, mapped_len, fraction) = resolve(cfg);
-        assert!((identity - 0.97).abs() < 1e-12);
-        assert_eq!(mapped_len, 50);
-        assert!((fraction - 0.80).abs() < 1e-12);
-    }
-
-    #[test]
-    fn illumina_default_strain_paired_also_uses_strain_specific_defaults() {
-        // Paired-end short-read strain mode must match single-end.
-        let mut cfg = test_app_config();
-        cfg.sequencer = Sequencer::Illumina;
-        cfg.is_paired = true;
-        cfg.strain = true;
-        cfg.mode = ProfileMode::Default;
-        let (_, identity, _, fraction) = resolve(cfg);
-        assert!((identity - 0.97).abs() < 1e-12);
-        assert!((fraction - 0.80).abs() < 1e-12);
-    }
-
-    #[test]
-    fn strain_defaults_apply_only_to_illumina() {
-        // The short-read strain thresholds are Illumina-only; a
-        // Nanopore strain run uses the long-read length-or-fraction default
-        // (mapped_len = 500) and the long-read strain identity (Default = 0.92).
-        let mut cfg = test_app_config();
-        cfg.sequencer = Sequencer::Nanopore;
-        cfg.strain = true;
-        cfg.mode = ProfileMode::Default;
-        let (_, identity, mapped_len, _) = resolve(cfg);
-        assert_eq!(mapped_len, 500);
-        assert!(
-            (identity - 0.92).abs() < 1e-12,
-            "Nanopore strain Default identity should be 0.92, got {identity}"
-        );
     }
 
     #[test]
     fn illumina_community_precision_and_recall_use_community_defaults() {
         let mut cfg = test_app_config();
         cfg.sequencer = Sequencer::Illumina;
-        cfg.strain = false;
         cfg.mode = ProfileMode::Precision;
-        let (_, identity, mapped_len, fraction) = resolve(cfg.clone());
+        let (identity, mapped_len, fraction) = resolve(cfg.clone());
         assert!((identity - 0.98).abs() < 1e-12);
         assert_eq!(mapped_len, 50);
         assert!((fraction - 0.80).abs() < 1e-12);
 
         let mut cfg_recall = cfg;
         cfg_recall.mode = ProfileMode::Recall;
-        let (_, identity, mapped_len, fraction) = resolve(cfg_recall);
+        let (identity, mapped_len, fraction) = resolve(cfg_recall);
         assert!((identity - 0.96).abs() < 1e-12);
         assert_eq!(mapped_len, 50);
         assert!((fraction - 0.60).abs() < 1e-12);
-    }
-
-    #[test]
-    fn illumina_strain_precision_and_recall_use_requested_defaults() {
-        let mut cfg = test_app_config();
-        cfg.sequencer = Sequencer::Illumina;
-        cfg.strain = true;
-        cfg.mode = ProfileMode::Precision;
-        let (_, identity, mapped_len, fraction) = resolve(cfg.clone());
-        assert!((identity - 0.98).abs() < 1e-12);
-        assert_eq!(mapped_len, 60);
-        assert!((fraction - 0.80).abs() < 1e-12);
-
-        let mut cfg_recall = cfg;
-        cfg_recall.mode = ProfileMode::Recall;
-        let (_, identity, mapped_len, fraction) = resolve(cfg_recall);
-        assert!((identity - 0.96).abs() < 1e-12);
-        assert_eq!(mapped_len, 50);
-        assert!((fraction - 0.65).abs() < 1e-12);
     }
 
     #[test]
@@ -1732,12 +1564,11 @@ mod tests {
         // the Illumina-non-strain-Default tightening.
         let mut cfg = test_app_config();
         cfg.sequencer = Sequencer::Illumina;
-        cfg.strain = false;
         cfg.mode = ProfileMode::Default;
         cfg.identity = Some(0.80);
         cfg.fraction = Some(0.50);
         cfg.mapped_len = Some(123);
-        let (_, identity, mapped_len, fraction) = resolve(cfg);
+        let (identity, mapped_len, fraction) = resolve(cfg);
         assert!((identity - 0.80).abs() < 1e-12);
         assert_eq!(mapped_len, 123);
         assert!((fraction - 0.50).abs() < 1e-12);
@@ -1750,9 +1581,8 @@ mod tests {
         for seq in [Sequencer::Nanopore, Sequencer::PacBio] {
             let mut cfg = test_app_config();
             cfg.sequencer = seq;
-            cfg.strain = false;
             cfg.mode = ProfileMode::Default;
-            let (_, identity, mapped_len, fraction) = resolve(cfg);
+            let (identity, mapped_len, fraction) = resolve(cfg);
             assert_eq!(mapped_len, 500, "{}", seq);
             assert!((fraction - 0.20).abs() < 1e-12, "{}", seq);
             assert!((identity - 0.92).abs() < 1e-12, "{}", seq);
@@ -1764,43 +1594,18 @@ mod tests {
         for seq in [Sequencer::Nanopore, Sequencer::PacBio] {
             let mut cfg = test_app_config();
             cfg.sequencer = seq;
-            cfg.strain = false;
             cfg.mode = ProfileMode::Precision;
-            let (_, identity, mapped_len, fraction) = resolve(cfg.clone());
+            let (identity, mapped_len, fraction) = resolve(cfg.clone());
             assert!((identity - 0.94).abs() < 1e-12, "{}", seq);
             assert_eq!(mapped_len, 500, "{}", seq);
             assert!((fraction - 0.30).abs() < 1e-12, "{}", seq);
 
             let mut cfg_recall = cfg;
             cfg_recall.mode = ProfileMode::Recall;
-            let (_, identity, mapped_len, fraction) = resolve(cfg_recall);
+            let (identity, mapped_len, fraction) = resolve(cfg_recall);
             assert!((identity - 0.90).abs() < 1e-12, "{}", seq);
             assert_eq!(mapped_len, 300, "{}", seq);
             assert!((fraction - 0.20).abs() < 1e-12, "{}", seq);
-        }
-    }
-
-    #[test]
-    fn long_read_strain_uses_length_or_fraction_defaults() {
-        // Strain long-read runs also use the length-or-fraction defaults
-        // (mapped_len = 500, fraction = 0.3) across modes; the strain identity
-        // is stricter than community by mode (Precision = 0.94, Recall = 0.90).
-        for seq in [Sequencer::Nanopore, Sequencer::PacBio] {
-            let mut cfg = test_app_config();
-            cfg.sequencer = seq;
-            cfg.strain = true;
-            cfg.mode = ProfileMode::Precision;
-            let (_, identity, mapped_len, fraction) = resolve(cfg.clone());
-            assert!((identity - 0.94).abs() < 1e-12, "{}", seq);
-            assert_eq!(mapped_len, 500, "{}", seq);
-            assert!((fraction - 0.30).abs() < 1e-12, "{}", seq);
-
-            let mut cfg_recall = cfg;
-            cfg_recall.mode = ProfileMode::Recall;
-            let (_, identity, mapped_len, fraction) = resolve(cfg_recall);
-            assert!((identity - 0.90).abs() < 1e-12, "{}", seq);
-            assert_eq!(mapped_len, 500, "{}", seq);
-            assert!((fraction - 0.30).abs() < 1e-12, "{}", seq);
         }
     }
 }
