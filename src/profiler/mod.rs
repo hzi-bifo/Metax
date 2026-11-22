@@ -651,9 +651,9 @@ pub struct ProfilerConfig {
     pub relative_identity_gap: Option<f64>,
 
     /// Report species removed by the species tests whose reads cover their
-    /// genome evenly, the fragments of other removed species at their genus
-    /// when the species' reads spread over its genome, and fragments without a
-    /// species-level candidate at their family. On unless `--strict-coverage`.
+    /// genome evenly, and the fragments that no kept species takes at the
+    /// lowest rank above species that their matches and their evidence
+    /// support. On unless `--strict-coverage`.
     pub removed_to_genus: bool,
 
     /// Estimate the share of the input that the profile does not explain and
@@ -682,7 +682,7 @@ pub struct ProfilerConfig {
     pub by_aligned: bool,
 
     /// Minimum identity of a read without a species-level candidate for the
-    /// family level. Comparison is inclusive (`identity >= family_identity`).
+    /// levels above species. Comparison is inclusive (`identity >= family_identity`).
     /// Default 0.80.
     pub family_identity: f64,
 

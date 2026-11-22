@@ -127,7 +127,7 @@ pub struct AppConfig {
     /// `true` = use mapped-read basis regardless of mapping rate.
     pub by_aligned: bool,
     /// Lower-bound identity of reads without a species-level candidate for
-    /// the family level (default 0.80).
+    /// the levels above species (default 0.80).
     pub family_identity: f64,
     /// Strict upper bound on mapping rate for the low-map path (default 0.30).
     pub low_map_rate_threshold: f64,

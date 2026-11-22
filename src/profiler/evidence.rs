@@ -193,7 +193,7 @@ pub(crate) struct EvidenceCoverage {
     /// Distinct marker genes hit, for a genome represented by marker genes.
     pub(crate) marker_genes_hit: Option<usize>,
     /// Share of genome windows that the reads reach; measured only for
-    /// the genus roll-up and when there are enough reads.
+    /// the even-coverage test and when there are enough reads.
     pub(crate) window_spread: Option<f64>,
 }
 

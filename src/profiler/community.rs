@@ -10,8 +10,8 @@
 //!    a chunk scaled to the genome's size.
 //!
 //! 3. **Run-level settings**: the mapping rate, the automatic chunk-breadth
-//!    cutoff of the species amount test, the inputs of the genus roll-up and
-//!    of `--estimate-unclassified`, and the marker-gene model.
+//!    cutoff of the species amount test, the inputs of the levels above
+//!    species and of `--estimate-unclassified`, and the marker-gene model.
 //!
 //! 4. **Profiling**: the level-wise engine ([`levels`]) judges species, the
 //!    genomes within them and the levels above, and writes the outputs.
@@ -411,7 +411,8 @@ impl CommunityProfiler {
             }
             species_to_genus_raw.retain(|species, _| species_with_genomes.contains(species));
         }
-        // The roll-up needs every genus, also on a fractional database.
+        // The genus of every species with genome references, also on a
+        // fractional database.
         let rollup_genus_of = self
             .cfg
             .removed_to_genus
@@ -1016,18 +1017,18 @@ fn add_marker_genome_reads(
 }
 
 // ============================================================================
-// Family-level gates and the chunk-breadth cutoff
+// Floor gates of the levels above species and the chunk-breadth cutoff
 // ============================================================================
 
 /// Minimum mapped length (inclusive) of a short read without a species-level
-/// candidate for the family level; long reads use `cfg.mapped_len` (see
-/// [`family_level_min_mapped_len`]).
+/// candidate for the levels above species; long reads use `cfg.mapped_len`
+/// (see [`family_level_min_mapped_len`]).
 const FAMILY_LEVEL_MIN_MAPPED_LEN: usize = 50;
 /// Minimum aligned fraction (inclusive) of a read without a species-level
-/// candidate for the family level.
+/// candidate for the levels above species.
 const FAMILY_LEVEL_MIN_FRACTION: f64 = 0.60;
 
-/// Mapped-length floor of the family level: a fixed 50 bases for Illumina
+/// Mapped-length floor of the levels above species: a fixed 50 bases for Illumina
 /// reads; for long reads the species cutoff (`cfg.mapped_len`, from defaults
 /// or `-m`).
 #[inline]
@@ -1338,14 +1339,15 @@ struct MappingData {
     /// absent.
     genus_of_species: Arc<HashMap<u32, u32>>,
 
-    /// Most-specific reference-supported rank for every terminal taxid. Other
-    /// rows (genus roll-up, family level) take their rank from the taxonomy.
+    /// Most-specific reference-supported rank for every terminal taxid. Rows
+    /// above species take their rank from the taxonomy.
     terminal_ranks: Arc<HashMap<u32, ProfileRank>>,
 
     /// Marker genes and fragment geometry when the database has marker genomes.
     marker_model: Option<Arc<MarkerModel>>,
 
-    /// Inputs of the genus roll-up; `None` when it is off (`--strict-coverage`).
+    /// Inputs of the levels above species and of the even-coverage species;
+    /// `None` when they are off (`--strict-coverage`).
     genus_rollup: Option<Arc<GenusRollup>>,
 
     /// Inputs of `--estimate-unclassified`; `None` when it is off.

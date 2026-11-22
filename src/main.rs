@@ -111,7 +111,7 @@ enum Commands {
         display_order = 1,
         override_usage = "metax profile [OPTIONS] --output <PREFIX> [-- <MAPPER_ARG>...]\n       metax profile --mapper-help",
         long_about = "Map metagenomic reads, evaluate taxonomic and coverage evidence, and estimate relative abundance.\n\nPipeline stages:\n  1. Generate candidate mappings\n  2. Share the reads among the candidate species and keep the species whose coverage is enough, even, and won\n  3. Report the reads of removed species at their genus and reads without a species-level match at their family\n  4. With --strain, report genomes within each kept species\n  5. Apply the report filters",
-        after_help = "Examples:\n  Single-end: metax profile -d DB -i reads.fq.gz -o sample -t 20\n  Paired-end: metax profile -d DB -i R1.fq.gz -I R2.fq.gz -o sample -t 20\n  Nanopore:   metax profile -d DB -i reads.fq.gz -o sample -s Nanopore -t 20\n\nSpecies at >=0.95 identity, family-level reads at >=0.80:\n  metax profile ... --min-identity 0.95 --family-identity 0.80\n\nMapper-only candidate-generation overrides must follow '--':\n  metax profile ... -- --top-n 20 --score-ratio 0.85 --min-identity 0.80"
+        after_help = "Examples:\n  Single-end: metax profile -d DB -i reads.fq.gz -o sample -t 20\n  Paired-end: metax profile -d DB -i R1.fq.gz -I R2.fq.gz -o sample -t 20\n  Nanopore:   metax profile -d DB -i reads.fq.gz -o sample -s Nanopore -t 20\n\nSpecies at >=0.95 identity, reads placed above species at >=0.80:\n  metax profile ... --min-identity 0.95 --family-identity 0.80\n\nMapper-only candidate-generation overrides must follow '--':\n  metax profile ... -- --top-n 20 --score-ratio 0.85 --min-identity 0.80"
     )]
     Profile(ProfileArgs),
 
@@ -309,7 +309,7 @@ struct ProfileArgs {
         long = "strict-coverage",
         action = ArgAction::SetTrue,
         help_heading = "Genus, family and low-map behavior",
-        help = "Report only the species kept by the species tests; the reads of removed species, and reads without a species-level match, are dropped. By default a removed species whose reads cover its whole genome evenly (at least 200 fragments, both coverage ratios 0.9-1.1, reads in at least 90 % of its windows, both coverage p-values at least 1e-5) is reported at species when no taxon of its genus is kept; the reads of other removed species are reported at their genus when they spread over the species' genome (chunk ratio of at least 0.40 and reads in at least half of the genome's windows) and the genus collects at least 200 fragments; and reads without a species-level match are reported at their family when at least 200 of them go to it, spread over at least half of a genome's windows, and make up at least 30 % of the reads that list the family. These recover large genomes at low depth, divergent strains, and new species of a genus or new genera of a family in the database; a reference that consists mostly of foreign DNA can still produce a false genus row. Species represented by marker genes do not take part, and a fractional database gets no even-coverage species and no genus or family row for a taxon with a kept species."
+        help = "Report only the species kept by the species tests; the reads that no kept species takes are dropped. By default a removed species whose reads cover its whole genome evenly (at least 200 fragments, both coverage ratios 0.9-1.1, reads in at least 90 % of its windows, both coverage p-values at least 1e-5) is reported at species when no taxon of its genus is kept. The other reads that no kept species takes (reads of removed species, and reads without a species-level match down to --family-identity) go above species. A read whose matches within the tie margin of its best lie in one genus counts for that genus, which gets a row when at least 200 such reads of one kind (of removed species, or without a species-level match) have a mean identity at most 0.09 below the species identity cutoff and a chunk ratio of at least 0.40 on the genome holding most of them; the row then holds the unique reads of both kinds. A read tied across genera goes to those of them with a genus row, shared by the likelihood EM over the genera with a row. The other reads go to the lowest common ancestor of their matches at family, order, class, phylum or domain rank, which gets a row when at least 200 reads reach it and reach at least half of the windows of the genome holding most of them; otherwise they move up a rank. These recover large genomes at low depth, divergent strains, and new species and genera of taxa in the database; a reference that consists mostly of foreign DNA can still produce a false row. Marker genomes do not take part, and a fractional database gets no even-coverage species and no row above species for a taxon with a kept species."
     )]
     strict_coverage: bool,
 
@@ -348,7 +348,7 @@ struct ProfileArgs {
         default_value_t = 0.80,
         value_parser = parse_probability,
         help_heading = "Genus, family and low-map behavior",
-        help = "Minimum identity (0-1) a read without a species-level match needs to count at the family level, independent of --min-identity."
+        help = "Minimum identity (0-1) a read without a species-level match needs to count above species (at genus or a higher rank), independent of --min-identity."
     )]
     family_identity: f64,
 
@@ -1050,7 +1050,7 @@ fn reject_removed_options(args: &ProfileArgs) -> Result<()> {
         ),
         (
             args.genus_identity.is_some(),
-            "--genus-identity is no longer an option: the identity a read without a species-level match needs to count at the family level is set with --family-identity (default 0.80). Use --family-identity instead.",
+            "--genus-identity is no longer an option: the identity a read without a species-level match needs to count above species is set with --family-identity (default 0.80). Use --family-identity instead.",
         ),
         (
             args.save_raw_profile,

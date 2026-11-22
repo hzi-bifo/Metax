@@ -15,13 +15,12 @@
 //!   rows by that EM's posteriors. A species reported at its genus counts its share
 //!   in the genus row; a species left out, or dropped by `--host`,
 //!   `--min-reads` or `--min-breadth`, counts it nowhere;
-//! - a fragment none of whose candidate species is kept goes whole to the
-//!   roll-up's genus row of its best candidate, when that species' reads were
-//!   rolled up;
 //! - a fragment without a species-level candidate is, on noisy long reads,
 //!   credited to the kept species tied with its best match, shared by their
-//!   weights and counted as above; otherwise the family level's EM shares it
-//!   among the families (its posteriors), counted in the family rows.
+//!   weights and counted as above;
+//! - any other fragment that no kept species takes goes to the rows above
+//!   species that place it ([`super::higher`]): whole to a genus or a taxon
+//!   above genus, or shared among the tied genera with genus rows.
 //!
 //! Shares on taxa without a row in the profile are dropped and the others
 //! renormalised; a fragment without any is not written, as are those of a
@@ -40,10 +39,9 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use super::genomes::SpeciesGenomes;
-use super::{Fragment, TaxonBlock, UnitShares};
+use super::{Fragment, TaxonBlock};
 use crate::profiler::community::MappingData;
 use crate::profiler::output::{create_classification_writer, finish_classification_writer};
-use crate::profiler::rollup::GenusRow;
 
 /// A fragment's shares: taxid and rank of a profile row, and the share.
 type Shares<'r> = Vec<(u32, &'r str, f64)>;
@@ -54,7 +52,7 @@ type Posteriors = [(u32, f64)];
 /// The profile's rows a share can go to.
 struct ProfileTaxa<'r> {
     /// The rank of each taxon's row: a unit's row (species, or the taxon its
-    /// references are labelled with), a genus or a family row.
+    /// references are labelled with), or a row above species.
     rows: HashMap<u32, &'r str>,
     /// Taxid of each genome's strain row, by assembly id.
     strain_rows: HashMap<u32, u32>,
@@ -111,12 +109,10 @@ pub(super) struct Classifications<'a> {
     pub(super) genome_level: &'a HashMap<u32, SpeciesGenomes>,
     /// Species reported at their genus: (genus, species, reads).
     pub(super) genus_members: &'a [(u32, u32, f64)],
-    pub(super) rollup_rows: &'a [GenusRow],
-    /// The fragments offered to the roll-up: read and best candidate.
-    pub(super) orphans: &'a [(usize, u32)],
+    /// Fragments placed above species: read and shares of the rows' taxa.
+    pub(super) higher: &'a [(usize, Vec<(u32, f64)>)],
     /// Credited fragments: read and shares of the kept species.
     pub(super) credited: &'a [(usize, Vec<(u32, f64)>)],
-    pub(super) families: Option<&'a UnitShares>,
 }
 
 impl Classifications<'_> {
@@ -193,31 +189,14 @@ impl Classifications<'_> {
             }
             rows.extend(renormalised(shares).map(|shares| (*read, shares)));
         }
-        let genus_of_donor: HashMap<u32, u32> = self
-            .rollup_rows
-            .iter()
-            .flat_map(|row| row.donors.iter().map(|&donor| (donor, row.genus)))
-            .collect();
-        for &(read, donor) in self.orphans {
-            if let Some(&genus) = genus_of_donor
-                .get(&donor)
-                .filter(|genus| taxa.rows.contains_key(genus))
-            {
-                rows.push((read, vec![(genus, "genus", 1.0)]));
-            }
-        }
-        if let Some(families) = self.families {
-            for (&read, group) in families.reads.iter().zip(&families.group_of) {
-                let Some(group) = group else {
-                    continue;
-                };
-                let shares = families.posteriors[*group]
-                    .iter()
-                    .filter(|(family, _)| taxa.rows.contains_key(family))
-                    .map(|&(family, posterior)| (family, "family", posterior))
-                    .collect();
-                rows.extend(renormalised(shares).map(|shares| (read, shares)));
-            }
+        for (read, placed) in self.higher {
+            let shares = placed
+                .iter()
+                .filter_map(|&(taxid, share)| {
+                    taxa.rows.get(&taxid).map(|&rank| (taxid, rank, share))
+                })
+                .collect();
+            rows.extend(renormalised(shares).map(|shares| (*read, shares)));
         }
         rows.sort_unstable_by_key(|row| row.0);
         rows
@@ -328,8 +307,9 @@ mod tests {
 
     /// The profile: species 1 (species row), species 4 with a species row
     /// and strain rows on genomes 40 (strain 400) and 41 (under the species'
-    /// taxid), species 2 at genus 100, genus 100 (with the roll-up of species
-    /// 5), and family 1000. Species 3 is kept but not reported (left out).
+    /// taxid), species 2 at genus 100, genus 100 (also a genus row of
+    /// fragments no kept species takes), and family 1000. Species 3 is kept
+    /// but not reported (left out).
     fn blocks() -> Vec<TaxonBlock> {
         vec![
             block(1, Some(row(1, "species", 10)), Vec::new()),
@@ -348,7 +328,7 @@ mod tests {
         let fragments = (0..6).map(fragment).collect::<Vec<_>>();
         // Read 0: species 1 only. Read 1: species 1 and species 3 (left out). Read 2: species 2 (at genus 100).
         // Read 3: species 4, a fragment the genome EM shares among its genomes. Read 4: species 4, not shared by the
-        // genome EM. Read 5: no kept candidate (roll-up).
+        // genome EM. Read 5: no kept candidate.
         let group_of = [Some(0), Some(1), Some(2), Some(3), Some(3), None];
         let posteriors = vec![
             vec![(1, 1.0)],
@@ -368,33 +348,22 @@ mod tests {
                 },
             },
         )]);
-        let rollup_rows = vec![GenusRow {
-            genus: 100,
-            fragments: 1.0,
-            equivalent: 1.0,
-            depth: 0.0,
-            mapped_len: 0.0,
-            witness: EvidenceCoverage::default(),
-            donors: vec![5],
-            reads: None,
-        }];
-        let families = UnitShares {
-            reads: vec![6, 7],
-            group_of: vec![Some(0), Some(1)],
-            // Read 6: family 1000 and 2000 (no row). Read 7: family 2000 only.
-            posteriors: vec![vec![(1000, 0.5), (2000, 0.5)], vec![(2000, 1.0)]],
-        };
         let classifications = Classifications {
             fragments: &fragments,
             group_of: &group_of,
             posteriors: &posteriors,
             genome_level: &genome_level,
             genus_members: &[(100, 2, 1.0)],
-            rollup_rows: &rollup_rows,
-            orphans: &[(5, 5)],
+            // Read 5: genus 100. Read 6: genus 100 and genus 200 (no row), tied. Read 7: family 2000 (no row).
+            // Read 9: genus 100 and family 1000.
+            higher: &[
+                (5, vec![(100, 1.0)]),
+                (6, vec![(100, 0.6), (200, 0.4)]),
+                (7, vec![(2000, 1.0)]),
+                (9, vec![(100, 0.25), (1000, 0.75)]),
+            ],
             // Read 8: credited to species 1 and 4.
             credited: &[(8, vec![(1, 0.25), (4, 0.75)])],
-            families: Some(&families),
         };
         let rows = classifications
             .shares(&blocks(), &accessions())
@@ -412,8 +381,10 @@ mod tests {
                 "read3\t400\tstrain\t400;4;1\t0.67500;0.22500;0.10000",
                 "read4\t4\tspecies\t4;1\t0.90000;0.10000",
                 "read5\t100\tgenus\t100\t1",
-                "read6\t1000\tfamily\t1000\t1",
+                // The share on a genus without a row is dropped.
+                "read6\t100\tgenus\t100\t1",
                 "read8\t4\tspecies\t4;1\t0.75000;0.25000",
+                "read9\t1000\tfamily\t1000;100\t0.75000;0.25000",
             ]
         );
         // The genome row on genome 41, under the species' taxid, keeps its rank.
@@ -463,10 +434,8 @@ mod tests {
             posteriors: &posteriors,
             genome_level: &HashMap::new(),
             genus_members: &[],
-            rollup_rows: &[],
-            orphans: &[],
+            higher: &[],
             credited: &[],
-            families: None,
         };
         let rows = classifications
             .shares(&blocks, &accessions())
