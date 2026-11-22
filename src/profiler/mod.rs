@@ -673,7 +673,7 @@ pub struct ProfilerConfig {
     pub lowbiomass: bool,
 
     /// Keep raw (unfiltered) profile output
-    pub keep_raw: bool,
+    pub save_decisions: bool,
 
     /// Write optional per-read taxonomic assignments.
     pub save_classifications: bool,
@@ -682,9 +682,9 @@ pub struct ProfilerConfig {
     pub by_aligned: bool,
 
     /// Minimum identity of a read without a species-level candidate for the
-    /// family level. Comparison is inclusive (`identity >= genus_identity`).
+    /// family level. Comparison is inclusive (`identity >= family_identity`).
     /// Default 0.80.
-    pub genus_identity: f64,
+    pub family_identity: f64,
 
     /// Mapping-rate cut-off for the low-map path. A run is considered
     /// low-map (auto `--by-mapped` forced on) when
@@ -882,10 +882,10 @@ pub(crate) fn log_resolved_profiler_parameters(
          \testimate_unclassified        {}\n\
          \tidentity_margin              {}\n\
          \tby_mapped                    {}\n\
-         \tgenus_identity               {:.3}\n\
+         \tfamily_identity              {:.3}\n\
          \tlow_map_rate_threshold       {:.3}\n\
          \tlowbiomass                   {}\n\
-         \tkeep_raw                     {}\n\
+         \tsave_decisions               {}\n\
          \tsave_classifications         {}\n\
          \tlenient_mapping_input        {}\n\
          \tsuppress_mapping_load_progress {}\n\
@@ -918,10 +918,10 @@ pub(crate) fn log_resolved_profiler_parameters(
         cfg.estimate_unclassified,
         display_option(cfg.identity_margin),
         cfg.by_aligned,
-        cfg.genus_identity,
+        cfg.family_identity,
         cfg.low_map_rate_threshold,
         cfg.lowbiomass,
-        cfg.keep_raw,
+        cfg.save_decisions,
         cfg.save_classifications,
         cfg.lenient_mapping_input,
         cfg.suppress_mapping_load_progress,
@@ -1267,10 +1267,10 @@ mod chunk_basis_tests {
             identity_margin: None,
             fraction: 0.7,
             lowbiomass: false,
-            keep_raw: false,
+            save_decisions: false,
             save_classifications: false,
             by_aligned: false,
-            genus_identity: 0.80,
+            family_identity: 0.80,
             low_map_rate_threshold: 0.30,
             pathogen_host: None,
             host: None,

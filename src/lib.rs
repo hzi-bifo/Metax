@@ -117,7 +117,7 @@ pub struct AppConfig {
     pub no_identity_margin: bool,
     pub fraction: Option<f64>,
     pub lowbiomass: bool,
-    pub keep_raw: bool,
+    pub save_decisions: bool,
     /// Write the optional per-read classification table.
     pub save_classifications: bool,
     /// Force mapped-read basis for the chunk-breadth estimate.
@@ -128,7 +128,7 @@ pub struct AppConfig {
     pub by_aligned: bool,
     /// Lower-bound identity of reads without a species-level candidate for
     /// the family level (default 0.80).
-    pub genus_identity: f64,
+    pub family_identity: f64,
     /// Strict upper bound on mapping rate for the low-map path (default 0.30).
     pub low_map_rate_threshold: f64,
     pub keep_mapping_output: bool,
@@ -612,8 +612,8 @@ impl MetaxApp {
             if self.config.lowbiomass {
                 flags.push("--low-biomass".to_string());
             }
-            if self.config.keep_raw {
-                flags.push("--save-raw-profile".to_string());
+            if self.config.save_decisions {
+                flags.push("--save-decisions".to_string());
             }
             if self.config.save_classifications {
                 flags.push("--save-classification".to_string());
@@ -905,7 +905,7 @@ impl MetaxApp {
                 fraction
             ));
         }
-        // NOTE: `--genus-identity` and `--low-map-rate-threshold` are
+        // NOTE: `--family-identity` and `--low-map-rate-threshold` are
         // validated eagerly at CLI parse time (see main::parse_probability),
         // so any library caller bypassing the CLI is trusted to supply
         // values in [0.0, 1.0].
@@ -987,10 +987,10 @@ impl MetaxApp {
             identity_margin,
             fraction,
             lowbiomass: self.config.lowbiomass,
-            keep_raw: self.config.keep_raw,
+            save_decisions: self.config.save_decisions,
             save_classifications: self.config.save_classifications,
             by_aligned: self.config.by_aligned,
-            genus_identity: self.config.genus_identity,
+            family_identity: self.config.family_identity,
             low_map_rate_threshold: self.config.low_map_rate_threshold,
             pathogen_host: self.config.pathogen_host.clone(),
             host: self.config.host.clone(),
@@ -1141,10 +1141,10 @@ mod tests {
             no_identity_margin: false,
             fraction: None,
             lowbiomass: false,
-            keep_raw: false,
+            save_decisions: false,
             save_classifications: false,
             by_aligned: false,
-            genus_identity: 0.80,
+            family_identity: 0.80,
             low_map_rate_threshold: 0.30,
             keep_mapping_output: false,
             stream_mappings: false,

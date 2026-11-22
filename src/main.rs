@@ -111,7 +111,7 @@ enum Commands {
         display_order = 1,
         override_usage = "metax profile [OPTIONS] --output <PREFIX> [-- <MAPPER_ARG>...]\n       metax profile --mapper-help",
         long_about = "Map metagenomic reads, evaluate taxonomic and coverage evidence, and estimate relative abundance.\n\nPipeline stages:\n  1. Generate candidate mappings\n  2. Share the reads among the candidate species and keep the species whose coverage is enough, even, and won\n  3. Report the reads of removed species at their genus and reads without a species-level match at their family\n  4. With --strain, report genomes within each kept species\n  5. Apply the report filters",
-        after_help = "Examples:\n  Single-end: metax profile -d DB -i reads.fq.gz -o sample -t 20\n  Paired-end: metax profile -d DB -i R1.fq.gz -I R2.fq.gz -o sample -t 20\n  Nanopore:   metax profile -d DB -i reads.fq.gz -o sample -s Nanopore -t 20\n\nSpecies at >=0.95 identity, family-level reads at >=0.80:\n  metax profile ... --min-identity 0.95 --genus-identity 0.80\n\nMapper-only candidate-generation overrides must follow '--':\n  metax profile ... -- --top-n 20 --score-ratio 0.85 --min-identity 0.80"
+        after_help = "Examples:\n  Single-end: metax profile -d DB -i reads.fq.gz -o sample -t 20\n  Paired-end: metax profile -d DB -i R1.fq.gz -I R2.fq.gz -o sample -t 20\n  Nanopore:   metax profile -d DB -i reads.fq.gz -o sample -s Nanopore -t 20\n\nSpecies at >=0.95 identity, family-level reads at >=0.80:\n  metax profile ... --min-identity 0.95 --family-identity 0.80\n\nMapper-only candidate-generation overrides must follow '--':\n  metax profile ... -- --top-n 20 --score-ratio 0.85 --min-identity 0.80"
     )]
     Profile(ProfileArgs),
 
@@ -272,7 +272,7 @@ struct ProfileArgs {
         value_name = "FRACTION",
         value_parser = parse_probability,
         help_heading = "Species and strain evidence",
-        help = "Minimum identity for species/strain assignment (0-1). When omitted, the preset is lowered by the reads' sequencing error rate from base quality (short reads: averaged over both mates; long reads: when noisy); a value given here is used as is. It does not discard lower-identity mapper output or change --genus-identity."
+        help = "Minimum identity for species/strain assignment (0-1). When omitted, the preset is lowered by the reads' sequencing error rate from base quality (short reads: averaged over both mates; long reads: when noisy); a value given here is used as is. It does not discard lower-identity mapper output or change --family-identity."
     )]
     identity: Option<f64>,
 
@@ -343,14 +343,14 @@ struct ProfileArgs {
     no_identity_margin: bool,
 
     #[arg(
-        long = "genus-identity",
+        long = "family-identity",
         value_name = "FRACTION",
         default_value_t = 0.80,
         value_parser = parse_probability,
         help_heading = "Genus, family and low-map behavior",
-        help = "Minimum identity (0-1) of reads without a species-level match for their family's row, independent of --min-identity."
+        help = "Minimum identity (0-1) a read without a species-level match needs to count at the family level, independent of --min-identity."
     )]
-    genus_identity: f64,
+    family_identity: f64,
 
     #[arg(
         long = "low-map-rate-threshold",
@@ -535,13 +535,12 @@ struct ProfileArgs {
 
     #[arg(
         short = 'k',
-        long = "save-raw-profile",
-        alias = "keep-raw",
+        long = "save-decisions",
         action = ArgAction::SetTrue,
         help_heading = "Saved and reused data",
         help = "Also write <PREFIX>.decisions.tsv: how every taxon judged at every rank was decided, with the coverage measurements and tests behind each decision."
     )]
-    keep_raw: bool,
+    save_decisions: bool,
 
     #[arg(
         long = "save-classification",
@@ -644,6 +643,12 @@ struct ProfileArgs {
 
     #[arg(long = "batch-size", num_args = 0..=1, hide = true)]
     batch_size: Option<Option<String>>,
+
+    #[arg(long = "genus-identity", num_args = 0..=1, hide = true)]
+    genus_identity: Option<Option<String>>,
+
+    #[arg(long = "save-raw-profile", alias = "keep-raw", action = ArgAction::SetTrue, hide = true)]
+    save_raw_profile: bool,
 
     #[arg(
         last = true,
@@ -1033,7 +1038,7 @@ fn reject_removed_options(args: &ProfileArgs) -> Result<()> {
         ),
         (
             args.genus_fallback,
-            "--genus-fallback is no longer an option: the reads of removed species are reported at their genus when they spread over the species' genome, and reads without a species-level match at their family; --genus-identity sets the identity those need, and --strict-coverage switches both off. Drop it.",
+            "--genus-fallback is no longer an option: the reads of removed species are reported at their genus when they spread over the species' genome, and reads without a species-level match at their family; --family-identity sets the identity those need, and --strict-coverage switches both off. Drop it.",
         ),
         (
             args.strict,
@@ -1042,6 +1047,14 @@ fn reject_removed_options(args: &ProfileArgs) -> Result<()> {
         (
             args.batch_size.is_some(),
             "--batch-size is no longer an option: the profiler takes no batch size, and the mapper's input batch size is set after '--' (see 'metax profile --mapper-help'). Drop it.",
+        ),
+        (
+            args.genus_identity.is_some(),
+            "--genus-identity is no longer an option: the identity a read without a species-level match needs to count at the family level is set with --family-identity (default 0.80). Use --family-identity instead.",
+        ),
+        (
+            args.save_raw_profile,
+            "--save-raw-profile is no longer an option: the decisions table (<PREFIX>.decisions.tsv) is written with --save-decisions (or -k). Use --save-decisions instead.",
         ),
     ];
     let given = removed
@@ -1162,10 +1175,10 @@ impl TryFrom<ProfileArgs> for AppConfig {
             no_identity_margin: args.no_identity_margin,
             fraction: args.fraction,
             lowbiomass: args.lowbiomass,
-            keep_raw: args.keep_raw,
+            save_decisions: args.save_decisions,
             save_classifications: args.save_classifications,
             by_aligned: args.by_aligned,
-            genus_identity: args.genus_identity,
+            family_identity: args.family_identity,
             low_map_rate_threshold: args.low_map_rate_threshold,
             keep_mapping_output: args.keep_mapping_output,
             stream_mappings: args.stream_mappings,
@@ -1741,7 +1754,7 @@ mod tests {
             "10",
             "--save-mapping",
             "--save-classification",
-            "--save-raw-profile",
+            "--save-decisions",
         ])
         .unwrap();
         let Commands::Profile(args) = cli.command else {
@@ -1761,7 +1774,7 @@ mod tests {
         assert_eq!(args.min_reads, Some(10));
         assert!(args.keep_mapping_output);
         assert!(args.save_classifications);
-        assert!(args.keep_raw);
+        assert!(args.save_decisions);
     }
 
     #[test]
@@ -1904,6 +1917,36 @@ mod tests {
                 "{message}"
             );
         }
+        // Renamed options name their new names.
+        for (given, named, new) in [
+            (
+                &["--genus-identity", "0.8"][..],
+                "--genus-identity",
+                "--family-identity",
+            ),
+            (
+                &["--genus-identity"][..],
+                "--genus-identity",
+                "--family-identity",
+            ),
+            (
+                &["--save-raw-profile"][..],
+                "--save-raw-profile",
+                "--save-decisions",
+            ),
+            (
+                &["--keep-raw"][..],
+                "--save-raw-profile",
+                "--save-decisions",
+            ),
+        ] {
+            let message = error(given);
+            assert!(
+                message.starts_with(&format!("{named} is no longer an option"))
+                    && message.ends_with(&format!("Use {new} instead.")),
+                "{message}"
+            );
+        }
         // Every removed option given is named.
         let message = error(&["--strict", "--level-engine"]);
         assert!(message.contains("--strict ") && message.contains("--level-engine "));
@@ -1934,7 +1977,6 @@ mod tests {
             "--pathogen-host",
             "pathogens.tsv",
             "--keep-mapping-output",
-            "--keep-raw",
         ])
         .unwrap();
         let Commands::Profile(args) = cli.command else {
@@ -1950,7 +1992,6 @@ mod tests {
         assert_eq!(args.pathogen_host.as_deref(), Some("pathogens.tsv"));
         assert!(args.lowbiomass);
         assert!(args.keep_mapping_output);
-        assert!(args.keep_raw);
     }
 
     #[test]
@@ -2037,6 +2078,8 @@ mod tests {
             "--reuse-mapping <MAPPING_TSV>",
             "--save-mapping",
             "--save-classification",
+            "--save-decisions",
+            "--family-identity <FRACTION>",
             "--stream-mappings",
             "--temp-dir <DIR>",
             "--mapper-help",
@@ -2053,6 +2096,9 @@ mod tests {
             "--genus-fallback",
             "--strict ",
             "--batch-size",
+            "--genus-identity",
+            "--save-raw-profile",
+            "--keep-raw",
         ] {
             assert!(!help.contains(removed), "{removed:?} in help\n{help}");
         }

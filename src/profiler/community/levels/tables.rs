@@ -1,5 +1,5 @@
 //! Tables of the profile: the lines that open it and, with
-//! `--save-raw-profile`, the decisions table (`<prefix>.decisions.tsv`). Each
+//! `--save-decisions`, the decisions table (`<prefix>.decisions.tsv`). Each
 //! opens with two lines starting with `#`: the run's metadata, in the style of
 //! the mapping file's header, then the column names.
 //!

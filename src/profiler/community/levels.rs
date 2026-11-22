@@ -42,7 +42,7 @@
 //! `--min-breadth` drop a taxon whose rows hold fewer reads (a species with its
 //! genome rows) or whose breadth is lower ([`drop_below_minimums`]), both
 //! before abundance is normalised. The profile opens with two `#` lines: the
-//! run's metadata and the column names. With `--save-raw-profile` the engine
+//! run's metadata and the column names. With `--save-decisions` the engine
 //! also writes `<prefix>.decisions.tsv`: how every taxon it judged, at every
 //! rank, was decided, with the tests behind it ([`tables`]), and with
 //! `--save-classification` `<prefix>.classify.txt.gz`: each fragment's shares
@@ -419,7 +419,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     // What became of each measured species, for the decisions table (empty
     // when it is not written); the identity rules and the genus reports below
     // refine it.
-    let mut outcomes = if cfg.keep_raw {
+    let mut outcomes = if cfg.save_decisions {
         tables::judged_species(
             &genomes,
             &best_fit,
@@ -473,10 +473,10 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         None => (Vec::new(), Vec::new()),
     };
     // Fragments with no candidate at the species identity are built again with
-    // the family level's gates: `--genus-identity`, and a fixed mapped length
+    // the family level's gates: `--family-identity`, and a fixed mapped length
     // and aligned fraction.
     let genus_policy = EvidencePolicy {
-        identity: cfg.genus_identity,
+        identity: cfg.family_identity,
         mapped_len: super::family_level_min_mapped_len(cfg),
         fraction: super::FAMILY_LEVEL_MIN_FRACTION,
         ..policy
@@ -738,7 +738,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                 }
             });
             let reads = reads_of(taxid);
-            if cfg.keep_raw || keep_shares {
+            if cfg.save_decisions || keep_shares {
                 genus_members.push((genus, taxid, reads));
             }
             let species_bases = bases.get(&taxid).copied().unwrap_or(0.0);
@@ -905,8 +905,8 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     set_abundance(&mut blocks);
     // By the taxon's total depth, then taxid.
     blocks.sort_by(|a, b| b.depth().total_cmp(&a.depth()).then(a.taxid.cmp(&b.taxid)));
-    // With `--save-raw-profile`, what each taxon holds in the profile.
-    let finals = cfg.keep_raw.then(|| FinalRows::of(&blocks));
+    // With `--save-decisions`, what each taxon holds in the profile.
+    let finals = cfg.save_decisions.then(|| FinalRows::of(&blocks));
     if let Some(path) = &classify_path {
         let written = classify::Classifications {
             fragments: &fragments,
