@@ -641,8 +641,8 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         );
         log::info!(
             target: "PROFILER",
-            "Level-wise engine: {:.0} fragments without a species-level candidate credited to the kept species that match them best.",
-            credited.reads.values().sum::<f64>()
+            "Level-wise engine: {} fragments without a species-level candidate credited to the kept species that match them best.",
+            credited.count
         );
         credited
     } else {
@@ -854,9 +854,10 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             .into_iter()
             .map(|(taxid, below)| (taxid, Removal::BelowMinimum(below))),
     );
-    set_abundance(&mut blocks);
-    // By the taxon's total depth, then taxid.
+    // By the taxon's total depth, then taxid; abundance is then summed in this
+    // order.
     blocks.sort_by(|a, b| b.depth().total_cmp(&a.depth()).then(a.taxid.cmp(&b.taxid)));
+    set_abundance(&mut blocks);
     // With `--save-decisions`, what each taxon holds in the profile.
     let finals = cfg.save_decisions.then(|| FinalRows::of(&blocks));
     if let Some(path) = &classify_path {
@@ -2220,7 +2221,7 @@ impl BelowMinimum {
 }
 
 /// Set every row's abundance: its depth over the summed depth of the rows, in
-/// percent.
+/// percent. The depths are summed in the order of `blocks`.
 fn set_abundance(blocks: &mut [TaxonBlock]) {
     let total_depth: f64 = blocks.iter().map(TaxonBlock::depth).sum();
     let abundance = |depth: f64| {
@@ -2336,13 +2337,14 @@ fn best_match_kept(
 }
 
 /// What the fragments credited to kept species add to each: reads, bases,
-/// and depth for a species reported on a marker genome; and when kept, each
-/// credited fragment's read with its shares.
+/// and depth for a species reported on a marker genome; the fragments
+/// credited; and when kept, each credited fragment's read with its shares.
 #[derive(Default)]
 struct Credited {
     reads: HashMap<u32, f64>,
     bases: HashMap<u32, f64>,
     marker_depth: HashMap<u32, f64>,
+    count: usize,
     fragments: Vec<(usize, Vec<(u32, f64)>)>,
 }
 
@@ -2404,6 +2406,7 @@ fn credited_reads(
             let Some(found) = found else {
                 return;
             };
+            credited.count += 1;
             if keep_shares {
                 credited
                     .fragments
@@ -3679,5 +3682,6 @@ mod tests {
         assert!((credited.reads[&3] - 0.25).abs() < 1e-12);
         assert!((credited.bases[&2] - 75.0).abs() < 1e-9);
         assert!(!credited.reads.contains_key(&4));
+        assert_eq!(credited.count, 1);
     }
 }

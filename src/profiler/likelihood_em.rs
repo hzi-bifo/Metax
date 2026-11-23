@@ -101,6 +101,16 @@ pub(crate) struct EmResult {
     pub(crate) iterations: usize,
 }
 
+impl EmResult {
+    /// The units' shares summed in unit order, so that the total does not
+    /// depend on the order of the map.
+    pub(crate) fn total_weight(&self) -> f64 {
+        let mut shares = self.weight.iter().collect::<Vec<_>>();
+        shares.sort_unstable_by_key(|share| share.0);
+        shares.into_iter().map(|share| share.1).sum()
+    }
+}
+
 /// Share the grouped reads among their candidates, every unit starting with
 /// an equal share. The EM is accelerated by SQUAREM (two EM steps, an
 /// extrapolation along their direction, one stabilising step): when nearly
@@ -318,6 +328,18 @@ mod tests {
         let sum: f64 = result.posteriors[1].iter().map(|p| p.1).sum();
         assert!((sum - 1.0).abs() < 1e-12);
         assert!(result.posteriors[1][0].1 > 0.99);
+    }
+
+    #[test]
+    fn the_total_weight_is_summed_in_unit_order() {
+        // In unit order the two single reads are lost beside the large share;
+        // summed in another order they would add 2.
+        let result = EmResult {
+            weight: HashMap::from([(3, 1.0), (2, 1e16), (1, 1.0)]),
+            posteriors: Vec::new(),
+            iterations: 0,
+        };
+        assert_eq!(result.total_weight(), 1e16);
     }
 
     #[test]

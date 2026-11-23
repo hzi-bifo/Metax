@@ -509,7 +509,7 @@ fn strain_genomes(
         genome.kept = tests.covers(&coverage);
         genome.coverage = Some(coverage);
     }
-    let total_weight: f64 = share.em.weight.values().sum::<f64>().max(1e-12);
+    let total_weight = share.em.total_weight().max(1e-12);
     let mut listed = resolved.keys().copied().collect::<Vec<_>>();
     if !resolved.contains_key(&share.best_fit) {
         listed.push(share.best_fit);
