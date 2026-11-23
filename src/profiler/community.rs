@@ -524,6 +524,9 @@ impl Profiler {
                 gate_rate
             );
         }
+        // The identity margin judges only where genomes are indexed in part.
+        let has_scaled_genomes = genome_sampling_scales.values().any(|scale| *scale > 1.0);
+        self.cfg.identity_margin = self.cfg.identity_margin.filter(|_| has_scaled_genomes);
         let basis = ChunkBasis::of(
             &self.cfg,
             gate_rate,
@@ -577,7 +580,7 @@ impl Profiler {
         Ok(MappingData {
             read_alignments,
             min_chunk_breadth: chunk_cutoff.cutoff,
-            has_scaled_genomes: genome_sampling_scales.values().any(|scale| *scale > 1.0),
+            has_scaled_genomes,
             total_reads,
             genus_of_species,
             terminal_ranks,

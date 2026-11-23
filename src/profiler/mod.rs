@@ -661,9 +661,10 @@ pub struct ProfilerConfig {
     /// append it as an `unclassified` row.
     pub estimate_unclassified: bool,
 
-    /// Report a species at its genus when the mean identity of its best
-    /// placements lies more than this below the sample's baseline. Off when
-    /// `None`.
+    /// On a fractional database, leave out a species, or report it at its
+    /// genus, when the mean identity of its best placements lies more than
+    /// this below the sample's baseline. Off when `None`, and the loader sets
+    /// it off unless some genome is indexed in part.
     pub identity_margin: Option<f64>,
 
     /// Minimum fraction of read that must map (0.0-1.0)
@@ -922,7 +923,7 @@ pub(crate) fn log_resolved_profiler_parameters(
          \tmin_coebr                    {}\n\
          \tmin_marker_genes             {}\n\
          \trelative_identity_gap        {}\n\
-         \tremoved_to_genus             {}\n\
+         \tabove_species                {}\n\
          \testimate_unclassified        {}\n\
          \tidentity_margin              {}\n\
          \tby_mapped                    {}\n\
@@ -957,10 +958,10 @@ pub(crate) fn log_resolved_profiler_parameters(
         display_option(cfg.min_oebr),
         display_option(cfg.min_coebr),
         cfg.min_marker_genes,
-        display_option(cfg.relative_identity_gap),
+        display_guard(cfg.relative_identity_gap),
         cfg.above_species,
         cfg.estimate_unclassified,
-        display_option(cfg.identity_margin),
+        display_guard(cfg.identity_margin),
         cfg.by_aligned,
         cfg.family_identity,
         cfg.low_map_rate_threshold,
@@ -977,6 +978,11 @@ pub(crate) fn log_resolved_profiler_parameters(
         display_option(cfg.dmp_dir.as_deref()),
         cfg.outprefix,
     );
+}
+
+/// An identity guard's value, `off` when it is not set.
+fn display_guard(value: Option<f64>) -> String {
+    value.map_or_else(|| "off".to_string(), |value| value.to_string())
 }
 
 fn display_option<T: ToString>(value: Option<T>) -> String {

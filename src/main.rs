@@ -79,7 +79,7 @@ use metax::profiler::{Host, ProfileMode};
 use metax::sequencer::Sequencer;
 use metax::{
     attach_taxonomy, build_index, info::run_info, report_genera_with_both_types, AppConfig,
-    MetaxApp, DEFAULT_IDENTITY_MARGIN,
+    MetaxApp,
 };
 
 /// Main command-line interface structure parsed by clap.
@@ -1138,13 +1138,6 @@ impl TryFrom<ProfileArgs> for AppConfig {
             },
             (None, None) => None,
         };
-        let identity_margin = if args.no_identity_margin {
-            None
-        } else {
-            args.identity_margin.or_else(|| {
-                (sequencer.is_illumina() && is_paired).then_some(DEFAULT_IDENTITY_MARGIN)
-            })
-        };
         let above_species = !args.strict_coverage;
         Ok(AppConfig {
             db: args.db,
@@ -1175,7 +1168,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             no_relative_identity_gap: args.no_relative_identity_gap,
             above_species,
             estimate_unclassified: args.estimate_unclassified,
-            identity_margin,
+            identity_margin: args.identity_margin,
             no_identity_margin: args.no_identity_margin,
             fraction: args.fraction,
             lowbiomass: args.lowbiomass,
@@ -1296,10 +1289,11 @@ mod tests {
 
     use metax::db::{DatabaseMetadata, ReferenceMetadata};
     use metax::mapper::tsv::{write_mapping_run_metadata, MappingProfilerMetadata};
+    use metax::DEFAULT_IDENTITY_MARGIN;
 
     use super::{
         mapper_options_help, resolve_index_match_both_strobes, resolve_profile_inputs, AppConfig,
-        Cli, Commands, ProfileMode, Sequencer, DEFAULT_IDENTITY_MARGIN,
+        Cli, Commands, ProfileMode, Sequencer,
     };
 
     fn clean_mapping(sequencer: Sequencer, paired: bool, mode: ProfileMode) -> NamedTempFile {
@@ -1514,7 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_margin_is_on_by_default_for_paired_illumina_reads() {
+    fn the_identity_margin_is_only_what_the_command_line_gives() {
         let margin = |extra: &[&str]| {
             let argv = ["metax", "profile", "-d", "db", "-o", "out"];
             let cli = Cli::try_parse_from(argv.iter().chain(extra)).unwrap();
@@ -1525,10 +1519,10 @@ mod tests {
         };
         let paired = ["-i", "r1.fq", "-I", "r2.fq"];
         let with = |more: &[&'static str]| [&paired[..], more].concat();
-        assert_eq!(margin(&paired), Some(DEFAULT_IDENTITY_MARGIN));
+        assert_eq!(margin(&paired), None);
         assert_eq!(margin(&with(&["--identity-margin", "0.04"])), Some(0.04));
         assert_eq!(margin(&with(&["--no-identity-margin"])), None);
-        assert_eq!(margin(&with(&["--strain"])), Some(DEFAULT_IDENTITY_MARGIN));
+        assert_eq!(margin(&with(&["--strain"])), None);
         assert_eq!(margin(&with(&["--sequencer", "Nanopore"])), None);
         assert_eq!(margin(&["-i", "r1.fq"]), None);
         assert_eq!(

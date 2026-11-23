@@ -268,7 +268,7 @@ fn profile_levels(profiler: &Profiler, data: MappingData) -> Result<()> {
     };
     log::info!(
         target: "PROFILER",
-        "Level-wise engine: {} fragments with candidates; error rate {:.5}, error penalty {:.3}.",
+        "{} fragments with candidates; error rate {:.5}, error penalty {:.3}.",
         fragments.len(),
         error_rate,
         em.penalty
@@ -307,7 +307,7 @@ fn profile_levels(profiler: &Profiler, data: MappingData) -> Result<()> {
     );
     log::info!(
         target: "PROFILER",
-        "Level-wise engine: baseline identity {:.5} (median identity of the species to their best-fit genome); \
+        "baseline identity {:.5} (median identity of the species to their best-fit genome); \
          {:.5} over strain-level matches.",
         genome_result.baseline_identity,
         genome_result.strain_baseline_identity
@@ -363,7 +363,7 @@ fn profile_levels(profiler: &Profiler, data: MappingData) -> Result<()> {
         .write(path, &blocks, &data)?;
         log::info!(
             target: "PROFILER",
-            "Level-wise engine: {written} fragments written to the per-read classifications."
+            "{written} fragments written to the per-read classifications."
         );
     }
     let profile_rows = blocks
@@ -616,7 +616,7 @@ impl Run<'_> {
         );
         log::info!(
             target: "PROFILER",
-            "Level-wise engine: second look kept {} removed species on {} fragments their removed sisters tied on.",
+            "second look kept {} removed species on {} fragments their removed sisters tied on.",
             taken.len(),
             taken.values().map(Vec::len).sum::<usize>()
         );
@@ -626,7 +626,7 @@ impl Run<'_> {
             });
         log::info!(
             target: "PROFILER",
-            "Level-wise engine: {} removed species kept on fragments that no kept species explains; {} of them \
+            "{} removed species kept on fragments that no kept species explains; {} of them \
              reported at their genus, as their reads tie with other species along their genome.",
             rescued.len(),
             rescued.values().filter(|&&genus| genus).count()
@@ -644,7 +644,7 @@ impl Run<'_> {
         );
         log::info!(
             target: "PROFILER",
-            "Level-wise engine: {} kept virus species removed: their own fragments do not cover the rest of their \
+            "{} kept virus species removed: their own fragments do not cover the rest of their \
              genome, beyond the part that kept cellular species explain.",
             removed_viruses.len()
         );
@@ -661,7 +661,7 @@ impl Run<'_> {
             );
             log::info!(
                 target: "PROFILER",
-                "Level-wise engine: {} kept units labelled above species removed: their own fragments do not cover \
+                "{} kept units labelled above species removed: their own fragments do not cover \
                  the rest of their genome, beyond the part that kept named units of their taxon explain.",
                 named_first.len()
             );
@@ -739,7 +739,7 @@ impl Run<'_> {
         let without_kept = shared.group_of.iter().filter(|g| g.is_none()).count();
         log::info!(
             target: "PROFILER",
-            "Level-wise engine: {} species kept, {} read groups, EM {} + {} iterations; {} fragments without a kept \
+            "{} species kept, {} read groups, EM {} + {} iterations; {} fragments without a kept \
              species.",
             species.best_fit.len(),
             shared.groups.len(),
@@ -782,7 +782,7 @@ impl Run<'_> {
         if above.is_some() && data.fractional {
             log::info!(
                 target: "PROFILER",
-                "Level-wise engine: on a database of sampled genomes, reads not placed at a species are not \
+                "on a database of sampled genomes, reads not placed at a species are not \
                  reported above species."
             );
         }
@@ -811,7 +811,7 @@ impl Run<'_> {
                 .count();
             log::info!(
                 target: "PROFILER",
-                "Level-wise engine: {} species kept for even coverage; above species, {} fragments without a \
+                "{} species kept for even coverage; above species, {} fragments without a \
                  species-level match and {} of species not kept: {} genus rows ({} candidates), {} rows above \
                  genus ({} candidates), {} fragments unexplained.",
                 even,
@@ -903,7 +903,7 @@ impl Run<'_> {
             );
             log::info!(
                 target: "PROFILER",
-                "Level-wise engine: {} fragments without a species-level candidate credited to the kept species \
+                "{} fragments without a species-level candidate credited to the kept species \
                  that match them best.",
                 credited.count
             );
@@ -931,8 +931,8 @@ impl Run<'_> {
     /// kept species (not the units labelled above species) with their mean
     /// identity to their `reported` genome and their depth from their
     /// `(bases, marker_depth)`. Reads from the unindexed parts of a genome land
-    /// on its relatives: the margin applies where genomes are indexed in part,
-    /// and the relative identity gap where it is on. Returns
+    /// on its relatives: the margin is set only where genomes are indexed in
+    /// part, and the relative identity gap where it is on. Returns
     /// the species left out and those reported at their genus.
     fn identity_rules(
         &self,
@@ -942,7 +942,7 @@ impl Run<'_> {
         (bases, marker_depth): (&HashMap<u32, f64>, &HashMap<u32, f64>),
     ) -> (HashSet<u32>, HashSet<u32>) {
         let (cfg, data) = (self.cfg, self.data);
-        let margin = cfg.identity_margin.filter(|_| data.has_scaled_genomes);
+        let margin = cfg.identity_margin;
         let gap = cfg.relative_identity_gap;
         if margin.is_none() && gap.is_none() {
             return (HashSet::new(), HashSet::new());
@@ -967,7 +967,7 @@ impl Run<'_> {
         );
         log::info!(
             target: "PROFILER",
-            "Level-wise engine: {} species left out and {} reported at their genus by the identity rules for \
+            "{} species left out and {} reported at their genus by the identity rules for \
              relatives (margin {}, relative identity gap {}).",
             found.0.len(),
             found.1.len(),
@@ -1141,7 +1141,7 @@ impl Run<'_> {
             .apply(blocks, &mut dropped);
             log::info!(
                 target: "PROFILER",
-                "Level-wise engine: {} rows dropped by --host {} ({} taxa entirely): not pathogens of the host.",
+                "{} rows dropped by --host {} ({} taxa entirely): not pathogens of the host.",
                 before - rows(blocks),
                 host.taxid,
                 dropped.taxa.len()
@@ -1157,7 +1157,7 @@ impl Run<'_> {
         if !below.is_empty() {
             log::info!(
                 target: "PROFILER",
-                "Level-wise engine: {} taxa dropped by --min-reads or --min-breadth; their reads go to no other taxon.",
+                "{} taxa dropped by --min-reads or --min-breadth; their reads go to no other taxon.",
                 below.len()
             );
         }

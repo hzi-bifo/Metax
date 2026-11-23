@@ -226,12 +226,17 @@ impl AppConfig {
 
     /// `--identity-margin` and `--relative-identity-gap` for this run. On a
     /// fractional database the reads of a genome's unindexed part land on
-    /// indexed relatives; single-end short reads have no mate to tell them
-    /// apart, so both guards are on there unless given or switched off.
+    /// indexed relatives. The margin is on by default for Illumina reads,
+    /// paired or on such a database (the profiler applies it only where
+    /// genomes are indexed in part); the gap for single-end short reads on
+    /// such a database, which have no mate to tell relatives apart. A value
+    /// given or switched off takes precedence.
     fn identity_guards(&self, fractional: bool) -> (Option<f64>, Option<f64>) {
-        let fractional_single_end = fractional && self.sequencer.is_illumina() && !self.is_paired;
+        let illumina = self.sequencer.is_illumina();
+        let fractional_single_end = fractional && illumina && !self.is_paired;
         let margin = self.identity_margin.or_else(|| {
-            (fractional_single_end && !self.no_identity_margin).then_some(DEFAULT_IDENTITY_MARGIN)
+            (illumina && (self.is_paired || fractional) && !self.no_identity_margin)
+                .then_some(DEFAULT_IDENTITY_MARGIN)
         });
         let gap = self.relative_identity_gap.or_else(|| {
             (fractional_single_end && !self.no_relative_identity_gap)
@@ -947,8 +952,9 @@ impl MetaxApp {
         };
         let fractional = db_metadata.as_ref().is_some_and(|db| db.is_fractional);
         let (identity_margin, relative_identity_gap) = self.config.identity_guards(fractional);
-        if identity_margin != self.config.identity_margin
-            || relative_identity_gap != self.config.relative_identity_gap
+        if !self.config.is_paired
+            && (identity_margin != self.config.identity_margin
+                || relative_identity_gap != self.config.relative_identity_gap)
         {
             log::info!(
                 target: "PROFILER",
@@ -1174,8 +1180,19 @@ mod tests {
         assert_eq!(config.identity_guards(true), (None, None));
         config.no_identity_margin = false;
         config.no_relative_identity_gap = false;
+        // Paired reads take the default margin on any database, and no gap.
         config.is_paired = true;
+        assert_eq!(
+            config.identity_guards(false),
+            (Some(DEFAULT_IDENTITY_MARGIN), None)
+        );
+        assert_eq!(
+            config.identity_guards(true),
+            (Some(DEFAULT_IDENTITY_MARGIN), None)
+        );
+        config.no_identity_margin = true;
         assert_eq!(config.identity_guards(true), (None, None));
+        config.no_identity_margin = false;
         config.is_paired = false;
         config.sequencer = Sequencer::Nanopore;
         assert_eq!(config.identity_guards(true), (None, None));
