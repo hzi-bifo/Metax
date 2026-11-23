@@ -90,8 +90,9 @@ pub(crate) struct GenusRollup {
     /// even-coverage species.
     pub(crate) marker_only: HashMap<u32, Option<u32>>,
     pub(crate) layout: GenomeLayout,
-    /// A fractional database: no taxon with a kept species gets a row above
-    /// species, and no species is kept for even coverage.
+    /// A database of sampled genomes (fractional): reads not placed at a
+    /// species are not reported above species, and no species is kept for
+    /// even coverage.
     pub(crate) fractional: bool,
 }
 

@@ -1548,6 +1548,89 @@ mod tests {
     }
 
     #[test]
+    fn reads_not_placed_at_a_species_go_above_species_only_on_a_full_database() {
+        // Genus 100 (family 40) holds species 1001 and 1002, each with 125 reads spread along its 1 Mb genome. Both
+        // fail the amount test, so their 250 reads, unique to genus 100, make a genus row on a full database and no
+        // row on a database of sampled genomes.
+        let directory = tempfile::tempdir().unwrap();
+        let node = |parent: u32, rank: &str| (parent, rank.to_string());
+        let taxonomy = Arc::new(Taxonomy::from_parts(
+            HashMap::from([
+                (1, node(1, "no rank")),
+                (40, node(1, "family")),
+                (100, node(40, "genus")),
+                (1001, node(100, "species")),
+                (1002, node(100, "species")),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashSet::new(),
+        ));
+        let genus_of = HashMap::from([(1001, 100), (1002, 100)]);
+        let alignment = |taxid: u32, assembly: u32, start: u32| EvidenceAlignment {
+            profile_taxid: taxid,
+            profile_rank: ProfileRank::Species,
+            reference_id: assembly,
+            assembly_id: assembly,
+            role: MappingRole::Unpaired,
+            pair_id: 0,
+            sampling_scale: 1.0,
+            asm_len: 1_000_000.0,
+            identity: 0.99,
+            fraction: 1.0,
+            mapped_len: 100,
+            read_len: 100,
+            span: (start, start + 100),
+            fixed_chunk: (start, start + 100),
+            flex_chunk: (start.saturating_sub(950), start + 1_050),
+            marker_gene_len: 0,
+        };
+        for fractional in [false, true] {
+            let prefix = directory.path().join(format!("fractional-{fractional}"));
+            let mut cfg = make_cfg(Sequencer::Illumina, None);
+            cfg.removed_to_genus = true;
+            cfg.outprefix = prefix.to_string_lossy().into_owned();
+            let profiler = CommunityProfiler::new(cfg, Arc::clone(&taxonomy)).unwrap();
+            let mapping_data = MappingData {
+                read_alignments: (0..250u32)
+                    .map(|i| ReadBundle {
+                        read_name: Arc::from(format!("read{i}")),
+                        alignments: vec![alignment(1001 + i % 2, i % 2, (i / 2) * 7_900)],
+                    })
+                    .collect(),
+                min_chunk_breadth: 0.9,
+                has_scaled_genomes: false,
+                total_reads: 250,
+                genus_of_species: Arc::new(genus_of.clone()),
+                terminal_ranks: Arc::new(HashMap::from([
+                    (1001, ProfileRank::Species),
+                    (1002, ProfileRank::Species),
+                ])),
+                marker_model: None,
+                genus_rollup: Some(Arc::new(GenusRollup {
+                    genus_of: genus_of.clone(),
+                    marker_only: HashMap::new(),
+                    layout: GenomeLayout::new([(0, 1_000_000), (1, 1_000_000)]),
+                    fractional,
+                })),
+                unclassified_species: None,
+                assembly_names: vec![Arc::from("GCF_1"), Arc::from("GCF_2")],
+            };
+            profiler.profile(mapping_data).unwrap();
+            let profile =
+                std::fs::read_to_string(format!("{}.profile.txt", prefix.to_string_lossy()))
+                    .unwrap();
+            let ranks = profile
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+                .map(|line| line.split('\t').nth(2).unwrap())
+                .collect::<Vec<_>>();
+            let expected: &[&str] = if fractional { &[] } else { &["genus"] };
+            assert_eq!(ranks, expected, "{profile}");
+        }
+    }
+
+    #[test]
     fn conflicting_terminal_rank_for_one_taxid_is_rejected() {
         let mut ranks = HashMap::new();
         record_terminal_rank(&mut ranks, 111, ProfileRank::Genus, "genus-ref").unwrap();

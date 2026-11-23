@@ -38,9 +38,10 @@
 //! counts the taxon's row above species as well. The fragments that no kept
 //! species takes go to rows above species: a genus when their matches lie in
 //! one and their evidence supports it, otherwise the lowest common ancestor of
-//! their matches when enough of them spread over a genome ([`higher`]); on
-//! noisy long reads, fragments without a species-level candidate whose best
-//! match is a kept species count for it instead ([`credited_reads`]).
+//! their matches when enough of them spread over a genome ([`higher`]); not on
+//! a database of sampled genomes, where they are not reported above species.
+//! On noisy long reads, fragments without a species-level candidate whose
+//! best match is a kept species count for it instead ([`credited_reads`]).
 //! `--host` drops the rows of taxa that the pathogen table lists for
 //! other hosts only and annotates the others ([`host`]), and `--min-reads` and
 //! `--min-breadth` drop a taxon whose rows hold fewer reads (a species with its
@@ -469,26 +470,25 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     } else {
         HashSet::new()
     };
-    // The fragments that no kept species takes, placed above species.
-    let higher = rollup.map(|rollup| {
+    // The fragments that no kept species takes, placed above species; not on
+    // a database of sampled genomes, where the reads of a genome missing from
+    // the database land on the sampled segments of many relatives and cannot
+    // be counted as full-index equivalents.
+    let sampled = rollup.is_some_and(|rollup| rollup.fractional);
+    if sampled {
+        log::info!(
+            target: "PROFILER",
+            "Level-wise engine: on a database of sampled genomes, reads not placed at a species are not reported \
+             above species."
+        );
+    }
+    let higher = rollup.filter(|_| !sampled).map(|rollup| {
         let not_kept = fragments
             .iter()
             .zip(&kept.group_of)
             .filter(|(_, group)| group.is_none())
             .map(|(fragment, _)| fragment.read)
             .collect::<Vec<_>>();
-        // On a database of sampled genomes, reads from the unindexed parts of
-        // a kept genome land on the sampled segments of its relatives, while
-        // the kept species' reads already stand for its whole genome: no taxon
-        // that holds a kept species gets a row.
-        let holds_kept: HashSet<u32> = if rollup.fractional {
-            best_fit
-                .keys()
-                .flat_map(|&taxid| ancestors(taxid))
-                .collect()
-        } else {
-            HashSet::new()
-        };
         let found = higher::place(&higher::Level {
             data: &data,
             taxonomy: &profiler.taxonomy,
@@ -497,7 +497,6 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
             below_species: (&unmatched, floor_policy),
             not_kept: (&not_kept, policy),
             noisy_kept: &noisy_kept,
-            holds_kept: &holds_kept,
             penalty,
             max_iterations: cfg.max_em_iterations,
             keep_shares,
@@ -798,7 +797,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                         .to_string(),
                     row.taxid,
                     row.rank.as_str(),
-                    (row.equivalent, row.depth),
+                    (row.reads, row.depth),
                     &row.measured.coverage,
                     data.assembly_names[row.measured.genome as usize].clone(),
                     Some((f64::NAN, f64::NAN)),

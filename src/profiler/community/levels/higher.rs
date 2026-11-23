@@ -42,11 +42,6 @@
 //! their best placements, on which the row's tests measure them. Genomes tied
 //! exactly with it on that number share the depth: it is the mean of the
 //! depths over each of them.
-//!
-//! On a database of sampled genomes, reads from the unindexed parts of a kept
-//! genome land on the sampled segments of its relatives, while the kept
-//! species already stands for its whole genome: no taxon that holds a kept
-//! species gets a row there.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -213,9 +208,6 @@ pub(super) struct Level<'a> {
     /// On noisy long reads, the kept species whose best-matched reads below
     /// the species gates count for them; otherwise empty.
     pub(super) noisy_kept: &'a HashSet<u32>,
-    /// On a database of sampled genomes, every taxon that holds a kept
-    /// species; otherwise empty.
-    pub(super) holds_kept: &'a HashSet<u32>,
     /// The EM's error penalty and its most iterations.
     pub(super) penalty: f64,
     pub(super) max_iterations: usize,
@@ -255,12 +247,12 @@ struct Placed {
 }
 
 /// The level's fragments, their distinct tie sets (taxa by taxid), and the
-/// length and sampling scale of each genome holding a best placement.
+/// indexed length of each genome holding a best placement.
 #[derive(Default)]
 struct Collected {
     placed: Vec<Placed>,
     sets: Vec<Vec<u32>>,
-    genomes: HashMap<u32, (f64, f64)>,
+    genomes: HashMap<u32, f64>,
 }
 
 /// The genera of a tie set's taxa that have one, by taxid, and the genus
@@ -291,7 +283,6 @@ pub(super) enum Failure {
     Identity { identity: f64, floor: f64 },
     ChunkRatio(f64),
     Spread(Option<f64>),
-    HoldsKept,
 }
 
 impl fmt::Display for Failure {
@@ -307,24 +298,14 @@ impl fmt::Display for Failure {
             Self::Spread(Some(spread)) => {
                 write!(f, "window spread: {spread:.4} < {MIN_WINDOW_SPREAD}")
             }
-            Self::HoldsKept => write!(f, "holds a kept species, on a database of sampled genomes"),
         }
     }
 }
 
 /// The tests a genus fails with its unique fragments of one kind: their mean
-/// `identity` against `floor`, their chunk ratio in `coverage`, and whether
-/// the genus `holds_kept` species on a database of sampled genomes.
-fn genus_failures(
-    identity: f64,
-    floor: f64,
-    coverage: &EvidenceCoverage,
-    holds_kept: bool,
-) -> Vec<Failure> {
+/// `identity` against `floor`, and their chunk ratio in `coverage`.
+fn genus_failures(identity: f64, floor: f64, coverage: &EvidenceCoverage) -> Vec<Failure> {
     let mut failed = Vec::new();
-    if holds_kept {
-        failed.push(Failure::HoldsKept);
-    }
     if identity < floor {
         failed.push(Failure::Identity { identity, floor });
     }
@@ -335,14 +316,9 @@ fn genus_failures(
 }
 
 /// The tests a taxon above genus fails with the fragments that reach it: the
-/// share of the windows of the genome holding most of them that they reach,
-/// and whether the taxon `holds_kept` species on a database of sampled
-/// genomes.
-pub(super) fn taxon_failures(measured: &Measured, holds_kept: bool) -> Vec<Failure> {
+/// share of the windows of the genome holding most of them that they reach.
+pub(super) fn taxon_failures(measured: &Measured) -> Vec<Failure> {
     let mut failed = Vec::new();
-    if holds_kept {
-        failed.push(Failure::HoldsKept);
-    }
     if measured
         .spread
         .is_none_or(|spread| spread < MIN_WINDOW_SPREAD)
@@ -399,14 +375,13 @@ impl TaxonCandidate {
 }
 
 /// A row above species: its fragments (a pair counting once), of a genus row
-/// those unique to the genus by kind, and their full-index equivalents, its
-/// depth (see the [module documentation](self)), and its evidence.
+/// those unique to the genus by kind, its depth (see the [module
+/// documentation](self)), and its evidence.
 pub(super) struct HigherRow {
     pub(super) taxid: u32,
     pub(super) rank: Rank,
     pub(super) reads: f64,
     pub(super) unique: [usize; 2],
-    pub(super) equivalent: f64,
     pub(super) depth: f64,
     pub(super) measured: Measured,
 }
@@ -526,12 +501,7 @@ pub(super) fn place(level: &Level) -> HigherLevels {
             tied: tied.get(&(genus, kind)).copied().unwrap_or(0),
             identity,
             measured,
-            failures: genus_failures(
-                identity,
-                identity_floor,
-                &measured.coverage,
-                level.holds_kept.contains(&genus),
-            ),
+            failures: genus_failures(identity, identity_floor, &measured.coverage),
             shown: false,
         });
     }
@@ -641,7 +611,7 @@ pub(super) fn place(level: &Level) -> HigherLevels {
             let (_, arrivals) = pending.remove(&taxid).expect("listed above");
             let passed = arrivals.fragments.len() >= MIN_FRAGMENTS && {
                 let measured = measure(&arrivals.fragments);
-                let failures = taxon_failures(&measured, level.holds_kept.contains(&taxid));
+                let failures = taxon_failures(&measured);
                 let passed = failures.is_empty();
                 if passed {
                     evidence.insert((rank, taxid), measured);
@@ -685,7 +655,7 @@ pub(super) fn place(level: &Level) -> HigherLevels {
     for candidate in candidates.iter().filter(|candidate| candidate.shown) {
         evidence.insert((Rank::Genus, candidate.genus), candidate.measured);
     }
-    let mut totals: HashMap<u32, [f64; 3]> = HashMap::new();
+    let mut totals: HashMap<u32, [f64; 2]> = HashMap::new();
     let mut shares = Vec::new();
     for (fragment, to) in placed.iter().zip(&destination) {
         let whole;
@@ -697,12 +667,10 @@ pub(super) fn place(level: &Level) -> HigherLevels {
             }
             Destination::Shared(index) => &tied_shares[index as usize],
         };
-        let scale = genomes[&fragment.assembly].1;
         for &(taxid, share) in parts {
             let total = totals.entry(taxid).or_default();
             total[0] += share;
-            total[1] += share * scale;
-            total[2] += share * f64::from(fragment.bases);
+            total[1] += share * f64::from(fragment.bases);
         }
         if level.keep_shares {
             shares.push((fragment.read, parts.to_vec()));
@@ -711,13 +679,12 @@ pub(super) fn place(level: &Level) -> HigherLevels {
     let rows = evidence
         .into_iter()
         .map(|((rank, taxid), measured)| {
-            let [reads, equivalent, bases] = totals[&taxid];
+            let [reads, bases] = totals[&taxid];
             HigherRow {
                 taxid,
                 rank,
                 reads,
                 unique: with_row.get(&taxid).copied().unwrap_or_default(),
-                equivalent,
                 depth: bases / measured.length,
                 measured,
             }
@@ -845,7 +812,7 @@ fn collect(level: &Level) -> Collected {
                 found
                     .genomes
                     .entry(best.assembly_id)
-                    .or_insert((best.asm_len, best.sampling_scale));
+                    .or_insert(best.asm_len);
                 found.placed.push(Placed {
                     read,
                     kind,
@@ -938,7 +905,7 @@ fn genera_of(taxa: &[u32], lineages: &mut Lineages) -> Genera {
 fn measure(
     placed: &[Placed],
     list: &[u32],
-    genomes: &HashMap<u32, (f64, f64)>,
+    genomes: &HashMap<u32, f64>,
     level: &Level,
 ) -> Measured {
     let mut counts: HashMap<u32, usize> = HashMap::new();
@@ -954,7 +921,7 @@ fn measure(
     let mut tied = counts
         .iter()
         .filter(|&(_, &n)| n == fragments)
-        .map(|(&id, _)| genomes[&id].0.max(1.0))
+        .map(|(&id, _)| genomes[&id].max(1.0))
         .collect::<Vec<_>>();
     let length = match tied[..] {
         [length] => length,
@@ -963,10 +930,8 @@ fn measure(
             tied.len() as f64 / tied.iter().map(|length| 1.0 / length).sum::<f64>()
         }
     };
-    let (asm_len, sampling_scale) = genomes[&genome];
     let mut assembly = PresenceAssembly {
-        asm_len,
-        sampling_scale,
+        asm_len: genomes[&genome],
         count: fragments as u64,
         intervals: Vec::with_capacity(fragments),
         ..PresenceAssembly::default()
@@ -1056,14 +1021,13 @@ mod tests {
             .collect()
     }
 
-    /// A read as [`read`], with genome 5 of 100 kb indexed, sampled at `scale`.
-    fn read_small(on: &[(u32, u32, f32)], start: u32, scale: f32) -> Vec<EvidenceAlignment> {
+    /// A read as [`read`], with genome 5 of 100 kb.
+    fn read_small(on: &[(u32, u32, f32)], start: u32) -> Vec<EvidenceAlignment> {
         read(on, start)
             .into_iter()
             .map(|a| match a.assembly_id {
                 5 => EvidenceAlignment {
                     asm_len: 100_000.0,
-                    sampling_scale: scale,
                     ..a
                 },
                 _ => a,
@@ -1097,11 +1061,10 @@ mod tests {
     }
 
     /// The level over `below` (reads without a species-level match, at the floor identity 0.80) and `not_kept`
-    /// (reads of species not kept, at the species identity 0.95); with `holds_kept` on a sampled database.
+    /// (reads of species not kept, at the species identity 0.95).
     fn place_reads(
         below: Vec<Vec<EvidenceAlignment>>,
         not_kept: Vec<Vec<EvidenceAlignment>>,
-        holds_kept: &HashSet<u32>,
     ) -> HigherLevels {
         let below_reads = (0..below.len()).collect::<Vec<_>>();
         let not_kept_reads = (below.len()..below.len() + not_kept.len()).collect::<Vec<_>>();
@@ -1125,7 +1088,6 @@ mod tests {
             below_species: (&below_reads, policy(0.80)),
             not_kept: (&not_kept_reads, policy(0.95)),
             noisy_kept: &HashSet::new(),
-            holds_kept,
             penalty: 3.0,
             max_iterations: 1000,
             keep_shares: true,
@@ -1177,9 +1139,8 @@ mod tests {
 
     #[test]
     fn a_genus_row_needs_enough_unique_reads_identity_and_an_even_chunk_ratio() {
-        let none = HashSet::new();
         // 250 reads of a species not kept, unique to genus 100 and spread along its genome.
-        let found = place_reads(Vec::new(), reads(&[(1001, 1, 0.99)], 250, true), &none);
+        let found = place_reads(Vec::new(), reads(&[(1001, 1, 0.99)], 250, true));
         assert_eq!(rows(&found), [(100, Rank::Genus, 250.0)]);
         let candidate = &found.genera[0];
         assert_eq!(
@@ -1192,11 +1153,11 @@ mod tests {
         // Depth: first-read bases over the genome's length.
         assert!((found.rows[0].depth - 250.0 * 100.0 / 1_000_000.0).abs() < 1e-12);
         // Fewer than 200 unique reads: no candidate; the reads go to the family, too few for a row there too.
-        let found = place_reads(Vec::new(), reads(&[(1001, 1, 0.99)], 199, true), &none);
+        let found = place_reads(Vec::new(), reads(&[(1001, 1, 0.99)], 199, true));
         assert!(found.rows.is_empty() && found.genera.is_empty());
         assert_eq!(found.unexplained, 199);
         // Reads in one place: the chunk ratio fails, and the family's window spread too.
-        let found = place_reads(Vec::new(), reads(&[(1001, 1, 0.99)], 250, false), &none);
+        let found = place_reads(Vec::new(), reads(&[(1001, 1, 0.99)], 250, false));
         assert!(found.rows.is_empty());
         assert!(
             matches!(found.genera[0].failures[..], [Failure::ChunkRatio(ratio)] if ratio < GENUS_MIN_CHUNK_RATIO)
@@ -1204,7 +1165,7 @@ mod tests {
         assert_eq!(found.taxa[0].taxid, 40);
         assert_eq!(found.taxa[0].from_genera, 250);
         // Reads without a species-level match below the genus identity (0.95 - 0.09): their family takes them.
-        let found = place_reads(reads(&[(1001, 1, 0.85)], 250, true), Vec::new(), &none);
+        let found = place_reads(reads(&[(1001, 1, 0.85)], 250, true), Vec::new());
         assert!(matches!(
             found.genera[0].failures[..],
             [Failure::Identity { identity, .. }] if (identity - 0.85).abs() < 1e-6
@@ -1220,7 +1181,6 @@ mod tests {
         let found = place_reads(
             reads(&[(1001, 1, 0.85)], 250, true),
             reads(&[(1001, 1, 0.99)], 250, true),
-            &HashSet::new(),
         );
         assert_eq!(rows(&found), [(100, Rank::Genus, 500.0)]);
         assert_eq!(found.rows[0].unique, [250, 250]);
@@ -1240,7 +1200,6 @@ mod tests {
         let found = place_reads(
             reads(&[(1001, 1, 0.85)], 50, true),
             reads(&[(1001, 1, 0.99)], 250, true),
-            &HashSet::new(),
         );
         assert_eq!(rows(&found), [(100, Rank::Genus, 300.0)]);
         assert_eq!(found.rows[0].unique, [50, 250]);
@@ -1259,13 +1218,12 @@ mod tests {
 
     #[test]
     fn reads_tied_across_genera_are_shared_by_the_em_among_the_genera_with_a_row() {
-        let none = HashSet::new();
         let tied = reads(&[(1001, 1, 0.99), (1011, 11, 0.99)], 10, true);
         // Genus 100 with 300 unique reads, genus 101 with 200: the EM shares the tied reads 3:2.
         let mut not_kept = reads(&[(1001, 1, 0.99)], 300, true);
         not_kept.extend(reads(&[(1011, 11, 0.99)], 200, true));
         not_kept.extend(tied.clone());
-        let found = place_reads(Vec::new(), not_kept, &none);
+        let found = place_reads(Vec::new(), not_kept);
         let reads_of = |found: &HigherLevels| {
             found
                 .rows
@@ -1285,7 +1243,7 @@ mod tests {
         let mut not_kept = reads(&[(1001, 1, 0.99)], 300, true);
         not_kept.extend(reads(&[(1011, 11, 0.99)], 150, true));
         not_kept.extend(tied.clone());
-        let found = place_reads(Vec::new(), not_kept, &none);
+        let found = place_reads(Vec::new(), not_kept);
         assert_eq!(rows(&found)[0], (100, Rank::Genus, 310.0));
         // A genus with a row that matches worse than the tie set takes a share by its likelihood; a tie set
         // without a genus with a row goes above genus even when a worse match has one.
@@ -1301,7 +1259,7 @@ mod tests {
             5,
             true,
         ));
-        let found = place_reads(Vec::new(), not_kept, &none);
+        let found = place_reads(Vec::new(), not_kept);
         let shared = split(&found);
         assert_eq!(shared.len(), 10);
         assert_eq!((shared[0][0].0, shared[0][1].0), (100, 102));
@@ -1312,14 +1270,14 @@ mod tests {
         // a row there or above.
         let mut below = reads(&[(1011, 11, 0.85)], 150, true);
         below.extend(reads(&[(1001, 1, 0.85), (1011, 11, 0.85)], 60, true));
-        let found = place_reads(below, reads(&[(1001, 1, 0.99)], 300, true), &none);
+        let found = place_reads(below, reads(&[(1001, 1, 0.99)], 300, true));
         assert_eq!(rows(&found), [(100, Rank::Genus, 360.0)]);
         assert_eq!(found.unexplained, 150);
         assert!(found.taxa.is_empty());
         // Tied reads without a genus row in their tie set go above genus, with the genera they list.
         let mut below = reads(&[(1011, 11, 0.85)], 150, true);
         below.extend(reads(&[(1001, 1, 0.85), (1011, 11, 0.85)], 60, true));
-        let found = place_reads(below, Vec::new(), &none);
+        let found = place_reads(below, Vec::new());
         assert_eq!(rows(&found), [(40, Rank::Family, 210.0)]);
         assert_eq!((found.taxa[0].tied, found.taxa[0].from_genera), (60, 150));
         assert_eq!(found.taxa[0].tied_genera, [100, 101]);
@@ -1331,11 +1289,7 @@ mod tests {
         not_kept.extend(reads(&[(1011, 11, 0.99)], 200, true));
         not_kept.extend(reads(&[(1001, 1, 0.99), (1011, 11, 0.99)], 30, true));
         not_kept.extend(reads(&[(1021, 21, 0.99), (1031, 31, 0.99)], 250, true));
-        let found = place_reads(
-            reads(&[(1001, 1, 0.85)], 220, true),
-            not_kept,
-            &HashSet::new(),
-        );
+        let found = place_reads(reads(&[(1001, 1, 0.85)], 220, true), not_kept);
         assert_eq!(found.rows.len(), 3);
         for row in &found.rows {
             let sum = found
@@ -1351,9 +1305,8 @@ mod tests {
 
     #[test]
     fn other_reads_go_to_the_lowest_common_ancestor_of_their_matches() {
-        let none = HashSet::new();
         let found_at = |on: &[(u32, u32, f32)]| {
-            let found = place_reads(Vec::new(), reads(on, 250, true), &none);
+            let found = place_reads(Vec::new(), reads(on, 250, true));
             (rows(&found), found.unexplained)
         };
         // Genera of one family, of one order, of one class.
@@ -1378,13 +1331,11 @@ mod tests {
 
     #[test]
     fn reads_of_a_taxon_without_a_row_move_up_rank_by_rank() {
-        let none = HashSet::new();
         // Clustered reads tied across genera 100 and 101: family 40 fails its window spread, and so does every
         // rank above it; the reads stay unexplained above the domain.
         let found = place_reads(
             Vec::new(),
             reads(&[(1001, 1, 0.99), (1011, 11, 0.99)], 250, false),
-            &none,
         );
         assert!(found.rows.is_empty());
         let path = found
@@ -1411,14 +1362,14 @@ mod tests {
         // order's row, spread along the genome.
         let mut not_kept = reads(&[(1001, 1, 0.99), (1011, 11, 0.99)], 150, true);
         not_kept.extend(reads(&[(1021, 21, 0.99), (1022, 22, 0.99)], 100, true));
-        let found = place_reads(Vec::new(), not_kept, &none);
+        let found = place_reads(Vec::new(), not_kept);
         // Species 1022 is not in the taxonomy: the second set's ancestor is the root, so its reads stay
         // unexplained; family 40's reads move up alone and are too few.
         assert!(found.rows.is_empty());
         assert_eq!(found.unexplained, 250);
         let mut not_kept = reads(&[(1001, 1, 0.99), (1011, 11, 0.99)], 150, true);
         not_kept.extend(reads(&[(1021, 21, 0.99), (1001, 1, 0.99)], 100, true));
-        let found = place_reads(Vec::new(), not_kept, &none);
+        let found = place_reads(Vec::new(), not_kept);
         assert_eq!(rows(&found), [(30, Rank::Order, 250.0)]);
         assert_eq!(found.end_of(40).map(|row| row.taxid), Some(30));
     }
@@ -1429,43 +1380,20 @@ mod tests {
         // Genus 100: 150 reads on genome 1 (1 Mb) and 100 on genome 5 (100 kb). All 250 count over genome 1,
         // which holds most of them.
         let mut not_kept = reads(&[(1001, 1, 0.99)], 150, true);
-        not_kept.extend((0..100).map(|i| read_small(&[(1002, 5, 0.99)], i * 990, 1.0)));
-        let found = place_reads(Vec::new(), not_kept, &HashSet::new());
+        not_kept.extend((0..100).map(|i| read_small(&[(1002, 5, 0.99)], i * 990)));
+        let found = place_reads(Vec::new(), not_kept);
         assert_eq!(rows(&found), [(100, Rank::Genus, 250.0)]);
         assert_eq!(found.rows[0].measured.genome, 1);
         assert!((depth(&found) - 250.0 * 100.0 / 1e6).abs() < 1e-12);
         // Reads tied across genera 100 and 101, 125 best on genome 5 (100 kb) and 125 on genome 6 (1 Mb): family
         // 40 is measured on genome 5 and its depth is the mean of the depths over the two genomes.
         let mut across = (0..125)
-            .map(|i| read_small(&[(1001, 5, 0.99), (1011, 11, 0.99)], i * 790, 1.0))
+            .map(|i| read_small(&[(1001, 5, 0.99), (1011, 11, 0.99)], i * 790))
             .collect::<Vec<_>>();
         across.extend(reads(&[(1001, 6, 0.99), (1011, 11, 0.99)], 125, true));
-        let found = place_reads(Vec::new(), across, &HashSet::new());
+        let found = place_reads(Vec::new(), across);
         assert_eq!(rows(&found), [(40, Rank::Family, 250.0)]);
         assert_eq!(found.rows[0].measured.genome, 5);
         assert!((depth(&found) - 250.0 * 100.0 * (1.0 / 1e5 + 1.0 / 1e6) / 2.0).abs() < 1e-12);
-        // On a genome indexed in sampled segments, reads count as full-index equivalents and the depth is taken
-        // over the indexed length.
-        let sampled = (0..250)
-            .map(|i| read_small(&[(1001, 5, 0.99)], i * 390, 10.0))
-            .collect();
-        let found = place_reads(Vec::new(), sampled, &HashSet::new());
-        assert_eq!(rows(&found), [(100, Rank::Genus, 250.0)]);
-        assert!((found.rows[0].equivalent - 2_500.0).abs() < 1e-9);
-        assert!((depth(&found) - 250.0 * 100.0 / 1e5).abs() < 1e-12);
-    }
-
-    #[test]
-    fn on_a_sampled_database_taxa_holding_a_kept_species_get_no_row() {
-        // Genus 100 and family 40 hold a kept species: the genus fails, and its reads move past the family to
-        // the order.
-        let found = place_reads(
-            Vec::new(),
-            reads(&[(1001, 1, 0.99)], 250, true),
-            &HashSet::from([100, 40]),
-        );
-        assert_eq!(found.genera[0].failures, [Failure::HoldsKept]);
-        assert_eq!(found.taxa[0].failures, [Failure::HoldsKept]);
-        assert_eq!(rows(&found), [(30, Rank::Order, 250.0)]);
     }
 }

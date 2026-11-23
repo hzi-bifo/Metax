@@ -988,9 +988,6 @@ impl Decisions<'_> {
                 failed(|f| matches!(f, higher::Failure::ChunkRatio(_))),
             );
             if !candidate.failures.is_empty() {
-                if candidate.failures.contains(&higher::Failure::HoldsKept) {
-                    tests.push_str(&format!(", {}", higher::Failure::HoldsKept));
-                }
                 if parts.row.is_some() {
                     tests.push_str(&format!("; they joined the genus row from reads {passed}"));
                 } else {
@@ -1340,7 +1337,6 @@ mod tests {
                     rank: Rank::Genus,
                     reads: 475.0,
                     unique: [220, 250],
-                    equivalent: 250.0,
                     depth: 0.1,
                     measured: genus,
                 },
@@ -1349,7 +1345,6 @@ mod tests {
                     rank: Rank::Family,
                     reads: 320.0,
                     unique: [0, 0],
-                    equivalent: 320.0,
                     depth: 0.1,
                     measured: family,
                 },
