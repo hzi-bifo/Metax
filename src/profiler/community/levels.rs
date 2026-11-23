@@ -1092,9 +1092,16 @@ fn add_placement(
 }
 
 /// Estimated ANI of the sample's strain to a genome: its fragments' mean
-/// `identity` to the genome relative to the sample's `baseline` identity.
+/// `identity` to the genome relative to the sample's `baseline` identity, at
+/// most 1; unknown (NaN) when the identity is.
 fn estimated_ani(baseline: f64, identity: f64) -> f64 {
-    (1.0 - (baseline - identity)).min(1.0)
+    let ani = 1.0 - (baseline - identity);
+    // Not `f64::min`, which would turn NaN into 1.
+    if ani > 1.0 {
+        1.0
+    } else {
+        ani
+    }
 }
 
 /// The identity rules for relatives, over the kept `species` with their mean
@@ -2817,6 +2824,13 @@ mod tests {
             "removed by --min-reads: 12.00 reads < 20; removed by --min-breadth: breadth 0.0310 < 0.0500"
         );
         assert_eq!(both.check(20.0, 0.05), None);
+    }
+
+    #[test]
+    fn the_estimated_ani_is_at_most_one_and_unknown_without_an_identity() {
+        assert!((estimated_ani(0.99, 0.98) - 0.99).abs() < 1e-12);
+        assert_eq!(estimated_ani(0.99, 0.995), 1.0);
+        assert!(estimated_ani(0.99, f64::NAN).is_nan());
     }
 
     #[test]
