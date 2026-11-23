@@ -782,8 +782,8 @@ impl Run<'_> {
         if above.is_some() && data.fractional {
             log::info!(
                 target: "PROFILER",
-                "on a database of sampled genomes, reads not placed at a species are not \
-                 reported above species."
+                "on a fractional database, reads not placed at a species are not reported \
+                 above species."
             );
         }
         let higher = above.filter(|_| !data.fractional).map(|above| {

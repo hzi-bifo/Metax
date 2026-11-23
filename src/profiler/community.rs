@@ -565,7 +565,7 @@ impl Profiler {
             ResolvedProfilerParameters {
                 min_breadth: self.cfg.breadth.unwrap_or(0.0),
                 min_chunk_breadth: chunk_cutoff.cutoff,
-                chunk_breadth_source: chunk_cutoff.source_in_words(&basis),
+                chunk_breadth_source: &chunk_cutoff.source_in_words(&basis),
                 chunk_breadth_basis_reads: basis.reads,
                 total_reads,
                 mapped_reads: aligned_reads,
@@ -842,20 +842,20 @@ impl ChunkCutoff {
     }
 
     /// Where the cutoff comes from, in words, with the `basis` of the curve.
-    fn source_in_words(&self, basis: &ChunkBasis) -> &'static str {
-        match self.source {
-            ChunkSource::User => "user-supplied --min-chunk-breadth",
-            ChunkSource::Automatic => {
-                let scaled = self.is_user_scaled() || self.is_recall_scaled();
-                match (scaled, basis.scaled, basis.mapped) {
-                    (true, true, _) => "recall-scaled auto-estimate from scaled mapped reads",
-                    (true, false, true) => "recall-scaled auto-estimate from mapped reads",
-                    (true, false, false) => "recall-scaled auto-estimate from total reads",
-                    (false, true, _) => "auto-estimated from scaled mapped reads",
-                    (false, false, true) => "auto-estimated from mapped reads",
-                    (false, false, false) => "auto-estimated from total reads",
-                }
-            }
+    fn source_in_words(&self, basis: &ChunkBasis) -> String {
+        if self.source == ChunkSource::User {
+            return "user-supplied --min-chunk-breadth".to_string();
+        }
+        let reads = match (basis.scaled, basis.mapped) {
+            (true, _) => "scaled mapped reads",
+            (false, true) => "mapped reads",
+            (false, false) => "total reads",
+        };
+        match (self.is_user_scaled(), self.is_recall_scaled()) {
+            (false, false) => format!("auto-estimated from {reads}"),
+            (true, false) => format!("user-scaled auto-estimate from {reads}"),
+            (false, true) => format!("recall-scaled auto-estimate from {reads}"),
+            (true, true) => format!("user- and recall-scaled auto-estimate from {reads}"),
         }
     }
 
@@ -1531,7 +1531,47 @@ mod tests {
                 scaled: false,
                 reads: 5_000_000
             }),
-            "recall-scaled auto-estimate from total reads"
+            "user- and recall-scaled auto-estimate from total reads"
+        );
+    }
+
+    #[test]
+    fn the_source_names_the_scaling_that_applied() {
+        let basis = |mapped, scaled| ChunkBasis {
+            mapped,
+            scaled,
+            reads: 5_000_000,
+        };
+        let words = |cfg: &ProfilerConfig, basis: ChunkBasis| {
+            ChunkCutoff::resolve(cfg, basis.reads).source_in_words(&basis)
+        };
+        let mut cfg = cfg(Sequencer::Illumina);
+        assert_eq!(
+            words(&cfg, basis(false, false)),
+            "auto-estimated from total reads"
+        );
+        assert_eq!(
+            words(&cfg, basis(true, false)),
+            "auto-estimated from mapped reads"
+        );
+        assert_eq!(
+            words(&cfg, basis(true, true)),
+            "auto-estimated from scaled mapped reads"
+        );
+        cfg.chunk_breadth_scale = 0.5;
+        assert_eq!(
+            words(&cfg, basis(false, false)),
+            "user-scaled auto-estimate from total reads"
+        );
+        cfg.mode = ProfileMode::Recall;
+        assert_eq!(
+            words(&cfg, basis(true, false)),
+            "user- and recall-scaled auto-estimate from mapped reads"
+        );
+        cfg.chunk_breadth_scale = 1.0;
+        assert_eq!(
+            words(&cfg, basis(true, true)),
+            "recall-scaled auto-estimate from scaled mapped reads"
         );
     }
 }
