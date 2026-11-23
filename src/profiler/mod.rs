@@ -984,61 +984,35 @@ fn display_option<T: ToString>(value: Option<T>) -> String {
         .unwrap_or_else(|| "None".to_string())
 }
 
-/// Main profiler: loads a sample's mappings and profiles them
-/// ([`community::CommunityProfiler`]).
-///
-/// # Usage
-///
-/// ```ignore
-/// let profiler = Profiler::new(config, taxonomy)?;
-/// profiler.run()?;
-/// ```
+/// The profiler of a sample: loads its mappings ([`community`]) and profiles
+/// them with the level-wise engine.
 pub struct Profiler {
-    /// Configuration for the profiling run
     cfg: ProfilerConfig,
-
-    /// Taxonomy database (shared via Arc for thread safety)
-    taxonomy: Arc<Taxonomy>,
+    taxonomy: Taxonomy,
 }
 
 impl Profiler {
-    /// Create a new profiler with the given configuration and taxonomy.
-    ///
-    /// The taxonomy is wrapped in Arc for efficient sharing across threads.
-    ///
-    /// # Arguments
-    ///
-    /// * `cfg` - Profiler configuration
-    /// * `taxonomy` - NCBI taxonomy database
-    ///
-    /// # Returns
-    ///
-    /// A new Profiler instance ready to run.
-    pub fn new(cfg: ProfilerConfig, taxonomy: Taxonomy) -> Result<Self> {
-        Ok(Self {
-            cfg,
-            taxonomy: Arc::new(taxonomy),
-        })
+    pub fn new(cfg: ProfilerConfig, taxonomy: Taxonomy) -> Self {
+        Self { cfg, taxonomy }
     }
 
-    /// Run the profiling pipeline on the mapping file.
-    ///
-    /// # Returns
-    ///
-    /// Ok(()) on success, or an error if profiling fails.
-    pub fn run(&self) -> Result<()> {
-        community::CommunityProfiler::new(self.cfg.clone(), self.taxonomy.clone())?.run()
+    /// Profile the saved or staged mapping file.
+    pub fn run(mut self) -> Result<()> {
+        log::info!(target: "PROFILER", "Initializing the profiler!");
+        let data = self.load_mapping_file()?;
+        self.profile(data)
     }
 
-    /// Run profiling from structured in-process Metam mappings, avoiding
-    /// mapping TSV serialization and parsing.
+    /// Profile structured in-process Metam mappings, without writing and
+    /// parsing a mapping file.
     pub fn run_with_metam_mappings(
-        &self,
+        mut self,
         receiver: MetamMappingReceiver,
         source: &str,
     ) -> Result<()> {
-        community::CommunityProfiler::new(self.cfg.clone(), self.taxonomy.clone())?
-            .run_with_metam_mappings(receiver, source)
+        log::info!(target: "PROFILER", "Initializing the profiler!");
+        let data = self.load_mapping_stream(receiver, source)?;
+        self.profile(data)
     }
 }
 

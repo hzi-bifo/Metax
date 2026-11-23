@@ -316,7 +316,7 @@ impl MetaxApp {
             check_taxonomy(&taxonomy)?;
         }
         let profiler_config = self.build_profiler_config(&prepared_mapping, thresholds)?;
-        let profiler = Profiler::new(profiler_config, taxonomy)?;
+        let profiler = Profiler::new(profiler_config, taxonomy);
         match prepared_mapping {
             PreparedMapping::MetamStream {
                 mapper, profile, ..
@@ -325,7 +325,6 @@ impl MetaxApp {
             }
             PreparedMapping::Metam { output, .. } => {
                 let profile_result = profiler.run();
-                drop(profiler);
                 if let Err(profile_error) = profile_result {
                     match output.preserve_after_failure() {
                         Ok(Some(path)) => log::warn!(

@@ -189,8 +189,13 @@ impl Names<'_> {
             .to_string()
     }
 
-    fn genome(&self, assembly_id: u32) -> &str {
+    pub(super) fn genome(&self, assembly_id: u32) -> &str {
         &self.genomes[assembly_id as usize]
+    }
+
+    /// The assembly id and accession of genome `assembly_id`.
+    pub(super) fn genome_entry(&self, assembly_id: u32) -> (u32, Arc<str>) {
+        (assembly_id, Arc::clone(&self.genomes[assembly_id as usize]))
     }
 
     /// The ancestor of `taxid` at `rank`.
@@ -204,8 +209,8 @@ pub(super) struct FinalRows {
     /// Of each species with rows of its own, summed over its species row and
     /// genome rows in profile order.
     species: HashMap<u32, [f64; 2]>,
-    /// Of each genome (strain) row, by genome.
-    strains: HashMap<Arc<str>, [f64; 2]>,
+    /// Of each genome (strain) row, by assembly id.
+    strains: HashMap<u32, [f64; 2]>,
     /// Of each row above species, by taxid.
     taxa: HashMap<u32, [f64; 2]>,
 }
@@ -233,9 +238,7 @@ impl FinalRows {
                 .chain(&block.genomes)
                 .fold(0.0, |total, row| total + row.abundance);
             for row in &block.genomes {
-                finals
-                    .strains
-                    .insert(Arc::clone(&row.best_fit.genome), amount(row));
+                finals.strains.insert(row.best_fit.assembly_id, amount(row));
             }
             finals
                 .species
@@ -786,7 +789,7 @@ impl Decisions<'_> {
                 row.taxid,
                 accession,
             );
-            let strain_row = finals.strains.get(accession).copied();
+            let strain_row = finals.strains.get(&row.assembly_id).copied();
             let passed = level.species.get(&row.taxid).is_some_and(|species| {
                 species
                     .strains
@@ -803,7 +806,7 @@ impl Decisions<'_> {
                 (
                     "passed".to_string(),
                     match (
-                        self.dropped.genomes.get(accession),
+                        self.dropped.genomes.get(&row.assembly_id),
                         self.dropped.taxa.get(&row.taxid),
                     ) {
                         (Some(removal), _) => removal.reason(),
@@ -1214,7 +1217,7 @@ mod tests {
             rank,
             (reads, 1.0),
             &EvidenceCoverage::default(),
-            Arc::from(format!("GCF_{genome}")),
+            (genome, Arc::from(format!("GCF_{genome}"))),
             (f64::NAN, f64::NAN),
         );
         row.abundance = abundance;

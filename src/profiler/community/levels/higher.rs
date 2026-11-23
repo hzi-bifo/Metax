@@ -400,7 +400,7 @@ pub(super) struct HigherLevels {
     pub(super) fragments: [usize; 2],
     pub(super) unexplained: usize,
     /// With `keep_shares`, each placed fragment's read and its shares.
-    pub(super) shares: Vec<(usize, Vec<(u32, f64)>)>,
+    pub(super) shares: FragmentShares,
     /// Where the fragments of each taxon without a row moved: the next taxon
     /// above it, or `None` (unexplained).
     pub(super) moved: HashMap<u32, Option<u32>>,
@@ -463,233 +463,32 @@ pub(super) fn place(level: &Level, lineages: &Lineages) -> HigherLevels {
         .map(|taxa| genera_of(taxa, lineages))
         .collect::<Vec<_>>();
     let identity_floor = level.not_kept.1.identity - GENUS_IDENTITY_BELOW_SPECIES;
-    let measure = |list: &[u32]| measure(&placed, list, &genomes, level);
-    let mut destination = vec![Destination::Unexplained; placed.len()];
-
-    // Step 1: genus rows from unique fragments, by kind.
-    let mut unique: BTreeMap<(u32, Kind), Vec<u32>> = BTreeMap::new();
-    let mut tied: HashMap<(u32, Kind), usize> = HashMap::new();
-    for (i, fragment) in placed.iter().enumerate() {
-        let of = &genera[fragment.ties as usize];
-        match of.unique {
-            Some(genus) => unique
-                .entry((genus, fragment.kind))
-                .or_default()
-                .push(i as u32),
-            None => {
-                for &genus in &of.genera {
-                    *tied.entry((genus, fragment.kind)).or_default() += 1;
-                }
-            }
-        }
-    }
-    let mut candidates = Vec::new();
-    for (&(genus, kind), list) in &unique {
-        if list.len() < MIN_FRAGMENTS {
-            continue;
-        }
-        let identity = list
-            .iter()
-            .map(|&i| f64::from(placed[i as usize].identity))
-            .sum::<f64>()
-            / list.len() as f64;
-        let measured = measure(list);
-        candidates.push(GenusCandidate {
-            genus,
-            kind,
-            unique: list.len(),
-            tied: tied.get(&(genus, kind)).copied().unwrap_or(0),
-            identity,
-            measured,
-            failures: genus_failures(identity, identity_floor, &measured.coverage),
-            shown: false,
-        });
-    }
-    // A genus with a row from either kind holds the fragments of both kinds
-    // unique to it; those of the others go to their family.
-    let mut with_row: BTreeMap<u32, [usize; 2]> = candidates
-        .iter()
-        .filter(|candidate| candidate.failures.is_empty())
-        .map(|candidate| (candidate.genus, [0; 2]))
-        .collect();
-    let mut pending: HashMap<u32, (Rank, Arrivals)> = HashMap::new();
-    let mut genus_start: HashMap<u32, Option<u32>> = HashMap::new();
-    let mut unexplained = 0;
-    for ((genus, kind), list) in unique {
-        if let Some(unique) = with_row.get_mut(&genus) {
-            unique[kind as usize] = list.len();
-            for &i in &list {
-                destination[i as usize] = Destination::Taxon(genus);
-            }
-            continue;
-        }
-        let start = lineages.above(genus, Rank::Genus);
-        genus_start.insert(genus, start.map(|(taxid, _)| taxid));
-        match start {
-            Some((start, rank)) => {
-                let arrivals = &mut pending
-                    .entry(start)
-                    .or_insert_with(|| (rank, Arrivals::default()))
-                    .1;
-                arrivals.from_genera += list.len();
-                arrivals.fragments.extend(list);
-            }
-            None => unexplained += list.len(),
-        }
-    }
-    // The genus row shows the evidence of its kind with most unique fragments.
-    let mut shown: HashMap<u32, usize> = HashMap::new();
-    for (index, candidate) in candidates.iter().enumerate() {
-        if candidate.failures.is_empty() {
-            let best = shown.entry(candidate.genus).or_insert(index);
-            if candidates[*best].unique < candidate.unique {
-                *best = index;
-            }
-        }
-    }
-    for &index in shown.values() {
-        candidates[index].shown = true;
-    }
-
-    // Step 2: fragments tied across genera go to the genera with a genus row
-    // when their tie set holds one, shared by the EM.
-    let mut tied: Vec<u32> = Vec::new();
-    let mut starts: HashMap<u32, Option<(u32, Rank)>> = HashMap::new();
-    for (i, fragment) in placed.iter().enumerate() {
-        let of = &genera[fragment.ties as usize];
-        if of.unique.is_some() {
-            continue;
-        }
-        if of.genera.iter().any(|genus| with_row.contains_key(genus)) {
-            tied.push(i as u32);
-            continue;
-        }
-        let start = *starts
-            .entry(fragment.ties)
-            .or_insert_with(|| lineages.common_start(&sets[fragment.ties as usize]));
-        match start {
-            Some((start, rank)) => {
-                let arrivals = &mut pending
-                    .entry(start)
-                    .or_insert_with(|| (rank, Arrivals::default()))
-                    .1;
-                arrivals.tied += 1;
-                *arrivals.sets.entry(fragment.ties).or_default() += 1;
-                arrivals.fragments.push(i as u32);
-            }
-            None => unexplained += 1,
-        }
-    }
-    let mut tied_shares: Vec<Vec<(u32, f64)>> = Vec::new();
-    if !tied.is_empty() {
-        let (em, groups) = share_tied(level, &placed, &tied, &with_row, lineages);
-        tied_shares = em.posteriors;
-        for (i, group) in groups {
-            let group = group.expect("a fragment with a genus row among its tie set's genera");
-            destination[i as usize] = Destination::Shared(group as u32);
-        }
-    }
-
-    // Step 3: rows above genus, rank by rank.
-    let mut taxa = Vec::new();
-    let mut evidence: BTreeMap<(Rank, u32), Measured> = BTreeMap::new();
-    let mut moved: HashMap<u32, Option<u32>> = HashMap::new();
-    for rank in [
-        Rank::Family,
-        Rank::Order,
-        Rank::Class,
-        Rank::Phylum,
-        Rank::Domain,
-    ] {
-        let mut here = pending
-            .iter()
-            .filter(|(_, (of, _))| *of == rank)
-            .map(|(&taxid, _)| taxid)
-            .collect::<Vec<_>>();
-        here.sort_unstable();
-        for taxid in here {
-            let (_, arrivals) = pending.remove(&taxid).expect("listed above");
-            let passed = arrivals.fragments.len() >= MIN_FRAGMENTS && {
-                let measured = measure(&arrivals.fragments);
-                let failures = taxon_failures(&measured);
-                let passed = failures.is_empty();
-                if passed {
-                    evidence.insert((rank, taxid), measured);
-                }
-                taxa.push(TaxonCandidate {
-                    taxid,
-                    rank,
-                    tied: arrivals.tied,
-                    from_genera: arrivals.from_genera,
-                    from_below: arrivals.from_below,
-                    tied_genera: most_listed(&arrivals.sets, &genera),
-                    measured,
-                    failures,
-                });
-                passed
-            };
-            if passed {
-                for &i in &arrivals.fragments {
-                    destination[i as usize] = Destination::Taxon(taxid);
-                }
-                continue;
-            }
-            let next = lineages.above(taxid, rank);
-            moved.insert(taxid, next.map(|(next, _)| next));
-            match next {
-                Some((next, next_rank)) => {
-                    let above = &mut pending
-                        .entry(next)
-                        .or_insert_with(|| (next_rank, Arrivals::default()))
-                        .1;
-                    above.from_below += arrivals.fragments.len();
-                    above.fragments.extend(arrivals.fragments);
-                }
-                None => unexplained += arrivals.fragments.len(),
-            }
-        }
-    }
-    debug_assert!(pending.is_empty());
-
-    // The rows: each fragment counted where it went.
+    let mut placing = Placing {
+        level,
+        lineages,
+        placed: &placed,
+        sets: &sets,
+        genera: &genera,
+        genomes: &genomes,
+        destination: vec![Destination::Unexplained; placed.len()],
+        pending: HashMap::new(),
+        unexplained: 0,
+    };
+    let GenusRows {
+        candidates,
+        with_row,
+        genus_start,
+    } = placing.genus_rows(identity_floor);
+    let tied_shares = placing.share_across_genera(&with_row);
+    let AboveGenus {
+        taxa,
+        mut evidence,
+        moved,
+    } = placing.rows_above_genus();
     for candidate in candidates.iter().filter(|candidate| candidate.shown) {
         evidence.insert((Rank::Genus, candidate.genus), candidate.measured);
     }
-    let mut totals: HashMap<u32, [f64; 2]> = HashMap::new();
-    let mut shares = Vec::new();
-    for (fragment, to) in placed.iter().zip(&destination) {
-        let whole;
-        let parts: &[(u32, f64)] = match *to {
-            Destination::Unexplained => continue,
-            Destination::Taxon(taxid) => {
-                whole = [(taxid, 1.0)];
-                &whole
-            }
-            Destination::Shared(index) => &tied_shares[index as usize],
-        };
-        for &(taxid, share) in parts {
-            let total = totals.entry(taxid).or_default();
-            total[0] += share;
-            total[1] += share * f64::from(fragment.bases);
-        }
-        if level.keep_shares {
-            shares.push((fragment.read, parts.to_vec()));
-        }
-    }
-    let rows = evidence
-        .into_iter()
-        .map(|((rank, taxid), measured)| {
-            let [reads, bases] = totals[&taxid];
-            HigherRow {
-                taxid,
-                rank,
-                reads,
-                unique: with_row.get(&taxid).copied().unwrap_or_default(),
-                depth: bases / measured.length,
-                measured,
-            }
-        })
-        .collect();
+    let (rows, shares) = placing.rows(evidence, &tied_shares, &with_row);
     let mut fragments = [0; 2];
     for fragment in &placed {
         fragments[fragment.kind as usize] += 1;
@@ -700,10 +499,311 @@ pub(super) fn place(level: &Level, lineages: &Lineages) -> HigherLevels {
         taxa,
         identity_floor,
         fragments,
-        unexplained,
+        unexplained: placing.unexplained,
         shares,
         moved,
         genus_start,
+    }
+}
+
+/// Each placed fragment's read and its shares of the rows' taxa.
+pub(super) type FragmentShares = Vec<(usize, Vec<(u32, f64)>)>;
+
+/// Step 1's genus rows: the genus candidates, by genus and kind; the genera
+/// with a genus row, with their unique fragments of each kind; and where the
+/// unique fragments of each other genus went: the first taxon above it, or
+/// none (unexplained).
+struct GenusRows {
+    candidates: Vec<GenusCandidate>,
+    with_row: BTreeMap<u32, [usize; 2]>,
+    genus_start: HashMap<u32, Option<u32>>,
+}
+
+/// Step 3's rows above genus: the candidates, by rank and taxid; the
+/// evidence of each taxon with a row; and where the fragments of each taxon
+/// without a row moved: the next taxon above it, or none (unexplained).
+struct AboveGenus {
+    taxa: Vec<TaxonCandidate>,
+    evidence: BTreeMap<(Rank, u32), Measured>,
+    moved: HashMap<u32, Option<u32>>,
+}
+
+/// The placing of the level's fragments: where each fragment went, the
+/// fragments waiting at a taxon above genus (with its rank), and the
+/// fragments left unexplained.
+struct Placing<'p> {
+    level: &'p Level<'p>,
+    lineages: &'p Lineages<'p>,
+    placed: &'p [Placed],
+    sets: &'p [Vec<u32>],
+    genera: &'p [Genera],
+    genomes: &'p HashMap<u32, f64>,
+    destination: Vec<Destination>,
+    pending: HashMap<u32, (Rank, Arrivals)>,
+    unexplained: usize,
+}
+
+impl Placing<'_> {
+    /// The evidence of the fragments `list` ([`measure`]).
+    fn measure(&self, list: &[u32]) -> Measured {
+        measure(self.placed, list, self.genomes, self.level)
+    }
+
+    /// The fragments waiting at `taxid` of `rank`.
+    fn arrivals(&mut self, taxid: u32, rank: Rank) -> &mut Arrivals {
+        &mut self
+            .pending
+            .entry(taxid)
+            .or_insert_with(|| (rank, Arrivals::default()))
+            .1
+    }
+
+    /// Step 1: genus rows from unique fragments, by kind ([`GenusRows`]).
+    fn genus_rows(&mut self, identity_floor: f64) -> GenusRows {
+        let (placed, genera) = (self.placed, self.genera);
+        let mut unique: BTreeMap<(u32, Kind), Vec<u32>> = BTreeMap::new();
+        let mut tied: HashMap<(u32, Kind), usize> = HashMap::new();
+        for (i, fragment) in placed.iter().enumerate() {
+            let of = &genera[fragment.ties as usize];
+            match of.unique {
+                Some(genus) => unique
+                    .entry((genus, fragment.kind))
+                    .or_default()
+                    .push(i as u32),
+                None => {
+                    for &genus in &of.genera {
+                        *tied.entry((genus, fragment.kind)).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let mut candidates = Vec::new();
+        for (&(genus, kind), list) in &unique {
+            if list.len() < MIN_FRAGMENTS {
+                continue;
+            }
+            let identity = list
+                .iter()
+                .map(|&i| f64::from(placed[i as usize].identity))
+                .sum::<f64>()
+                / list.len() as f64;
+            let measured = self.measure(list);
+            candidates.push(GenusCandidate {
+                genus,
+                kind,
+                unique: list.len(),
+                tied: tied.get(&(genus, kind)).copied().unwrap_or(0),
+                identity,
+                measured,
+                failures: genus_failures(identity, identity_floor, &measured.coverage),
+                shown: false,
+            });
+        }
+        // A genus with a row from either kind holds the fragments of both
+        // kinds unique to it; those of the others go to their family.
+        let mut with_row: BTreeMap<u32, [usize; 2]> = candidates
+            .iter()
+            .filter(|candidate| candidate.failures.is_empty())
+            .map(|candidate| (candidate.genus, [0; 2]))
+            .collect();
+        let mut genus_start: HashMap<u32, Option<u32>> = HashMap::new();
+        for ((genus, kind), list) in unique {
+            if let Some(unique) = with_row.get_mut(&genus) {
+                unique[kind as usize] = list.len();
+                for &i in &list {
+                    self.destination[i as usize] = Destination::Taxon(genus);
+                }
+                continue;
+            }
+            let start = self.lineages.above(genus, Rank::Genus);
+            genus_start.insert(genus, start.map(|(taxid, _)| taxid));
+            match start {
+                Some((start, rank)) => {
+                    let arrivals = self.arrivals(start, rank);
+                    arrivals.from_genera += list.len();
+                    arrivals.fragments.extend(list);
+                }
+                None => self.unexplained += list.len(),
+            }
+        }
+        // The genus row shows the evidence of its kind with most unique
+        // fragments.
+        let mut shown: HashMap<u32, usize> = HashMap::new();
+        for (index, candidate) in candidates.iter().enumerate() {
+            if candidate.failures.is_empty() {
+                let best = shown.entry(candidate.genus).or_insert(index);
+                if candidates[*best].unique < candidate.unique {
+                    *best = index;
+                }
+            }
+        }
+        for &index in shown.values() {
+            candidates[index].shown = true;
+        }
+        GenusRows {
+            candidates,
+            with_row,
+            genus_start,
+        }
+    }
+
+    /// Step 2: fragments tied across genera go to the genera with a genus row
+    /// (`with_row`) when their tie set holds one, shared by the EM
+    /// ([`share_tied`]), and otherwise wait at the first taxon above genus of
+    /// their tie set ([`Lineages::common_start`]). Returns the posteriors of
+    /// the EM's read groups.
+    fn share_across_genera(
+        &mut self,
+        with_row: &BTreeMap<u32, [usize; 2]>,
+    ) -> Vec<Vec<(u32, f64)>> {
+        let (placed, genera, sets, lineages) = (self.placed, self.genera, self.sets, self.lineages);
+        let mut tied: Vec<u32> = Vec::new();
+        let mut starts: HashMap<u32, Option<(u32, Rank)>> = HashMap::new();
+        for (i, fragment) in placed.iter().enumerate() {
+            let of = &genera[fragment.ties as usize];
+            if of.unique.is_some() {
+                continue;
+            }
+            if of.genera.iter().any(|genus| with_row.contains_key(genus)) {
+                tied.push(i as u32);
+                continue;
+            }
+            let start = *starts
+                .entry(fragment.ties)
+                .or_insert_with(|| lineages.common_start(&sets[fragment.ties as usize]));
+            match start {
+                Some((start, rank)) => {
+                    let arrivals = self.arrivals(start, rank);
+                    arrivals.tied += 1;
+                    *arrivals.sets.entry(fragment.ties).or_default() += 1;
+                    arrivals.fragments.push(i as u32);
+                }
+                None => self.unexplained += 1,
+            }
+        }
+        if tied.is_empty() {
+            return Vec::new();
+        }
+        let (em, groups) = share_tied(self.level, placed, &tied, with_row, lineages);
+        for (i, group) in groups {
+            let group = group.expect("a fragment with a genus row among its tie set's genera");
+            self.destination[i as usize] = Destination::Shared(group as u32);
+        }
+        em.posteriors
+    }
+
+    /// Step 3: rows above genus, rank by rank ([`AboveGenus`]).
+    fn rows_above_genus(&mut self) -> AboveGenus {
+        let mut taxa = Vec::new();
+        let mut evidence: BTreeMap<(Rank, u32), Measured> = BTreeMap::new();
+        let mut moved: HashMap<u32, Option<u32>> = HashMap::new();
+        for rank in [
+            Rank::Family,
+            Rank::Order,
+            Rank::Class,
+            Rank::Phylum,
+            Rank::Domain,
+        ] {
+            let mut here = self
+                .pending
+                .iter()
+                .filter(|(_, (of, _))| *of == rank)
+                .map(|(&taxid, _)| taxid)
+                .collect::<Vec<_>>();
+            here.sort_unstable();
+            for taxid in here {
+                let (_, arrivals) = self.pending.remove(&taxid).expect("listed above");
+                let passed = arrivals.fragments.len() >= MIN_FRAGMENTS && {
+                    let measured = self.measure(&arrivals.fragments);
+                    let failures = taxon_failures(&measured);
+                    let passed = failures.is_empty();
+                    if passed {
+                        evidence.insert((rank, taxid), measured);
+                    }
+                    taxa.push(TaxonCandidate {
+                        taxid,
+                        rank,
+                        tied: arrivals.tied,
+                        from_genera: arrivals.from_genera,
+                        from_below: arrivals.from_below,
+                        tied_genera: most_listed(&arrivals.sets, self.genera),
+                        measured,
+                        failures,
+                    });
+                    passed
+                };
+                if passed {
+                    for &i in &arrivals.fragments {
+                        self.destination[i as usize] = Destination::Taxon(taxid);
+                    }
+                    continue;
+                }
+                let next = self.lineages.above(taxid, rank);
+                moved.insert(taxid, next.map(|(next, _)| next));
+                match next {
+                    Some((next, next_rank)) => {
+                        let above = self.arrivals(next, next_rank);
+                        above.from_below += arrivals.fragments.len();
+                        above.fragments.extend(arrivals.fragments);
+                    }
+                    None => self.unexplained += arrivals.fragments.len(),
+                }
+            }
+        }
+        debug_assert!(self.pending.is_empty());
+        AboveGenus {
+            taxa,
+            evidence,
+            moved,
+        }
+    }
+
+    /// The rows of the taxa with `evidence`, each fragment counted where it
+    /// went (`tied_shares`: the posteriors of step 2's read groups; `with_row`:
+    /// each genus row's unique fragments by kind), and with
+    /// [`Level::keep_shares`], each placed fragment's read and shares.
+    fn rows(
+        &self,
+        evidence: BTreeMap<(Rank, u32), Measured>,
+        tied_shares: &[Vec<(u32, f64)>],
+        with_row: &BTreeMap<u32, [usize; 2]>,
+    ) -> (Vec<HigherRow>, FragmentShares) {
+        let mut totals: HashMap<u32, [f64; 2]> = HashMap::new();
+        let mut shares = Vec::new();
+        for (fragment, to) in self.placed.iter().zip(&self.destination) {
+            let whole;
+            let parts: &[(u32, f64)] = match *to {
+                Destination::Unexplained => continue,
+                Destination::Taxon(taxid) => {
+                    whole = [(taxid, 1.0)];
+                    &whole
+                }
+                Destination::Shared(index) => &tied_shares[index as usize],
+            };
+            for &(taxid, share) in parts {
+                let total = totals.entry(taxid).or_default();
+                total[0] += share;
+                total[1] += share * f64::from(fragment.bases);
+            }
+            if self.level.keep_shares {
+                shares.push((fragment.read, parts.to_vec()));
+            }
+        }
+        let rows = evidence
+            .into_iter()
+            .map(|((rank, taxid), measured)| {
+                let [reads, bases] = totals[&taxid];
+                HigherRow {
+                    taxid,
+                    rank,
+                    reads,
+                    unique: with_row.get(&taxid).copied().unwrap_or_default(),
+                    depth: bases / measured.length,
+                    measured,
+                }
+            })
+            .collect();
+        (rows, shares)
     }
 }
 

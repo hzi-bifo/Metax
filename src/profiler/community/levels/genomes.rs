@@ -117,7 +117,7 @@ pub(super) struct GenomeResult {
 /// Strain-level identity and the baseline that genome rows are measured
 /// against.
 #[derive(Clone, Copy)]
-struct StrainLevel {
+struct StrainIdentity {
     identity: f64,
     baseline: f64,
 }
@@ -209,7 +209,7 @@ pub(super) fn resolve(
     )
     .unwrap_or(1.0 - level.error_rate);
     let strain_identity = baseline_identity - STRAIN_MARGIN;
-    let strain = StrainLevel {
+    let strain = StrainIdentity {
         identity: strain_identity,
         baseline: weighted_median(
             shares
@@ -427,7 +427,7 @@ fn best_fit_identities(
 fn strain_genomes(
     data: &MappingData,
     share: &SpeciesShare,
-    strain: StrainLevel,
+    strain: StrainIdentity,
     level: &GenomeLevel,
     diagnostics: &mut Vec<StrainDiagnostic>,
 ) -> (Vec<StrainGenome>, StrainShares) {

@@ -10,7 +10,6 @@
 //! `<prefix>.pathogen`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use super::higher::Lineages;
 use super::{Dropped, Removal, TaxonBlock};
@@ -115,9 +114,7 @@ impl HostFilter<'_> {
                 };
                 let kept = Self::keep(row, &verdict);
                 if !kept {
-                    dropped
-                        .genomes
-                        .insert(Arc::clone(&row.best_fit.genome), removal);
+                    dropped.genomes.insert(row.best_fit.assembly_id, removal);
                 }
                 kept
             });
@@ -135,6 +132,8 @@ mod tests {
     use std::collections::HashSet;
 
     use super::super::profile_row;
+    use std::sync::Arc;
+
     use super::*;
     use crate::profiler::evidence::EvidenceCoverage;
     use crate::taxonomy::Taxonomy;
@@ -191,7 +190,7 @@ mod tests {
             rank,
             (10.0, 1.0),
             &EvidenceCoverage::default(),
-            Arc::from(format!("GCF_{genome}")),
+            (genome, Arc::from(format!("GCF_{genome}"))),
             (f64::NAN, f64::NAN),
         )
     }
@@ -284,13 +283,9 @@ mod tests {
         let mut taxa = dropped.taxa.keys().copied().collect::<Vec<_>>();
         taxa.sort_unstable();
         assert_eq!(taxa, [2, 2000]);
-        let mut genomes = dropped
-            .genomes
-            .keys()
-            .map(|genome| genome.to_string())
-            .collect::<Vec<_>>();
+        let mut genomes = dropped.genomes.keys().copied().collect::<Vec<_>>();
         genomes.sort_unstable();
-        assert_eq!(genomes, ["GCF_12", "GCF_21"]);
+        assert_eq!(genomes, [12, 21]);
         assert_eq!(
             dropped.taxa[&2].reason(),
             "removed by --host: not a pathogen of host 9606"

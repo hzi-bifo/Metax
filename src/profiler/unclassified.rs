@@ -230,6 +230,7 @@ mod tests {
             expected_flex_chunk: 0.0,
             chunk_pvalue: None,
             best_fit: BestFitReport {
+                assembly_id: 1,
                 genome: Arc::from("GCF_1"),
                 evidence_depth: 0.0,
                 identity: (f64::NAN, f64::NAN),

@@ -34,7 +34,6 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -63,12 +62,7 @@ struct ProfileTaxa<'r> {
 }
 
 impl<'r> ProfileTaxa<'r> {
-    fn of(
-        blocks: &'r [TaxonBlock],
-        genome_level: &HashMap<u32, SpeciesGenomes>,
-        genus_members: &[(u32, u32, f64)],
-        assembly_names: &[Arc<str>],
-    ) -> Self {
+    fn of(blocks: &'r [TaxonBlock], genus_members: &[(u32, u32, f64)]) -> Self {
         let mut taxa = Self {
             rows: HashMap::new(),
             strain_rows: HashMap::new(),
@@ -78,16 +72,8 @@ impl<'r> ProfileTaxa<'r> {
             if let Some(row) = &block.taxon {
                 taxa.rows.insert(block.taxid, row.rank.as_str());
             }
-            let strains = genome_level
-                .get(&block.taxid)
-                .map_or(&[][..], |g| &g.strains);
             for row in &block.genomes {
-                if let Some(strain) = strains
-                    .iter()
-                    .find(|s| assembly_names[s.assembly_id as usize] == row.best_fit.genome)
-                {
-                    taxa.strain_rows.insert(strain.assembly_id, row.taxid);
-                }
+                taxa.strain_rows.insert(row.best_fit.assembly_id, row.taxid);
             }
         }
         for &(genus, species, _) in genus_members {
@@ -124,7 +110,7 @@ impl Classifications<'_> {
         blocks: &[TaxonBlock],
         data: &MappingData,
     ) -> Result<usize> {
-        let rows = self.shares(blocks, &data.assembly_names);
+        let rows = self.shares(blocks);
         let mut writer = create_classification_writer(path)?;
         for (read, shares) in &rows {
             writeln!(
@@ -139,17 +125,8 @@ impl Classifications<'_> {
 
     /// Each written fragment's read and its shares on the profile's rows,
     /// renormalised, in read order.
-    fn shares<'r>(
-        &self,
-        blocks: &'r [TaxonBlock],
-        assembly_names: &[Arc<str>],
-    ) -> Vec<(usize, Shares<'r>)> {
-        let taxa = ProfileTaxa::of(
-            blocks,
-            self.genome_level,
-            self.genus_members,
-            assembly_names,
-        );
+    fn shares<'r>(&self, blocks: &'r [TaxonBlock]) -> Vec<(usize, Shares<'r>)> {
+        let taxa = ProfileTaxa::of(blocks, self.genus_members);
         // The genome EM's posteriors of each fragment it shares, by read.
         let mut genome_shares: HashMap<usize, (u32, &Posteriors)> = HashMap::new();
         for (&species, genomes) in self.genome_level {
@@ -250,6 +227,8 @@ fn classification_row(read: &str, shares: &Shares) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::super::genomes::{StrainGenome, StrainShares};
     use super::super::profile_row;
     use super::*;
@@ -263,7 +242,7 @@ mod tests {
             rank,
             (1.0, 1.0),
             &EvidenceCoverage::default(),
-            Arc::from(format!("GCF_{genome}")),
+            (genome, Arc::from(format!("GCF_{genome}"))),
             (f64::NAN, f64::NAN),
         )
     }
@@ -299,11 +278,6 @@ mod tests {
             coverage: EvidenceCoverage::default(),
             asm_len: 1.0,
         }
-    }
-
-    /// Accessions `GCF_<id>` of assembly ids 0-99.
-    fn accessions() -> Vec<Arc<str>> {
-        (0..100).map(|id| Arc::from(format!("GCF_{id}"))).collect()
     }
 
     /// The profile: species 1 (species row), species 4 with a species row
@@ -367,7 +341,7 @@ mod tests {
             credited: &[(8, vec![(1, 0.25), (4, 0.75)])],
         };
         let rows = classifications
-            .shares(&blocks(), &accessions())
+            .shares(&blocks())
             .into_iter()
             .map(|(read, shares)| classification_row(&format!("read{read}"), &shares))
             .collect::<Vec<_>>();
@@ -390,7 +364,7 @@ mod tests {
         );
         // The genome row on genome 41, under the species' taxid, keeps its rank.
         let blocks = blocks();
-        let shares = classifications.shares(&blocks, &accessions());
+        let shares = classifications.shares(&blocks);
         let read3 = &shares.iter().find(|row| row.0 == 3).unwrap().1;
         assert_eq!((read3[1].0, read3[1].1), (4, "strain"));
         assert!((read3[1].2 - 0.225).abs() < 1e-12);
@@ -439,7 +413,7 @@ mod tests {
             credited: &[],
         };
         let rows = classifications
-            .shares(&blocks, &accessions())
+            .shares(&blocks)
             .into_iter()
             .map(|(read, shares)| classification_row(&format!("read{read}"), &shares))
             .collect::<Vec<_>>();

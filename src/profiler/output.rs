@@ -44,6 +44,8 @@ pub(crate) const HOST_COLUMNS: [&str; 3] = ["host_names", "host_taxids", "diseas
 /// depth of that evidence there before abundance estimation.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BestFitReport {
+    /// The genome's assembly id and accession.
+    pub(crate) assembly_id: u32,
     pub(crate) genome: Arc<str>,
     pub(crate) evidence_depth: f64,
     /// Mean identity of the row's fragments to the genome and the estimated
@@ -185,6 +187,7 @@ mod tests {
             expected_flex_chunk: 0.13,
             chunk_pvalue: None,
             best_fit: BestFitReport {
+                assembly_id: 0,
                 genome: Arc::from("GCF_000000001.1"),
                 evidence_depth: 1.5,
                 identity: (f64::NAN, 0.99),

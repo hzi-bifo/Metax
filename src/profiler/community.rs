@@ -17,16 +17,12 @@
 //!    genomes within them and the levels above, and writes the outputs.
 
 use std::collections::{hash_map::Entry, HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufRead, Write};
+use std::io::BufRead;
 use std::path::Path;
 use std::str;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-
-use crate::taxonomy::Taxonomy;
-use csv::WriterBuilder;
 
 use crate::db::{DatabaseMetadata, ReferenceType};
 use crate::mapper::tsv::{
@@ -35,17 +31,17 @@ use crate::mapper::tsv::{
     MetamParseStats, MetamProfile,
 };
 use crate::progress;
+use crate::taxonomy::Taxonomy;
 
-use super::evidence::{CandidatePlacement, EvidenceAlignment, GeneHit, MappingRole};
+use super::evidence::{EvidenceAlignment, MappingRole};
 use super::markers::{FragmentGeometry, FragmentLayout, LengthHistogram, MarkerModel};
-use super::output::ProfileRow;
 use super::rollup::{AboveSpeciesInputs, GenomeLayout};
-use super::unclassified::{self, GenomeReads, MarkerSpecies, ReferenceKind};
+use super::unclassified::{self, MarkerSpecies, ReferenceKind};
 use super::{
     coverage_passes, log_reference_taxonomy_adjustments, log_resolved_profiler_parameters,
     parse_reference_taxonomy, push_string_keyed_value, record_genome_sampling_scale,
     record_reference_taxonomy_adjustment, sampling_scale_from_sizes, scale_automatic_chunk_breadth,
-    strip_pair_suffix, ProfileMode, ProfileRank, ProfilerConfig, ReferenceTaxonomy,
+    strip_pair_suffix, ProfileMode, ProfileRank, Profiler, ProfilerConfig, ReferenceTaxonomy,
     ReferenceTaxonomyAdjustments, ReferenceTaxonomyResolver, ResolvedProfilerParameters,
     StableReadMap, UnresolvedReferences,
 };
@@ -134,29 +130,10 @@ impl<'a> MetamReferences<'a> {
     }
 }
 
-/// The profiler of a sample: loads its mappings and profiles them with the
-/// level-wise engine.
-pub struct CommunityProfiler {
-    cfg: ProfilerConfig,
-
-    /// Taxonomy database (shared across threads)
-    taxonomy: Arc<Taxonomy>,
-}
-
-impl CommunityProfiler {
-    /// Create a profiler with the given configuration.
-    ///
-    /// # Arguments
-    /// * `cfg` - Profiler configuration
-    /// * `taxonomy` - NCBI taxonomy database (wrapped in Arc)
-    pub fn new(cfg: ProfilerConfig, taxonomy: Arc<Taxonomy>) -> Result<Self> {
-        Ok(Self { cfg, taxonomy })
-    }
-
-    /// Load the saved or staged mapping file and profile it.
-    pub fn run(mut self) -> Result<()> {
-        log::info!(target: "PROFILER", "Initializing the profiler!");
-
+/// Loading the mappings of a sample.
+impl Profiler {
+    /// The saved or staged mapping file's mappings.
+    pub(super) fn load_mapping_file(&mut self) -> Result<MappingData> {
         let mappings = self
             .cfg
             .mapper_mappings
@@ -168,24 +145,22 @@ impl CommunityProfiler {
                 .as_ref()
                 .ok_or_else(|| anyhow!("missing reference metadata for native mappings"))?,
         );
-        let mapping_data = self.load_metam(Path::new(&mappings), &db)?;
-        self.profile(mapping_data)
+        self.load_metam(Path::new(&mappings), &db)
     }
 
-    pub fn run_with_metam_mappings(
-        mut self,
+    /// The mappings streamed from the mapper.
+    pub(super) fn load_mapping_stream(
+        &mut self,
         receiver: MetamMappingReceiver,
         source: &str,
-    ) -> Result<()> {
-        log::info!(target: "PROFILER", "Initializing the profiler!");
+    ) -> Result<MappingData> {
         let db = Arc::clone(
             self.cfg
                 .db_metadata
                 .as_ref()
                 .ok_or_else(|| anyhow!("missing Metax database metadata for streamed mappings"))?,
         );
-        let mapping_data = self.load_metam_mappings(receiver, source, &db)?;
-        self.profile(mapping_data)
+        self.load_metam_mappings(receiver, source, &db)
     }
 
     /// Lower an automatic long-read identity cutoff when the reads align worse
@@ -681,7 +656,7 @@ impl CommunityProfiler {
     /// rank or above) that has one: the taxon itself at genus rank, or its
     /// ancestor there.
     fn genus_of_taxa(&self, taxids: &HashSet<u32>) -> HashMap<u32, u32> {
-        let taxonomy = self.taxonomy.as_ref();
+        let taxonomy = &self.taxonomy;
         taxids
             .iter()
             .filter_map(|&taxid| {
@@ -692,96 +667,6 @@ impl CommunityProfiler {
                 resolve_genus_taxid(taxonomy, taxid).map(|genus| (taxid, genus))
             })
             .collect()
-    }
-
-    /// Profile the loaded mappings with the level-wise engine ([`levels`]).
-    fn profile(&self, mapping_data: MappingData) -> Result<()> {
-        levels::profile(self, mapping_data)
-    }
-
-    /// The unclassified share (`--estimate-unclassified`): `None` when not
-    /// requested, `Some(None)` when it cannot be estimated.
-    fn estimate_unclassified(
-        &self,
-        data: &MappingData,
-        rows: &[ProfileRow],
-        marker_genome_reads: &HashMap<u32, GenomeReads>,
-        long_reads: bool,
-    ) -> Option<Option<unclassified::UnclassifiedEstimate>> {
-        data.unclassified_species.as_ref().map(|species| {
-            // Long reads differ in length and in the genes each covers, so
-            // their scales come from the reads themselves.
-            let scales = unclassified::marker_scales(
-                species,
-                data.marker_model.as_deref(),
-                marker_genome_reads,
-                long_reads,
-            );
-            let estimate = unclassified::estimate(rows, &scales, data.total_reads);
-            match estimate {
-                Ok(estimate) => log::info!(
-                    target: "PROFILER",
-                    "Unclassified estimate: {:.2}% of {} input {} are not explained by the profile.",
-                    estimate.share * 100.0,
-                    data.total_reads,
-                    if self.cfg.is_paired { "fragments" } else { "reads" }
-                ),
-                Err(taxid) => log::warn!(
-                    target: "PROFILER",
-                    "Unclassified estimate unavailable: species {taxid} is represented by marker genes that declare no genome size, cannot hold a read of this length, or have no resolved long read."
-                ),
-            }
-            estimate.ok()
-        })
-    }
-
-    /// Path prefix of the profile files: `<prefix>.pathogen` with `--host`.
-    fn profile_prefix(&self) -> String {
-        if self.cfg.host.is_some() {
-            format!("{}.pathogen", self.cfg.outprefix)
-        } else {
-            self.cfg.outprefix.clone()
-        }
-    }
-
-    /// Write `<prefix>.profile.txt`: the `header` text, then the rows and, with
-    /// `--estimate-unclassified`, the unclassified row.
-    fn write_profile(
-        &self,
-        header: &str,
-        rows: &[ProfileRow],
-        unclassified: Option<Option<unclassified::UnclassifiedEstimate>>,
-    ) -> Result<()> {
-        let mut file = File::create(format!("{}.profile.txt", self.profile_prefix()))?;
-        file.write_all(header.as_bytes())?;
-        let mut profile_writer = WriterBuilder::new()
-            .has_headers(false)
-            .delimiter(b'\t')
-            .from_writer(file);
-        for row in rows {
-            row.write(&mut profile_writer)?;
-        }
-        if let Some(estimate) = unclassified {
-            unclassified::write_row(&mut profile_writer, estimate)?;
-        }
-        profile_writer.flush()?;
-        Ok(())
-    }
-
-    /// Path of the per-read classifications, when they are requested and can
-    /// be written for this database.
-    fn classification_path(&self, data: &MappingData) -> Option<String> {
-        self.cfg
-            .writes_classifications(data.has_scaled_genomes)
-            .then(|| {
-                let classification_path = format!("{}.classify.txt.gz", self.cfg.outprefix);
-                log::info!(
-                    target: "PROFILER",
-                    "Writing per-read classifications to {}",
-                    classification_path
-                );
-                classification_path
-            })
     }
 }
 
@@ -847,64 +732,6 @@ fn sample_fragment_geometry(
     };
     let template_len = templates.median().unwrap_or(read_len);
     FragmentGeometry::new(layout, read_len, template_len, cfg.mapped_len, cfg.fraction)
-}
-
-/// Depth that one fragment adds to its candidate: its mapped bases over the
-/// genome length. A fragment on a marker gene stands for one fragment of the
-/// whole genome: it adds its whole read length, also when the read is clipped
-/// at a gene end, over the placements that the genome's genes offer a read of
-/// its length, so that marker and genome taxa have comparable depths; a long
-/// read adds this for every gene of the genome it covers, as the placements
-/// count every gene. Marker genes that cannot hold a read keep mapped bases
-/// over their summed length.
-fn fragment_depth(
-    placement: CandidatePlacement,
-    mapped: u32,
-    markers: Option<&MarkerModel>,
-) -> f64 {
-    match markers
-        .and_then(|model| model.placements_for_read(placement.assembly_id, placement.read_len))
-    {
-        Some(placements) => {
-            f64::from(1 + placement.other_genes) * f64::from(placement.read_len) / placements
-        }
-        None => f64::from(mapped) / placement.asm_len.max(1.0),
-    }
-}
-
-/// Record a resolved fragment's `placement` on a marker genome for the
-/// unclassified estimate: for long reads (`long_reads`) the whole-genome reads
-/// that its hits on the genome's genes, with `other_gene_hits`, stand for; for
-/// other reads one fragment with its gene hits. Placements on other genomes
-/// are not recorded.
-fn add_marker_genome_reads(
-    model: &MarkerModel,
-    long_reads: bool,
-    placement: &CandidatePlacement,
-    other_gene_hits: &[GeneHit],
-    reads: &mut HashMap<u32, GenomeReads>,
-) {
-    if long_reads {
-        let genes = std::iter::once(placement.reference_id).chain(
-            other_gene_hits
-                .iter()
-                .filter(|hit| hit.assembly_id == placement.assembly_id)
-                .map(|hit| hit.interval.reference_id),
-        );
-        if let Some((hits, per_hit)) =
-            model.whole_genome_reads(placement.assembly_id, placement.read_len, genes)
-        {
-            reads
-                .entry(placement.assembly_id)
-                .or_default()
-                .add(hits, per_hit);
-        }
-    } else if model.is_marker_genome(placement.assembly_id) {
-        reads
-            .entry(placement.assembly_id)
-            .or_default()
-            .add_fragment(1 + placement.other_genes);
-    }
 }
 
 // ============================================================================
@@ -1139,7 +966,7 @@ fn chunk_breadth_curve(num_reads: usize, illumina: bool) -> f64 {
 /// Aggregated data from mapping loading.
 ///
 /// Contains all information needed for the profiling phase.
-struct MappingData {
+pub(super) struct MappingData {
     /// Per-read alignment bundles
     read_alignments: Vec<ReadBundle>,
 
@@ -1200,65 +1027,6 @@ mod tests {
         );
     }
 
-    fn placement(assembly_id: u32, mapped: u32, read_len: u32) -> CandidatePlacement {
-        CandidatePlacement {
-            taxid: 1,
-            reference_id: 0,
-            assembly_id,
-            sampling_scale: 1.0,
-            asm_len: 2_000.0,
-            r1_mapped: mapped,
-            both_mapped: mapped,
-            read_len,
-            other_genes: 0,
-            pair_errors: 0.0,
-            long_score: 0.0,
-            span: (1, 1 + mapped),
-            mate_span: (0, 0),
-            fixed_chunk: (1, 1 + mapped),
-            flex_chunk: (1, 1 + mapped),
-            input_order: 0,
-        }
-    }
-
-    #[test]
-    fn a_long_read_adds_depth_for_every_marker_gene_it_covers() {
-        // Long reads of 3,000 bases on genes of 1,000 bases: 500 bases inside
-        // a gene, 1,000 - 1,000 + 3,001 = 3,001 placements per gene.
-        let geometry = FragmentGeometry::new(FragmentLayout::LongReads, 3_000, 3_000, 500, 0.2);
-        let markers = MarkerModel::from_gene_lengths(&[(7, &[1_000, 1_000])], geometry);
-        let mut read = placement(7, 900, 3_000);
-        approx_equal(fragment_depth(read, 900, Some(&markers)), 3_000.0 / 6_002.0);
-        read.other_genes = 1;
-        approx_equal(fragment_depth(read, 900, Some(&markers)), 6_000.0 / 6_002.0);
-        // A read of another length is placed by its own length.
-        let short = placement(7, 900, 1_000);
-        approx_equal(
-            fragment_depth(short, 900, Some(&markers)),
-            1_000.0 / (2.0 * (1_000.0 + 1_001.0 - 400.0)),
-        );
-    }
-
-    #[test]
-    fn a_fragment_on_a_marker_gene_adds_its_read_over_the_genes_placements() {
-        // 150 bp pairs of 400 bases with lone mates: genes of 1,000 bases
-        // offer 1,191 placements each; a gene of 100 bases holds no read.
-        let geometry = FragmentGeometry::new(FragmentLayout::PairsAndLoneMates, 150, 400, 50, 0.7);
-        let markers =
-            MarkerModel::from_gene_lengths(&[(7, &[1_000, 1_000]), (8, &[100])], geometry);
-        let depth = |assembly, mapped, markers| {
-            fragment_depth(placement(assembly, mapped, 150), mapped, markers)
-        };
-        approx_equal(depth(7, 150, Some(&markers)), 150.0 / 2_382.0);
-        // A read clipped at a gene end stands for its whole read.
-        approx_equal(depth(7, 110, Some(&markers)), 150.0 / 2_382.0);
-        // Genome references and marker genes without placements keep mapped
-        // bases over the summed length.
-        approx_equal(depth(9, 140, Some(&markers)), 140.0 / 2_000.0);
-        approx_equal(depth(8, 90, Some(&markers)), 90.0 / 2_000.0);
-        approx_equal(depth(7, 140, None), 140.0 / 2_000.0);
-    }
-
     #[test]
     fn expected_breadth_is_clamped_for_high_depths() {
         let expected = crate::profiler::evidence::expected_breadth(10.0, 5.0);
@@ -1277,7 +1045,7 @@ mod tests {
         }
     }
 
-    fn test_taxonomy(directory: &Path) -> Arc<Taxonomy> {
+    fn test_taxonomy(directory: &Path) -> Taxonomy {
         let nodes = directory.join("nodes.dmp");
         let names = directory.join("names.dmp");
         let merged = directory.join("merged.dmp");
@@ -1292,13 +1060,12 @@ mod tests {
         )
         .unwrap();
         std::fs::write(&merged, "").unwrap();
-        Arc::new(Taxonomy::from_files(&nodes, &names, &merged, None).unwrap())
+        Taxonomy::from_files(&nodes, &names, &merged, None).unwrap()
     }
 
     #[test]
     fn no_classifications_are_written_for_a_fractional_database() {
         let directory = tempfile::tempdir().unwrap();
-        let taxonomy = test_taxonomy(directory.path());
         for fractional in [false, true] {
             let prefix = directory.path().join(format!("fractional-{fractional}"));
             let mut cfg = cfg(Sequencer::Illumina);
@@ -1309,7 +1076,7 @@ mod tests {
                 references: Vec::new(),
                 is_fractional: fractional,
             }));
-            let profiler = CommunityProfiler::new(cfg, Arc::clone(&taxonomy)).unwrap();
+            let profiler = Profiler::new(cfg, test_taxonomy(directory.path()));
             let mapping_data = MappingData {
                 read_alignments: Vec::new(),
                 min_chunk_breadth: 0.05,
@@ -1338,18 +1105,20 @@ mod tests {
         // row on a database of sampled genomes.
         let directory = tempfile::tempdir().unwrap();
         let node = |parent: u32, rank: &str| (parent, rank.to_string());
-        let taxonomy = Arc::new(Taxonomy::from_parts(
-            HashMap::from([
-                (1, node(1, "no rank")),
-                (40, node(1, "family")),
-                (100, node(40, "genus")),
-                (1001, node(100, "species")),
-                (1002, node(100, "species")),
-            ]),
-            HashMap::new(),
-            HashMap::new(),
-            HashSet::new(),
-        ));
+        let taxonomy = || {
+            Taxonomy::from_parts(
+                HashMap::from([
+                    (1, node(1, "no rank")),
+                    (40, node(1, "family")),
+                    (100, node(40, "genus")),
+                    (1001, node(100, "species")),
+                    (1002, node(100, "species")),
+                ]),
+                HashMap::new(),
+                HashMap::new(),
+                HashSet::new(),
+            )
+        };
         let alignment = |taxid: u32, assembly: u32, start: u32| EvidenceAlignment {
             profile_taxid: taxid,
             reference_id: assembly,
@@ -1372,7 +1141,7 @@ mod tests {
             let mut cfg = cfg(Sequencer::Illumina);
             cfg.above_species = true;
             cfg.outprefix = prefix.to_string_lossy().into_owned();
-            let profiler = CommunityProfiler::new(cfg, Arc::clone(&taxonomy)).unwrap();
+            let profiler = Profiler::new(cfg, taxonomy());
             let mapping_data = MappingData {
                 read_alignments: (0..250u32)
                     .map(|i| ReadBundle {
@@ -1534,7 +1303,7 @@ mod tests {
                 HashMap::new(),
                 HashSet::new(),
             );
-            let mut profiler = CommunityProfiler::new(cfg, Arc::new(taxonomy)).unwrap();
+            let mut profiler = Profiler::new(cfg, taxonomy);
             profiler.lower_identity_to_alignments(&reads);
             profiler.cfg.identity
         };
