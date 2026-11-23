@@ -491,7 +491,6 @@ struct ProfileArgs {
             "in_seq",
             "in_seq2",
             "sequencer",
-            "is_paired",
             "resume",
             "keep_mapping_output",
             "stream_mappings",
@@ -612,14 +611,6 @@ struct ProfileArgs {
     progress_interval: u64,
 
     #[arg(
-        short = 'p',
-        long = "is-paired",
-        action = ArgAction::SetTrue,
-        hide = true
-    )]
-    is_paired: bool,
-
-    #[arg(
         long = "mapper-help",
         action = ArgAction::SetTrue,
         help_heading = "Advanced mapper candidate generation",
@@ -629,6 +620,9 @@ struct ProfileArgs {
 
     // Removed options, kept only to say what to do instead
     // (`reject_removed_options`).
+    #[arg(short = 'p', long = "is-paired", action = ArgAction::SetTrue, hide = true)]
+    is_paired: bool,
+
     #[arg(long = "exact-ties", alias = "pe-exact-ties", num_args = 0..=1, hide = true)]
     exact_ties: Option<Option<String>>,
 
@@ -951,7 +945,6 @@ struct InfoArgs {
 fn resolve_profile_inputs(
     in_seq: Option<String>,
     in_seq2: Option<String>,
-    is_paired_flag: bool,
 ) -> Result<(Option<String>, bool)> {
     let mut reads = Vec::new();
     if let Some(value) = in_seq {
@@ -973,9 +966,6 @@ fn resolve_profile_inputs(
             bail!("use either '-i R1 -I R2' or legacy '-i R1,R2', not both");
         }
         reads.push(value);
-    }
-    if is_paired_flag && reads.len() != 2 {
-        bail!("--is-paired requires exactly two input files; use '-i R1 -I R2'");
     }
     let is_paired = reads.len() == 2;
     let input_sequences = if reads.is_empty() {
@@ -1022,6 +1012,10 @@ fn resolve_index_match_both_strobes(
 /// do instead.
 fn reject_removed_options(args: &ProfileArgs) -> Result<()> {
     let removed = [
+        (
+            args.is_paired,
+            "--is-paired is no longer an option: two read files (-i R1 -I R2) mean paired reads, and a saved mapping records the pairing in its header. Drop it.",
+        ),
         (
             args.exact_ties.is_some(),
             "--exact-ties is no longer an option: reads that align equally well to several species are shared among them by the EM, and add to the coverage of a species only when they go to it with a posterior of at least 0.9. Drop it.",
@@ -1092,7 +1086,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
                 .expect("reuse metadata is loaded above");
             (None, metadata.is_paired)
         } else {
-            resolve_profile_inputs(args.in_seq, args.in_seq2, args.is_paired)?
+            resolve_profile_inputs(args.in_seq, args.in_seq2)?
         };
         let sequencer = if let Some(metadata) = reuse_metadata.as_ref() {
             metadata.sequencer
@@ -1345,12 +1339,9 @@ mod tests {
 
     #[test]
     fn paired_input_is_inferred_from_mate2_flag() {
-        let (input, is_paired) = resolve_profile_inputs(
-            Some("r1.fq.gz".to_string()),
-            Some("r2.fq.gz".to_string()),
-            false,
-        )
-        .unwrap();
+        let (input, is_paired) =
+            resolve_profile_inputs(Some("r1.fq.gz".to_string()), Some("r2.fq.gz".to_string()))
+                .unwrap();
         assert_eq!(input.as_deref(), Some("r1.fq.gz,r2.fq.gz"));
         assert!(is_paired);
     }
@@ -1358,17 +1349,9 @@ mod tests {
     #[test]
     fn legacy_comma_paired_input_still_works() {
         let (input, is_paired) =
-            resolve_profile_inputs(Some("r1.fq.gz,r2.fq.gz".to_string()), None, false).unwrap();
+            resolve_profile_inputs(Some("r1.fq.gz,r2.fq.gz".to_string()), None).unwrap();
         assert_eq!(input.as_deref(), Some("r1.fq.gz,r2.fq.gz"));
         assert!(is_paired);
-    }
-
-    #[test]
-    fn is_paired_without_two_inputs_is_rejected() {
-        let err = resolve_profile_inputs(Some("r1.fq.gz".to_string()), None, true).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("--is-paired requires exactly two input files"));
     }
 
     #[test]
@@ -1376,7 +1359,6 @@ mod tests {
         let err = resolve_profile_inputs(
             Some("r1.fq.gz,r2.fq.gz".to_string()),
             Some("other.fq.gz".to_string()),
-            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("not both"));
@@ -1631,7 +1613,6 @@ mod tests {
             vec!["--reads", "reads.fq.gz"],
             vec!["--save-mapping"],
             vec!["--sequencer", "Illumina"],
-            vec!["--is-paired"],
         ] {
             let mut argv = vec![
                 "metax",
@@ -1663,6 +1644,31 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.to_string().contains("cannot be used with"));
+
+        // The pairing of a saved mapping comes from its header.
+        for flag in ["--is-paired", "-p"] {
+            let cli = Cli::try_parse_from([
+                "metax",
+                "profile",
+                "--reuse-mapping",
+                file.path().to_str().unwrap(),
+                "--db",
+                "db",
+                "-o",
+                "result",
+                flag,
+            ])
+            .unwrap();
+            let Commands::Profile(args) = cli.command else {
+                panic!("expected profile command");
+            };
+            let message = AppConfig::try_from(args).unwrap_err().to_string();
+            assert!(
+                message.starts_with("--is-paired is no longer an option")
+                    && message.contains("in its header"),
+                "{message}"
+            );
+        }
     }
 
     #[test]
@@ -1866,6 +1872,13 @@ mod tests {
             AppConfig::try_from(args).unwrap_err().to_string()
         };
         for (given, named, instead) in [
+            (&["--is-paired"][..], "--is-paired", "mean paired reads"),
+            (&["-p"][..], "--is-paired", "mean paired reads"),
+            (
+                &["-I", "r2.fq", "-p"][..],
+                "--is-paired",
+                "mean paired reads",
+            ),
             (
                 &["--exact-ties", "guarded-map"][..],
                 "--exact-ties",
@@ -2081,6 +2094,7 @@ mod tests {
         }
         assert!(!help.contains("--taxonomy-dir"));
         for removed in [
+            "--is-paired",
             "--exact-ties",
             "--genus-fallback",
             "--strict ",

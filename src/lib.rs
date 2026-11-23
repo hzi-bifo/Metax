@@ -604,9 +604,6 @@ impl MetaxApp {
             if self.config.resume {
                 flags.push("-r".to_string());
             }
-            if self.config.is_paired {
-                flags.push("--is-paired".to_string());
-            }
             if self.config.genome_level {
                 flags.push("--strain".to_string());
             }
