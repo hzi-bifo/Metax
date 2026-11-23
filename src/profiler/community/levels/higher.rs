@@ -4,7 +4,7 @@
 //! Two kinds of fragments come here:
 //!
 //! - fragments without a species-level candidate, placed at the floor gates
-//!   (`--family-identity`, a fixed mapped length on short reads or the species
+//!   (`--genus-identity`, a fixed mapped length on short reads or the species
 //!   length cutoff on long reads, and a fixed aligned fraction); on noisy long
 //!   reads not those whose best match, or one tied with it, is a kept
 //!   species, which count for that species;
@@ -1228,7 +1228,7 @@ mod tests {
         );
         assert_eq!(found.taxa[0].taxid, 40);
         assert_eq!(found.taxa[0].from_genera, 250);
-        // Reads without a species-level match below the genus identity (0.95 - 0.09): their family takes them.
+        // Reads without a species-level match below the genus row's mean identity test (0.95 - 0.09): their family takes them.
         let found = place_reads(reads(&[(1001, 1, 0.85)], 250, true), Vec::new());
         assert!(matches!(
             found.genera[0].failures[..],

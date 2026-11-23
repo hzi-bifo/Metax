@@ -132,7 +132,7 @@ pub struct AppConfig {
     pub by_aligned: bool,
     /// Lower-bound identity of reads without a species-level candidate for
     /// the levels above species (default 0.80).
-    pub family_identity: f64,
+    pub genus_identity: f64,
     /// Strict upper bound on mapping rate for the low-map path (default 0.30).
     pub low_map_rate_threshold: f64,
     pub keep_mapping_output: bool,
@@ -906,7 +906,7 @@ impl MetaxApp {
                 fraction
             ));
         }
-        // NOTE: `--family-identity` and `--low-map-rate-threshold` are
+        // NOTE: `--genus-identity` and `--low-map-rate-threshold` are
         // validated eagerly at CLI parse time (see main::parse_probability),
         // so any library caller bypassing the CLI is trusted to supply
         // values in [0.0, 1.0].
@@ -992,7 +992,7 @@ impl MetaxApp {
             save_decisions: self.config.save_decisions,
             save_classifications: self.config.save_classifications,
             by_aligned: self.config.by_aligned,
-            family_identity: self.config.family_identity,
+            genus_identity: self.config.genus_identity,
             low_map_rate_threshold: self.config.low_map_rate_threshold,
             host: self.config.host.clone(),
             threads: self.config.threads,
@@ -1145,7 +1145,7 @@ mod tests {
             save_decisions: false,
             save_classifications: false,
             by_aligned: false,
-            family_identity: 0.80,
+            genus_identity: 0.80,
             low_map_rate_threshold: 0.30,
             keep_mapping_output: false,
             stream_mappings: false,

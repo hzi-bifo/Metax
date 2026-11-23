@@ -111,7 +111,7 @@ enum Commands {
         display_order = 1,
         override_usage = "metax profile [OPTIONS] --output <PREFIX> [-- <MAPPER_ARG>...]\n       metax profile --mapper-help",
         long_about = "Map metagenomic reads, evaluate taxonomic and coverage evidence, and estimate relative abundance.\n\nPipeline stages:\n  1. Generate candidate mappings\n  2. Share the reads among the candidate species and keep the species whose coverage is enough, even, and won\n  3. Place the reads that no kept species takes at the lowest rank above species that their matches and evidence support\n  4. With --strain, report genomes within each kept species\n  5. Apply the report filters",
-        after_help = "Examples:\n  Single-end: metax profile -d DB -i reads.fq.gz -o sample -t 20\n  Paired-end: metax profile -d DB -i R1.fq.gz -I R2.fq.gz -o sample -t 20\n  Nanopore:   metax profile -d DB -i reads.fq.gz -o sample -s Nanopore -t 20\n\nSpecies at >=0.95 identity, reads placed above species at >=0.80:\n  metax profile ... --min-identity 0.95 --family-identity 0.80\n\nMapper-only candidate-generation overrides must follow '--':\n  metax profile ... -- --top-n 20 --score-ratio 0.85 --min-identity 0.80"
+        after_help = "Examples:\n  Single-end: metax profile -d DB -i reads.fq.gz -o sample -t 20\n  Paired-end: metax profile -d DB -i R1.fq.gz -I R2.fq.gz -o sample -t 20\n  Nanopore:   metax profile -d DB -i reads.fq.gz -o sample -s Nanopore -t 20\n\nSpecies at >=0.95 identity, reads placed above species at >=0.80:\n  metax profile ... --min-identity 0.95 --genus-identity 0.80\n\nMapper-only candidate-generation overrides must follow '--':\n  metax profile ... -- --top-n 20 --score-ratio 0.85 --min-identity 0.80"
     )]
     Profile(ProfileArgs),
 
@@ -272,7 +272,7 @@ struct ProfileArgs {
         value_name = "FRACTION",
         value_parser = parse_probability,
         help_heading = "Species and strain evidence",
-        help = "Minimum identity for species/strain assignment (0-1). When omitted, the preset is lowered by the reads' sequencing error rate from base quality (short reads: averaged over both mates; long reads: when noisy); a value given here is used as is. It does not discard lower-identity mapper output or change --family-identity."
+        help = "Minimum identity for species/strain assignment (0-1). When omitted, the preset is lowered by the reads' sequencing error rate from base quality (short reads: averaged over both mates; long reads: when noisy); a value given here is used as is. It does not discard lower-identity mapper output or change --genus-identity."
     )]
     identity: Option<f64>,
 
@@ -309,7 +309,7 @@ struct ProfileArgs {
         long = "strict-coverage",
         action = ArgAction::SetTrue,
         help_heading = "Above-species and low-map behavior",
-        help = "Report only the species kept by the species tests; the fragments (a read pair counts once) that no kept species takes are dropped, and noisy long reads below the species gates are not credited to the kept species they match best. By default a removed species whose fragments cover its whole genome evenly (at least 200 fragments, both coverage ratios 0.9-1.1, fragments in at least 90 % of its windows, both coverage p-values at least 1e-5) is reported at species when no taxon of its genus is kept. The other fragments that no kept species takes (of removed species, and without a species-level match down to --family-identity) go above species. A fragment whose matches within the tie margin of its best lie in one genus counts for that genus, which gets a row when at least 200 such fragments of one kind (of removed species, or without a species-level match) have a mean identity at most 0.09 below the species identity cutoff and a chunk ratio of at least 0.40 on the genome holding most of them; the row then holds the unique fragments of both kinds. A fragment tied across genera goes to those of them with a genus row, shared by the likelihood EM over the genera with a row. The other fragments go to the lowest common ancestor of their matches at family, order, class, phylum or domain rank, which gets a row when at least 200 fragments reach it and reach at least half of the windows of the genome holding most of them; otherwise they move up a rank. These recover large genomes at low depth, divergent strains, and new species and genera of taxa in the database; a reference that consists mostly of foreign DNA can still produce a false row. Marker genomes do not take part. On a fractional database, fragments not placed at a species are not reported above species, and no species is kept for even coverage."
+        help = "Report only the species kept by the species tests; the fragments (a read pair counts once) that no kept species takes are dropped, and noisy long reads below the species gates are not credited to the kept species they match best. By default a removed species whose fragments cover its whole genome evenly (at least 200 fragments, both coverage ratios 0.9-1.1, fragments in at least 90 % of its windows, both coverage p-values at least 1e-5) is reported at species when no taxon of its genus is kept. The other fragments that no kept species takes (of removed species, and without a species-level match down to --genus-identity) go above species. A fragment whose matches within the tie margin of its best lie in one genus counts for that genus, which gets a row when at least 200 such fragments of one kind (of removed species, or without a species-level match) have a mean identity at most 0.09 below the species identity cutoff and a chunk ratio of at least 0.40 on the genome holding most of them; the row then holds the unique fragments of both kinds. A fragment tied across genera goes to those of them with a genus row, shared by the likelihood EM over the genera with a row. The other fragments go to the lowest common ancestor of their matches at family, order, class, phylum or domain rank, which gets a row when at least 200 fragments reach it and reach at least half of the windows of the genome holding most of them; otherwise they move up a rank. These recover large genomes at low depth, divergent strains, and new species and genera of taxa in the database; a reference that consists mostly of foreign DNA can still produce a false row. Marker genomes do not take part. On a fractional database, fragments not placed at a species are not reported above species, and no species is kept for even coverage."
     )]
     strict_coverage: bool,
 
@@ -343,14 +343,14 @@ struct ProfileArgs {
     no_identity_margin: bool,
 
     #[arg(
-        long = "family-identity",
+        long = "genus-identity",
         value_name = "FRACTION",
         default_value_t = 0.80,
         value_parser = parse_probability,
         help_heading = "Above-species and low-map behavior",
-        help = "Minimum identity (0-1) a read without a species-level match needs to count above species (at genus or a higher rank), independent of --min-identity."
+        help = "Minimum identity (0-1) a read without a species-level match needs to count above species at all (at genus or a higher rank), independent of --min-identity. A genus row has its own, stricter test: the mean identity of its fragments must be at least the species identity cutoff minus 0.09."
     )]
-    family_identity: f64,
+    genus_identity: f64,
 
     #[arg(
         long = "low-map-rate-threshold",
@@ -643,9 +643,6 @@ struct ProfileArgs {
 
     #[arg(long = "batch-size", num_args = 0..=1, hide = true)]
     batch_size: Option<Option<String>>,
-
-    #[arg(long = "genus-identity", num_args = 0..=1, hide = true)]
-    genus_identity: Option<Option<String>>,
 
     #[arg(long = "save-raw-profile", alias = "keep-raw", action = ArgAction::SetTrue, hide = true)]
     save_raw_profile: bool,
@@ -1038,7 +1035,7 @@ fn reject_removed_options(args: &ProfileArgs) -> Result<()> {
         ),
         (
             args.genus_fallback,
-            "--genus-fallback is no longer an option: the reads that no kept species takes are placed at the lowest rank above species that their matches and evidence support; --family-identity sets the identity that reads without a species-level match need, and --strict-coverage switches this off. Drop it.",
+            "--genus-fallback is no longer an option: the reads that no kept species takes are placed at the lowest rank above species that their matches and evidence support; --genus-identity sets the identity that reads without a species-level match need, and --strict-coverage switches this off. Drop it.",
         ),
         (
             args.strict,
@@ -1047,10 +1044,6 @@ fn reject_removed_options(args: &ProfileArgs) -> Result<()> {
         (
             args.batch_size.is_some(),
             "--batch-size is no longer an option: the profiler takes no batch size, and the mapper's input batch size is set after '--' (see 'metax profile --mapper-help'). Drop it.",
-        ),
-        (
-            args.genus_identity.is_some(),
-            "--genus-identity is no longer an option: the identity a read without a species-level match needs to count above species is set with --family-identity (default 0.80). Use --family-identity instead.",
         ),
         (
             args.save_raw_profile,
@@ -1175,7 +1168,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             save_decisions: args.save_decisions,
             save_classifications: args.save_classifications,
             by_aligned: args.by_aligned,
-            family_identity: args.family_identity,
+            genus_identity: args.genus_identity,
             low_map_rate_threshold: args.low_map_rate_threshold,
             keep_mapping_output: args.keep_mapping_output,
             stream_mappings: args.stream_mappings,
@@ -1917,16 +1910,6 @@ mod tests {
         // Renamed options name their new names.
         for (given, named, new) in [
             (
-                &["--genus-identity", "0.8"][..],
-                "--genus-identity",
-                "--family-identity",
-            ),
-            (
-                &["--genus-identity"][..],
-                "--genus-identity",
-                "--family-identity",
-            ),
-            (
                 &["--save-raw-profile"][..],
                 "--save-raw-profile",
                 "--save-decisions",
@@ -1947,6 +1930,24 @@ mod tests {
         // Every removed option given is named.
         let message = error(&["--strict", "--level-engine"]);
         assert!(message.contains("--strict ") && message.contains("--level-engine "));
+    }
+
+    #[test]
+    fn genus_identity_needs_a_value_and_defaults_to_080() {
+        let parse = |extra: &[&str]| {
+            let argv = ["metax", "profile", "-d", "db", "-o", "out", "-i", "r1.fq"];
+            Cli::try_parse_from(argv.iter().chain(extra))
+        };
+        let value = |extra: &[&str]| {
+            let Commands::Profile(args) = parse(extra).unwrap().command else {
+                panic!("expected profile command");
+            };
+            args.genus_identity
+        };
+        assert_eq!(value(&[]), 0.80);
+        assert_eq!(value(&["--genus-identity", "0.9"]), 0.9);
+        assert!(parse(&["--genus-identity"]).is_err());
+        assert!(parse(&["--genus-identity", "1.5"]).is_err());
     }
 
     #[test]
@@ -2076,7 +2077,7 @@ mod tests {
             "--save-mapping",
             "--save-classification",
             "--save-decisions",
-            "--family-identity <FRACTION>",
+            "--genus-identity <FRACTION>",
             "--stream-mappings",
             "--temp-dir <DIR>",
             "--mapper-help",
@@ -2093,7 +2094,6 @@ mod tests {
             "--genus-fallback",
             "--strict ",
             "--batch-size",
-            "--genus-identity",
             "--save-raw-profile",
             "--keep-raw",
         ] {

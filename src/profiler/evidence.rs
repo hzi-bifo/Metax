@@ -87,7 +87,7 @@ const FLOOR_MIN_FRACTION: f64 = 0.60;
 impl EvidencePolicy {
     /// The floor gates of the fragments without a species-level candidate,
     /// for the levels above species and the noisy long reads credited to kept
-    /// species: `--family-identity` (`identity`), [`FLOOR_MIN_MAPPED_LEN`]
+    /// species: `--genus-identity` (`identity`), [`FLOOR_MIN_MAPPED_LEN`]
     /// mapped bases of a short read (a long read keeps the species length
     /// cutoff), and [`FLOOR_MIN_FRACTION`] of a read aligned.
     pub(crate) fn floor(self, identity: f64) -> Self {

@@ -771,7 +771,7 @@ impl Run<'_> {
         even: usize,
     ) -> (Option<higher::HigherLevels>, Vec<usize>) {
         let (cfg, data) = (self.cfg, self.data);
-        let floor_policy = self.policy.floor(cfg.family_identity);
+        let floor_policy = self.policy.floor(cfg.genus_identity);
         let (unmatched, to_credit) = if self.credits_noisy_reads() {
             let kept = species.best_fit.keys().copied().collect::<HashSet<_>>();
             split_best_kept(data, floor_policy, &unmatched, &kept)
@@ -896,7 +896,7 @@ impl Run<'_> {
         let credited = if self.credits_noisy_reads() {
             let credited = credited_reads(
                 data,
-                self.policy.floor(cfg.family_identity),
+                self.policy.floor(cfg.genus_identity),
                 to_credit,
                 (&kept.em.weight, reported),
                 self.keep_shares,

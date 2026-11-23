@@ -683,10 +683,11 @@ pub struct ProfilerConfig {
     /// Force mapped-read basis for the chunk-breadth estimate.
     pub by_aligned: bool,
 
-    /// Minimum identity of a read without a species-level candidate for the
-    /// levels above species. Comparison is inclusive (`identity >= family_identity`).
-    /// Default 0.80.
-    pub family_identity: f64,
+    /// Minimum identity of a read without a species-level candidate to count
+    /// above species at all. Comparison is inclusive (`identity >=
+    /// genus_identity`). Default 0.80. A genus row has its own test on the mean
+    /// identity of its fragments.
+    pub genus_identity: f64,
 
     /// Mapping-rate cut-off for the low-map path. A run is considered
     /// low-map (auto `--by-mapped` forced on) when
@@ -848,7 +849,7 @@ impl ProfilerConfig {
             save_decisions: false,
             save_classifications: false,
             by_aligned: false,
-            family_identity: 0.80,
+            genus_identity: 0.80,
             low_map_rate_threshold: 0.30,
             host: None,
             threads: 1,
@@ -927,7 +928,7 @@ pub(crate) fn log_resolved_profiler_parameters(
          \testimate_unclassified        {}\n\
          \tidentity_margin              {}\n\
          \tby_mapped                    {}\n\
-         \tfamily_identity              {:.3}\n\
+         \tgenus_identity               {:.3}\n\
          \tlow_map_rate_threshold       {:.3}\n\
          \tlowbiomass                   {}\n\
          \tsave_decisions               {}\n\
@@ -963,7 +964,7 @@ pub(crate) fn log_resolved_profiler_parameters(
         cfg.estimate_unclassified,
         display_guard(cfg.identity_margin),
         cfg.by_aligned,
-        cfg.family_identity,
+        cfg.genus_identity,
         cfg.low_map_rate_threshold,
         cfg.lowbiomass,
         cfg.save_decisions,
