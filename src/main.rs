@@ -629,9 +629,6 @@ struct ProfileArgs {
 
     // Removed options, kept only to say what to do instead
     // (`reject_removed_options`).
-    #[arg(long = "level-engine", action = ArgAction::SetTrue, hide = true)]
-    level_engine: bool,
-
     #[arg(long = "exact-ties", alias = "pe-exact-ties", num_args = 0..=1, hide = true)]
     exact_ties: Option<Option<String>>,
 
@@ -1025,10 +1022,6 @@ fn resolve_index_match_both_strobes(
 /// do instead.
 fn reject_removed_options(args: &ProfileArgs) -> Result<()> {
     let removed = [
-        (
-            args.level_engine,
-            "--level-engine is no longer an option: the level-wise engine always runs. Drop it.",
-        ),
         (
             args.exact_ties.is_some(),
             "--exact-ties is no longer an option: reads that align equally well to several species are shared among them by the EM, and add to the coverage of a species only when they go to it with a posterior of at least 0.9. Drop it.",
@@ -1873,7 +1866,6 @@ mod tests {
             AppConfig::try_from(args).unwrap_err().to_string()
         };
         for (given, named, instead) in [
-            (&["--level-engine"][..], "--level-engine", "always runs"),
             (
                 &["--exact-ties", "guarded-map"][..],
                 "--exact-ties",
@@ -1928,8 +1920,8 @@ mod tests {
             );
         }
         // Every removed option given is named.
-        let message = error(&["--strict", "--level-engine"]);
-        assert!(message.contains("--strict ") && message.contains("--level-engine "));
+        let message = error(&["--strict", "--batch-size"]);
+        assert!(message.contains("--strict ") && message.contains("--batch-size "));
     }
 
     #[test]
@@ -2089,7 +2081,6 @@ mod tests {
         }
         assert!(!help.contains("--taxonomy-dir"));
         for removed in [
-            "--level-engine",
             "--exact-ties",
             "--genus-fallback",
             "--strict ",

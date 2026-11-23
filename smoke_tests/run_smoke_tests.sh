@@ -491,7 +491,6 @@ assert_not_exists "$WORK/pe_strain.rprofile.txt"
 assert_not_exists "$WORK/pe_strain.classify.txt.gz"
 
 # Options that no longer exist stop the run and say what to use instead.
-assert_profile_error removed_engine "the level-wise engine always runs" --level-engine
 assert_profile_error renamed_decisions "Use --save-decisions instead." --save-raw-profile
 
 # --host filters the profile by the pathogen table, which it needs.
