@@ -110,22 +110,21 @@ impl Classifications<'_> {
         blocks: &[TaxonBlock],
         data: &MappingData,
     ) -> Result<usize> {
-        let rows = self.shares(blocks);
         let mut writer = create_classification_writer(path)?;
-        for (read, shares) in &rows {
-            writeln!(
-                writer,
-                "{}",
-                classification_row(&data.read_alignments[*read].read_name, shares)
-            )?;
-        }
+        let written = self.for_each_row(blocks, |read, shares| {
+            write_row(&mut writer, &data.read_alignments[read].read_name, shares)
+        })?;
         finish_classification_writer(writer)?;
-        Ok(rows.len())
+        Ok(written)
     }
 
-    /// Each written fragment's read and its shares on the profile's rows,
-    /// renormalised, in read order.
-    fn shares<'r>(&self, blocks: &'r [TaxonBlock]) -> Vec<(usize, Shares<'r>)> {
+    /// Hand each written fragment's read and its shares on the profile's rows,
+    /// renormalised, to `each` in read order; returns the fragments written.
+    fn for_each_row<'r>(
+        &self,
+        blocks: &'r [TaxonBlock],
+        mut each: impl FnMut(usize, &Shares<'r>) -> std::io::Result<()>,
+    ) -> std::io::Result<usize> {
         let taxa = ProfileTaxa::of(blocks, self.genus_members);
         // The genome EM's posteriors of each fragment it shares, by read.
         let mut genome_shares: HashMap<usize, (u32, &Posteriors)> = HashMap::new();
@@ -149,41 +148,60 @@ impl Classifications<'_> {
                 shares.push((species, rank, share));
             }
         };
-        let mut rows = Vec::new();
-        for (fragment, group) in self.fragments.iter().zip(self.group_of) {
-            let Some(group) = group else {
-                continue;
+        // The three sources hold disjoint reads. The fragments with candidate
+        // species and the credited fragments come in read order; the
+        // fragments placed above species are put in it.
+        let mut with_species = self
+            .fragments
+            .iter()
+            .zip(self.group_of)
+            .filter_map(|(fragment, group)| group.map(|group| (fragment.read, group)))
+            .peekable();
+        let mut credited = self.credited.iter().peekable();
+        let mut higher = self.higher.iter().collect::<Vec<_>>();
+        higher.sort_unstable_by_key(|placed| placed.0);
+        let mut higher = higher.into_iter().peekable();
+        let mut shares: Shares = Vec::new();
+        let mut written = 0;
+        loop {
+            let next = [
+                with_species.peek().map(|f| f.0),
+                credited.peek().map(|c| c.0),
+                higher.peek().map(|h| h.0),
+            ];
+            let Some(read) = next.iter().flatten().min().copied() else {
+                break;
             };
-            let mut shares = Vec::new();
-            for &(species, posterior) in &self.posteriors[*group] {
-                species_share(&mut shares, fragment.read, species, posterior);
-            }
-            rows.extend(renormalised(shares).map(|shares| (fragment.read, shares)));
-        }
-        for (read, credited) in self.credited {
-            let mut shares = Vec::new();
-            for &(species, share) in credited {
-                species_share(&mut shares, *read, species, share);
-            }
-            rows.extend(renormalised(shares).map(|shares| (*read, shares)));
-        }
-        for (read, placed) in self.higher {
-            let shares = placed
-                .iter()
-                .filter_map(|&(taxid, share)| {
+            shares.clear();
+            if next[0] == Some(read) {
+                let (_, group) = with_species.next().expect("peeked");
+                for &(species, posterior) in &self.posteriors[group] {
+                    species_share(&mut shares, read, species, posterior);
+                }
+            } else if next[1] == Some(read) {
+                let (_, credited) = credited.next().expect("peeked");
+                for &(species, share) in credited {
+                    species_share(&mut shares, read, species, share);
+                }
+            } else {
+                let (_, placed) = higher.next().expect("peeked");
+                shares.extend(placed.iter().filter_map(|&(taxid, share)| {
                     taxa.rows.get(&taxid).map(|&rank| (taxid, rank, share))
-                })
-                .collect();
-            rows.extend(renormalised(shares).map(|shares| (*read, shares)));
+                }));
+            }
+            if renormalise(&mut shares) {
+                each(read, &shares)?;
+                written += 1;
+            }
         }
-        rows.sort_unstable_by_key(|row| row.0);
-        rows
+        Ok(written)
     }
 }
 
-/// `shares` with those on one row summed, renormalised to 1, largest first
-/// (equal shares by taxid, then rank); `None` without a positive share.
-fn renormalised(mut shares: Shares) -> Option<Shares> {
+/// Sum the `shares` on one row, renormalise them to 1 and order them largest
+/// first (equal shares by taxid, then rank); `false` without a positive
+/// share.
+fn renormalise(shares: &mut Shares) -> bool {
     shares.retain(|share| share.2.is_finite() && share.2 > 0.0);
     shares.sort_by_key(|share| (share.0, share.1));
     shares.dedup_by(|later, kept| {
@@ -195,34 +213,32 @@ fn renormalised(mut shares: Shares) -> Option<Shares> {
     });
     let total: f64 = shares.iter().map(|share| share.2).sum();
     if total <= 0.0 {
-        return None;
+        return false;
     }
-    for share in &mut shares {
+    for share in shares.iter_mut() {
         share.2 /= total;
     }
     shares.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(b.1)));
-    Some(shares)
+    true
 }
 
-/// One row of the file: read id, taxid and rank of the largest share, the
-/// taxids, and the shares (`1` for a single one, else five decimals).
-fn classification_row(read: &str, shares: &Shares) -> String {
+/// Write one row of the file: read id, taxid and rank of the largest share,
+/// the taxids, and the shares (`1` for a single one, else five decimals).
+fn write_row(out: &mut impl Write, read: &str, shares: &Shares) -> std::io::Result<()> {
     let (taxid, rank, _) = shares[0];
-    let taxids = shares
-        .iter()
-        .map(|share| share.0.to_string())
-        .collect::<Vec<_>>()
-        .join(";");
-    let fractions = if shares.len() == 1 {
-        "1".to_string()
-    } else {
-        shares
-            .iter()
-            .map(|share| format_five(share.2))
-            .collect::<Vec<_>>()
-            .join(";")
-    };
-    format!("{read}\t{taxid}\t{rank}\t{taxids}\t{fractions}")
+    write!(out, "{read}\t{taxid}\t{rank}\t")?;
+    for (index, share) in shares.iter().enumerate() {
+        let separator = if index == 0 { "" } else { ";" };
+        write!(out, "{separator}{}", share.0)?;
+    }
+    if shares.len() == 1 {
+        return out.write_all(b"\t1\n");
+    }
+    for (index, share) in shares.iter().enumerate() {
+        let separator = if index == 0 { "\t" } else { ";" };
+        write!(out, "{separator}{}", format_five(share.2))?;
+    }
+    out.write_all(b"\n")
 }
 
 #[cfg(test)]
@@ -233,6 +249,33 @@ mod tests {
     use super::super::profile_row;
     use super::*;
     use crate::profiler::evidence::EvidenceCoverage;
+
+    /// Each written fragment's read and shares.
+    fn written_rows<'r>(
+        classifications: &Classifications,
+        blocks: &'r [TaxonBlock],
+    ) -> Vec<(usize, Shares<'r>)> {
+        let mut rows = Vec::new();
+        classifications
+            .for_each_row(blocks, |read, shares| {
+                rows.push((read, shares.clone()));
+                Ok(())
+            })
+            .unwrap();
+        rows
+    }
+
+    /// The file's lines, with read ids `read<read>`.
+    fn lines(classifications: &Classifications, blocks: &[TaxonBlock]) -> Vec<String> {
+        written_rows(classifications, blocks)
+            .into_iter()
+            .map(|(read, shares)| {
+                let mut line = Vec::new();
+                write_row(&mut line, &format!("read{read}"), &shares).unwrap();
+                String::from_utf8(line).unwrap().trim_end().to_string()
+            })
+            .collect()
+    }
 
     /// A profile row of `rank` for `taxid` on genome `GCF_<genome>`.
     fn row(taxid: u32, rank: &str, genome: u32) -> crate::profiler::output::ProfileRow {
@@ -340,11 +383,7 @@ mod tests {
             // Read 8: credited to species 1 and 4.
             credited: &[(8, vec![(1, 0.25), (4, 0.75)])],
         };
-        let rows = classifications
-            .shares(&blocks())
-            .into_iter()
-            .map(|(read, shares)| classification_row(&format!("read{read}"), &shares))
-            .collect::<Vec<_>>();
+        let rows = lines(&classifications, &blocks());
         assert_eq!(
             rows,
             [
@@ -364,7 +403,7 @@ mod tests {
         );
         // The genome row on genome 41, under the species' taxid, keeps its rank.
         let blocks = blocks();
-        let shares = classifications.shares(&blocks);
+        let shares = written_rows(&classifications, &blocks);
         let read3 = &shares.iter().find(|row| row.0 == 3).unwrap().1;
         assert_eq!((read3[1].0, read3[1].1), (4, "strain"));
         assert!((read3[1].2 - 0.225).abs() < 1e-12);
@@ -372,23 +411,28 @@ mod tests {
 
     #[test]
     fn shares_on_one_row_are_summed_and_renormalised() {
-        let shares = vec![
+        let mut shares = vec![
             (100, "genus", 0.25),
             (7, "species", 0.5),
             (100, "genus", 0.25),
             (8, "species", 0.0),
         ];
-        let shares = renormalised(shares).unwrap();
+        assert!(renormalise(&mut shares));
         assert_eq!(shares.len(), 2);
         assert_eq!((shares[0].0, shares[0].1), (7, "species"));
         assert!((shares[0].2 - 0.5).abs() < 1e-12 && (shares[1].2 - 0.5).abs() < 1e-12);
         // Equal shares come by taxid.
         assert_eq!(shares[1].0, 100);
-        assert!(renormalised(vec![(1, "species", 0.0)]).is_none());
+        assert!(!renormalise(&mut vec![(1, "species", 0.0)]));
+        let mut line = Vec::new();
+        write_row(&mut line, "r", &shares).unwrap();
         assert_eq!(
-            classification_row("r", &shares),
-            "r\t7\tspecies\t7;100\t0.50000;0.50000"
+            String::from_utf8(line).unwrap(),
+            "r\t7\tspecies\t7;100\t0.50000;0.50000\n"
         );
+        let mut line = Vec::new();
+        write_row(&mut line, "r", &shares[..1].to_vec()).unwrap();
+        assert_eq!(String::from_utf8(line).unwrap(), "r\t7\tspecies\t7\t1\n");
     }
 
     #[test]
@@ -412,11 +456,7 @@ mod tests {
             higher: &[],
             credited: &[],
         };
-        let rows = classifications
-            .shares(&blocks)
-            .into_iter()
-            .map(|(read, shares)| classification_row(&format!("read{read}"), &shares))
-            .collect::<Vec<_>>();
+        let rows = lines(&classifications, &blocks);
         assert_eq!(rows, ["read0\t100\tgenus\t100;1\t0.70000;0.30000"]);
     }
 }

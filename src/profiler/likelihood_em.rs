@@ -42,25 +42,23 @@ pub(crate) type Candidates = Vec<(u32, f64)>;
 /// Reads grouped by identical candidates and rounded error counts.
 #[derive(Default)]
 pub(crate) struct ReadGroups {
-    index: HashMap<Vec<(u32, u32)>, usize>,
-    groups: Vec<Group>,
+    /// Each group's key, its candidates by unit, each with its errors above
+    /// the group's best candidate in units of [`ERROR_STEP`], and the group's
+    /// index.
+    index: HashMap<Box<[(u32, u32)]>, usize>,
+    /// Reads in each group.
+    weights: Vec<f64>,
     /// The key of the read being added, kept to look groups up without
     /// allocating.
     key: Vec<(u32, u32)>,
 }
 
-struct Group {
-    units: Vec<u32>,
-    /// Errors above the group's best candidate, in units of [`ERROR_STEP`].
-    excess_steps: Vec<u32>,
-    /// Reads in the group.
-    weight: f64,
-}
-
 impl ReadGroups {
-    /// Add a read and return the index of its group. Candidates of one unit
-    /// keep their fewest errors. A read without candidates is not added.
-    pub(crate) fn add(&mut self, mut candidates: Candidates) -> Option<usize> {
+    /// Add a read with its `candidates` and return the index of its group.
+    /// Candidates of one unit keep their fewest errors. A read without
+    /// candidates is not added. `candidates` is left sorted by unit, one per
+    /// unit.
+    pub(crate) fn add(&mut self, candidates: &mut Candidates) -> Option<usize> {
         if candidates.is_empty() {
             return None;
         }
@@ -74,21 +72,17 @@ impl ReadGroups {
             }),
         );
         if let Some(&slot) = self.index.get(self.key.as_slice()) {
-            self.groups[slot].weight += 1.0;
+            self.weights[slot] += 1.0;
             return Some(slot);
         }
-        self.groups.push(Group {
-            units: self.key.iter().map(|k| k.0).collect(),
-            excess_steps: self.key.iter().map(|k| k.1).collect(),
-            weight: 1.0,
-        });
-        let slot = self.groups.len() - 1;
-        self.index.insert(self.key.clone(), slot);
+        let slot = self.weights.len();
+        self.weights.push(1.0);
+        self.index.insert(self.key.as_slice().into(), slot);
         Some(slot)
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.groups.len()
+        self.weights.len()
     }
 }
 
@@ -124,37 +118,41 @@ pub(crate) fn run(
     max_iterations: usize,
     tolerance: f64,
 ) -> EmResult {
-    let mut units: Vec<u32> = groups
-        .groups
+    let mut keys: Vec<&[(u32, u32)]> = vec![&[]; groups.len()];
+    for (key, &group) in &groups.index {
+        keys[group] = key;
+    }
+    let mut units: Vec<u32> = keys
         .iter()
-        .flat_map(|g| g.units.iter().copied())
+        .flat_map(|key| key.iter().map(|c| c.0))
         .collect();
     units.sort_unstable();
     units.dedup();
     let slot: HashMap<u32, usize> = units.iter().enumerate().map(|(i, &u)| (u, i)).collect();
-    // Per group: unit slots and each candidate's likelihood relative to the
-    // group's best candidate.
-    let indexed = groups
-        .groups
-        .iter()
-        .map(|g| {
-            let slots = g.units.iter().map(|u| slot[u]).collect::<Vec<_>>();
-            let relative = g
-                .excess_steps
-                .iter()
-                .map(|&s| (-penalty * ERROR_STEP * f64::from(s)).exp())
-                .collect::<Vec<_>>();
-            (slots, relative, g.weight)
-        })
-        .collect::<Vec<_>>();
-    let total: f64 = indexed.iter().map(|g| g.2).sum();
+    // The groups' candidates, one after the other (group `g` from
+    // `starts[g]` to `starts[g + 1]`): each candidate's unit slot and its
+    // likelihood relative to the group's best candidate.
+    let mut starts = Vec::with_capacity(keys.len() + 1);
+    let (mut slots, mut relative) = (Vec::new(), Vec::new());
+    starts.push(0);
+    for key in &keys {
+        for &(unit, steps) in key.iter() {
+            slots.push(slot[&unit]);
+            relative.push((-penalty * ERROR_STEP * f64::from(steps)).exp());
+        }
+        starts.push(slots.len());
+    }
+    let weights = &groups.weights;
+    let total: f64 = weights.iter().sum();
     let mut share = vec![1.0; units.len()];
     normalise(&mut share, total);
 
     let step = |from: &[f64], into: &mut Vec<f64>| {
         into.clear();
         into.resize(from.len(), 0.0);
-        for (slots, relative, weight) in &indexed {
+        for (group, weight) in weights.iter().enumerate() {
+            let members = starts[group]..starts[group + 1];
+            let (slots, relative) = (&slots[members.clone()], &relative[members]);
             let norm: f64 = slots.iter().zip(relative).map(|(&u, r)| from[u] * r).sum();
             if norm > 0.0 {
                 for (&u, r) in slots.iter().zip(relative) {
@@ -164,22 +162,22 @@ pub(crate) fn run(
         }
     };
     let (mut first, mut second, mut jumped) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut r, mut v) = (Vec::new(), Vec::new());
     let mut iterations = 0;
     while iterations < max_iterations.max(1) {
         step(&share, &mut first);
         step(&first, &mut second);
         iterations += 2;
-        let r = first
-            .iter()
-            .zip(&share)
-            .map(|(a, b)| a - b)
-            .collect::<Vec<_>>();
-        let v = second
-            .iter()
-            .zip(&first)
-            .zip(&r)
-            .map(|((c, b), r)| c - b - r)
-            .collect::<Vec<_>>();
+        r.clear();
+        r.extend(first.iter().zip(&share).map(|(a, b)| a - b));
+        v.clear();
+        v.extend(
+            second
+                .iter()
+                .zip(&first)
+                .zip(&r)
+                .map(|((c, b), r)| c - b - r),
+        );
         let r_norm = r.iter().map(|x| x * x).sum::<f64>().sqrt();
         let v_norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
         let next = if v_norm > 0.0 && r_norm > 0.0 {
@@ -213,9 +211,10 @@ pub(crate) fn run(
             break;
         }
     }
-    let posteriors = indexed
-        .iter()
-        .map(|(slots, relative, _)| {
+    let posteriors = (0..keys.len())
+        .map(|group| {
+            let members = starts[group]..starts[group + 1];
+            let (slots, relative) = (&slots[members.clone()], &relative[members]);
             let norm: f64 = slots.iter().zip(relative).map(|(&u, r)| share[u] * r).sum();
             slots
                 .iter()
@@ -264,10 +263,10 @@ mod tests {
         // one error fewer. Unit 2 has no read of its own and ends near zero.
         let mut groups = ReadGroups::default();
         for _ in 0..900 {
-            groups.add(vec![(1, 0.5), (2, 0.5)]);
+            groups.add(&mut vec![(1, 0.5), (2, 0.5)]);
         }
         for _ in 0..100 {
-            groups.add(vec![(1, 0.0), (2, 1.0)]);
+            groups.add(&mut vec![(1, 0.0), (2, 1.0)]);
         }
         assert_eq!(groups.len(), 2);
         let result = run_default(&groups);
@@ -281,10 +280,10 @@ mod tests {
         // plain EM would leave unit 2 near half after 200 rounds.
         let mut groups = ReadGroups::default();
         for _ in 0..9_990 {
-            groups.add(vec![(1, 0.0), (2, 0.0)]);
+            groups.add(&mut vec![(1, 0.0), (2, 0.0)]);
         }
         for _ in 0..10 {
-            groups.add(vec![(1, 0.0), (2, 1.0)]);
+            groups.add(&mut vec![(1, 0.0), (2, 1.0)]);
         }
         let result = run(&groups, error_penalty(0.003), 200, 1e-9);
         assert!(result.weight[&2] < 100.0, "unit 2 {}", result.weight[&2]);
@@ -300,13 +299,13 @@ mod tests {
         // Unit 1 has 300 better-matching reads, unit 2 has 100; 600 are tied.
         let mut groups = ReadGroups::default();
         for _ in 0..600 {
-            groups.add(vec![(1, 0.0), (2, 0.0)]);
+            groups.add(&mut vec![(1, 0.0), (2, 0.0)]);
         }
         for _ in 0..300 {
-            groups.add(vec![(1, 0.0), (2, 2.0)]);
+            groups.add(&mut vec![(1, 0.0), (2, 2.0)]);
         }
         for _ in 0..100 {
-            groups.add(vec![(1, 2.0), (2, 0.0)]);
+            groups.add(&mut vec![(1, 2.0), (2, 0.0)]);
         }
         let result = run_default(&groups);
         let ratio = result.weight[&1] / result.weight[&2];
@@ -318,9 +317,9 @@ mod tests {
     #[test]
     fn posteriors_sum_to_one_and_follow_the_order_of_groups() {
         let mut groups = ReadGroups::default();
-        groups.add(vec![(7, 0.0)]);
+        groups.add(&mut vec![(7, 0.0)]);
         for _ in 0..2 {
-            groups.add(vec![(7, 0.0), (9, 3.0)]);
+            groups.add(&mut vec![(7, 0.0), (9, 3.0)]);
         }
         let result = run_default(&groups);
         assert_eq!(result.posteriors.len(), 2);
@@ -345,15 +344,15 @@ mod tests {
     #[test]
     fn a_unit_keeps_its_fewest_errors_and_reads_are_grouped() {
         let mut groups = ReadGroups::default();
-        assert_eq!(groups.add(vec![(1, 2.0), (1, 0.0), (2, 0.4)]), Some(0));
-        assert_eq!(groups.add(vec![(2, 0.6), (1, 0.1)]), Some(0));
+        assert_eq!(groups.add(&mut vec![(1, 2.0), (1, 0.0), (2, 0.4)]), Some(0));
+        assert_eq!(groups.add(&mut vec![(2, 0.6), (1, 0.1)]), Some(0));
         assert_eq!(
             groups.len(),
             1,
             "same units and rounded excess errors form one group"
         );
-        assert_eq!(groups.add(vec![(1, 0.0)]), Some(1));
-        assert_eq!(groups.add(vec![]), None);
+        assert_eq!(groups.add(&mut vec![(1, 0.0)]), Some(1));
+        assert_eq!(groups.add(&mut vec![]), None);
         assert_eq!(groups.len(), 2, "reads without candidates are ignored");
     }
 }

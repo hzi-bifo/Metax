@@ -448,10 +448,34 @@ struct ExplicitPairRows {
 }
 
 impl CandidateScratch {
+    /// The fragment's candidates among its alignment `rows` under `policy`,
+    /// ordered as [`candidate_order`] ranks them.
     pub(crate) fn build<'a>(
         &'a mut self,
         rows: &[EvidenceAlignment],
         policy: EvidencePolicy,
+    ) -> &'a [TerminalCandidate] {
+        self.build_of(rows, policy, None)
+    }
+
+    /// The candidate of taxon `taxid` alone among the fragment's `rows`, as
+    /// [`Self::build`] builds it; the other taxa's alignments are read only
+    /// where they decide which single mates a fragment of pairs admits.
+    pub(crate) fn build_for(
+        &mut self,
+        rows: &[EvidenceAlignment],
+        policy: EvidencePolicy,
+        taxid: u32,
+    ) -> Option<&TerminalCandidate> {
+        self.build_of(rows, policy, Some(taxid)).first()
+    }
+
+    /// The candidates of the taxon `only` when given, else of every taxon.
+    fn build_of<'a>(
+        &'a mut self,
+        rows: &[EvidenceAlignment],
+        policy: EvidencePolicy,
+        only: Option<u32>,
     ) -> &'a [TerminalCandidate] {
         self.by_taxon_assembly.clear();
         self.by_taxon_gene.clear();
@@ -463,9 +487,9 @@ impl CandidateScratch {
         self.output.clear();
 
         match policy.mode {
-            EvidenceMode::Paired => self.build_paired(rows, policy),
-            EvidenceMode::Single => self.build_single(rows, policy),
-            EvidenceMode::Long => self.build_long(rows, policy),
+            EvidenceMode::Paired => self.build_paired(rows, policy, only),
+            EvidenceMode::Single => self.build_unpaired(rows, policy, |_, _| true, only),
+            EvidenceMode::Long => self.build_long(rows, policy, only),
         }
 
         for (_, placement) in self.by_taxon_assembly.drain() {
@@ -507,7 +531,12 @@ impl CandidateScratch {
         &self.output
     }
 
-    fn build_paired(&mut self, rows: &[EvidenceAlignment], policy: EvidencePolicy) {
+    fn build_paired(
+        &mut self,
+        rows: &[EvidenceAlignment],
+        policy: EvidencePolicy,
+        only: Option<u32>,
+    ) {
         for (index, row) in rows.iter().enumerate() {
             if row.pair_id == 0 {
                 continue;
@@ -532,6 +561,8 @@ impl CandidateScratch {
             }
         }
 
+        // Whether any pair, of any taxon, stands for the fragment.
+        let mut any_pair = false;
         for order_index in 0..self.pair_order.len() {
             let pair_id = self.pair_order[order_index];
             let Some(pair) = self.paired_rows.get(&pair_id).copied() else {
@@ -549,6 +580,10 @@ impl CandidateScratch {
                 || r1.profile_taxid != r2.profile_taxid
                 || r1.assembly_id != r2.assembly_id
             {
+                continue;
+            }
+            if only.is_some_and(|taxid| taxid != r1.profile_taxid) {
+                any_pair = any_pair || pair_qualifies(r1, r2, policy);
                 continue;
             }
             if !pair_qualifies(r1, r2, policy) {
@@ -584,34 +619,39 @@ impl CandidateScratch {
                 input_order: r1_index.min(r2_index),
             };
             self.insert_placement(placement, policy.mode);
+            any_pair = true;
         }
 
         // Without any pair, the fragment's evidence is a mate whose mate may
         // lie beyond the end of its reference, or a mate whose partner on the
         // same marker gene was clipped at the gene's end: the only single
         // mates that paired-end profiling admits.
-        if self.by_taxon_assembly.is_empty() {
+        if !any_pair {
             let half_pair_mates = std::mem::take(&mut self.half_pair_mates);
-            self.build_unpaired(rows, policy, |index, mapping| {
-                mapping.pair_id == 0 || half_pair_mates.contains(&index)
-            });
+            self.build_unpaired(
+                rows,
+                policy,
+                |index, mapping| mapping.pair_id == 0 || half_pair_mates.contains(&index),
+                only,
+            );
             self.half_pair_mates = half_pair_mates;
         }
     }
 
-    fn build_single(&mut self, rows: &[EvidenceAlignment], policy: EvidencePolicy) {
-        self.build_unpaired(rows, policy, |_, _| true);
-    }
-
-    /// One placement per qualifying single-read row accepted by `include`.
+    /// One placement per qualifying single-read row accepted by `include`, of
+    /// the taxon `only` when given.
     fn build_unpaired(
         &mut self,
         rows: &[EvidenceAlignment],
         policy: EvidencePolicy,
         include: impl Fn(usize, &EvidenceAlignment) -> bool,
+        only: Option<u32>,
     ) {
         for (input_order, mapping) in rows.iter().enumerate() {
-            if !include(input_order, mapping) || !single_mapping_qualifies(mapping, policy) {
+            if only.is_some_and(|taxid| taxid != mapping.profile_taxid)
+                || !include(input_order, mapping)
+                || !single_mapping_qualifies(mapping, policy)
+            {
                 continue;
             }
             let placement = CandidatePlacement {
@@ -637,9 +677,18 @@ impl CandidateScratch {
         self.count_other_genes();
     }
 
-    fn build_long(&mut self, rows: &[EvidenceAlignment], policy: EvidencePolicy) {
+    /// One placement per qualifying long-read row, of the taxon `only` when
+    /// given.
+    fn build_long(
+        &mut self,
+        rows: &[EvidenceAlignment],
+        policy: EvidencePolicy,
+        only: Option<u32>,
+    ) {
         for (input_order, mapping) in rows.iter().enumerate() {
-            if !long_mapping_qualifies(mapping, policy) {
+            if only.is_some_and(|taxid| taxid != mapping.profile_taxid)
+                || !long_mapping_qualifies(mapping, policy)
+            {
                 continue;
             }
             let placement = CandidatePlacement {
@@ -931,6 +980,53 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].best.both_mapped, 200);
         assert_eq!(candidates[1].best.both_mapped, 200);
+    }
+
+    #[test]
+    fn one_taxon_s_candidate_is_built_as_among_all() {
+        // Lone mates of species 1 and 2 place the fragment without a pair, and
+        // not beside a pair of species 3.
+        let mut lone = vec![
+            mapping(1, 10, 1, 0.99, 100, 100, MappingRole::Mate1),
+            mapping(1, 11, 1, 0.98, 100, 100, MappingRole::Mate2),
+            mapping(2, 20, 2, 0.97, 100, 100, MappingRole::Mate2),
+        ];
+        for row in &mut lone {
+            row.pair_id = 0;
+        }
+        let mut paired = vec![
+            mapping(3, 30, 3, 0.99, 100, 100, MappingRole::Mate1),
+            mapping(3, 30, 3, 0.99, 100, 100, MappingRole::Mate2),
+        ];
+        paired[0].pair_id = 7;
+        paired[1].pair_id = 7;
+        paired.extend(lone.iter().cloned());
+        let describe = |candidate: &TerminalCandidate| {
+            (
+                candidate.taxid,
+                candidate.best.reference_id,
+                candidate.best.both_mapped,
+                candidate.placements.len(),
+            )
+        };
+        let mut scratch = CandidateScratch::default();
+        for (rows, mode) in [
+            (&lone, EvidenceMode::Paired),
+            (&paired, EvidenceMode::Paired),
+            (&paired, EvidenceMode::Single),
+            (&paired, EvidenceMode::Long),
+        ] {
+            let all = scratch
+                .build(rows, policy(mode))
+                .iter()
+                .map(describe)
+                .collect::<Vec<_>>();
+            for taxid in [1, 2, 3, 4] {
+                let one = scratch.build_for(rows, policy(mode), taxid).map(describe);
+                let among_all = all.iter().find(|c| c.0 == taxid).copied();
+                assert_eq!(one, among_all, "{mode:?} taxon {taxid}");
+            }
+        }
     }
 
     #[test]

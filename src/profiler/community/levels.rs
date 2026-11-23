@@ -192,20 +192,6 @@ struct SharedReads {
     group_bases: Vec<f64>,
 }
 
-impl SharedReads {
-    /// Each unit's share of the fragments' bases in `em`, the EM over these
-    /// read groups.
-    fn unit_bases(&self, em: &likelihood_em::EmResult) -> HashMap<u32, f64> {
-        let mut bases: HashMap<u32, f64> = HashMap::new();
-        for (posteriors, &group_total) in em.posteriors.iter().zip(&self.group_bases) {
-            for &(unit, posterior) in posteriors {
-                *bases.entry(unit).or_insert(0.0) += group_total * posterior;
-            }
-        }
-        bases
-    }
-}
-
 /// The unit a read group resolves to: the first of its `posteriors` at
 /// [`RESOLVE_POSTERIOR`] or above.
 fn resolved_unit(posteriors: &[(u32, f64)]) -> Option<u32> {
@@ -356,7 +342,7 @@ fn profile_levels(profiler: &Profiler, data: MappingData) -> Result<()> {
     if let Some(path) = &classify_path {
         let written = classify::Classifications {
             fragments: &fragments,
-            group_of: &kept.shared.group_of,
+            group_of: &kept.group_of,
             posteriors: &kept.em.posteriors,
             genome_level: &genome_result.species,
             genus_members: &rows.genus_members,
@@ -487,9 +473,11 @@ impl SpeciesJudgment {
     }
 }
 
-/// The second EM, over the kept species: its read groups and its result.
+/// The second EM, over the kept species: each fragment's read group (`None`
+/// without a kept candidate), each group's bases, and the EM's result.
 struct KeptShares {
-    shared: SharedReads,
+    group_of: Vec<Option<usize>>,
+    group_bases: Vec<f64>,
     em: likelihood_em::EmResult,
 }
 
@@ -497,11 +485,21 @@ impl KeptShares {
     /// Each fragment's species in the second EM, when it gives the fragment
     /// to one species ([`RESOLVE_POSTERIOR`]), with that species' share.
     fn species_of(&self) -> Vec<Option<(u32, f64)>> {
-        self.shared
-            .group_of
+        self.group_of
             .iter()
             .map(|group| group.and_then(|g| resolved_share(&self.em.posteriors[g])))
             .collect()
+    }
+
+    /// Each species' share of the fragments' bases.
+    fn unit_bases(&self) -> HashMap<u32, f64> {
+        let mut bases: HashMap<u32, f64> = HashMap::new();
+        for (posteriors, &group_total) in self.em.posteriors.iter().zip(&self.group_bases) {
+            for &(unit, posterior) in posteriors {
+                *bases.entry(unit).or_insert(0.0) += group_total * posterior;
+            }
+        }
+        bases
     }
 }
 
@@ -548,24 +546,26 @@ impl Run<'_> {
         // of that species' genomes.
         let all = share_reads(fragments, |_| true, self.em.penalty);
         let first_em = self.em.run(&all.groups);
+        // Only the fragments' read groups are read again.
+        let SharedReads { group_of, .. } = all;
         let resolved_taxid = first_em
             .posteriors
             .iter()
             .map(|posteriors| resolved_unit(posteriors))
             .collect::<Vec<_>>();
-        let first = FirstEm::new(fragments, &all.group_of, &first_em, &resolved_taxid);
+        let first = FirstEm::new(fragments, &group_of, &first_em, &resolved_taxid);
         let mut counts = first.counts();
         let resolved_fragments = first
             .won()
             .map(|(fragment, taxid)| (fragments[fragment].read, taxid))
             .collect::<Vec<_>>();
         let mut genomes: HashMap<u32, GenomeEvidence> = HashMap::new();
-        fold_candidates(
+        fold_candidate_of(
             data,
             policy,
             &resolved_fragments,
-            |r| r.0,
-            |r, candidates| species_placements(candidates, r.1),
+            (|r| r.0, |r| r.1),
+            |_, candidate| species_hits(candidate),
             |r, hits| add_hits(&mut genomes, r.1, hits),
         );
         drop(resolved_fragments);
@@ -735,7 +735,11 @@ impl Run<'_> {
             em.iterations,
             without_kept
         );
-        KeptShares { shared, em }
+        KeptShares {
+            group_of: shared.group_of,
+            group_bases: shared.group_bases,
+            em,
+        }
     }
 
     /// The fragments that no kept species takes, placed above species
@@ -775,7 +779,7 @@ impl Run<'_> {
             let not_kept = self
                 .fragments
                 .iter()
-                .zip(&kept.shared.group_of)
+                .zip(&kept.group_of)
                 .filter(|(_, group)| group.is_none())
                 .map(|(fragment, _)| fragment.read)
                 .collect::<Vec<_>>();
@@ -857,7 +861,7 @@ impl Run<'_> {
     ) -> SpeciesAmounts {
         let (cfg, data) = (self.cfg, self.data);
         // Each species' share of the fragments' bases.
-        let mut bases = kept.shared.unit_bases(&kept.em);
+        let mut bases = kept.unit_bases();
         let MarkerEvidence {
             depth: mut marker_depth,
             genome_reads,
@@ -869,7 +873,7 @@ impl Run<'_> {
                     data,
                     self.policy,
                     self.fragments,
-                    (&kept.shared, &kept.em),
+                    (&kept.group_of, &kept.em),
                     reported,
                     (model, cfg.estimate_unclassified.then_some(self.long_reads)),
                 )
@@ -1285,16 +1289,13 @@ fn share_reads(fragments: &[Fragment], allowed: impl Fn(u32) -> bool, penalty: f
         group_of: Vec::with_capacity(fragments.len()),
         group_bases: Vec::new(),
     };
+    let mut candidates: likelihood_em::Candidates = Vec::new();
     for fragment in fragments {
-        let mut candidates = fragment
-            .candidates
-            .iter()
-            .filter(|c| allowed(c.0))
-            .copied()
-            .collect::<Vec<_>>();
+        candidates.clear();
+        candidates.extend(fragment.candidates.iter().filter(|c| allowed(c.0)));
         let fewest = candidates.iter().map(|c| c.1).fold(f64::INFINITY, f64::min);
         candidates.retain(|c| c.1 - fewest <= max_excess_errors);
-        let slot = shared.groups.add(candidates);
+        let slot = shared.groups.add(&mut candidates);
         if let Some(slot) = slot {
             if slot == shared.group_bases.len() {
                 shared.group_bases.push(0.0);
@@ -1433,7 +1434,7 @@ struct MarkerEvidence {
 
 /// [`MarkerEvidence`] of the kept species reported on a marker genome
 /// (`reported`). A species' depth is the sum over its fragments of their share
-/// in the final EM (`shared`, `em`) times the depth one
+/// in the final EM (each fragment's read group `group_of`, `em`) times the depth one
 /// fragment adds on that genome, [`fragment_depth`]: its read length times the
 /// genes it hits over the placements that the genome's genes offer a read of
 /// its length. With `unclassified` (`--estimate-unclassified`; `Some(true)` for
@@ -1444,7 +1445,7 @@ fn marker_evidence(
     data: &MappingData,
     policy: EvidencePolicy,
     fragments: &[Fragment],
-    (shared, em): (&SharedReads, &likelihood_em::EmResult),
+    (group_of, em): (&[Option<usize>], &likelihood_em::EmResult),
     reported: &HashMap<u32, u32>,
     (model, unclassified): (&MarkerModel, Option<bool>),
 ) -> MarkerEvidence {
@@ -1455,7 +1456,7 @@ fn marker_evidence(
     };
     let items = fragments
         .iter()
-        .zip(&shared.group_of)
+        .zip(group_of)
         .filter_map(|(fragment, group)| {
             let group = (*group)?;
             em.posteriors[group]
@@ -1547,15 +1548,52 @@ fn fold_candidates<I: Sync, T: Send>(
     items: &[I],
     read_of: impl Fn(&I) -> usize + Sync,
     extract: impl Fn(&I, &[TerminalCandidate]) -> T + Sync,
+    fold: impl FnMut(&I, T),
+) {
+    fold_built(
+        items,
+        |scratch, item| {
+            let rows = &data.read_alignments[read_of(item)].alignments;
+            extract(item, scratch.build(rows, policy))
+        },
+        fold,
+    );
+}
+
+/// [`fold_candidates`] for a pass that reads one taxon's candidate per item
+/// (`taxid_of`): only that candidate is built
+/// ([`CandidateScratch::build_for`]).
+fn fold_candidate_of<I: Sync, T: Send>(
+    data: &MappingData,
+    policy: EvidencePolicy,
+    items: &[I],
+    (read_of, taxid_of): (impl Fn(&I) -> usize + Sync, impl Fn(&I) -> u32 + Sync),
+    extract: impl Fn(&I, Option<&TerminalCandidate>) -> T + Sync,
+    fold: impl FnMut(&I, T),
+) {
+    fold_built(
+        items,
+        |scratch, item| {
+            let rows = &data.read_alignments[read_of(item)].alignments;
+            extract(item, scratch.build_for(rows, policy, taxid_of(item)))
+        },
+        fold,
+    );
+}
+
+/// Run `work` on each of `items` on the profiler's threads, each thread with
+/// its own candidate storage, and hand the results to `fold` in item order,
+/// [`PARALLEL_BLOCK`] items at a time.
+fn fold_built<I: Sync, T: Send>(
+    items: &[I],
+    work: impl Fn(&mut CandidateScratch, &I) -> T + Sync,
     mut fold: impl FnMut(&I, T),
 ) {
     for block in items.chunks(PARALLEL_BLOCK) {
         let results = block
             .par_iter()
             .map_init(CandidateScratch::default, |scratch, item| {
-                let candidates =
-                    scratch.build(&data.read_alignments[read_of(item)].alignments, policy);
-                extract(item, candidates)
+                work(scratch, item)
             })
             .collect::<Vec<_>>();
         for (item, result) in block.iter().zip(results) {
@@ -1572,10 +1610,9 @@ struct SpeciesHits {
     gene_hits: Vec<GeneHit>,
 }
 
-/// The placements and gene hits of species `taxid` among a fragment's
-/// `candidates`.
-fn species_placements(candidates: &[TerminalCandidate], taxid: u32) -> SpeciesHits {
-    candidate_of(candidates, taxid).map_or_else(SpeciesHits::default, |candidate| SpeciesHits {
+/// The placements and gene hits of a fragment's `candidate` of a species.
+fn species_hits(candidate: Option<&TerminalCandidate>) -> SpeciesHits {
+    candidate.map_or_else(SpeciesHits::default, |candidate| SpeciesHits {
         placements: candidate
             .placements
             .iter()
@@ -1609,12 +1646,12 @@ fn add_fragment_hits(
     list: &[usize],
     genomes: &mut HashMap<u32, GenomeEvidence>,
 ) {
-    fold_candidates(
+    fold_candidate_of(
         data,
         policy,
         list,
-        |&f| fragments[f].read,
-        |_, candidates| species_placements(candidates, taxid),
+        (|&f| fragments[f].read, |_| taxid),
+        |_, candidate| species_hits(candidate),
         |_, hits| add_hits(genomes, taxid, hits),
     );
 }
@@ -2035,7 +2072,7 @@ fn prophage_look(
     let hosts = with_labelled(hosts, labelled);
     let explainers = viruses
         .into_iter()
-        .map(|virus| (virus, hosts.clone()))
+        .map(|virus| (virus, &hosts))
         .collect::<HashMap<_, _>>();
     own_reads_look(first, taken, tests, genomes, &explainers, evidence)
         .into_iter()
@@ -2085,7 +2122,7 @@ fn named_first_look(
     }
     let lineage: HashMap<u32, Vec<u32>> =
         kept.iter().map(|&unit| (unit, ancestors(unit))).collect();
-    let explainers = kept
+    let inside = kept
         .iter()
         .filter(|unit| labels.contains_key(unit))
         .filter_map(|&label| {
@@ -2097,9 +2134,13 @@ fn named_first_look(
             (!inside.is_empty()).then_some((label, inside))
         })
         .collect::<HashMap<_, _>>();
-    if explainers.is_empty() {
+    if inside.is_empty() {
         return HashMap::new();
     }
+    let explainers = inside
+        .iter()
+        .map(|(&label, units)| (label, units))
+        .collect::<HashMap<_, _>>();
     own_reads_look(first, taken, tests, genomes, &explainers, evidence)
         .into_iter()
         .collect()
@@ -2121,7 +2162,7 @@ fn own_reads_look(
     taken: &HashMap<u32, Vec<usize>>,
     tests: &CoverageTests,
     genomes: &mut HashMap<u32, GenomeEvidence>,
-    explainers: &HashMap<u32, HashSet<u32>>,
+    explainers: &HashMap<u32, &HashSet<u32>>,
     mut evidence: impl FnMut(u32, &[usize]) -> HashMap<u32, GenomeEvidence>,
 ) -> Vec<(u32, Vec<u32>)> {
     let mut held = first.won_by(|taxid| explainers.contains_key(&taxid));
@@ -2578,7 +2619,8 @@ impl StrongestGenome {
 
 /// Each measured species' strongest genome
 /// ([`StrongestGenome::stronger_than`]; the lowest assembly id when neither
-/// of two is stronger), with the window spread of its reads on `layout`.
+/// of two is stronger), with the window spread of its reads on `layout` when
+/// it is not kept, the only case the even-coverage rule reads it.
 fn strongest_genomes(
     genomes: &HashMap<u32, GenomeEvidence>,
     layout: &GenomeLayout,
@@ -2590,10 +2632,7 @@ fn strongest_genomes(
         };
         let candidate = StrongestGenome {
             genome: assembly_id,
-            coverage: EvidenceCoverage {
-                window_spread: layout.window_spread(assembly_id, &genome.assembly.intervals),
-                ..coverage
-            },
+            coverage,
             kept: genome.kept,
         };
         let stronger = strongest.get(&genome.taxid).is_none_or(|current| {
@@ -2603,6 +2642,10 @@ fn strongest_genomes(
         if stronger {
             strongest.insert(genome.taxid, candidate);
         }
+    }
+    for genome in strongest.values_mut().filter(|genome| !genome.kept) {
+        let intervals = &genomes[&genome.genome].assembly.intervals;
+        genome.coverage.window_spread = layout.window_spread(genome.genome, intervals);
     }
     strongest
 }
@@ -4029,11 +4072,7 @@ mod tests {
                 bases: 100.0,
             })
             .collect::<Vec<_>>();
-        let shared = SharedReads {
-            groups: ReadGroups::default(),
-            group_of: vec![Some(0), Some(0), Some(1)],
-            group_bases: Vec::new(),
-        };
+        let group_of = [Some(0), Some(0), Some(1)];
         let em = likelihood_em::EmResult {
             weight: HashMap::new(),
             posteriors: vec![vec![(1, 1.0)], vec![(1, 0.5), (2, 0.5)]],
@@ -4045,7 +4084,7 @@ mod tests {
             &data,
             policy,
             &fragments,
-            (&shared, &em),
+            (&group_of, &em),
             &reported,
             (&model, Some(false)),
         );

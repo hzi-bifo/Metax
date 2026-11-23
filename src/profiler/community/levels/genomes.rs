@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 
 use super::{
-    add_placement, candidate_errors, candidate_of, estimated_ani, fold_candidates,
+    add_placement, candidate_errors, estimated_ani, fold_candidate_of, fold_candidates,
     longest_alignment, placement_identity, resolved_unit, tie_margin, tied_errors, with_errors,
     CoverageTests, EmSettings, Fragment, GenomeEvidence, LONG_TIE_SHARE, MIN_JUDGED_SPECIES,
 };
@@ -179,9 +179,14 @@ pub(super) fn resolve(
         .into_par_iter()
         .map(|(taxid, members)| {
             let mut groups = ReadGroups::default();
+            let mut candidates = Vec::new();
             let group_of = members
                 .iter()
-                .map(|m| groups.add(m.genomes.iter().map(|g| (g.0, g.1)).collect()))
+                .map(|m| {
+                    candidates.clear();
+                    candidates.extend(m.genomes.iter().map(|g| (g.0, g.1)));
+                    groups.add(&mut candidates)
+                })
                 .collect::<Vec<_>>();
             let em = level.em.run(&groups);
             let best_fit = em
@@ -301,12 +306,12 @@ fn genome_fragments(
         .filter_map(|(fragment, species)| species.map(|(taxid, share)| (fragment, taxid, share)))
         .collect::<Vec<_>>();
     let mut out: HashMap<u32, Vec<GenomeFragment>> = HashMap::new();
-    fold_candidates(
+    fold_candidate_of(
         data,
         policy,
         &resolved,
-        |r| r.0.read,
-        |r, candidates| Some(candidate_genomes(candidate_of(candidates, r.1)?, policy)),
+        (|r| r.0.read, |r| r.1),
+        |_, candidate| Some(candidate_genomes(candidate?, policy)),
         |&(fragment, taxid, share), genomes| {
             if let Some(genomes) = genomes {
                 out.entry(taxid).or_default().push(GenomeFragment {
@@ -465,16 +470,12 @@ fn strain_genomes(
         strain_level.push((member.read, assembly));
     }
     let mut evidence: HashMap<u32, GenomeEvidence> = HashMap::new();
-    fold_candidates(
+    fold_candidate_of(
         data,
         level.policy,
         &strain_level,
-        |r| r.0,
-        |&(_, assembly), candidates| {
-            candidate_of(candidates, taxid)
-                .and_then(|c| c.placement_on(assembly))
-                .copied()
-        },
+        (|r| r.0, |_| taxid),
+        |&(_, assembly), candidate| candidate.and_then(|c| c.placement_on(assembly)).copied(),
         |_, placement| {
             if let Some(placement) = placement {
                 add_placement(&mut evidence, taxid, &placement, true);
@@ -604,16 +605,19 @@ fn share_among_kept(
     level: &GenomeLevel,
 ) -> KeptShares {
     let mut groups = ReadGroups::default();
+    let mut candidates = Vec::new();
     let slots = members
         .iter()
         .map(|member| {
-            let candidates = member
-                .genomes
-                .iter()
-                .filter(|g| kept.contains_key(&g.0) && g.2 >= strain_identity)
-                .map(|g| (g.0, g.1))
-                .collect::<Vec<_>>();
-            groups.add(candidates)
+            candidates.clear();
+            candidates.extend(
+                member
+                    .genomes
+                    .iter()
+                    .filter(|g| kept.contains_key(&g.0) && g.2 >= strain_identity)
+                    .map(|g| (g.0, g.1)),
+            );
+            groups.add(&mut candidates)
         })
         .collect::<Vec<_>>();
     let em = level.em.run(&groups);
