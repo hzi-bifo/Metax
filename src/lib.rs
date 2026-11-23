@@ -112,7 +112,9 @@ pub struct AppConfig {
     pub relative_identity_gap: Option<f64>,
     /// `--no-relative-identity-gap`: no default gap either.
     pub no_relative_identity_gap: bool,
-    pub removed_to_genus: bool,
+    /// The levels above species and the even-coverage species; off with
+    /// `--strict-coverage`.
+    pub above_species: bool,
     pub estimate_unclassified: bool,
     pub identity_margin: Option<f64>,
     /// `--no-identity-margin`: no default margin either.
@@ -616,7 +618,7 @@ impl MetaxApp {
             if self.config.by_aligned {
                 flags.push("--by-mapped".to_string());
             }
-            if !self.config.removed_to_genus {
+            if !self.config.above_species {
                 flags.push("--strict-coverage".to_string());
             }
             if self.config.estimate_unclassified {
@@ -977,7 +979,7 @@ impl MetaxApp {
             min_coebr: self.config.min_coebr,
             min_marker_genes: self.config.min_marker_genes,
             relative_identity_gap,
-            removed_to_genus: self.config.removed_to_genus,
+            above_species: self.config.above_species,
             estimate_unclassified: self.config.estimate_unclassified,
             identity_margin,
             fraction,
@@ -1129,7 +1131,7 @@ mod tests {
             min_marker_genes: 3,
             relative_identity_gap: None,
             no_relative_identity_gap: false,
-            removed_to_genus: false,
+            above_species: false,
             estimate_unclassified: false,
             identity_margin: None,
             no_identity_margin: false,

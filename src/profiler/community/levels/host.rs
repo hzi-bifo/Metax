@@ -12,10 +12,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::higher::Lineages;
 use super::{Dropped, Removal, TaxonBlock};
 use crate::profiler::output::{ProfileAnnotations, ProfileRow};
 use crate::profiler::pathogen::PathogenEntry;
-use crate::taxonomy::Taxonomy;
 
 /// What the pathogen table says about a taxon for the host.
 #[derive(Clone, Debug, PartialEq)]
@@ -28,11 +28,11 @@ enum Verdict {
     OtherHosts,
 }
 
-/// The host and the pathogen table.
+/// The host, the pathogen table, and the taxa's lineages.
 pub(super) struct HostFilter<'a> {
     pub(super) host: u32,
     pub(super) table: &'a HashMap<u32, PathogenEntry>,
-    pub(super) taxonomy: &'a Taxonomy,
+    pub(super) lineages: &'a Lineages<'a>,
 }
 
 /// The distinct items of a `;`-separated field, in their order; `None` when
@@ -64,10 +64,10 @@ impl HostFilter<'_> {
         let of_host = hosts.iter().any(|&listed| {
             listed == self.host
                 || self
-                    .taxonomy
-                    .get_parents(listed)
+                    .lineages
+                    .of(listed)
                     .iter()
-                    .any(|(ancestor, _, _)| *ancestor == self.host)
+                    .any(|node| node.0 == self.host)
         });
         if !of_host {
             return Verdict::OtherHosts;
@@ -137,6 +137,7 @@ mod tests {
     use super::super::profile_row;
     use super::*;
     use crate::profiler::evidence::EvidenceCoverage;
+    use crate::taxonomy::Taxonomy;
 
     /// Primates 9443 > Homo 9605 > human 9606; mouse 10090 elsewhere.
     fn taxonomy() -> Taxonomy {
@@ -209,10 +210,11 @@ mod tests {
     fn a_listed_taxon_is_kept_for_its_hosts_and_their_ancestors_only() {
         let table = table();
         let taxonomy = taxonomy();
+        let lineages = Lineages::new(&taxonomy);
         let filter = |host| HostFilter {
             host,
             table: &table,
-            taxonomy: &taxonomy,
+            lineages: &lineages,
         };
         let pathogen = filter(9606).verdict(1);
         assert_eq!(
@@ -234,6 +236,7 @@ mod tests {
     fn rows_are_annotated_or_dropped_and_strains_follow_their_species() {
         let table = table();
         let taxonomy = taxonomy();
+        let lineages = Lineages::new(&taxonomy);
         let mut blocks = vec![
             block(
                 1,
@@ -254,7 +257,7 @@ mod tests {
         HostFilter {
             host: 9606,
             table: &table,
-            taxonomy: &taxonomy,
+            lineages: &lineages,
         }
         .apply(&mut blocks, &mut dropped);
         let kept = blocks
@@ -298,6 +301,7 @@ mod tests {
     fn abundance_is_normalised_over_the_rows_kept() {
         let table = table();
         let taxonomy = taxonomy();
+        let lineages = Lineages::new(&taxonomy);
         let mut blocks = vec![
             block(1, Some(row(1, "species", 10)), vec![row(11, "strain", 11)]),
             block(2, Some(row(2, "species", 20)), Vec::new()),
@@ -306,7 +310,7 @@ mod tests {
         HostFilter {
             host: 9606,
             table: &table,
-            taxonomy: &taxonomy,
+            lineages: &lineages,
         }
         .apply(&mut blocks, &mut Dropped::default());
         super::super::set_abundance(&mut blocks);

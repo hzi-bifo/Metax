@@ -43,18 +43,18 @@
 //! exactly with it on that number share the depth: it is the mean of the
 //! depths over each of them.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
 use super::{
-    best_match_kept, candidate_errors, fold_candidates, longest_alignment, share_reads, tie_margin,
-    Fragment, SpeciesTests, EM_TOLERANCE, LONG_TIE_SHARE,
+    best_tied, fold_candidates, placement_identity, ranked, share_reads, CoverageTests, EmSettings,
+    Fragment,
 };
 use crate::profiler::community::MappingData;
 use crate::profiler::evidence::{
-    CandidatePlacement, EvidenceCoverage, EvidencePolicy, PresenceAssembly, PresenceInterval,
-    TerminalCandidate,
+    EvidenceCoverage, EvidencePolicy, PresenceAssembly, PresenceInterval, TerminalCandidate,
 };
 use crate::profiler::likelihood_em;
 use crate::profiler::rollup::GenomeLayout;
@@ -129,25 +129,25 @@ impl Rank {
 }
 
 /// A taxon's lineage, the taxon first, each with its rank among [`Rank`].
-type Lineage = Arc<[(u32, Option<Rank>)]>;
+pub(super) type Lineage = Arc<[(u32, Option<Rank>)]>;
 
 /// Lineages read from the taxonomy, once per taxon.
-struct Lineages<'t> {
+pub(super) struct Lineages<'t> {
     taxonomy: &'t Taxonomy,
-    known: HashMap<u32, Lineage>,
+    known: RefCell<HashMap<u32, Lineage>>,
 }
 
 impl<'t> Lineages<'t> {
-    fn new(taxonomy: &'t Taxonomy) -> Self {
+    pub(super) fn new(taxonomy: &'t Taxonomy) -> Self {
         Self {
             taxonomy,
-            known: HashMap::new(),
+            known: RefCell::new(HashMap::new()),
         }
     }
 
-    fn of(&mut self, taxid: u32) -> Lineage {
+    pub(super) fn of(&self, taxid: u32) -> Lineage {
         let taxonomy = self.taxonomy;
-        Arc::clone(self.known.entry(taxid).or_insert_with(|| {
+        Arc::clone(self.known.borrow_mut().entry(taxid).or_insert_with(|| {
             taxonomy
                 .get_parents(taxid)
                 .into_iter()
@@ -156,17 +156,22 @@ impl<'t> Lineages<'t> {
         }))
     }
 
-    /// The genus of `taxid`: the taxon itself at genus rank, or its ancestor
-    /// there.
-    fn genus(&mut self, taxid: u32) -> Option<u32> {
+    /// The taxa of the lineage of `taxid`, the taxon first.
+    pub(super) fn ancestors(&self, taxid: u32) -> Vec<u32> {
+        self.of(taxid).iter().map(|node| node.0).collect()
+    }
+
+    /// The taxon of the lineage of `taxid` at `rank`: the taxon itself, or its
+    /// ancestor there.
+    pub(super) fn at_rank(&self, taxid: u32, rank: Rank) -> Option<u32> {
         self.of(taxid)
             .iter()
-            .find(|node| node.1 == Some(Rank::Genus))
+            .find(|node| node.1 == Some(rank))
             .map(|node| node.0)
     }
 
     /// The first taxon of the lineage of `taxid` ranked above `rank`.
-    fn above(&mut self, taxid: u32, rank: Rank) -> Option<(u32, Rank)> {
+    fn above(&self, taxid: u32, rank: Rank) -> Option<(u32, Rank)> {
         first_above(&self.of(taxid), rank)
     }
 
@@ -174,7 +179,7 @@ impl<'t> Lineages<'t> {
     /// start: their lowest common ancestor when it is ranked above genus,
     /// else the first taxon above it that is; `None` when there is none below
     /// the root.
-    fn common_start(&mut self, taxa: &[u32]) -> Option<(u32, Rank)> {
+    fn common_start(&self, taxa: &[u32]) -> Option<(u32, Rank)> {
         let first = self.of(taxa[0]);
         let mut at = 0;
         for &taxid in &taxa[1..] {
@@ -197,20 +202,15 @@ fn first_above(lineage: &[(u32, Option<Rank>)], rank: Rank) -> Option<(u32, Rank
 /// What the level places and with what.
 pub(super) struct Level<'a> {
     pub(super) data: &'a MappingData,
-    pub(super) taxonomy: &'a Taxonomy,
-    pub(super) tests: &'a SpeciesTests,
+    pub(super) tests: &'a CoverageTests,
     pub(super) layout: &'a GenomeLayout,
-    /// The reads without a species-level candidate, and the floor gates.
+    /// The reads without a species-level candidate (on noisy long reads, not
+    /// those whose best match is a kept species), and the floor gates.
     pub(super) below_species: (&'a [usize], EvidencePolicy),
     /// The reads of fragments whose candidate species are none kept, and the
     /// species gates.
     pub(super) not_kept: (&'a [usize], EvidencePolicy),
-    /// On noisy long reads, the kept species whose best-matched reads below
-    /// the species gates count for them; otherwise empty.
-    pub(super) noisy_kept: &'a HashSet<u32>,
-    /// The EM's error penalty and its most iterations.
-    pub(super) penalty: f64,
-    pub(super) max_iterations: usize,
+    pub(super) em: EmSettings,
     /// Keep each fragment's shares for the per-read classifications.
     pub(super) keep_shares: bool,
 }
@@ -450,9 +450,9 @@ struct Arrivals {
     sets: HashMap<u32, usize>,
 }
 
-/// Place the level's fragments ([module documentation](self)).
-pub(super) fn place(level: &Level) -> HigherLevels {
-    let mut lineages = Lineages::new(level.taxonomy);
+/// Place the level's fragments ([module documentation](self)), with the
+/// taxa's `lineages`.
+pub(super) fn place(level: &Level, lineages: &Lineages) -> HigherLevels {
     let Collected {
         placed,
         sets,
@@ -460,7 +460,7 @@ pub(super) fn place(level: &Level) -> HigherLevels {
     } = collect(level);
     let genera = sets
         .iter()
-        .map(|taxa| genera_of(taxa, &mut lineages))
+        .map(|taxa| genera_of(taxa, lineages))
         .collect::<Vec<_>>();
     let identity_floor = level.not_kept.1.identity - GENUS_IDENTITY_BELOW_SPECIES;
     let measure = |list: &[u32]| measure(&placed, list, &genomes, level);
@@ -582,7 +582,7 @@ pub(super) fn place(level: &Level) -> HigherLevels {
     }
     let mut tied_shares: Vec<Vec<(u32, f64)>> = Vec::new();
     if !tied.is_empty() {
-        let (em, groups) = share_tied(level, &placed, &tied, &with_row, &mut lineages);
+        let (em, groups) = share_tied(level, &placed, &tied, &with_row, lineages);
         tied_shares = em.posteriors;
         for (i, group) in groups {
             let group = group.expect("a fragment with a genus row among its tie set's genera");
@@ -719,7 +719,7 @@ fn share_tied(
     placed: &[Placed],
     list: &[u32],
     with_row: &BTreeMap<u32, [usize; 2]>,
-    lineages: &mut Lineages,
+    lineages: &Lineages,
 ) -> (likelihood_em::EmResult, Vec<(u32, Option<usize>)>) {
     let mut fragments = Vec::new();
     for (&genus, unique) in with_row {
@@ -744,7 +744,7 @@ fn share_tied(
             &of_kind,
             |&i| placed[i as usize].read,
             |_, candidates| {
-                ranked(candidates, policy, |c| level.takes_part(c)).map(|found| found.0)
+                ranked(candidates, policy.mode, |c| level.takes_part(c)).map(|found| found.0)
             },
             |&i, found| {
                 let fragment = &placed[i as usize];
@@ -753,7 +753,7 @@ fn share_tied(
                     .flatten()
                     .filter_map(|&(taxid, errors)| {
                         lineages
-                            .genus(taxid)
+                            .at_rank(taxid, Rank::Genus)
                             .filter(|genus| with_row.contains_key(genus))
                             .map(|genus| (genus, errors))
                     })
@@ -767,13 +767,8 @@ fn share_tied(
             },
         );
     }
-    let shared = share_reads(&fragments, |_| true, level.penalty);
-    let em = likelihood_em::run(
-        &shared.groups,
-        level.penalty,
-        level.max_iterations,
-        EM_TOLERANCE,
-    );
+    let shared = share_reads(&fragments, |_| true, level.em.penalty);
+    let em = level.em.run(&shared.groups);
     let groups = order
         .into_iter()
         .zip(shared.group_of[first_tied..].iter().copied())
@@ -790,18 +785,14 @@ fn collect(level: &Level) -> Collected {
         (Kind::BelowSpecies, level.below_species),
         (Kind::NotKept, level.not_kept),
     ] {
-        let leave_kept = kind == Kind::BelowSpecies && !level.noisy_kept.is_empty();
         fold_candidates(
             level.data,
             policy,
             reads,
             |&read| read,
-            |&read, candidates| {
-                if leave_kept && best_match_kept(read, candidates, policy, level.noisy_kept) {
-                    return None;
-                }
-                ranked(candidates, policy, |c| level.takes_part(c))
-                    .map(|(ranked, best)| (tie_set(&ranked), best))
+            |_, candidates| {
+                ranked(candidates, policy.mode, |c| level.takes_part(c))
+                    .map(|(ranked, best)| (tie_set(&ranked), best.best))
             },
             |&read, result| {
                 let Some((taxa, best)) = result else {
@@ -818,15 +809,9 @@ fn collect(level: &Level) -> Collected {
                     kind,
                     ties,
                     assembly: best.assembly_id,
-                    identity: (1.0 - best.pair_errors / f64::from(best.both_mapped.max(1))) as f32,
+                    identity: placement_identity(&best) as f32,
                     bases: best.r1_mapped as f32,
-                    interval: PresenceInterval {
-                        reference_id: best.reference_id,
-                        span: best.span,
-                        mate_span: best.mate_span,
-                        fixed_chunk: best.fixed_chunk,
-                        flex_chunk: best.flex_chunk,
-                    },
+                    interval: PresenceInterval::from(&best),
                 });
             },
         );
@@ -838,58 +823,20 @@ fn collect(level: &Level) -> Collected {
     found
 }
 
-/// A fragment's `candidates` under `policy` among those that take part,
-/// ranked as the species level ranks them ([`super::fragment_of`]): each
-/// taxon with its estimated errors, those within the tie margin of the best
-/// carrying the best's errors, by errors, then taxid; and the best
-/// candidate's placement. `None` without a candidate.
-fn ranked(
-    candidates: &[TerminalCandidate],
-    policy: EvidencePolicy,
-    takes_part: impl Fn(&TerminalCandidate) -> bool,
-) -> Option<(Vec<(u32, f64)>, CandidatePlacement)> {
-    let longest = longest_alignment(candidates);
-    let mut ranked = candidates
-        .iter()
-        .filter(|candidate| takes_part(candidate))
-        .map(|candidate| (candidate_errors(&candidate.best, longest), candidate))
-        .collect::<Vec<_>>();
-    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.taxid.cmp(&b.1.taxid)));
-    let &(fewest, best) = ranked.first()?;
-    let margin = tie_margin(
-        policy.mode,
-        f64::from(best.best.both_mapped),
-        LONG_TIE_SHARE,
-    );
-    let taxa = ranked
-        .iter()
-        .map(|&(errors, candidate)| {
-            let tied = errors - fewest < margin;
-            (candidate.taxid, if tied { fewest } else { errors })
-        })
-        .collect();
-    Some((taxa, best.best))
-}
-
-/// The taxa of a fragment's tie set: those of its `ranked` candidates with
-/// the best's errors, by taxid.
+/// The taxa of a fragment's tie set: those of its `ranked` candidates tied
+/// with the best ([`best_tied`]), by taxid.
 fn tie_set(ranked: &[(u32, f64)]) -> Vec<u32> {
-    let fewest = ranked[0].1;
-    let mut taxa = ranked
+    best_tied(ranked)
         .iter()
-        .take_while(|candidate| candidate.1 == fewest)
         .map(|candidate| candidate.0)
-        .collect::<Vec<_>>();
-    taxa.sort_unstable();
-    taxa.dedup();
-    taxa
+        .collect()
 }
 
 /// The genera of a tie set's `taxa`.
-fn genera_of(taxa: &[u32], lineages: &mut Lineages) -> Genera {
+fn genera_of(taxa: &[u32], lineages: &Lineages) -> Genera {
     let of = taxa
         .iter()
-        .map(|&taxid| lineages.genus(taxid))
+        .map(|&taxid| lineages.at_rank(taxid, Rank::Genus))
         .collect::<Vec<_>>();
     let mut genera = of.iter().flatten().copied().collect::<Vec<_>>();
     genera.sort_unstable();
@@ -939,9 +886,7 @@ fn measure(
     for &i in list {
         let fragment = &placed[i as usize];
         if fragment.assembly == genome {
-            let span = fragment.interval.span;
-            assembly.reference_span_bases += u64::from(span.1.saturating_sub(span.0));
-            assembly.intervals.push(fragment.interval);
+            assembly.add_interval(fragment.interval);
         }
     }
     let spread = level.layout.window_spread(genome, &assembly.intervals);
@@ -971,6 +916,8 @@ fn most_listed(sets: &HashMap<u32, usize>, genera: &[Genera]) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::super::test_fixtures::{data, row};
     use super::*;
     use crate::profiler::evidence::{CandidateScratch, EvidenceAlignment, EvidenceMode};
@@ -1069,7 +1016,7 @@ mod tests {
         let below_reads = (0..below.len()).collect::<Vec<_>>();
         let not_kept_reads = (below.len()..below.len() + not_kept.len()).collect::<Vec<_>>();
         let data = data(below.into_iter().chain(not_kept).collect());
-        let tests = SpeciesTests {
+        let tests = CoverageTests {
             multiple_tests: 1,
             chunk_cutoff: 0.0,
             ratio_bounds: (0.6, 0.75),
@@ -1080,18 +1027,21 @@ mod tests {
         let layout =
             GenomeLayout::new((0..=60).map(|id| (id, if id == 5 { 100_000 } else { 1_000_000 })));
         let taxonomy = taxonomy();
-        place(&Level {
-            data: &data,
-            taxonomy: &taxonomy,
-            tests: &tests,
-            layout: &layout,
-            below_species: (&below_reads, policy(0.80)),
-            not_kept: (&not_kept_reads, policy(0.95)),
-            noisy_kept: &HashSet::new(),
-            penalty: 3.0,
-            max_iterations: 1000,
-            keep_shares: true,
-        })
+        place(
+            &Level {
+                data: &data,
+                tests: &tests,
+                layout: &layout,
+                below_species: (&below_reads, policy(0.80)),
+                not_kept: (&not_kept_reads, policy(0.95)),
+                em: EmSettings {
+                    penalty: 3.0,
+                    max_iterations: 1000,
+                },
+                keep_shares: true,
+            },
+            &Lineages::new(&taxonomy),
+        )
     }
 
     /// Each row's taxid, rank and reads (to six decimals).
@@ -1108,7 +1058,8 @@ mod tests {
         let alignments = read(&[(1001, 1, 0.99), (1011, 11, 0.99), (1021, 21, 0.97)], 100);
         let mut scratch = CandidateScratch::default();
         let candidates = scratch.build(&alignments, policy(0.95));
-        let (found, best) = ranked(candidates, policy(0.95), |_| true).unwrap();
+        let mode = policy(0.95).mode;
+        let (found, best) = ranked(candidates, mode, |_| true).unwrap();
         // Species 1021 has two more errors: not tied; the best is the first tied species by taxid.
         assert_eq!(
             found.iter().map(|c| c.0).collect::<Vec<_>>(),
@@ -1119,21 +1070,32 @@ mod tests {
         assert_eq!(tie_set(&found), [1001, 1011]);
         assert_eq!(best.taxid, 1001);
         // Candidates that take no part are left out before the ranking.
-        let (found, best) = ranked(candidates, policy(0.95), |c| c.taxid != 1001).unwrap();
+        let (found, best) = ranked(candidates, mode, |c| c.taxid != 1001).unwrap();
         assert_eq!((tie_set(&found), best.taxid), (vec![1011], 1011));
-        assert!(ranked(candidates, policy(0.95), |_| false).is_none());
+        assert!(ranked(candidates, mode, |_| false).is_none());
+    }
+
+    #[test]
+    fn a_lineage_gives_the_taxa_at_each_rank_above_species() {
+        let taxonomy = taxonomy();
+        let lineages = Lineages::new(&taxonomy);
+        assert_eq!(lineages.at_rank(1001, Rank::Genus), Some(100));
+        assert_eq!(lineages.at_rank(100, Rank::Genus), Some(100));
+        assert_eq!(lineages.at_rank(1001, Rank::Family), Some(40));
+        assert_eq!(lineages.at_rank(5000, Rank::Genus), None);
+        assert_eq!(lineages.ancestors(1001)[..3], [1001, 100, 40]);
     }
 
     #[test]
     fn a_tie_set_in_one_genus_is_unique_to_it() {
         let taxonomy = taxonomy();
-        let mut lineages = Lineages::new(&taxonomy);
-        let one = genera_of(&[1001, 1002], &mut lineages);
+        let lineages = Lineages::new(&taxonomy);
+        let one = genera_of(&[1001, 1002], &lineages);
         assert_eq!((one.genera, one.unique), (vec![100], Some(100)));
-        let two = genera_of(&[1001, 1011], &mut lineages);
+        let two = genera_of(&[1001, 1011], &lineages);
         assert_eq!((two.genera, two.unique), (vec![100, 101], None));
         // A taxon without a genus keeps the set from lying in one genus.
-        let partly = genera_of(&[1001, 5000], &mut lineages);
+        let partly = genera_of(&[1001, 5000], &lineages);
         assert_eq!((partly.genera, partly.unique), (vec![100], None));
     }
 

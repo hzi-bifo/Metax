@@ -39,7 +39,7 @@ use crate::progress;
 use super::evidence::{CandidatePlacement, EvidenceAlignment, GeneHit, MappingRole};
 use super::markers::{FragmentGeometry, FragmentLayout, LengthHistogram, MarkerModel};
 use super::output::ProfileRow;
-use super::rollup::{GenomeLayout, GenusRollup};
+use super::rollup::{AboveSpeciesInputs, GenomeLayout};
 use super::unclassified::{self, GenomeReads, MarkerSpecies, ReferenceKind};
 use super::{
     coverage_passes, log_reference_taxonomy_adjustments, log_resolved_profiler_parameters,
@@ -290,6 +290,16 @@ impl CommunityProfiler {
         ) -> Result<MetamParseStats>,
     {
         log::info!(target: "PROFILER", "Loading Metam coordinate mappings ...");
+        let mut assembly_ids: HashMap<&str, u32> = HashMap::new();
+        let mut assembly_names: Vec<Arc<str>> = Vec::new();
+        for reference in &db.references {
+            if !assembly_ids.contains_key(&*reference.genome) {
+                let next = u32::try_from(assembly_ids.len())
+                    .context("database contains more than 2^32 assemblies")?;
+                assembly_ids.insert(&*reference.genome, next);
+                assembly_names.push(Arc::clone(&reference.genome));
+            }
+        }
         let mut asm_lengths_raw: HashMap<String, f64> = HashMap::new();
         let mut genome_sampling_scales: HashMap<String, f64> = HashMap::new();
         let mut profile_taxids: HashSet<u32> = HashSet::new();
@@ -300,6 +310,8 @@ impl CommunityProfiler {
         let mut unresolved = UnresolvedReferences::default();
         let has_marker_genomes = db.uniform_reference_type() != Some(ReferenceType::Genome);
         let mut taxids_with_genomes: HashSet<u32> = HashSet::new();
+        let mut strain_taxids = vec![None; assembly_names.len()];
+        let mut previous_genome = None;
         // The references of a genome share its taxonomy field, so a field
         // equal to the previous one is not parsed again.
         let mut previous_taxonomy: Option<(&str, ReferenceTaxonomy)> = None;
@@ -318,6 +330,15 @@ impl CommunityProfiler {
                     taxonomy
                 }
             };
+            // The strain that a genome's references declare, read where they
+            // start; the dump may not know it.
+            let assembly_id = assembly_ids[&*reference.genome];
+            if previous_genome != Some(assembly_id) {
+                if let Some(strain) = declared_taxonomy.primary_taxid {
+                    strain_taxids[assembly_id as usize] = Some(strain);
+                }
+                previous_genome = Some(assembly_id);
+            }
             let taxonomy = match taxonomy_resolver.resolve(declared_taxonomy, &reference.name) {
                 Ok(taxonomy) => taxonomy,
                 Err(error) => {
@@ -363,16 +384,6 @@ impl CommunityProfiler {
             &taxonomy_adjustments,
             self.cfg.verbose || self.cfg.very_verbose,
         );
-        let mut assembly_ids: HashMap<&str, u32> = HashMap::new();
-        let mut assembly_names: Vec<Arc<str>> = Vec::new();
-        for reference in &db.references {
-            if !assembly_ids.contains_key(&*reference.genome) {
-                let next = u32::try_from(assembly_ids.len())
-                    .context("database contains more than 2^32 assemblies")?;
-                assembly_ids.insert(&*reference.genome, next);
-                assembly_names.push(Arc::clone(&reference.genome));
-            }
-        }
         // The species represented only by marker genomes, with those genomes.
         let marker_species = if has_marker_genomes {
             unclassified::marker_species(
@@ -391,7 +402,7 @@ impl CommunityProfiler {
             MarkerSpecies::new()
         };
         let mut genus_of_species = self.genus_of_taxa(&profile_taxids);
-        let marker_only = if self.cfg.removed_to_genus {
+        let marker_only = if self.cfg.above_species {
             marker_species
                 .keys()
                 .map(|&species| (species, genus_of_species.get(&species).copied()))
@@ -406,14 +417,13 @@ impl CommunityProfiler {
             // with genome-type references have a genus here.
             genus_of_species.retain(|species, _| taxids_with_genomes.contains(species));
         }
-        let genus_rollup = self.cfg.removed_to_genus.then(|| GenusRollup {
+        let above_species = self.cfg.above_species.then(|| AboveSpeciesInputs {
             marker_only,
             layout: GenomeLayout::new(
                 db.references
                     .iter()
                     .map(|reference| (assembly_ids[&*reference.genome], reference.length as u64)),
             ),
-            fractional: db.is_fractional,
         });
         let assemblies = assembly_names
             .iter()
@@ -598,9 +608,11 @@ impl CommunityProfiler {
             genus_of_species,
             terminal_ranks,
             marker_model,
-            genus_rollup,
+            fractional: db.is_fractional,
+            above_species,
             unclassified_species: self.cfg.estimate_unclassified.then_some(marker_species),
             assembly_names,
+            strain_taxids,
         })
     }
 
@@ -694,6 +706,7 @@ impl CommunityProfiler {
         data: &MappingData,
         rows: &[ProfileRow],
         marker_genome_reads: &HashMap<u32, GenomeReads>,
+        long_reads: bool,
     ) -> Option<Option<unclassified::UnclassifiedEstimate>> {
         data.unclassified_species.as_ref().map(|species| {
             // Long reads differ in length and in the genes each covers, so
@@ -702,7 +715,7 @@ impl CommunityProfiler {
                 species,
                 data.marker_model.as_deref(),
                 marker_genome_reads,
-                self.cfg.coverage_gate_is_or(),
+                long_reads,
             );
             let estimate = unclassified::estimate(rows, &scales, data.total_reads);
             match estimate {
@@ -895,28 +908,8 @@ fn add_marker_genome_reads(
 }
 
 // ============================================================================
-// Floor gates of the levels above species and the chunk-breadth cutoff
+// The chunk-breadth cutoff
 // ============================================================================
-
-/// Minimum mapped length (inclusive) of a short read without a species-level
-/// candidate for the levels above species; long reads use `cfg.mapped_len`
-/// (see [`family_level_min_mapped_len`]).
-const FAMILY_LEVEL_MIN_MAPPED_LEN: usize = 50;
-/// Minimum aligned fraction (inclusive) of a read without a species-level
-/// candidate for the levels above species.
-const FAMILY_LEVEL_MIN_FRACTION: f64 = 0.60;
-
-/// Mapped-length floor of the levels above species: a fixed 50 bases for Illumina
-/// reads; for long reads the species cutoff (`cfg.mapped_len`, from defaults
-/// or `-m`).
-#[inline]
-fn family_level_min_mapped_len(cfg: &ProfilerConfig) -> usize {
-    if cfg.sequencer.is_illumina() {
-        FAMILY_LEVEL_MIN_MAPPED_LEN
-    } else {
-        cfg.mapped_len
-    }
-}
 
 /// The read count that the automatic chunk-breadth curve is read at.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1172,15 +1165,23 @@ struct MappingData {
     /// Marker genes and fragment geometry when the database has marker genomes.
     marker_model: Option<Arc<MarkerModel>>,
 
+    /// A database of sampled genomes (fractional): reads not placed at a
+    /// species are not reported above species, and no species is kept for
+    /// even coverage.
+    fractional: bool,
+
     /// Inputs of the levels above species and of the even-coverage species;
     /// `None` when they are off (`--strict-coverage`).
-    genus_rollup: Option<GenusRollup>,
+    above_species: Option<AboveSpeciesInputs>,
 
     /// Inputs of `--estimate-unclassified`; `None` when it is off.
     unclassified_species: Option<MarkerSpecies>,
 
     /// Genome accession of each assembly id.
     assembly_names: Vec<Arc<str>>,
+
+    /// The strain taxid that each genome declares (`t:`), by assembly id.
+    strain_taxids: Vec<Option<u32>>,
 }
 
 #[cfg(test)]
@@ -1317,9 +1318,11 @@ mod tests {
                 genus_of_species: HashMap::new(),
                 terminal_ranks: HashMap::new(),
                 marker_model: None,
-                genus_rollup: None,
+                fractional: false,
+                above_species: None,
                 unclassified_species: None,
                 assembly_names: Vec::new(),
+                strain_taxids: Vec::new(),
             };
             profiler.profile(mapping_data).unwrap();
             let written =
@@ -1367,7 +1370,7 @@ mod tests {
         for fractional in [false, true] {
             let prefix = directory.path().join(format!("fractional-{fractional}"));
             let mut cfg = cfg(Sequencer::Illumina);
-            cfg.removed_to_genus = true;
+            cfg.above_species = true;
             cfg.outprefix = prefix.to_string_lossy().into_owned();
             let profiler = CommunityProfiler::new(cfg, Arc::clone(&taxonomy)).unwrap();
             let mapping_data = MappingData {
@@ -1386,13 +1389,14 @@ mod tests {
                     (1002, ProfileRank::Species),
                 ]),
                 marker_model: None,
-                genus_rollup: Some(GenusRollup {
+                fractional,
+                above_species: Some(AboveSpeciesInputs {
                     marker_only: HashMap::new(),
                     layout: GenomeLayout::new([(0, 1_000_000), (1, 1_000_000)]),
-                    fractional,
                 }),
                 unclassified_species: None,
                 assembly_names: vec![Arc::from("GCF_1"), Arc::from("GCF_2")],
+                strain_taxids: vec![None; 2],
             };
             profiler.profile(mapping_data).unwrap();
             let profile =

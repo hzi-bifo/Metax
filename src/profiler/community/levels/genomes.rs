@@ -18,12 +18,13 @@ use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 
 use super::{
-    add_placement, candidate_errors, fold_candidates, longest_alignment, resolved_unit, tie_margin,
-    Fragment, GenomeEvidence, SpeciesTests, LONG_TIE_SHARE, MIN_JUDGED_SPECIES,
+    add_placement, candidate_errors, candidate_of, estimated_ani, fold_candidates,
+    longest_alignment, placement_identity, resolved_unit, tie_margin, tied_errors, with_errors,
+    CoverageTests, EmSettings, Fragment, GenomeEvidence, LONG_TIE_SHARE, MIN_JUDGED_SPECIES,
 };
 use crate::profiler::community::MappingData;
 use crate::profiler::evidence::{
-    CandidatePlacement, EvidenceCoverage, EvidenceMode, EvidencePolicy, TerminalCandidate,
+    EvidenceCoverage, EvidenceMode, EvidencePolicy, TerminalCandidate,
 };
 use crate::profiler::likelihood_em::{self, ReadGroups};
 use crate::profiler::ProfileRank;
@@ -135,6 +136,7 @@ pub(super) struct GenomeLevel {
     pub(super) policy: EvidencePolicy,
     /// The sample's error rate, which sets the EM's error penalty.
     pub(super) error_rate: f64,
+    pub(super) em: EmSettings,
     /// Report genomes on their own (`--strain`).
     pub(super) report_strains: bool,
     /// Keep each fragment's shares of the genomes reported on their own, for
@@ -142,14 +144,20 @@ pub(super) struct GenomeLevel {
     pub(super) keep_shares: bool,
     pub(super) chunk_cutoff: f64,
     pub(super) ratio_bounds: (f64, f64),
-    pub(super) max_iterations: usize,
-    pub(super) tolerance: f64,
 }
 
 impl GenomeLevel {
-    /// The EM's penalty per error at the sample's error rate.
-    fn penalty(&self) -> f64 {
-        likelihood_em::error_penalty(self.error_rate)
+    /// The coverage tests of a genome reported on its own, corrected for
+    /// `multiple_tests` genomes.
+    pub(super) fn tests(&self, multiple_tests: usize) -> CoverageTests {
+        CoverageTests {
+            multiple_tests,
+            chunk_cutoff: self.chunk_cutoff,
+            ratio_bounds: self.ratio_bounds,
+            // Marker genomes are never reported on their own.
+            markers: None,
+            min_marker_genes: 0,
+        }
     }
 }
 
@@ -165,7 +173,6 @@ pub(super) fn resolve(
     labels: &HashMap<u32, ProfileRank>,
     level: &GenomeLevel,
 ) -> GenomeResult {
-    let penalty = level.penalty();
     let shares = genome_fragments(data, fragments, species_of, level.policy)
         .into_iter()
         .collect::<Vec<_>>()
@@ -176,7 +183,7 @@ pub(super) fn resolve(
                 .iter()
                 .map(|m| groups.add(m.genomes.iter().map(|g| (g.0, g.1)).collect()))
                 .collect::<Vec<_>>();
-            let em = likelihood_em::run(&groups, penalty, level.max_iterations, level.tolerance);
+            let em = level.em.run(&groups);
             let best_fit = em
                 .weight
                 .iter()
@@ -299,10 +306,7 @@ fn genome_fragments(
         policy,
         &resolved,
         |r| r.0.read,
-        |r, candidates| {
-            let candidate = candidates.iter().find(|c| c.taxid == r.1)?;
-            Some(candidate_genomes(candidate, policy))
-        },
+        |r, candidates| Some(candidate_genomes(candidate_of(candidates, r.1)?, policy)),
         |&(fragment, taxid, share), genomes| {
             if let Some(genomes) = genomes {
                 out.entry(taxid).or_default().push(GenomeFragment {
@@ -323,11 +327,7 @@ fn candidate_genomes(
     candidate: &TerminalCandidate,
     policy: EvidencePolicy,
 ) -> Vec<(u32, f64, f64)> {
-    let longest = candidate
-        .placements
-        .iter()
-        .map(|p| f64::from(p.both_mapped))
-        .fold(0.0, f64::max);
+    let longest = longest_alignment(candidate.placements.iter());
     let mut genomes = candidate
         .placements
         .iter()
@@ -342,16 +342,9 @@ fn candidate_genomes(
     let fewest = genomes.iter().map(|g| g.1).fold(f64::INFINITY, f64::min);
     let margin = tie_margin(policy.mode, longest, GENOME_LONG_TIE_SHARE);
     for genome in &mut genomes {
-        if genome.1 - fewest < margin {
-            genome.1 = fewest;
-        }
+        genome.1 = tied_errors(genome.1, fewest, margin);
     }
     genomes
-}
-
-/// Identity of a placement: one less its estimated errors per aligned base.
-fn placement_identity(placement: &CandidatePlacement) -> f64 {
-    1.0 - placement.pair_errors / f64::from(placement.both_mapped).max(1.0)
 }
 
 /// Per species with a best-fit genome in `best_fit`, the mean identity to
@@ -409,24 +402,18 @@ fn best_fit_identities(
     best_fit: &HashMap<u32, u32>,
     mode: EvidenceMode,
 ) -> Vec<(u32, f64)> {
-    let longest = longest_alignment(candidates);
-    let species = candidates
-        .iter()
-        .map(|c| (c, candidate_errors(&c.best, longest)))
-        .collect::<Vec<_>>();
-    let Some(&(best, fewest)) = species.iter().min_by(|a, b| a.1.total_cmp(&b.1)) else {
+    let species = with_errors(candidates, |_| true);
+    // The best is the first candidate with the fewest errors, in candidate
+    // order; its aligned bases set the tie margin of long reads.
+    let Some(&(fewest, best)) = species.iter().min_by(|a, b| a.0.total_cmp(&b.0)) else {
         return Vec::new();
     };
     let margin = tie_margin(mode, f64::from(best.best.both_mapped), LONG_TIE_SHARE);
     species
         .iter()
-        .filter(|&&(_, errors)| errors - fewest < margin)
-        .filter_map(|&(candidate, _)| {
-            let assembly = *best_fit.get(&candidate.taxid)?;
-            let placement = candidate
-                .placements
-                .iter()
-                .find(|p| p.assembly_id == assembly)?;
+        .filter(|&&(errors, _)| errors - fewest < margin)
+        .filter_map(|&(_, candidate)| {
+            let placement = candidate.placement_on(*best_fit.get(&candidate.taxid)?)?;
             Some((candidate.taxid, placement_identity(placement)))
         })
         .collect()
@@ -484,10 +471,8 @@ fn strain_genomes(
         &strain_level,
         |r| r.0,
         |&(_, assembly), candidates| {
-            candidates
-                .iter()
-                .find(|c| c.taxid == taxid)
-                .and_then(|c| c.placements.iter().find(|p| p.assembly_id == assembly))
+            candidate_of(candidates, taxid)
+                .and_then(|c| c.placement_on(assembly))
                 .copied()
         },
         |_, placement| {
@@ -496,14 +481,7 @@ fn strain_genomes(
             }
         },
     );
-    let tests = SpeciesTests {
-        multiple_tests: evidence.len().max(1),
-        chunk_cutoff: level.chunk_cutoff,
-        ratio_bounds: level.ratio_bounds,
-        // Marker genomes are left out above.
-        markers: None,
-        min_marker_genes: 0,
-    };
+    let tests = level.tests(evidence.len().max(1));
     for (&assembly, genome) in evidence.iter_mut() {
         let coverage = tests.measure(assembly, &mut genome.assembly);
         genome.kept = tests.covers(&coverage);
@@ -563,7 +541,7 @@ fn strain_genomes(
         let failing = kept
             .keys()
             .filter(|assembly| {
-                let ani = 1.0 - (strain.baseline - mean_identity(assembly));
+                let ani = estimated_ani(strain.baseline, mean_identity(assembly));
                 ani.is_nan() || ani < GENOME_ROW_ANI
             })
             .copied()
@@ -638,12 +616,7 @@ fn share_among_kept(
             groups.add(candidates)
         })
         .collect::<Vec<_>>();
-    let em = likelihood_em::run(
-        &groups,
-        level.penalty(),
-        level.max_iterations,
-        level.tolerance,
-    );
+    let em = level.em.run(&groups);
     let mut reads: HashMap<u32, f64> = HashMap::new();
     let mut bases: HashMap<u32, f64> = HashMap::new();
     let mut identity: HashMap<u32, (f64, f64)> = HashMap::new();
@@ -686,12 +659,14 @@ mod tests {
                 fraction: 0.5,
             },
             error_rate: 0.003,
+            em: EmSettings {
+                penalty: likelihood_em::error_penalty(0.003),
+                max_iterations: 200,
+            },
             report_strains: false,
             keep_shares: false,
             chunk_cutoff: 0.5,
             ratio_bounds: (0.75, 0.75),
-            max_iterations: 200,
-            tolerance: 1e-6,
         }
     }
 

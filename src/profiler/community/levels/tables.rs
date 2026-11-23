@@ -82,11 +82,12 @@ use anyhow::{Context, Result};
 
 use super::genomes::{SpeciesGenomes, StrainDiagnostic};
 use super::higher::{
-    self, GenusCandidate, HigherLevels, HigherRow, Rank, TaxonCandidate, GENUS_MIN_CHUNK_RATIO,
+    self, GenusCandidate, HigherLevels, HigherRow, Lineages, Rank, TaxonCandidate,
+    GENUS_MIN_CHUNK_RATIO,
 };
 use super::{
-    strain_label, wins_enough, within, Dropped, FragmentCounts, GenomeEvidence, SpeciesTests,
-    TaxonBlock, MAX_BREADTH_RATIO, MIN_WON_SHARE,
+    strain_label, unit_rank, wins_enough, within, CoverageTests, Dropped, FragmentCounts,
+    GenomeEvidence, Removal, TaxonBlock, MAX_BREADTH_RATIO, MIN_WON_SHARE,
 };
 use crate::db::DatabaseMetadata;
 use crate::profiler::evidence::EvidenceCoverage;
@@ -173,14 +174,15 @@ impl TableHeader {
     }
 }
 
-/// Names of taxa and genomes (by assembly id).
+/// Names of taxa and genomes (by assembly id), and the taxa's lineages.
 pub(super) struct Names<'a> {
     pub(super) taxonomy: &'a Taxonomy,
     pub(super) genomes: &'a [Arc<str>],
+    pub(super) lineages: &'a Lineages<'a>,
 }
 
 impl Names<'_> {
-    fn taxon(&self, taxid: u32) -> String {
+    pub(super) fn taxon(&self, taxid: u32) -> String {
         self.taxonomy
             .get_name(taxid)
             .unwrap_or("unknown")
@@ -192,12 +194,8 @@ impl Names<'_> {
     }
 
     /// The ancestor of `taxid` at `rank`.
-    fn ancestor(&self, taxid: u32, rank: &str) -> Option<u32> {
-        self.taxonomy
-            .get_parents(taxid)
-            .into_iter()
-            .find(|(_, _, r)| r == rank)
-            .map(|(ancestor, _, _)| ancestor)
+    fn ancestor(&self, taxid: u32, rank: Rank) -> Option<u32> {
+        self.lineages.at_rank(taxid, rank)
     }
 }
 
@@ -229,17 +227,19 @@ impl FinalRows {
                 }
                 continue;
             }
-            let mut total = [0.0; 2];
-            for row in block.taxon.iter().chain(&block.genomes) {
-                total[0] += row.equivalent_mapcount;
-                total[1] += row.abundance;
-            }
+            let abundance = block
+                .taxon
+                .iter()
+                .chain(&block.genomes)
+                .fold(0.0, |total, row| total + row.abundance);
             for row in &block.genomes {
                 finals
                     .strains
                     .insert(Arc::clone(&row.best_fit.genome), amount(row));
             }
-            finals.species.insert(block.taxid, total);
+            finals
+                .species
+                .insert(block.taxid, [block.reads(), abundance]);
         }
         finals
     }
@@ -386,15 +386,16 @@ pub(super) struct StrainLevel<'a> {
     /// The genomes the genome level reports for each species.
     pub(super) species: &'a HashMap<u32, SpeciesGenomes>,
     /// Its coverage tests (chunk-breadth cutoff and ratio bounds).
-    pub(super) tests: SpeciesTests,
-    pub(super) strain_taxids: &'a HashMap<Arc<str>, u32>,
+    pub(super) tests: CoverageTests,
+    /// The strain taxid each genome declares, by assembly id.
+    pub(super) strain_taxids: &'a [Option<u32>],
 }
 
 /// What the decisions table is written from.
 pub(super) struct Decisions<'a> {
     pub(super) genomes: &'a HashMap<u32, GenomeEvidence>,
     pub(super) counts: &'a FragmentCounts,
-    pub(super) tests: &'a SpeciesTests,
+    pub(super) tests: &'a CoverageTests,
     pub(super) outcomes: &'a HashMap<u32, SpeciesDecision>,
     /// The genome each kept species is reported on.
     pub(super) reported: &'a HashMap<u32, u32>,
@@ -457,7 +458,37 @@ fn pvalue(value: Option<f64>) -> String {
     value.map_or_else(na, |v| format!("{v:.3e}"))
 }
 
-impl DecisionRow<'_> {
+impl<'n> DecisionRow<'n> {
+    /// A row of taxon `taxid` at `rank` with what every row of the taxon
+    /// shows; the row's own columns are `NA` until set.
+    fn of(
+        rank: &'static str,
+        taxid: u32,
+        name: String,
+        (kept, reason, reported_as): (bool, String, &'static str),
+    ) -> Self {
+        Self {
+            rank,
+            taxid,
+            name,
+            parent: None,
+            genome: None,
+            decided: false,
+            reads: String::new(),
+            coverage: None,
+            chunk_cutoff: None,
+            counts: [None; 4],
+            em_share: None,
+            strain_identity_reads: None,
+            window_spread: None,
+            genome_tests: String::new(),
+            kept,
+            reason,
+            reported_as,
+            finals: None,
+        }
+    }
+
     fn fields(&self) -> [String; DECISION_COLUMNS.len()] {
         let coverage = self.coverage.as_ref();
         let measured = |value: fn(&EvidenceCoverage) -> String| coverage.map_or_else(na, value);
@@ -510,7 +541,7 @@ fn tests_in_words(failed: &[String]) -> String {
 }
 
 /// The coverage tests of `tests` that `coverage` fails, in words.
-fn coverage_failures(tests: &SpeciesTests, coverage: &EvidenceCoverage) -> Vec<String> {
+fn coverage_failures(tests: &CoverageTests, coverage: &EvidenceCoverage) -> Vec<String> {
     let mut failed = Vec::new();
     if !tests.amount_ok(coverage) {
         failed.push(format!(
@@ -585,6 +616,28 @@ impl Decisions<'_> {
         rows
     }
 
+    /// What became of a taxon above species with rows in the profile
+    /// (`in_profile`) or without: what dropped its rows (`--host`,
+    /// `--min-reads` or `--min-breadth`), whether it is kept, and the rank of
+    /// the rows holding its reads: its own `rank` when kept, `none` when
+    /// dropped, otherwise that of `end`, the row its reads went to.
+    fn above_species_outcome(
+        &self,
+        taxid: u32,
+        in_profile: bool,
+        rank: &'static str,
+        end: Option<&HigherRow>,
+    ) -> (Option<&Removal>, bool, &'static str) {
+        let below = self.dropped.taxa.get(&taxid).filter(|_| in_profile);
+        let kept = in_profile && below.is_none();
+        let reported_as = match (kept, below) {
+            (true, _) => rank,
+            (false, Some(_)) => "none",
+            (false, None) => end.map_or("none", |end| end.rank.as_str()),
+        };
+        (below, kept, reported_as)
+    }
+
     /// The tests of genome `genome` of its species, in words.
     fn species_genome_tests(&self, genome: &GenomeEvidence) -> String {
         let coverage = genome.coverage.as_ref().expect("measured before");
@@ -632,6 +685,10 @@ impl Decisions<'_> {
             if let Some(position) = ids.iter().position(|&id| id == decided) {
                 ids[..=position].rotate_right(1);
             }
+            let tests = ids
+                .iter()
+                .map(|id| self.species_genome_tests(&self.genomes[id]))
+                .collect::<Vec<_>>();
             let decision = self.outcomes[&taxid];
             let below = self.dropped.taxa.get(&taxid);
             // A species reported at its genus whose genus row was dropped.
@@ -639,12 +696,16 @@ impl Decisions<'_> {
                 .get(&taxid)
                 .and_then(|genus| self.dropped.taxa.get(genus));
             let label = self.labels.get(&taxid).copied();
-            let rank = label.map_or("species", ProfileRank::as_str);
+            let rank = unit_rank(label);
             let mut reason = match below {
                 Some(below) => below.reason(),
                 None => {
-                    let reason =
-                        decision.reason(&self.species_genome_tests(&self.genomes[&decided]));
+                    let decided_tests = ids
+                        .iter()
+                        .position(|&id| id == decided)
+                        .map(|position| &tests[position])
+                        .expect("the decided genome is measured");
+                    let reason = decision.reason(decided_tests);
                     match genus_dropped {
                         Some(genus) => format!("{reason}; its genus row {}", genus.reason()),
                         None => reason,
@@ -668,18 +729,16 @@ impl Decisions<'_> {
                 None => "none",
             };
             let parent = match label {
-                None => names.ancestor(taxid, "genus"),
-                Some(ProfileRank::Genus) => names.ancestor(taxid, "family"),
+                None => names.ancestor(taxid, Rank::Genus),
+                Some(ProfileRank::Genus) => names.ancestor(taxid, Rank::Family),
                 Some(_) => None,
             };
             let count =
                 |map: &HashMap<u32, u64>| Some(map.get(&taxid).copied().unwrap_or(0) as f64);
-            for id in ids {
+            let kept = decision.kept() && below.is_none();
+            for (id, genome_tests) in ids.into_iter().zip(tests) {
                 let genome = &self.genomes[&id];
                 rows.push(DecisionRow {
-                    rank,
-                    taxid,
-                    name: names.taxon(taxid),
                     parent,
                     genome: Some(names.genome(id)),
                     decided: id == decided,
@@ -692,14 +751,14 @@ impl Decisions<'_> {
                         count(&self.counts.second_look),
                         count(&self.counts.own),
                     ],
-                    em_share: None,
-                    strain_identity_reads: None,
-                    window_spread: None,
-                    genome_tests: self.species_genome_tests(genome),
-                    kept: decision.kept() && below.is_none(),
-                    reason: reason.clone(),
-                    reported_as,
+                    genome_tests,
                     finals: total.filter(|_| id == decided),
+                    ..DecisionRow::of(
+                        rank,
+                        taxid,
+                        names.taxon(taxid),
+                        (kept, reason.clone(), reported_as),
+                    )
                 });
             }
         }
@@ -721,8 +780,12 @@ impl Decisions<'_> {
         let mut rows = Vec::new();
         for row in diagnostics {
             let accession = names.genome(row.assembly_id);
-            let (name, taxid) =
-                strain_label(names.taxonomy, level.strain_taxids, row.taxid, accession);
+            let (name, taxid) = strain_label(
+                names,
+                level.strain_taxids[row.assembly_id as usize],
+                row.taxid,
+                accession,
+            );
             let strain_row = finals.strains.get(accession).copied();
             let passed = level.species.get(&row.taxid).is_some_and(|species| {
                 species
@@ -776,29 +839,28 @@ impl Decisions<'_> {
                     "not measured: no read resolves to it at strain-level identity".to_string(),
                 )
             };
+            let reported_as = if strain_row.is_some() {
+                "strain"
+            } else {
+                "none"
+            };
             rows.push(DecisionRow {
-                rank: "strain",
-                taxid,
-                name,
                 parent: Some(row.taxid),
                 genome: Some(accession),
                 decided: strain_row.is_some(),
                 reads: row.resolved.to_string(),
                 coverage: row.coverage,
                 chunk_cutoff: Some(level.tests.chunk_cutoff),
-                counts: [None; 4],
                 em_share: Some(row.em_share),
                 strain_identity_reads: Some(row.gated),
-                window_spread: None,
                 genome_tests,
-                kept: strain_row.is_some(),
-                reason,
-                reported_as: if strain_row.is_some() {
-                    "strain"
-                } else {
-                    "none"
-                },
                 finals: strain_row,
+                ..DecisionRow::of(
+                    "strain",
+                    taxid,
+                    name,
+                    (strain_row.is_some(), reason, reported_as),
+                )
             });
         }
         rows
@@ -832,9 +894,12 @@ impl Decisions<'_> {
         let mut groups = Vec::new();
         for (genus, mut parts) in genera {
             parts.members.sort_by_key(|member| member.0);
-            let in_profile = parts.row.is_some() || !parts.members.is_empty();
-            let below = self.dropped.taxa.get(&genus).filter(|_| in_profile);
-            let kept = in_profile && below.is_none();
+            let (below, kept, reported_as) = self.above_species_outcome(
+                genus,
+                parts.row.is_some() || !parts.members.is_empty(),
+                "genus",
+                self.higher.and_then(|higher| higher.end_of_genus(genus)),
+            );
             let made_of = self.genus_parts_in_words(genus, &parts, names);
             let reason = match below {
                 Some(below) => format!("{}; made of {made_of}", below.reason()),
@@ -843,15 +908,6 @@ impl Decisions<'_> {
                 ),
                 None if kept => format!("kept: {made_of}"),
                 None => format!("removed: {made_of}"),
-            };
-            let reported_as = if kept {
-                "genus"
-            } else if below.is_some() {
-                "none"
-            } else {
-                self.higher
-                    .and_then(|higher| higher.end_of_genus(genus))
-                    .map_or("none", |end| end.rank.as_str())
             };
             // The candidate whose evidence the genus row shows; without one,
             // the species reported at the genus, or else the candidate with
@@ -871,24 +927,16 @@ impl Decisions<'_> {
                     })
                 });
             let row = |genome: u32, decided: bool| DecisionRow {
-                rank: "genus",
-                taxid: genus,
-                name: names.taxon(genus),
-                parent: names.ancestor(genus, "family"),
+                parent: names.ancestor(genus, Rank::Family),
                 genome: Some(names.genome(genome)),
                 decided,
-                reads: String::new(),
-                coverage: None,
-                chunk_cutoff: None,
-                counts: [None; 4],
-                em_share: None,
-                strain_identity_reads: None,
-                window_spread: None,
-                genome_tests: String::new(),
-                kept,
-                reason: reason.clone(),
-                reported_as,
                 finals: finals.taxa.get(&genus).copied().filter(|_| decided),
+                ..DecisionRow::of(
+                    "genus",
+                    genus,
+                    names.taxon(genus),
+                    (kept, reason.clone(), reported_as),
+                )
             };
             let mut rows = Vec::new();
             if decided.is_none() {
@@ -1020,11 +1068,10 @@ impl Decisions<'_> {
             .map(|candidate| {
                 let taxid = candidate.taxid;
                 let rank = candidate.rank.as_str();
-                let in_profile = higher.row(taxid).is_some();
-                let below = self.dropped.taxa.get(&taxid).filter(|_| in_profile);
-                let kept = in_profile && below.is_none();
-                let made_of = taxon_parts_in_words(candidate, names);
                 let end = higher.end_of(taxid);
+                let (below, kept, reported_as) =
+                    self.above_species_outcome(taxid, higher.row(taxid).is_some(), rank, end);
+                let made_of = taxon_parts_in_words(candidate, names);
                 let reason = match below {
                     Some(below) => below.reason(),
                     None if kept => {
@@ -1044,33 +1091,24 @@ impl Decisions<'_> {
                         destination_in_words("move up to", end, names)
                     ),
                 };
-                let reported_as = match (kept, below) {
-                    (true, _) => rank,
-                    (false, Some(_)) => "none",
-                    (false, None) => end.map_or("none", |end| end.rank.as_str()),
-                };
                 let measured = &candidate.measured;
                 (
                     candidate.rank,
                     DecisionRow {
-                        rank,
-                        taxid,
-                        name: names.taxon(taxid),
-                        parent: None,
                         genome: Some(names.genome(measured.genome)),
                         decided: true,
                         reads: measured.fragments.to_string(),
                         coverage: Some(measured.coverage),
-                        chunk_cutoff: None,
                         counts: [Some(candidate.fragments() as f64), None, None, None],
-                        em_share: None,
-                        strain_identity_reads: None,
                         window_spread: measured.spread,
                         genome_tests: tests_in_words(&failures_in_words(&candidate.failures)),
-                        kept,
-                        reason,
-                        reported_as,
                         finals: finals.taxa.get(&taxid).copied().filter(|_| kept),
+                        ..DecisionRow::of(
+                            rank,
+                            taxid,
+                            names.taxon(taxid),
+                            (kept, reason, reported_as),
+                        )
                     },
                 )
             })
@@ -1213,12 +1251,12 @@ mod tests {
     struct Fixture {
         genomes: HashMap<u32, GenomeEvidence>,
         counts: FragmentCounts,
-        tests: SpeciesTests,
+        tests: CoverageTests,
         outcomes: HashMap<u32, SpeciesDecision>,
         reported: HashMap<u32, u32>,
         diagnostics: Vec<StrainDiagnostic>,
         species: HashMap<u32, SpeciesGenomes>,
-        strain_taxids: HashMap<Arc<str>, u32>,
+        strain_taxids: Vec<Option<u32>>,
         higher: HigherLevels,
         genus_members: Vec<(u32, u32, f64)>,
         blocks: Vec<TaxonBlock>,
@@ -1242,7 +1280,7 @@ mod tests {
             second_look: HashMap::from([(4, 7)]),
             ..FragmentCounts::default()
         };
-        let tests = SpeciesTests {
+        let tests = CoverageTests {
             multiple_tests: 1,
             chunk_cutoff: 0.5,
             ratio_bounds: (0.6, 0.75),
@@ -1406,7 +1444,7 @@ mod tests {
             reported,
             diagnostics,
             species,
-            strain_taxids: HashMap::from([(Arc::from("GCF_40"), 400)]),
+            strain_taxids: (0..100).map(|id| (id == 40).then_some(400)).collect(),
             higher,
             genus_members: vec![(100, 2, 12.0)],
             blocks,
@@ -1427,7 +1465,7 @@ mod tests {
             strains: Some(StrainLevel {
                 rows: &fixture.diagnostics,
                 species: &fixture.species,
-                tests: SpeciesTests {
+                tests: CoverageTests {
                     multiple_tests: 1,
                     chunk_cutoff: 0.5,
                     ratio_bounds: (0.75, 0.75),
@@ -1443,13 +1481,15 @@ mod tests {
             named_first: &fixture.named_first,
         };
         let mut out = Vec::new();
+        let taxonomy = taxonomy();
         table
             .write(
                 &mut out,
                 &header(),
                 &Names {
-                    taxonomy: &taxonomy(),
+                    taxonomy: &taxonomy,
                     genomes: &accessions(),
+                    lineages: &Lineages::new(&taxonomy),
                 },
                 &FinalRows::of(&fixture.blocks),
             )
@@ -2044,7 +2084,7 @@ mod tests {
         super::super::host::HostFilter {
             host: 9606,
             table: &table,
-            taxonomy: &taxonomy,
+            lineages: &Lineages::new(&taxonomy),
         }
         .apply(&mut fixture.blocks, &mut fixture.dropped);
         let (_, rows) = decisions(&fixture);

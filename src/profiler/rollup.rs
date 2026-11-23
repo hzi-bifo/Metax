@@ -5,7 +5,7 @@
 //! A species that the coverage evidence removed although its reads cover its
 //! whole genome evenly, but too thinly for the amount tests, is reported at
 //! species instead, when no taxon of its genus is kept
-//! ([`GenusRollup::even_coverage_species`]).
+//! ([`AboveSpeciesInputs::even_coverage_species`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -81,19 +81,15 @@ impl GenomeLayout {
 /// Database-wide inputs of the levels above species and of the even-coverage
 /// species.
 #[derive(Debug)]
-pub(crate) struct GenusRollup {
+pub(crate) struct AboveSpeciesInputs {
     /// Species represented only by marker genes, with their genus when known.
     /// They never take part, but a kept one keeps its genus from an
     /// even-coverage species.
     pub(crate) marker_only: HashMap<u32, Option<u32>>,
     pub(crate) layout: GenomeLayout,
-    /// A database of sampled genomes (fractional): reads not placed at a
-    /// species are not reported above species, and no species is kept for
-    /// even coverage.
-    pub(crate) fractional: bool,
 }
 
-impl GenusRollup {
+impl AboveSpeciesInputs {
     /// Species that the coverage evidence removed although their reads cover
     /// their genome evenly, among the measured `species`, each given with the
     /// coverage of its strongest genome and whether it is kept: at least
@@ -102,8 +98,8 @@ impl GenusRollup {
     /// [`EVEN_MIN_WINDOW_SPREAD`], both p-values at least [`EVEN_MIN_PVALUE`],
     /// and fixed chunk breadth below the cutoff `chunk_cutoff`. A species
     /// takes part only when no taxon of its genus (`genus_of`) is kept.
-    /// Species represented only by marker genes never take part, and none
-    /// does on a fractional database. Sorted by taxid.
+    /// Species represented only by marker genes never take part. Sorted by
+    /// taxid.
     pub(crate) fn even_coverage_species<'a>(
         &self,
         species: impl Iterator<Item = (u32, &'a EvidenceCoverage, bool)> + Clone,
@@ -111,9 +107,6 @@ impl GenusRollup {
         rank_of: impl Fn(u32) -> Option<ProfileRank>,
         chunk_cutoff: f64,
     ) -> Vec<u32> {
-        if self.fractional {
-            return Vec::new();
-        }
         let genus = |taxid: u32| match rank_of(taxid) {
             Some(ProfileRank::Genus) => Some(taxid),
             _ => genus_of
@@ -189,7 +182,7 @@ mod tests {
     /// The even-coverage species among `species` with genera `genus_of`:
     /// taxa from 100 up are genera, the others species.
     fn even_species(
-        rollup: &GenusRollup,
+        rollup: &AboveSpeciesInputs,
         species: &HashMap<u32, (EvidenceCoverage, bool)>,
         genus_of: &[(u32, u32)],
     ) -> Vec<u32> {
@@ -272,17 +265,12 @@ mod tests {
         // A species without a genus is not blocked.
         let decisions = HashMap::from([(7, even(false)), (2, even(true))]);
         assert_eq!(even_species(&rollup, &decisions, &genus_of), vec![7]);
-        // None on a fractional database.
-        rollup.fractional = true;
-        let decisions = HashMap::from([(1, even(false))]);
-        assert!(even_species(&rollup, &decisions, &genus_of).is_empty());
     }
 
-    fn rollup() -> GenusRollup {
-        GenusRollup {
+    fn rollup() -> AboveSpeciesInputs {
+        AboveSpeciesInputs {
             marker_only: HashMap::new(),
             layout: GenomeLayout::new([(0, 1_000)]),
-            fractional: false,
         }
     }
 

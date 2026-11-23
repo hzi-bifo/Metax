@@ -654,7 +654,7 @@ pub struct ProfilerConfig {
     /// genome evenly, and the fragments that no kept species takes at the
     /// lowest rank above species that their matches and their evidence
     /// support. On unless `--strict-coverage`.
-    pub removed_to_genus: bool,
+    pub above_species: bool,
 
     /// Estimate the share of the input that the profile does not explain and
     /// append it as an `unclassified` row.
@@ -838,7 +838,7 @@ impl ProfilerConfig {
             min_coebr: None,
             min_marker_genes: 3,
             relative_identity_gap: None,
-            removed_to_genus: false,
+            above_species: false,
             estimate_unclassified: false,
             identity_margin: None,
             fraction: 0.6,
@@ -957,7 +957,7 @@ pub(crate) fn log_resolved_profiler_parameters(
         display_option(cfg.min_coebr),
         cfg.min_marker_genes,
         display_option(cfg.relative_identity_gap),
-        cfg.removed_to_genus,
+        cfg.above_species,
         cfg.estimate_unclassified,
         display_option(cfg.identity_margin),
         cfg.by_aligned,

@@ -98,6 +98,13 @@ pub(crate) fn finish_classification_writer(writer: ClassificationWriter) -> Resu
 }
 
 impl ProfileRow {
+    /// Add the reads and depth of `other` to this row; its coverage, best-fit
+    /// genome and identity stay this row's.
+    pub(crate) fn add_reads_and_depth(&mut self, other: &ProfileRow) {
+        self.equivalent_mapcount += other.equivalent_mapcount;
+        self.depth += other.depth;
+    }
+
     pub(crate) fn write<W: Write>(&self, writer: &mut Writer<W>) -> csv::Result<()> {
         let mut fields = Vec::with_capacity(
             PROFILE_COLUMNS.len() + self.annotations.as_ref().map_or(0, |_| HOST_COLUMNS.len()),

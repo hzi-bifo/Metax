@@ -1145,7 +1145,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
                 (sequencer.is_illumina() && is_paired).then_some(DEFAULT_IDENTITY_MARGIN)
             })
         };
-        let removed_to_genus = !args.strict_coverage;
+        let above_species = !args.strict_coverage;
         Ok(AppConfig {
             db: args.db,
             dmp_dir: args.dmp_dir,
@@ -1173,7 +1173,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             min_marker_genes: args.min_marker_genes,
             relative_identity_gap: args.relative_identity_gap,
             no_relative_identity_gap: args.no_relative_identity_gap,
-            removed_to_genus,
+            above_species,
             estimate_unclassified: args.estimate_unclassified,
             identity_margin,
             no_identity_margin: args.no_identity_margin,
@@ -1610,7 +1610,7 @@ mod tests {
             let Commands::Profile(args) = cli.command else {
                 panic!("expected profile command");
             };
-            AppConfig::try_from(args).unwrap().removed_to_genus
+            AppConfig::try_from(args).unwrap().above_species
         };
         assert!(rollup(&[]));
         assert!(rollup(&["-I", "r2.fq"]));

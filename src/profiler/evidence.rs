@@ -78,7 +78,30 @@ pub(crate) struct EvidencePolicy {
     pub(crate) fraction: f64,
 }
 
+/// Fewest mapped bases (inclusive) of a short read at the floor gates
+/// ([`EvidencePolicy::floor`]).
+const FLOOR_MIN_MAPPED_LEN: usize = 50;
+/// Lowest aligned fraction (inclusive) of a read at the floor gates.
+const FLOOR_MIN_FRACTION: f64 = 0.60;
+
 impl EvidencePolicy {
+    /// The floor gates of the fragments without a species-level candidate,
+    /// for the levels above species and the noisy long reads credited to kept
+    /// species: `--family-identity` (`identity`), [`FLOOR_MIN_MAPPED_LEN`]
+    /// mapped bases of a short read (a long read keeps the species length
+    /// cutoff), and [`FLOOR_MIN_FRACTION`] of a read aligned.
+    pub(crate) fn floor(self, identity: f64) -> Self {
+        Self {
+            identity,
+            mapped_len: match self.mode {
+                EvidenceMode::Long => self.mapped_len,
+                EvidenceMode::Paired | EvidenceMode::Single => FLOOR_MIN_MAPPED_LEN,
+            },
+            fraction: FLOOR_MIN_FRACTION,
+            ..self
+        }
+    }
+
     pub(crate) fn from_config(cfg: &ProfilerConfig) -> Option<Self> {
         let mode = if cfg.is_paired && cfg.sequencer.is_illumina() {
             EvidenceMode::Paired
@@ -153,6 +176,27 @@ pub(crate) struct PresenceInterval {
     pub(crate) flex_chunk: (u32, u32),
 }
 
+impl From<&CandidatePlacement> for PresenceInterval {
+    fn from(placement: &CandidatePlacement) -> Self {
+        Self {
+            reference_id: placement.reference_id,
+            span: placement.span,
+            mate_span: placement.mate_span,
+            fixed_chunk: placement.fixed_chunk,
+            flex_chunk: placement.flex_chunk,
+        }
+    }
+}
+
+impl TerminalCandidate {
+    /// The candidate's placement on genome `assembly_id`, if it has one.
+    pub(crate) fn placement_on(&self, assembly_id: u32) -> Option<&CandidatePlacement> {
+        self.placements
+            .iter()
+            .find(|p| p.assembly_id == assembly_id)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PresenceAssembly {
     /// Effective indexed assembly size. This is the coordinate space that can
@@ -189,6 +233,14 @@ pub(crate) struct EvidenceCoverage {
     /// Share of genome windows that the reads reach; measured only for
     /// the even-coverage test and when there are enough reads.
     pub(crate) window_spread: Option<f64>,
+}
+
+impl PresenceAssembly {
+    /// Add a fragment's `interval` and the bases of its read's span.
+    pub(crate) fn add_interval(&mut self, interval: PresenceInterval) {
+        self.reference_span_bases += u64::from(interval.span.1.saturating_sub(interval.span.0));
+        self.intervals.push(interval);
+    }
 }
 
 /// Reduce one assembly in-place. Reusing the same interval vector for the
@@ -271,21 +323,34 @@ fn read_bases(intervals: &mut [PresenceInterval]) -> (u64, u64) {
             reads.push((record.reference_id, mate));
         }
     }
-    reads.sort_unstable();
-    let mut covered = 0u64;
-    let (mut reference, mut current) = reads[0];
-    for &(id, span) in &reads[1..] {
-        if id == reference && span.0 <= current.1 {
-            current.1 = current.1.max(span.1);
-        } else {
-            covered += u64::from(current.1.saturating_sub(current.0));
-            (reference, current) = (id, span);
+    merge_spans(&mut reads);
+    let covered = reads
+        .iter()
+        .map(|(_, span)| u64::from(span.1 - span.0))
+        .sum();
+    (covered, second_mate_bases)
+}
+
+/// Merge `spans`, each `(contig, (start, end))`, into the segments they cover:
+/// spans of a contig that overlap or touch join, empty spans are left out, and
+/// the segments come in contig and position order.
+pub(crate) fn merge_spans(spans: &mut Vec<(u32, (u32, u32))>) {
+    spans.retain(|(_, span)| span.1 > span.0);
+    spans.sort_unstable();
+    let mut segments = 0usize;
+    for index in 0..spans.len() {
+        let (contig, span) = spans[index];
+        match segments.checked_sub(1).map(|last| &mut spans[last]) {
+            Some((last_contig, last)) if *last_contig == contig && span.0 <= last.1 => {
+                last.1 = last.1.max(span.1);
+            }
+            _ => {
+                spans[segments] = (contig, span);
+                segments += 1;
+            }
         }
     }
-    (
-        covered + u64::from(current.1.saturating_sub(current.0)),
-        second_mate_bases,
-    )
+    spans.truncate(segments);
 }
 
 pub(crate) fn merged_interval_bases<F>(intervals: &mut [PresenceInterval], select: F) -> u64
@@ -1245,5 +1310,33 @@ mod tests {
         assert!((coverage.fixed_chunk - 0.40).abs() < 1e-12);
         assert!((coverage.flex_chunk - 0.50).abs() < 1e-12);
         assert!((coverage.depth - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn spans_join_where_they_overlap_or_touch() {
+        let mut spans = vec![
+            (1, (10, 20)),
+            (0, (5, 8)),
+            (1, (20, 25)),
+            (1, (30, 30)),
+            (1, (15, 18)),
+            (1, (40, 50)),
+        ];
+        merge_spans(&mut spans);
+        assert_eq!(spans, [(0, (5, 8)), (1, (10, 25)), (1, (40, 50))]);
+    }
+
+    #[test]
+    fn floor_gates_keep_the_length_cutoff_of_long_reads() {
+        let floor = policy(EvidenceMode::Paired).floor(0.8);
+        assert_eq!(
+            (floor.identity, floor.mapped_len, floor.fraction),
+            (0.8, FLOOR_MIN_MAPPED_LEN, FLOOR_MIN_FRACTION)
+        );
+        let long = EvidencePolicy {
+            mapped_len: 1_000,
+            ..policy(EvidenceMode::Long)
+        };
+        assert_eq!(long.floor(0.8).mapped_len, 1_000);
     }
 }

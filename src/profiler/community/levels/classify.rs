@@ -41,7 +41,9 @@ use anyhow::Result;
 use super::genomes::SpeciesGenomes;
 use super::{Fragment, TaxonBlock};
 use crate::profiler::community::MappingData;
-use crate::profiler::output::{create_classification_writer, finish_classification_writer};
+use crate::profiler::output::{
+    create_classification_writer, finish_classification_writer, format_five,
+};
 
 /// A fragment's shares: taxid and rank of a profile row, and the share.
 type Shares<'r> = Vec<(u32, &'r str, f64)>;
@@ -239,7 +241,7 @@ fn classification_row(read: &str, shares: &Shares) -> String {
     } else {
         shares
             .iter()
-            .map(|share| format!("{:.5}", share.2))
+            .map(|share| format_five(share.2))
             .collect::<Vec<_>>()
             .join(";")
     };
