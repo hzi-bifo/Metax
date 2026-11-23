@@ -63,13 +63,12 @@ use super::{add_marker_genome_reads, fragment_depth, CommunityProfiler, MappingD
 use crate::profiler::evidence::{
     calculate_coverage, CandidatePlacement, CandidateScratch, EvidenceCoverage, EvidenceMode,
     EvidencePolicy, GeneHit, PresenceAssembly, PresenceInterval, TerminalCandidate,
-    WitnessDecision, STANDARD_RATIO_UPPER,
 };
 use crate::profiler::likelihood_em::{self, ReadGroups};
 use crate::profiler::markers::MarkerModel;
-use crate::profiler::output::{BestFitReport, ProfileRow};
+use crate::profiler::output::{BestFitReport, ProfileRow, HOST_COLUMNS, PROFILE_COLUMNS};
 use crate::profiler::pathogen::load_pathogen_table;
-use crate::profiler::rollup::GenusRollup;
+use crate::profiler::rollup::GenomeLayout;
 use crate::profiler::unclassified::GenomeReads;
 use crate::profiler::{
     equivalent_read_count_passes_minimum, parse_reference_taxonomy, ProfileRank,
@@ -82,10 +81,7 @@ mod higher;
 mod host;
 mod tables;
 
-use tables::{
-    Decisions, FinalRows, Names, SpeciesDecision, StrainLevel, TableHeader, HOST_COLUMNS,
-    PROFILE_COLUMNS,
-};
+use tables::{Decisions, FinalRows, Names, SpeciesDecision, StrainLevel, TableHeader};
 
 /// Each base that a candidate aligns less than the read's longest alignment
 /// counts as this many errors in the EM.
@@ -115,6 +111,8 @@ const MIN_WON_SHARE: f64 = 0.3;
 /// while its chunks stay evenly covered, which the chunk-level ratio (COEBR)
 /// still tests at its own bound.
 const SPECIES_MIN_OEBR: f64 = 0.6;
+/// Upper bound of both breadth ratios (OEBR and COEBR), at every level.
+const MAX_BREADTH_RATIO: f64 = 1.50;
 /// Lower bound of a species' chunk-level breadth ratio (COEBR) for short
 /// reads.
 const SPECIES_MIN_COEBR_SHORT_READS: f64 = 0.75;
@@ -401,25 +399,26 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
     // `--strict-coverage`): each measured species' strongest genome is its
     // decision, and a removed species whose reads cover its genome evenly is
     // kept on that genome.
-    let rollup = data.genus_rollup.as_deref();
-    let decisions = rollup.map_or_else(HashMap::new, |rollup| species_decisions(&genomes, rollup));
+    let rollup = data.genus_rollup.as_ref();
+    let strongest = rollup.map_or_else(HashMap::new, |rollup| {
+        strongest_genomes(&genomes, &rollup.layout)
+    });
     // The placements on the measured genomes are not read again.
     for genome in genomes.values_mut() {
         genome.assembly.intervals = Vec::new();
     }
-    let decision_metrics: HashMap<u32, WitnessDecision> = decisions
-        .iter()
-        .map(|(&taxid, &(decision, _))| (taxid, decision))
-        .collect();
     let even = rollup.map_or_else(Vec::new, |rollup| {
         rollup.even_coverage_species(
-            &decision_metrics,
+            strongest
+                .iter()
+                .map(|(&taxid, genome)| (taxid, &genome.coverage, genome.kept)),
+            &data.genus_of_species,
             |taxid| data.terminal_ranks.get(&taxid).copied(),
             data.min_chunk_breadth,
         )
     });
     for &taxid in &even {
-        best_fit.insert(taxid, decisions[&taxid].1);
+        best_fit.insert(taxid, strongest[&taxid].genome);
     }
     // What became of each measured species, for the decisions table (empty
     // when it is not written); the identity rules and the genus reports below
@@ -693,12 +692,12 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         let species_name = profiler.taxonomy.get_name(taxid).unwrap_or("unknown");
         // Every row of the profile has the identity columns, NA when
         // the species has no fragments of its own.
-        let identity = Some(found.map_or((f64::NAN, f64::NAN), |g| {
+        let identity = found.map_or((f64::NAN, f64::NAN), |g| {
             (
                 g.mean_identity,
                 estimated_ani(baseline_identity, g.mean_identity),
             )
-        }));
+        });
         // A unit labelled above species stays at its own rank.
         let rank = labels.get(&taxid).map_or("species", |rank| rank.as_str());
         let reported_at_genus = !labels.contains_key(&taxid)
@@ -731,7 +730,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                     (reads * scale, depth(species_bases)),
                     coverage,
                     data.assembly_names[assembly_id as usize].clone(),
-                    Some((f64::NAN, f64::NAN)),
+                    (f64::NAN, f64::NAN),
                 ),
             ));
             continue;
@@ -771,7 +770,7 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                 ),
                 &strain.coverage,
                 accession,
-                Some((strain.mean_identity, strain_ani)),
+                (strain.mean_identity, strain_ani),
             ));
         }
         blocks.push(TaxonBlock {
@@ -800,21 +799,16 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
                     (row.reads, row.depth),
                     &row.measured.coverage,
                     data.assembly_names[row.measured.genome as usize].clone(),
-                    Some((f64::NAN, f64::NAN)),
+                    (f64::NAN, f64::NAN),
                 ),
             )
         })
         .collect();
     add_rows_above_species(&mut blocks, higher_rows, genus_parts);
     // `--host` drops rows first, then `--min-reads` and `--min-breadth`.
-    let host = profiler.host_taxid();
     let mut dropped = Dropped::default();
-    if let Some(host) = host {
-        let table = cfg
-            .pathogen_host
-            .as_deref()
-            .map(load_pathogen_table)
-            .transpose()?;
+    if let Some(host) = &cfg.host {
+        let table = load_pathogen_table(&host.pathogen_table)?;
         let rows = |blocks: &[TaxonBlock]| {
             blocks
                 .iter()
@@ -823,15 +817,16 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         };
         let before = rows(&blocks);
         host::HostFilter {
-            host,
-            table: table.as_ref(),
+            host: host.taxid,
+            table: &table,
             taxonomy: &profiler.taxonomy,
         }
         .apply(&mut blocks, &mut dropped);
         log::info!(
             target: "PROFILER",
-            "Level-wise engine: {} rows dropped by --host {host} ({} taxa entirely): not pathogens of the host.",
+            "Level-wise engine: {} rows dropped by --host {} ({} taxa entirely): not pathogens of the host.",
             before - rows(&blocks),
+            host.taxid,
             dropped.taxa.len()
         );
     }
@@ -882,8 +877,8 @@ fn profile_levels(profiler: &CommunityProfiler, data: MappingData) -> Result<()>
         .collect::<Vec<_>>();
 
     let unclassified = profiler.estimate_unclassified(&data, &rows, &genome_reads);
-    let header = TableHeader::of(cfg, host);
-    let columns = if host.is_some() {
+    let header = TableHeader::of(cfg);
+    let columns = if cfg.host.is_some() {
         [&PROFILE_COLUMNS[..], &HOST_COLUMNS[..]].concat()
     } else {
         PROFILE_COLUMNS.to_vec()
@@ -1362,12 +1357,11 @@ fn add_fragment_hits(
 }
 
 /// Fragments listing each species among their candidates, those resolved to
-/// any species, those resolved to it, those it took on the second look, and
-/// those it won with no kept species among their candidates.
+/// it, those it took on the second look, and those it won with no kept
+/// species among their candidates.
 #[derive(Default)]
 struct FragmentCounts {
     candidates: HashMap<u32, u64>,
-    resolved_candidates: HashMap<u32, u64>,
     won: HashMap<u32, u64>,
     second_look: HashMap<u32, u64>,
     own: HashMap<u32, u64>,
@@ -1442,8 +1436,8 @@ struct FirstEm<'a> {
 }
 
 impl FirstEm<'_> {
-    /// Fragments listing each species among their candidates, those resolved
-    /// to any species, and those resolved to it, counted per read group.
+    /// Fragments listing each species among their candidates and those
+    /// resolved to it, counted per read group.
     fn counts(&self) -> FragmentCounts {
         let mut counts = FragmentCounts::default();
         let sizes = group_sizes(self.group_of, self.em.posteriors.len());
@@ -1452,9 +1446,6 @@ impl FirstEm<'_> {
         {
             for &(taxid, _) in posteriors {
                 *counts.candidates.entry(taxid).or_default() += size;
-                if resolved.is_some() {
-                    *counts.resolved_candidates.entry(taxid).or_default() += size;
-                }
             }
             if let Some(taxid) = resolved {
                 *counts.won.entry(taxid).or_default() += size;
@@ -2115,7 +2106,7 @@ impl GroupMembers {
 }
 
 fn within(ratio: f64, lower: f64) -> bool {
-    ratio.is_finite() && ratio >= lower && ratio <= STANDARD_RATIO_UPPER
+    ratio.is_finite() && ratio >= lower && ratio <= MAX_BREADTH_RATIO
 }
 
 /// The reads and bases of a species that its reported genomes, given as
@@ -2293,37 +2284,66 @@ fn drop_below_minimums(
     dropped
 }
 
-/// Each measured species' decision for the genus level: its strongest genome
-/// (a kept genome first, then the larger fixed-chunk breadth, breadth, depth
-/// and read count; the lowest assembly id on a tie), with the window spread of
-/// its reads, and that genome.
-fn species_decisions(
+/// A measured species' strongest genome, on which the even-coverage rule
+/// judges the species: its coverage, with the window spread of its reads, and
+/// whether it is kept.
+#[derive(Clone, Copy)]
+struct StrongestGenome {
+    genome: u32,
+    coverage: EvidenceCoverage,
+    kept: bool,
+}
+
+impl StrongestGenome {
+    /// Whether this genome is stronger than `other`: a kept genome first,
+    /// then the larger fixed-chunk breadth, breadth, depth and read count.
+    fn stronger_than(&self, other: &Self) -> bool {
+        if self.kept != other.kept {
+            return self.kept;
+        }
+        let (own, others) = (&self.coverage, &other.coverage);
+        if own.fixed_chunk != others.fixed_chunk {
+            return own.fixed_chunk > others.fixed_chunk;
+        }
+        if own.breadth != others.breadth {
+            return own.breadth > others.breadth;
+        }
+        if own.depth != others.depth {
+            return own.depth > others.depth;
+        }
+        own.count > others.count
+    }
+}
+
+/// Each measured species' strongest genome
+/// ([`StrongestGenome::stronger_than`]; the lowest assembly id when neither
+/// of two is stronger), with the window spread of its reads on `layout`.
+fn strongest_genomes(
     genomes: &HashMap<u32, GenomeEvidence>,
-    rollup: &GenusRollup,
-) -> HashMap<u32, (WitnessDecision, u32)> {
-    let mut decisions: HashMap<u32, (WitnessDecision, u32)> = HashMap::new();
+    layout: &GenomeLayout,
+) -> HashMap<u32, StrongestGenome> {
+    let mut strongest: HashMap<u32, StrongestGenome> = HashMap::new();
     for (&assembly_id, genome) in genomes {
         let Some(coverage) = genome.coverage else {
             continue;
         };
-        let decision = WitnessDecision {
-            metrics: EvidenceCoverage {
-                window_spread: rollup
-                    .layout
-                    .window_spread(assembly_id, &genome.assembly.intervals),
+        let candidate = StrongestGenome {
+            genome: assembly_id,
+            coverage: EvidenceCoverage {
+                window_spread: layout.window_spread(assembly_id, &genome.assembly.intervals),
                 ..coverage
             },
-            standard: genome.kept,
+            kept: genome.kept,
         };
-        let (id, decision) = match decisions.get(&genome.taxid) {
-            Some(&(current, current_id)) => {
-                super::coherent_witness_max((current_id, current), (assembly_id, decision))
-            }
-            None => (assembly_id, decision),
-        };
-        decisions.insert(genome.taxid, (decision, id));
+        let stronger = strongest.get(&genome.taxid).is_none_or(|current| {
+            candidate.stronger_than(current)
+                || (!current.stronger_than(&candidate) && assembly_id < current.genome)
+        });
+        if stronger {
+            strongest.insert(genome.taxid, candidate);
+        }
     }
-    decisions
+    strongest
 }
 
 /// Whether the best match of a fragment's `candidates` under `policy` (fewest
@@ -2490,7 +2510,7 @@ fn profile_row(
     (reads, depth): (f64, f64),
     coverage: &EvidenceCoverage,
     genome: Arc<str>,
-    identity: Option<(f64, f64)>,
+    identity: (f64, f64),
 ) -> ProfileRow {
     ProfileRow {
         taxname: name,
@@ -2506,11 +2526,11 @@ fn profile_row(
         flex_chunk: coverage.flex_chunk,
         expected_flex_chunk: coverage.expected_flex_chunk,
         chunk_pvalue: coverage.chunk_pvalue,
-        best_fit: Some(BestFitReport {
+        best_fit: BestFitReport {
             genome,
             evidence_depth: coverage.depth,
             identity,
-        }),
+        },
         annotations: None,
     }
 }
@@ -2563,17 +2583,14 @@ fn strain_label(
 #[cfg(test)]
 mod test_fixtures {
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     use crate::profiler::community::{MappingData, ReadBundle};
     use crate::profiler::evidence::{EvidenceAlignment, MappingRole};
-    use crate::profiler::ProfileRank;
 
     /// A single-end read of 100 bases aligned over its whole length.
     pub(super) fn row(taxid: u32, assembly: u32, identity: f32) -> EvidenceAlignment {
         EvidenceAlignment {
             profile_taxid: taxid,
-            profile_rank: ProfileRank::Species,
             reference_id: assembly,
             assembly_id: assembly,
             role: MappingRole::Unpaired,
@@ -2597,15 +2614,15 @@ mod test_fixtures {
                 .into_iter()
                 .enumerate()
                 .map(|(i, alignments)| ReadBundle {
-                    read_name: Arc::from(format!("read{i}")),
+                    read_name: Box::from(format!("read{i}")),
                     alignments,
                 })
                 .collect(),
             min_chunk_breadth: 0.0,
             has_scaled_genomes: false,
             total_reads: 0,
-            genus_of_species: Arc::new(HashMap::new()),
-            terminal_ranks: Arc::new(HashMap::new()),
+            genus_of_species: HashMap::new(),
+            terminal_ranks: HashMap::new(),
             marker_model: None,
             genus_rollup: None,
             unclassified_species: None,
@@ -2647,14 +2664,9 @@ mod tests {
         );
     }
 
-    /// Single-reference genomes 0..=12 of 1 Mb each; species 1 and 2 in genus 100, species 3 in genus 200.
-    fn rollup() -> GenusRollup {
-        GenusRollup {
-            genus_of: HashMap::from([(1, 100), (2, 100), (3, 200)]),
-            marker_only: HashMap::new(),
-            layout: crate::profiler::rollup::GenomeLayout::new((0..=12).map(|id| (id, 1_000_000))),
-            fractional: false,
-        }
+    /// Single-reference genomes 0..=12 of 1 Mb each.
+    fn layout() -> GenomeLayout {
+        GenomeLayout::new((0..=12).map(|id| (id, 1_000_000)))
     }
 
     /// A genome's evidence from `n` placements spread along its 1 Mb.
@@ -2693,14 +2705,12 @@ mod tests {
             (11, evidence(1, false, 80)),
             (12, evidence(2, false, 40)),
         ]);
-        let decisions = species_decisions(&genomes, &rollup());
-        let (one, genome) = decisions[&1];
-        assert_eq!(genome, 10);
-        assert!(one.standard);
-        let (two, genome) = decisions[&2];
-        assert_eq!(genome, 12);
-        assert!(!two.standard);
-        assert!(two.metrics.window_spread.is_some());
+        let strongest = strongest_genomes(&genomes, &layout());
+        assert_eq!(strongest[&1].genome, 10);
+        assert!(strongest[&1].kept);
+        assert_eq!(strongest[&2].genome, 12);
+        assert!(!strongest[&2].kept);
+        assert!(strongest[&2].coverage.window_spread.is_some());
     }
 
     #[test]
@@ -2721,7 +2731,7 @@ mod tests {
                 (reads, 1.0),
                 &EvidenceCoverage::default(),
                 Arc::from("GCF_1"),
-                Some((f64::NAN, f64::NAN)),
+                (f64::NAN, f64::NAN),
             )
         };
         let rows = [
@@ -2748,7 +2758,7 @@ mod tests {
                 (reads, 1.0),
                 &EvidenceCoverage::default(),
                 Arc::from("GCF_1"),
-                Some((f64::NAN, f64::NAN)),
+                (f64::NAN, f64::NAN),
             )
         };
         let blocks = || {
@@ -2851,10 +2861,8 @@ mod tests {
             .has_headers(false)
             .delimiter(b'\t')
             .from_writer(Vec::new());
-        row("Known", Some((0.99, 0.995)))
-            .write(&mut writer)
-            .unwrap();
-        row("Unknown", Some((f64::NAN, f64::NAN)))
+        row("Known", (0.99, 0.995)).write(&mut writer).unwrap();
+        row("Unknown", (f64::NAN, f64::NAN))
             .write(&mut writer)
             .unwrap();
         let text = String::from_utf8(writer.into_inner().unwrap()).unwrap();
@@ -3201,13 +3209,7 @@ mod tests {
     #[test]
     fn references_labelled_above_species_are_candidate_units() {
         // A read on a genome of species 2 and, better, on a genome labelled only at genus 100.
-        let data = data(vec![vec![
-            row(2, 20, 0.97),
-            crate::profiler::evidence::EvidenceAlignment {
-                profile_rank: ProfileRank::Genus,
-                ..row(100, 30, 0.99)
-            },
-        ]]);
+        let data = data(vec![vec![row(2, 20, 0.97), row(100, 30, 0.99)]]);
         let policy = EvidencePolicy {
             mode: EvidenceMode::Single,
             identity: 0.95,
@@ -3356,7 +3358,7 @@ mod tests {
                 (reads, reads / 100.0),
                 coverage,
                 Arc::from(genome),
-                Some((0.99, 0.995)),
+                (0.99, 0.995),
             )
         };
         let genus_row = row("genus", 40.0, "GCF_2", &EvidenceCoverage::default());
@@ -3373,7 +3375,7 @@ mod tests {
         assert!((merged.depth - 1.0).abs() < 1e-12);
         // The unit's coverage, genome and identity stay.
         assert_eq!(merged.breadth, 0.8);
-        assert_eq!(&*merged.best_fit.as_ref().unwrap().genome, "GCF_1");
+        assert_eq!(&*merged.best_fit.genome, "GCF_1");
         // A unit whose reads all sit in genome rows takes the row.
         let mut block = TaxonBlock {
             taxid: 100,
@@ -3396,7 +3398,7 @@ mod tests {
                 (reads, reads / 100.0),
                 &EvidenceCoverage::default(),
                 Arc::from(format!("GCF_{taxid}")),
-                Some((f64::NAN, f64::NAN)),
+                (f64::NAN, f64::NAN),
             )
         };
         // A kept unit labelled at genus 100, and species 1.
@@ -3453,14 +3455,7 @@ mod tests {
         );
         // The unit keeps its own genome; the genus row of 200 its own.
         assert_eq!(
-            &*blocks[0]
-                .taxon
-                .as_ref()
-                .unwrap()
-                .best_fit
-                .as_ref()
-                .unwrap()
-                .genome,
+            &*blocks[0].taxon.as_ref().unwrap().best_fit.genome,
             "GCF_100"
         );
         assert!((blocks[2].taxon.as_ref().unwrap().depth - 0.33).abs() < 1e-12);

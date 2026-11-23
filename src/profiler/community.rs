@@ -36,9 +36,7 @@ use crate::mapper::tsv::{
 };
 use crate::progress;
 
-use super::evidence::{
-    witness_is_better, CandidatePlacement, EvidenceAlignment, GeneHit, MappingRole, WitnessDecision,
-};
+use super::evidence::{CandidatePlacement, EvidenceAlignment, GeneHit, MappingRole};
 use super::markers::{FragmentGeometry, FragmentLayout, LengthHistogram, MarkerModel};
 use super::output::ProfileRow;
 use super::rollup::{GenomeLayout, GenusRollup};
@@ -80,16 +78,8 @@ fn record_terminal_rank(
 
 mod levels;
 
-/// Information about a single alignment of a read to a reference.
-///
-/// Derived fields are computed once where the alignment enters the profiler --
-/// in [`CommunityProfiler::entry_from_metam_mapping`] -- and stored here ready
-/// to use, so the profiler touches no `HashMap` or `String::split` per
-/// alignment.
-type AlignmentEntry = EvidenceAlignment;
-
 /// Narrow a genomic coordinate/length to `u32` for the packed
-/// [`AlignmentEntry`] fields. Coordinates are bounded by `ref_len + 1`, and the
+/// [`EvidenceAlignment`] fields. Coordinates are bounded by `ref_len + 1`, and the
 /// index rejects references `>= 2^32` bases, so the `.min` only guards the
 /// unreachable 4 Gbp-contig edge — every real value is preserved exactly.
 #[inline]
@@ -104,25 +94,18 @@ fn clamp_u32(value: usize) -> u32 {
 #[derive(Clone, Debug)]
 struct ReadBundle {
     /// Read identifier (pair suffix stripped for paired-end)
-    read_name: Arc<str>,
+    read_name: Box<str>,
 
-    /// All alignments for this read, ordered by quality
-    alignments: Vec<AlignmentEntry>,
+    /// All alignments of this read, in the order of the mapping records.
+    alignments: Vec<EvidenceAlignment>,
 }
 
-/// Reference metadata pre-parsed for the Metam coordinate path.
-///
-/// Metam emits the reference name on every mapping row. Splitting that
-/// reference name and re-looking-up assembly lengths in the hot loop creates
-/// avoidable allocator and hash-table work. This cache moves that work to DB
-/// load time, where each reference is parsed once.
 #[derive(Clone, Debug)]
 /// A database reference as the mapping loader needs it; values shared by its
 /// genome are in [`MetamAssembly`].
 struct MetamReferenceEntry {
     ref_len: usize,
     profile_taxid: u32,
-    profile_rank: ProfileRank,
     assembly_id: u32,
     is_marker: bool,
 }
@@ -216,7 +199,7 @@ impl CommunityProfiler {
         let Some(claimed) = cfg.identity_check_accuracy else {
             return;
         };
-        let score = |aln: &&AlignmentEntry| f64::from(aln.identity) * f64::from(aln.mapped_len);
+        let score = |aln: &&EvidenceAlignment| f64::from(aln.identity) * f64::from(aln.mapped_len);
         let mut best: Vec<f32> = reads
             .iter()
             .filter_map(|read| {
@@ -307,7 +290,6 @@ impl CommunityProfiler {
         ) -> Result<MetamParseStats>,
     {
         log::info!(target: "PROFILER", "Loading Metam coordinate mappings ...");
-        let fixed_flank_len = NATIVE_FIXED_FLANK_LEN;
         let mut asm_lengths_raw: HashMap<String, f64> = HashMap::new();
         let mut genome_sampling_scales: HashMap<String, f64> = HashMap::new();
         let mut profile_taxids: HashSet<u32> = HashSet::new();
@@ -381,45 +363,6 @@ impl CommunityProfiler {
             &taxonomy_adjustments,
             self.cfg.verbose || self.cfg.very_verbose,
         );
-        let asm_flex_lengths: HashMap<String, usize> = asm_lengths_raw
-            .iter()
-            .map(|(asm, len)| {
-                let flex = len.sqrt().round() as usize;
-                (asm.clone(), flex.max(1))
-            })
-            .collect();
-        let (species_normalize_raw, mut species_to_genus_raw) =
-            self.build_taxonomy_lookups(&profile_taxids);
-        let normalize = |taxid: u32| species_normalize_raw.get(&taxid).copied().unwrap_or(taxid);
-        let mut marker_only_species: HashMap<u32, Option<u32>> = HashMap::new();
-        if has_marker_genomes {
-            // A marker gene holds too little of a genome for its reads to
-            // stand for a genus or family: reads failing every species there
-            // come mostly from the homologous genes of relatives. Only species
-            // with genome-type references have a genus here.
-            let species_with_genomes: HashSet<u32> = taxids_with_genomes
-                .iter()
-                .map(|&taxid| normalize(taxid))
-                .collect();
-            if self.cfg.removed_to_genus {
-                marker_only_species = profile_taxids
-                    .iter()
-                    .map(|&taxid| normalize(taxid))
-                    .filter(|species| !species_with_genomes.contains(species))
-                    .map(|species| (species, species_to_genus_raw.get(&species).copied()))
-                    .collect();
-            }
-            species_to_genus_raw.retain(|species, _| species_with_genomes.contains(species));
-        }
-        // The genus of every species with genome references, also on a
-        // fractional database.
-        let rollup_genus_of = self
-            .cfg
-            .removed_to_genus
-            .then(|| species_to_genus_raw.clone());
-        let db_is_subsampled = db.is_fractional;
-        let species_normalize = Arc::new(species_normalize_raw);
-        let genus_of_species = Arc::new(species_to_genus_raw);
         let mut assembly_ids: HashMap<&str, u32> = HashMap::new();
         let mut assembly_names: Vec<Arc<str>> = Vec::new();
         for reference in &db.references {
@@ -430,27 +373,57 @@ impl CommunityProfiler {
                 assembly_names.push(Arc::clone(&reference.genome));
             }
         }
-        let genus_rollup = rollup_genus_of.map(|genus_of| {
-            let layout = GenomeLayout::new(
+        // The species represented only by marker genomes, with those genomes.
+        let marker_species = if has_marker_genomes {
+            unclassified::marker_species(
+                db.references.iter().zip(&reference_taxonomies).filter_map(
+                    |(reference, taxonomy)| {
+                        Some(ReferenceKind {
+                            taxid: taxonomy.as_ref()?.profile_taxid,
+                            assembly_id: assembly_ids[&*reference.genome],
+                            reference_type: reference.reference_type,
+                            declared_genome_size: reference.declared_genome_size,
+                        })
+                    },
+                ),
+            )
+        } else {
+            MarkerSpecies::new()
+        };
+        let mut genus_of_species = self.genus_of_taxa(&profile_taxids);
+        let marker_only = if self.cfg.removed_to_genus {
+            marker_species
+                .keys()
+                .map(|&species| (species, genus_of_species.get(&species).copied()))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        if has_marker_genomes {
+            // A marker gene holds too little of a genome for its reads to
+            // stand for a genus or family: reads failing every species there
+            // come mostly from the homologous genes of relatives. Only species
+            // with genome-type references have a genus here.
+            genus_of_species.retain(|species, _| taxids_with_genomes.contains(species));
+        }
+        let genus_rollup = self.cfg.removed_to_genus.then(|| GenusRollup {
+            marker_only,
+            layout: GenomeLayout::new(
                 db.references
                     .iter()
                     .map(|reference| (assembly_ids[&*reference.genome], reference.length as u64)),
-            );
-            Arc::new(GenusRollup {
-                genus_of,
-                marker_only: marker_only_species,
-                layout,
-                fractional: db_is_subsampled,
-            })
+            ),
+            fractional: db.is_fractional,
         });
         let assemblies = assembly_names
             .iter()
             .map(|asm| MetamAssembly {
                 asm_len: asm_lengths_raw.get(&**asm).copied().unwrap_or(0.0),
-                flex_len: asm_flex_lengths
+                flex_len: asm_lengths_raw
                     .get(&**asm)
-                    .copied()
-                    .unwrap_or(fixed_flank_len),
+                    .map_or(NATIVE_FIXED_FLANK_LEN, |len| {
+                        (len.sqrt().round() as usize).max(1)
+                    }),
                 sampling_scale: genome_sampling_scales.get(&**asm).copied().unwrap_or(1.0) as f32,
             })
             .collect::<Vec<_>>();
@@ -470,11 +443,6 @@ impl CommunityProfiler {
                 metam_refs.entries.push(None);
                 continue;
             };
-            let raw_profile_taxid = taxonomy.profile_taxid;
-            let profile_taxid = species_normalize
-                .get(&raw_profile_taxid)
-                .copied()
-                .unwrap_or(raw_profile_taxid);
             let reference_id = u32::try_from(reference_index)
                 .context("database contains more than 2^32 references")?;
             match metam_refs.ids.entry(reference.name.as_str()) {
@@ -488,15 +456,13 @@ impl CommunityProfiler {
             }
             metam_refs.entries.push(Some(MetamReferenceEntry {
                 ref_len: reference.length,
-                profile_taxid,
-                profile_rank: taxonomy.profile_rank,
+                profile_taxid: taxonomy.profile_taxid,
                 assembly_id,
                 is_marker: reference.reference_type == ReferenceType::Markers,
             }));
         }
 
-        let mut read_map: StableReadMap<AlignmentEntry> = StableReadMap::default();
-        let mut num_skipped_reference = 0usize;
+        let mut read_map: StableReadMap<EvidenceAlignment> = StableReadMap::default();
         let mut num_alignments = 0usize;
         let mut read_lengths = LengthHistogram::default();
         let mut lone_mates = false;
@@ -517,13 +483,8 @@ impl CommunityProfiler {
                 read_lengths.add(mapping.read_len);
                 lone_mates |= mapping.is_mate_beyond_reference_end();
             }
-            match self.entry_from_metam_mapping(mapping, &metam_refs, fixed_flank_len) {
-                Some((read_id, entry)) => {
-                    push_string_keyed_value(&mut read_map, read_id, entry);
-                }
-                None => {
-                    num_skipped_reference += 1;
-                }
+            if let Some((read_id, entry)) = self.entry_from_metam_mapping(mapping, &metam_refs) {
+                push_string_keyed_value(&mut read_map, read_id, entry);
             }
             Ok(())
         });
@@ -549,7 +510,7 @@ impl CommunityProfiler {
         let read_alignments = read_map
             .into_iter()
             .map(|(read_name, alignments)| ReadBundle {
-                read_name: Arc::<str>::from(read_name),
+                read_name: Box::<str>::from(read_name),
                 alignments,
             })
             .collect::<Vec<_>>();
@@ -562,21 +523,6 @@ impl CommunityProfiler {
         } else {
             None
         };
-        let unclassified_species = self.cfg.estimate_unclassified.then(|| {
-            unclassified::marker_species(
-                db.references.iter().zip(&reference_taxonomies).filter_map(
-                    |(reference, taxonomy)| {
-                        let taxid = taxonomy.as_ref()?.profile_taxid;
-                        Some(ReferenceKind {
-                            taxid: species_normalize.get(&taxid).copied().unwrap_or(taxid),
-                            assembly_id: assembly_ids[&*reference.genome],
-                            reference_type: reference.reference_type,
-                            declared_genome_size: reference.declared_genome_size,
-                        })
-                    },
-                ),
-            )
-        });
 
         let mapping_rate = if total_reads == 0 {
             0.0
@@ -594,21 +540,13 @@ impl CommunityProfiler {
                 gate_rate
             );
         }
-        let gate_active = low_map_gate_active(&self.cfg, gate_rate);
-        let chunk_plan = plan_chunk_breadth(
+        let basis = ChunkBasis::of(
             &self.cfg,
             gate_rate,
-            total_reads,
-            aligned_reads,
-            db_is_subsampled,
-            gate_active,
+            (total_reads, aligned_reads),
+            db.is_fractional,
         );
-        let min_breadth = self.cfg.breadth.unwrap_or(0.0);
-        let chunk_thresholds =
-            resolve_community_chunk_breadth(&self.cfg, chunk_plan.estimate_reads);
-        let min_chunk_breadth_value = chunk_thresholds.standard;
-        let chunk_breadth_source =
-            community_chunk_breadth_source(&self.cfg, chunk_plan, chunk_thresholds);
+        let chunk_cutoff = ChunkCutoff::resolve(&self.cfg, basis.reads);
 
         log::info!(target: "PROFILER", "Total number of reads: {}", total_reads);
         log::info!(target: "PROFILER", "Number of mapping records: {}", num_alignments);
@@ -620,35 +558,32 @@ impl CommunityProfiler {
         );
         log::info!(target: "PROFILER", "Metam reported mapped read records: {}", profile.mapped_reads);
         log::info!(target: "PROFILER", "Metam emitted mapping records: {}", profile.emitted_records);
-        if self.cfg.lowbiomass && self.cfg.chunk_breadth.is_none() {
-            log::info!(
+        match chunk_cutoff.source {
+            ChunkSource::LowBiomass => log::info!(
                 target: "PROFILER",
                 "Automatic minimum chunk breadth filter disabled by --low-biomass."
-            );
-        } else if self.cfg.chunk_breadth.is_none() {
-            if chunk_plan.use_aligned_basis {
-                log::info!(
-                    target: "PROFILER",
-                    "Minimum chunk breadth estimated from mapped {} ({}).",
-                    mapped_unit,
-                    aligned_reads
-                );
-            } else {
-                log::info!(
-                    target: "PROFILER",
-                    "Minimum chunk breadth estimated from total reads ({}).",
-                    total_reads
-                );
-            }
+            ),
+            ChunkSource::Automatic if basis.mapped => log::info!(
+                target: "PROFILER",
+                "Minimum chunk breadth estimated from mapped {} ({}).",
+                mapped_unit,
+                aligned_reads
+            ),
+            ChunkSource::Automatic => log::info!(
+                target: "PROFILER",
+                "Minimum chunk breadth estimated from total reads ({}).",
+                total_reads
+            ),
+            ChunkSource::User => {}
         }
-        log_chunk_breadth_scaling(chunk_thresholds);
+        chunk_cutoff.log_scaling();
         log_resolved_profiler_parameters(
             &self.cfg,
             ResolvedProfilerParameters {
-                min_breadth,
-                min_chunk_breadth: min_chunk_breadth_value,
-                chunk_breadth_source,
-                chunk_breadth_basis_reads: chunk_plan.estimate_reads,
+                min_breadth: self.cfg.breadth.unwrap_or(0.0),
+                min_chunk_breadth: chunk_cutoff.cutoff,
+                chunk_breadth_source: chunk_cutoff.source_in_words(&basis),
+                chunk_breadth_basis_reads: basis.reads,
                 total_reads,
                 mapped_reads: aligned_reads,
                 mapping_rate,
@@ -657,14 +592,14 @@ impl CommunityProfiler {
 
         Ok(MappingData {
             read_alignments,
-            min_chunk_breadth: min_chunk_breadth_value,
+            min_chunk_breadth: chunk_cutoff.cutoff,
             has_scaled_genomes: genome_sampling_scales.values().any(|scale| *scale > 1.0),
             total_reads,
             genus_of_species,
-            terminal_ranks: Arc::new(terminal_ranks),
+            terminal_ranks,
             marker_model,
             genus_rollup,
-            unclassified_species,
+            unclassified_species: self.cfg.estimate_unclassified.then_some(marker_species),
             assembly_names,
         })
     }
@@ -673,11 +608,7 @@ impl CommunityProfiler {
         &self,
         mapping: MetamMappingRecord<'a>,
         metam_refs: &MetamReferences,
-        fixed_flank_len: usize,
-    ) -> Option<(&'a str, AlignmentEntry)> {
-        if self.cfg.is_paired && !mapping.is_paired_evidence() {
-            return None;
-        }
+    ) -> Option<(&'a str, EvidenceAlignment)> {
         let (reference_id, reference, assembly) = metam_refs.get(mapping.ref_id)?;
         if reference.ref_len == 0 || mapping.read_len == 0 || mapping.mapped_bases == 0 {
             return None;
@@ -686,9 +617,9 @@ impl CommunityProfiler {
         let mut end = mapping.end_1based_exclusive.max(start.saturating_add(1));
         end = end.min(reference.ref_len.saturating_add(1));
         let midpoint = start + ((end.saturating_sub(start)) / 2);
-        let fixed_chunk_start = start.saturating_sub(fixed_flank_len).max(1);
+        let fixed_chunk_start = start.saturating_sub(NATIVE_FIXED_FLANK_LEN).max(1);
         let fixed_chunk_end = end
-            .saturating_add(fixed_flank_len)
+            .saturating_add(NATIVE_FIXED_FLANK_LEN)
             .min(reference.ref_len.saturating_add(1));
         let flex_chunk_start = midpoint.saturating_sub(assembly.flex_len).max(1);
         let flex_chunk_end = midpoint
@@ -702,9 +633,8 @@ impl CommunityProfiler {
         };
         Some((
             read_name,
-            AlignmentEntry {
+            EvidenceAlignment {
                 profile_taxid: reference.profile_taxid,
-                profile_rank: reference.profile_rank,
                 reference_id,
                 assembly_id: reference.assembly_id,
                 role: if self.cfg.is_paired {
@@ -735,52 +665,21 @@ impl CommunityProfiler {
         ))
     }
 
-    /// Precompute taxonomy lookups used during per-read assignment.
-    ///
-    /// Given the set of raw taxids of the database references, this produces:
-    ///
-    /// - `species_normalize`: sparse `raw -> species` map. Only contains
-    ///   entries where the raw taxid is **below** species rank and a
-    ///   species ancestor exists. Entries where raw is already species
-    ///   (or has no species ancestor) are omitted; callers treat a
-    ///   missing entry as "use the raw taxid unchanged". This is the
-    ///   mechanism that merges multiple sub-species / strains belonging
-    ///   to the same species into a single species-level assignment.
-    ///
-    /// - `species_to_genus`: `species -> genus` map, keyed by the
-    ///   **post-normalization** species taxid so that the genus is looked
-    ///   up once per species regardless of how many sub-taxon flavours
-    ///   share that species.
-    ///
-    /// Taxids without a resolvable genus are simply absent from
-    /// `species_to_genus`.
-    fn build_taxonomy_lookups(
-        &self,
-        raw_taxids: &HashSet<u32>,
-    ) -> (HashMap<u32, u32>, HashMap<u32, u32>) {
-        let tax = self.taxonomy.as_ref();
-        let mut species_normalize: HashMap<u32, u32> = HashMap::new();
-        let mut species_to_genus: HashMap<u32, u32> = HashMap::with_capacity(raw_taxids.len());
-        for &raw in raw_taxids {
-            // Determine the species anchor (or fall back to the raw id
-            // when no species ancestor exists, to preserve behaviour for
-            // references that already point above species rank).
-            let species = match resolve_species_taxid(tax, raw) {
-                Some(s) => {
-                    if s != raw {
-                        species_normalize.insert(raw, s);
-                    }
-                    s
-                }
-                None => raw,
-            };
-            if let Entry::Vacant(slot) = species_to_genus.entry(species) {
-                if let Some(g) = resolve_genus_taxid(tax, species) {
-                    slot.insert(g);
-                }
-            }
-        }
-        (species_normalize, species_to_genus)
+    /// The genus of each of the references' profile taxa (`taxids`, at species
+    /// rank or above) that has one: the taxon itself at genus rank, or its
+    /// ancestor there.
+    fn genus_of_taxa(&self, taxids: &HashSet<u32>) -> HashMap<u32, u32> {
+        let taxonomy = self.taxonomy.as_ref();
+        taxids
+            .iter()
+            .filter_map(|&taxid| {
+                debug_assert!(
+                    resolve_species_taxid(taxonomy, taxid).is_none_or(|species| species == taxid),
+                    "profile taxid {taxid} lies below species"
+                );
+                resolve_genus_taxid(taxonomy, taxid).map(|genus| (taxid, genus))
+            })
+            .collect()
     }
 
     /// Profile the loaded mappings with the level-wise engine ([`levels`]).
@@ -870,27 +769,6 @@ impl CommunityProfiler {
                 );
                 classification_path
             })
-    }
-
-    fn host_taxid(&self) -> Option<u32> {
-        self.cfg.host.as_deref().and_then(|h| h.parse::<u32>().ok())
-    }
-}
-
-/// Return the preferred coherent witness using a total, order-independent
-/// comparison. The taxid tiebreak is required because `witness_is_better`
-/// intentionally compares evidence strength only.
-#[inline]
-fn coherent_witness_max(
-    left: (u32, WitnessDecision),
-    right: (u32, WitnessDecision),
-) -> (u32, WitnessDecision) {
-    let right_is_better = witness_is_better(right.1, left.1);
-    let equivalent = !right_is_better && !witness_is_better(left.1, right.1);
-    if right_is_better || (equivalent && right.0 < left.0) {
-        right
-    } else {
-        left
     }
 }
 
@@ -1040,56 +918,35 @@ fn family_level_min_mapped_len(cfg: &ProfilerConfig) -> usize {
     }
 }
 
-/// Whether the low-map gate is active: the chunk-breadth cutoff is then
-/// estimated from the mapped reads ([`plan_chunk_breadth`]).
-fn low_map_gate_active(cfg: &ProfilerConfig, mapping_rate: f64) -> bool {
-    cfg.is_low_map_run(mapping_rate)
-}
-
-/// Run-level decision for the read count fed into the automatic chunk-breadth
-/// curve.
+/// The read count that the automatic chunk-breadth curve is read at.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ChunkBreadthPlan {
-    /// `true` when the unscaled basis is mapped reads; `false` for total reads.
-    use_aligned_basis: bool,
-    /// `true` when aligned basis was selected by the automatic low-map rule.
-    by_aligned_auto: bool,
-    /// Unscaled read count selected as the chunk-breadth basis.
-    basis_reads: usize,
-    /// Read count actually passed to the automatic chunk-breadth curve.
-    estimate_reads: usize,
-    /// Whether `basis_reads` was multiplied by `LOW_MAP_CHUNK_BASIS_SCALE`.
+struct ChunkBasis {
+    /// Mapped reads (`--by-mapped`, or a low-map run), otherwise total reads.
+    mapped: bool,
+    /// Mapped reads of a low-map run on a full database, without a given
+    /// `--min-chunk-breadth`: multiplied by [`LOW_MAP_CHUNK_BASIS_SCALE`].
     scaled: bool,
+    reads: usize,
 }
 
-/// Choose the read-count basis used to estimate chunk breadth.
-#[inline]
-fn plan_chunk_breadth(
-    cfg: &ProfilerConfig,
-    mapping_rate: f64,
-    total_reads: usize,
-    aligned_reads: usize,
-    db_is_subsampled: bool,
-    low_map_gate_active: bool,
-) -> ChunkBreadthPlan {
-    let chunk_breadth_pinned = cfg.chunk_breadth.is_some();
-    let by_aligned_effective = cfg.resolve_by_aligned(mapping_rate);
-    let basis_reads = if by_aligned_effective {
-        aligned_reads
-    } else {
-        total_reads
-    };
-
-    let low_map_full_database = low_map_gate_active && !db_is_subsampled;
-    let scaled = !chunk_breadth_pinned && by_aligned_effective && low_map_full_database;
-    let estimate_reads = scale_low_map_chunk_basis(basis_reads, scaled);
-
-    ChunkBreadthPlan {
-        use_aligned_basis: by_aligned_effective,
-        by_aligned_auto: by_aligned_effective && !cfg.by_aligned && low_map_gate_active,
-        basis_reads,
-        estimate_reads,
-        scaled,
+impl ChunkBasis {
+    /// The basis of a run with `mapping_rate` and `(total, mapped)` reads, on
+    /// a `fractional` database or not.
+    fn of(
+        cfg: &ProfilerConfig,
+        mapping_rate: f64,
+        (total, mapped): (usize, usize),
+        fractional: bool,
+    ) -> Self {
+        let low_map = cfg.is_low_map_run(mapping_rate);
+        let by_mapped = cfg.by_aligned || low_map;
+        let scaled = cfg.chunk_breadth.is_none() && low_map && !fractional;
+        let reads = if by_mapped { mapped } else { total };
+        Self {
+            mapped: by_mapped,
+            scaled,
+            reads: scale_low_map_chunk_basis(reads, scaled),
+        }
     }
 }
 
@@ -1105,81 +962,116 @@ const RECALL_CHUNK_SCALE_MIN_BASIS: usize = 1_000_000;
 const SHORT_RECALL_CHUNK_SCALE_FLOOR: f64 = 0.70;
 const LONG_RECALL_CHUNK_SCALE: f64 = 0.80;
 
-/// The automatic chunk-breadth cutoff, after a user scale (`safeguard`) and
-/// then recall mode (`standard`, the cutoff the species amount test uses).
+/// Where the chunk-breadth cutoff of the species amount test comes from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChunkSource {
+    /// `--min-chunk-breadth`.
+    User,
+    /// `--low-biomass` without `--min-chunk-breadth`: no cutoff.
+    LowBiomass,
+    /// The automatic curve at the run's read count.
+    Automatic,
+}
+
+/// The chunk-breadth cutoff of the species amount test: the curve's value
+/// (or the given cutoff), times the user scale (`--chunk-breadth-scale`,
+/// capped at 1), times the recall-mode scale.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct CommunityChunkBreadthThresholds {
-    /// Calibrated read-count curve before any user or mode adjustment.
-    automatic: f64,
-    /// The cutoff of the species amount test: `safeguard` times the recall
-    /// scale.
-    standard: f64,
-    /// Automatic cutoff after the explicit user scale.
-    safeguard: f64,
+struct ChunkCutoff {
+    source: ChunkSource,
+    curve: f64,
     user_scale: f64,
+    /// The curve's value times the user scale.
+    user_scaled: f64,
     recall_scale: f64,
+    /// The cutoff of the species amount test: `user_scaled` times the recall
+    /// scale.
+    cutoff: f64,
 }
 
-impl CommunityChunkBreadthThresholds {
-    #[inline]
-    fn is_user_scaled(self) -> bool {
-        self.user_scale != 1.0 && self.automatic > 0.0
-    }
-
-    #[inline]
-    fn is_recall_scaled(self) -> bool {
-        self.recall_scale < 1.0 && self.safeguard > 0.0
-    }
-
-    #[inline]
-    fn is_scaled(self) -> bool {
-        self.is_user_scaled() || self.is_recall_scaled()
-    }
-}
-
-/// Resolve the chunk-breadth cutoffs once.
-fn resolve_community_chunk_breadth(
-    cfg: &ProfilerConfig,
-    basis_reads: usize,
-) -> CommunityChunkBreadthThresholds {
-    // Explicit user policy is authoritative in every mode, including
-    // low-biomass mode and recall mode.
-    if let Some(cutoff) = cfg.chunk_breadth {
-        return CommunityChunkBreadthThresholds {
-            automatic: cutoff,
-            standard: cutoff,
-            safeguard: cutoff,
+impl ChunkCutoff {
+    /// The cutoff of a run whose automatic curve is read at `basis_reads`. A
+    /// given `--min-chunk-breadth` is taken as it is, in every mode.
+    fn resolve(cfg: &ProfilerConfig, basis_reads: usize) -> Self {
+        let fixed = |source, cutoff| Self {
+            source,
+            curve: cutoff,
             user_scale: 1.0,
+            user_scaled: cutoff,
             recall_scale: 1.0,
+            cutoff,
         };
+        if let Some(cutoff) = cfg.chunk_breadth {
+            return fixed(ChunkSource::User, cutoff);
+        }
+        if cfg.lowbiomass {
+            return fixed(ChunkSource::LowBiomass, 0.0);
+        }
+        let curve = chunk_breadth_curve(basis_reads, cfg.sequencer.is_illumina());
+        let user_scaled = scale_automatic_chunk_breadth(curve, cfg.chunk_breadth_scale);
+        let recall_scale = recall_chunk_scale(cfg, basis_reads);
+        Self {
+            source: ChunkSource::Automatic,
+            curve,
+            user_scale: cfg.chunk_breadth_scale,
+            user_scaled,
+            recall_scale,
+            cutoff: user_scaled * recall_scale,
+        }
     }
 
-    // Low-biomass mode has no automatic chunk-breadth filtering, and
-    // therefore nothing to scale.
-    if cfg.lowbiomass {
-        return CommunityChunkBreadthThresholds {
-            automatic: 0.0,
-            standard: 0.0,
-            safeguard: 0.0,
-            user_scale: 1.0,
-            recall_scale: 1.0,
-        };
+    fn is_user_scaled(&self) -> bool {
+        self.user_scale != 1.0 && self.curve > 0.0
     }
 
-    let automatic = community_chunk_breadth_cutoff(basis_reads, cfg.sequencer.is_illumina());
-    let safeguard = scale_automatic_chunk_breadth(automatic, cfg.chunk_breadth_scale);
-    let recall_scale = automatic_recall_chunk_breadth_scale(cfg, basis_reads);
-    let standard = if recall_scale == 1.0 {
-        safeguard
-    } else {
-        safeguard * recall_scale
-    };
-    CommunityChunkBreadthThresholds {
-        automatic,
-        standard,
-        safeguard,
-        user_scale: cfg.chunk_breadth_scale,
-        recall_scale,
+    fn is_recall_scaled(&self) -> bool {
+        self.recall_scale < 1.0 && self.user_scaled > 0.0
+    }
+
+    /// Where the cutoff comes from, in words, with the `basis` of the curve.
+    fn source_in_words(&self, basis: &ChunkBasis) -> &'static str {
+        match self.source {
+            ChunkSource::User => "user-supplied --min-chunk-breadth",
+            ChunkSource::LowBiomass => "disabled by --low-biomass",
+            ChunkSource::Automatic => {
+                let scaled = self.is_user_scaled() || self.is_recall_scaled();
+                match (scaled, basis.scaled, basis.mapped) {
+                    (true, true, _) => "recall-scaled auto-estimate from scaled mapped reads",
+                    (true, false, true) => "recall-scaled auto-estimate from mapped reads",
+                    (true, false, false) => "recall-scaled auto-estimate from total reads",
+                    (false, true, _) => "auto-estimated from scaled mapped reads",
+                    (false, false, true) => "auto-estimated from mapped reads",
+                    (false, false, false) => "auto-estimated from total reads",
+                }
+            }
+        }
+    }
+
+    /// Log the user and recall-mode scaling of the automatic cutoff.
+    fn log_scaling(&self) {
+        if self.is_user_scaled() {
+            let capped = if self.curve * self.user_scale > 1.0 {
+                ", capped at 1.000000"
+            } else {
+                ""
+            };
+            log::info!(
+                target: "PROFILER",
+                "User chunk-breadth scale adjusted the automatic cutoff: {:.6} x {} = {:.6}{capped}.",
+                self.curve,
+                self.user_scale,
+                self.user_scaled,
+            );
+        }
+        if self.is_recall_scaled() {
+            log::info!(
+                target: "PROFILER",
+                "Recall mode scaled the automatic chunk-breadth cutoff: {:.6} x {:.4} = {:.6}; OEBR/COEBR thresholds are unchanged.",
+                self.user_scaled,
+                self.recall_scale,
+                self.cutoff,
+            );
+        }
     }
 }
 
@@ -1187,16 +1079,10 @@ fn resolve_community_chunk_breadth(
 /// curve is continuous at one million reads and approaches 0.70 smoothly:
 /// `scale = 0.70 + 0.30 / m`, where `m = basis_reads / 1e6`. Long reads use
 /// a fixed 0.80 multiplier above the same depth gate.
-#[inline]
-fn automatic_recall_chunk_breadth_scale(cfg: &ProfilerConfig, basis_reads: usize) -> f64 {
-    if cfg.mode != ProfileMode::Recall
-        || cfg.lowbiomass
-        || cfg.chunk_breadth.is_some()
-        || basis_reads <= RECALL_CHUNK_SCALE_MIN_BASIS
-    {
+fn recall_chunk_scale(cfg: &ProfilerConfig, basis_reads: usize) -> f64 {
+    if cfg.mode != ProfileMode::Recall || basis_reads <= RECALL_CHUNK_SCALE_MIN_BASIS {
         return 1.0;
     }
-
     if cfg.sequencer.is_illumina() {
         let millions = basis_reads as f64 / 1_000_000.0;
         (SHORT_RECALL_CHUNK_SCALE_FLOOR + (1.0 - SHORT_RECALL_CHUNK_SCALE_FLOOR) / millions)
@@ -1206,61 +1092,7 @@ fn automatic_recall_chunk_breadth_scale(cfg: &ProfilerConfig, basis_reads: usize
     }
 }
 
-fn community_chunk_breadth_source(
-    cfg: &ProfilerConfig,
-    plan: ChunkBreadthPlan,
-    thresholds: CommunityChunkBreadthThresholds,
-) -> &'static str {
-    if cfg.chunk_breadth.is_some() {
-        "user-supplied --min-chunk-breadth"
-    } else if cfg.lowbiomass {
-        "disabled by --low-biomass"
-    } else {
-        match (thresholds.is_scaled(), plan.scaled, plan.use_aligned_basis) {
-            (true, true, _) => "recall-scaled auto-estimate from scaled mapped reads",
-            (true, false, true) => "recall-scaled auto-estimate from mapped reads",
-            (true, false, false) => "recall-scaled auto-estimate from total reads",
-            (false, true, _) => "auto-estimated from scaled mapped reads",
-            (false, false, true) => "auto-estimated from mapped reads",
-            (false, false, false) => "auto-estimated from total reads",
-        }
-    }
-}
-
-fn log_chunk_breadth_scaling(thresholds: CommunityChunkBreadthThresholds) {
-    if thresholds.is_user_scaled() {
-        let uncapped = thresholds.automatic * thresholds.user_scale;
-        if uncapped > 1.0 {
-            log::info!(
-                target: "PROFILER",
-                "User chunk-breadth scale adjusted the automatic cutoff: {:.6} x {} = {:.6}, capped at 1.000000.",
-                thresholds.automatic,
-                thresholds.user_scale,
-                thresholds.safeguard,
-            );
-        } else {
-            log::info!(
-                target: "PROFILER",
-                "User chunk-breadth scale adjusted the automatic cutoff: {:.6} x {} = {:.6}.",
-                thresholds.automatic,
-                thresholds.user_scale,
-                thresholds.safeguard,
-            );
-        }
-    }
-    if thresholds.is_recall_scaled() {
-        log::info!(
-            target: "PROFILER",
-            "Recall mode scaled the automatic chunk-breadth cutoff: {:.6} x {:.4} = {:.6}; OEBR/COEBR thresholds are unchanged.",
-            thresholds.safeguard,
-            thresholds.recall_scale,
-            thresholds.standard,
-        );
-    }
-}
-
 /// Scale the read count used as input to the automatic chunk-breadth curve.
-#[inline]
 fn scale_low_map_chunk_basis(chunk_basis_reads: usize, scale: bool) -> usize {
     if scale {
         ((chunk_basis_reads as f64) * LOW_MAP_CHUNK_BASIS_SCALE).round() as usize
@@ -1269,13 +1101,11 @@ fn scale_low_map_chunk_basis(chunk_basis_reads: usize, scale: bool) -> usize {
     }
 }
 
-/// Derive the genus taxid for a species taxid using the NCBI taxonomy
-/// lineage (no header parsing).
-///
-/// Returns `None` if the species has no ancestor at rank "genus".
-fn resolve_genus_taxid(taxonomy: &Taxonomy, species_taxid: u32) -> Option<u32> {
+/// The genus of `taxid`: the taxon itself at genus rank, or its ancestor
+/// there; `None` without one.
+fn resolve_genus_taxid(taxonomy: &Taxonomy, taxid: u32) -> Option<u32> {
     taxonomy
-        .get_parents(species_taxid)
+        .get_parents(taxid)
         .into_iter()
         .find(|(_, _, rank)| rank == "genus")
         .map(|(taxid, _, _)| taxid)
@@ -1303,7 +1133,7 @@ fn resolve_species_taxid(taxonomy: &Taxonomy, taxid: u32) -> Option<u32> {
 ///
 /// The cutoff rises smoothly with sequencing depth and then plateaus. The
 /// 0.95 clamp is defensive; both fitted plateaus are lower.
-fn community_chunk_breadth_cutoff(num_reads: usize, illumina: bool) -> f64 {
+fn chunk_breadth_curve(num_reads: usize, illumina: bool) -> f64 {
     let m = num_reads as f64 / 1_000_000.0;
     let value = if illumina {
         0.66 * m / (m + 1.0) + 0.24 * m / (m + 100.0)
@@ -1312,10 +1142,6 @@ fn community_chunk_breadth_cutoff(num_reads: usize, illumina: bool) -> f64 {
     };
     value.min(0.95)
 }
-
-// ============================================================================
-// Utility Functions
-// ============================================================================
 
 /// Aggregated data from mapping loading.
 ///
@@ -1337,18 +1163,18 @@ struct MappingData {
     /// The genus of every species with whole-genome references, also on a
     /// fractional database. Species represented only by marker genes are
     /// absent.
-    genus_of_species: Arc<HashMap<u32, u32>>,
+    genus_of_species: HashMap<u32, u32>,
 
     /// Most-specific reference-supported rank for every terminal taxid. Rows
     /// above species take their rank from the taxonomy.
-    terminal_ranks: Arc<HashMap<u32, ProfileRank>>,
+    terminal_ranks: HashMap<u32, ProfileRank>,
 
     /// Marker genes and fragment geometry when the database has marker genomes.
     marker_model: Option<Arc<MarkerModel>>,
 
     /// Inputs of the levels above species and of the even-coverage species;
     /// `None` when they are off (`--strict-coverage`).
-    genus_rollup: Option<Arc<GenusRollup>>,
+    genus_rollup: Option<GenusRollup>,
 
     /// Inputs of `--estimate-unclassified`; `None` when it is off.
     unclassified_species: Option<MarkerSpecies>,
@@ -1376,7 +1202,6 @@ mod tests {
     fn placement(assembly_id: u32, mapped: u32, read_len: u32) -> CandidatePlacement {
         CandidatePlacement {
             taxid: 1,
-            profile_rank: ProfileRank::Species,
             reference_id: 0,
             assembly_id,
             sampling_scale: 1.0,
@@ -1443,55 +1268,11 @@ mod tests {
         approx_equal(zero, 0.0);
     }
 
-    // ------------------------------------------------------------------
-    // Test helpers.
-    // ------------------------------------------------------------------
-
-    /// Minimal `ProfilerConfig` for unit tests. Callers mutate only the
-    /// fields relevant to the scenario under test.
-    fn make_cfg(sequencer: Sequencer, host: Option<&str>) -> ProfilerConfig {
+    /// The test configuration for reads of `sequencer`.
+    fn cfg(sequencer: Sequencer) -> ProfilerConfig {
         ProfilerConfig {
-            genome_level: false,
-            mapper_mappings: None,
-            mapping_profile_memory: None,
-            db_metadata: None,
             sequencer,
-            max_em_iterations: 200,
-            lenient_mapping_input: false,
-            is_paired: false,
-            identity: 0.95,
-            identity_check_accuracy: None,
-            noisy_long_reads: false,
-            mapped_len: 50,
-            breadth: Some(0.0),
-            chunk_breadth: Some(0.0),
-            chunk_breadth_scale: 1.0,
-            min_reads: None,
-            min_oebr: None,
-            min_coebr: None,
-            min_marker_genes: 3,
-            relative_identity_gap: None,
-            removed_to_genus: false,
-            estimate_unclassified: false,
-            identity_margin: None,
-            fraction: 0.6,
-            lowbiomass: false,
-            save_decisions: false,
-            save_classifications: false,
-            by_aligned: false,
-            family_identity: 0.80,
-            low_map_rate_threshold: 0.30,
-            pathogen_host: None,
-            host: host.map(|s| s.to_string()),
-            threads: 1,
-            verbose: false,
-            very_verbose: false,
-            progress: crate::progress::ProgressOptions::default(),
-            suppress_mapping_load_progress: false,
-            outprefix: "test".to_string(),
-            mode: ProfileMode::Default,
-            dmp_dir: None,
-            ignore_unresolved_references: false,
+            ..ProfilerConfig::for_tests()
         }
     }
 
@@ -1519,7 +1300,7 @@ mod tests {
         let taxonomy = test_taxonomy(directory.path());
         for fractional in [false, true] {
             let prefix = directory.path().join(format!("fractional-{fractional}"));
-            let mut cfg = make_cfg(Sequencer::Illumina, None);
+            let mut cfg = cfg(Sequencer::Illumina);
             cfg.save_classifications = true;
             cfg.outprefix = prefix.to_string_lossy().into_owned();
             cfg.db_metadata = Some(Arc::new(DatabaseMetadata {
@@ -1533,8 +1314,8 @@ mod tests {
                 min_chunk_breadth: 0.05,
                 has_scaled_genomes: false,
                 total_reads: 2,
-                genus_of_species: Arc::new(HashMap::new()),
-                terminal_ranks: Arc::new(HashMap::new()),
+                genus_of_species: HashMap::new(),
+                terminal_ranks: HashMap::new(),
                 marker_model: None,
                 genus_rollup: None,
                 unclassified_species: None,
@@ -1566,10 +1347,8 @@ mod tests {
             HashMap::new(),
             HashSet::new(),
         ));
-        let genus_of = HashMap::from([(1001, 100), (1002, 100)]);
         let alignment = |taxid: u32, assembly: u32, start: u32| EvidenceAlignment {
             profile_taxid: taxid,
-            profile_rank: ProfileRank::Species,
             reference_id: assembly,
             assembly_id: assembly,
             role: MappingRole::Unpaired,
@@ -1587,32 +1366,31 @@ mod tests {
         };
         for fractional in [false, true] {
             let prefix = directory.path().join(format!("fractional-{fractional}"));
-            let mut cfg = make_cfg(Sequencer::Illumina, None);
+            let mut cfg = cfg(Sequencer::Illumina);
             cfg.removed_to_genus = true;
             cfg.outprefix = prefix.to_string_lossy().into_owned();
             let profiler = CommunityProfiler::new(cfg, Arc::clone(&taxonomy)).unwrap();
             let mapping_data = MappingData {
                 read_alignments: (0..250u32)
                     .map(|i| ReadBundle {
-                        read_name: Arc::from(format!("read{i}")),
+                        read_name: Box::from(format!("read{i}")),
                         alignments: vec![alignment(1001 + i % 2, i % 2, (i / 2) * 7_900)],
                     })
                     .collect(),
                 min_chunk_breadth: 0.9,
                 has_scaled_genomes: false,
                 total_reads: 250,
-                genus_of_species: Arc::new(genus_of.clone()),
-                terminal_ranks: Arc::new(HashMap::from([
+                genus_of_species: HashMap::from([(1001, 100), (1002, 100)]),
+                terminal_ranks: HashMap::from([
                     (1001, ProfileRank::Species),
                     (1002, ProfileRank::Species),
-                ])),
+                ]),
                 marker_model: None,
-                genus_rollup: Some(Arc::new(GenusRollup {
-                    genus_of: genus_of.clone(),
+                genus_rollup: Some(GenusRollup {
                     marker_only: HashMap::new(),
                     layout: GenomeLayout::new([(0, 1_000_000), (1, 1_000_000)]),
                     fractional,
-                })),
+                }),
                 unclassified_species: None,
                 assembly_names: vec![Arc::from("GCF_1"), Arc::from("GCF_2")],
             };
@@ -1649,7 +1427,7 @@ mod tests {
             let mut row = native_mapping(1, 10, 1, 0.99, 100, 100, MappingRole::Unpaired);
             row.sampling_scale = scale;
             ReadBundle {
-                read_name: Arc::from("read"),
+                read_name: Box::from("read"),
                 alignments: vec![row],
             }
         };
@@ -1676,33 +1454,9 @@ mod tests {
         mapped_len: u32,
         read_len: u32,
         role: MappingRole,
-    ) -> AlignmentEntry {
-        native_mapping_at_rank(
-            species,
-            ProfileRank::Species,
-            reference_id,
-            assembly_id,
-            identity,
-            mapped_len,
-            read_len,
-            role,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn native_mapping_at_rank(
-        species: u32,
-        profile_rank: ProfileRank,
-        reference_id: u32,
-        assembly_id: u32,
-        identity: f32,
-        mapped_len: u32,
-        read_len: u32,
-        role: MappingRole,
-    ) -> AlignmentEntry {
-        AlignmentEntry {
+    ) -> EvidenceAlignment {
+        EvidenceAlignment {
             profile_taxid: species,
-            profile_rank,
             reference_id,
             assembly_id,
             role,
@@ -1726,7 +1480,7 @@ mod tests {
 
     #[test]
     fn evidence_policy_is_limited_to_supported_inputs() {
-        let mut cfg = make_cfg(Sequencer::Illumina, None);
+        let mut cfg = cfg(Sequencer::Illumina);
         assert_eq!(
             EvidencePolicy::from_config(&cfg).map(|policy| policy.mode),
             Some(EvidenceMode::Single)
@@ -1765,7 +1519,7 @@ mod tests {
             })
             .collect();
         let resolved = |claimed: Option<f64>, identity: f64| {
-            let mut cfg = make_cfg(Sequencer::Nanopore, None);
+            let mut cfg = cfg(Sequencer::Nanopore);
             cfg.mapped_len = 500;
             cfg.fraction = 0.20;
             cfg.identity = identity;
@@ -1788,92 +1542,67 @@ mod tests {
         assert_eq!(resolved(None, 0.91), 0.91);
     }
 
-    // ------------------------------------------------------------------
-    // Low-map gate tests
-    // ------------------------------------------------------------------
-
     #[test]
-    fn low_map_gate_activates_only_below_mapping_rate_threshold() {
-        let cfg = make_cfg(Sequencer::Illumina, None);
-        assert!(low_map_gate_active(&cfg, 0.0));
-        assert!(low_map_gate_active(&cfg, 0.29));
-        assert!(low_map_gate_active(&cfg, 0.2999999));
-        // Exactly at the 0.30 threshold is NOT active (strict `<`).
-        assert!(!low_map_gate_active(&cfg, 0.30));
-        assert!(!low_map_gate_active(&cfg, 0.50));
-        assert!(!low_map_gate_active(&cfg, 1.0));
-    }
-
-    #[test]
-    fn low_map_gate_disabled_when_host_is_set() {
-        // Any host string (e.g. human 9606) disables the low-map gate regardless
-        // of sequencer or mapping rate.
-        let cfg_host = make_cfg(Sequencer::Illumina, Some("9606"));
-        assert!(!low_map_gate_active(&cfg_host, 0.0));
-        assert!(!low_map_gate_active(&cfg_host, 0.1));
-    }
-
-    #[test]
-    fn low_map_gate_covers_long_reads_but_not_assembly() {
-        // Nanopore and PacBio honour the low-map auto-trigger too.
-        for seq in [Sequencer::Nanopore, Sequencer::PacBio] {
-            let cfg = make_cfg(seq, None);
-            assert!(
-                low_map_gate_active(&cfg, 0.0),
-                "expected the gate active for low-map {seq}"
-            );
-            assert!(
-                !low_map_gate_active(&cfg, 0.99),
-                "expected the gate inactive for high-map {seq}"
-            );
-        }
-    }
-
-    #[test]
-    fn low_map_gate_respects_custom_low_map_rate_threshold() {
-        // With the default 0.30 threshold, 0.40 is NOT low-map.
-        let mut cfg = make_cfg(Sequencer::Illumina, None);
-        assert!(!low_map_gate_active(&cfg, 0.40));
-        // Raise the threshold: now 0.40 IS low-map (strict `<`).
-        cfg.low_map_rate_threshold = 0.50;
-        assert!(low_map_gate_active(&cfg, 0.40));
-        assert!(low_map_gate_active(&cfg, 0.4999));
-        assert!(!low_map_gate_active(&cfg, 0.50));
-        // Lower the threshold: even 0.05 no longer triggers when = threshold.
-        cfg.low_map_rate_threshold = 0.05;
-        assert!(!low_map_gate_active(&cfg, 0.05));
-        assert!(low_map_gate_active(&cfg, 0.0499));
-    }
-
-    #[test]
-    fn resolve_by_aligned_honors_explicit_flag() {
-        // --by-mapped flag present: mapped basis is forced regardless of
-        // sequencer, host, or mapping rate.
-        let mut cfg = make_cfg(Sequencer::Illumina, None);
+    fn the_chunk_basis_is_mapped_reads_on_low_map_runs_or_when_asked() {
+        let (total, mapped) = (100_000usize, 10_000usize);
+        let basis = |cfg: &ProfilerConfig, rate, fractional| {
+            ChunkBasis::of(cfg, rate, (total, mapped), fractional)
+        };
+        let mut cfg = cfg(Sequencer::Illumina);
+        // Total reads at a high mapping rate.
+        assert_eq!(
+            basis(&cfg, 0.90, false),
+            ChunkBasis {
+                mapped: false,
+                scaled: false,
+                reads: total
+            }
+        );
+        // A low-map run on a full database: 1.5 times the mapped reads.
+        assert_eq!(
+            basis(&cfg, 0.10, false),
+            ChunkBasis {
+                mapped: true,
+                scaled: true,
+                reads: 15_000
+            }
+        );
+        // On a fractional database the mapped reads as they are.
+        assert_eq!(
+            basis(&cfg, 0.10, true),
+            ChunkBasis {
+                mapped: true,
+                scaled: false,
+                reads: mapped
+            }
+        );
+        // --by-mapped alone: the mapped reads as they are.
         cfg.by_aligned = true;
-        assert!(cfg.resolve_by_aligned(0.99));
-        cfg.sequencer = Sequencer::Nanopore;
-        assert!(cfg.resolve_by_aligned(0.99));
-        cfg.host = Some("9606".to_string());
-        assert!(cfg.resolve_by_aligned(0.99));
+        assert_eq!(
+            basis(&cfg, 0.90, false),
+            ChunkBasis {
+                mapped: true,
+                scaled: false,
+                reads: mapped
+            }
+        );
+        // A given --min-chunk-breadth is never scaled.
+        cfg.chunk_breadth = Some(0.25);
+        assert!(!basis(&cfg, 0.10, false).scaled);
+        // A host turns the low-map rule off.
+        let mut cfg = cfg_with_host();
+        cfg.chunk_breadth = None;
+        assert!(!basis(&cfg, 0.10, false).mapped);
     }
 
-    #[test]
-    fn resolve_by_aligned_auto_forces_for_low_map_read_platforms_non_pathogen() {
-        // Default cfg has --by-mapped unset (false); auto-rule applies.
-        let cfg = make_cfg(Sequencer::Illumina, None);
-        assert!(!cfg.by_aligned);
-        // Below default 0.30 threshold => aligned basis is auto-forced.
-        assert!(cfg.resolve_by_aligned(0.10));
-        // At or above threshold => total-read basis.
-        assert!(!cfg.resolve_by_aligned(0.30));
-        assert!(!cfg.resolve_by_aligned(0.50));
-        // Pathogen mode on disables auto-force.
-        let cfg_host = make_cfg(Sequencer::Illumina, Some("9606"));
-        assert!(!cfg_host.resolve_by_aligned(0.10));
-        // Long-read platforms also auto-force on low map.
-        let cfg_np = make_cfg(Sequencer::Nanopore, None);
-        assert!(cfg_np.resolve_by_aligned(0.10));
+    fn cfg_with_host() -> ProfilerConfig {
+        ProfilerConfig {
+            host: Some(crate::profiler::Host {
+                taxid: 9606,
+                pathogen_table: "pathogens.tsv".to_string(),
+            }),
+            ..cfg(Sequencer::Illumina)
+        }
     }
 
     #[test]
@@ -1891,80 +1620,14 @@ mod tests {
         assert_eq!(scale_low_map_chunk_basis(10, true), 15);
         assert_eq!(scale_low_map_chunk_basis(100, true), 150);
         assert_eq!(scale_low_map_chunk_basis(100_000, true), 150_000);
-        // Round-half-to-even-ish: 3 * 1.5 = 4.5 => rounds to 5.
+        // Half rounds away from zero: 3 * 1.5 = 4.5 => 5.
         assert_eq!(scale_low_map_chunk_basis(3, true), 5);
     }
 
     #[test]
-    fn low_map_chunk_basis_scale_constant_is_one_and_a_half() {
-        assert!((LOW_MAP_CHUNK_BASIS_SCALE - 1.5).abs() < 1e-12);
-    }
-
-    #[test]
-    fn chunk_breadth_plan_scales_only_low_map_aligned_basis() {
-        let total_reads = 100_000usize;
-        let aligned_reads = 10_000usize;
-
-        // --by-mapped alone: mapped basis, same equation, no 1.5x.
-        let mut cfg = make_cfg(Sequencer::Illumina, None);
-        cfg.chunk_breadth = None;
-        cfg.by_aligned = true;
-        let plan = plan_chunk_breadth(&cfg, 0.90, total_reads, aligned_reads, false, false);
-        assert!(plan.use_aligned_basis);
-        assert!(!plan.scaled);
-        assert_eq!(plan.basis_reads, aligned_reads);
-        assert_eq!(plan.estimate_reads, aligned_reads);
-
-        // Automatic low-map gate on a full DB: aligned basis with 1.5x.
-        let mut cfg = make_cfg(Sequencer::Illumina, None);
-        cfg.chunk_breadth = None;
-        let gate = low_map_gate_active(&cfg, 0.10);
-        let plan = plan_chunk_breadth(&cfg, 0.10, total_reads, aligned_reads, false, gate);
-        assert!(plan.use_aligned_basis);
-        assert!(plan.by_aligned_auto);
-        assert!(plan.scaled);
-        assert_eq!(plan.basis_reads, aligned_reads);
-        assert_eq!(plan.estimate_reads, 15_000);
-
-        // Without the low-map gate and --by-mapped: total basis, no scale.
-        let plan = plan_chunk_breadth(&cfg, 0.90, total_reads, aligned_reads, false, false);
-        assert!(!plan.use_aligned_basis);
-        assert!(!plan.scaled);
-        assert_eq!(plan.basis_reads, total_reads);
-        assert_eq!(plan.estimate_reads, total_reads);
-
-        // A low-map subsampled run takes the mapped basis without scaling.
-        let mut cfg = make_cfg(Sequencer::Illumina, None);
-        cfg.chunk_breadth = None;
-        let gate = low_map_gate_active(&cfg, 0.10);
-        let plan = plan_chunk_breadth(&cfg, 0.10, total_reads, aligned_reads, true, gate);
-        assert!(plan.use_aligned_basis);
-        assert!(!plan.scaled);
-        assert_eq!(plan.estimate_reads, aligned_reads);
-
-        // User-pinned --min-chunk-breadth is never rescaled.
-        cfg.chunk_breadth = Some(0.25);
-        let plan = plan_chunk_breadth(&cfg, 0.10, total_reads, aligned_reads, false, gate);
-        assert!(plan.use_aligned_basis);
-        assert!(!plan.scaled);
-        assert_eq!(plan.estimate_reads, aligned_reads);
-    }
-
-    #[test]
-    fn low_map_gate_active_for_illumina_single_and_paired() {
-        // Single-end
-        let mut cfg = make_cfg(Sequencer::Illumina, None);
-        cfg.is_paired = false;
-        assert!(low_map_gate_active(&cfg, 0.1));
-        // Paired-end
-        cfg.is_paired = true;
-        assert!(low_map_gate_active(&cfg, 0.1));
-    }
-
-    #[test]
-    fn community_chunk_breadth_curve_matches_spec() {
+    fn chunk_breadth_curve_matches_spec() {
         // Short (Illumina): 0.66*m/(m+1) + 0.24*m/(m+100), plateau 0.90.
-        let short = |n| community_chunk_breadth_cutoff(n, true);
+        let short = |n| chunk_breadth_curve(n, true);
         assert!((short(0) - 0.0).abs() < 1e-12);
         assert!((short(10_000) - 0.00656).abs() < 1e-4);
         assert!((short(100_000) - 0.06024).abs() < 1e-4);
@@ -1976,7 +1639,7 @@ mod tests {
         assert!(short_deep > 0.899 && short_deep < 0.95);
 
         // Long (Nanopore/PacBio): 0.85*m/(m+0.78), plateau 0.85.
-        let long = |n| community_chunk_breadth_cutoff(n, false);
+        let long = |n| chunk_breadth_curve(n, false);
         assert!((long(0) - 0.0).abs() < 1e-12);
         assert!((long(10_000) - 0.01076).abs() < 1e-4);
         assert!((long(100_000) - 0.09659).abs() < 1e-4);
@@ -1992,129 +1655,120 @@ mod tests {
             (100_000, 1_000_000),
             (1_000_000, 16_600_000),
         ] {
-            assert!(
-                community_chunk_breadth_cutoff(b, true) >= community_chunk_breadth_cutoff(a, true)
-            );
-            assert!(
-                community_chunk_breadth_cutoff(b, false)
-                    >= community_chunk_breadth_cutoff(a, false)
-            );
+            assert!(chunk_breadth_curve(b, true) >= chunk_breadth_curve(a, true));
+            assert!(chunk_breadth_curve(b, false) >= chunk_breadth_curve(a, false));
         }
     }
 
     #[test]
-    fn recall_scales_only_deep_automatic_community_chunk_cutoffs() {
-        let mut cfg = make_cfg(Sequencer::Illumina, None);
-        cfg.chunk_breadth = None;
+    fn recall_scales_only_deep_automatic_chunk_cutoffs() {
+        let mut cfg = cfg(Sequencer::Illumina);
         cfg.mode = ProfileMode::Recall;
 
-        let at_gate = resolve_community_chunk_breadth(&cfg, 1_000_000);
+        let at_gate = ChunkCutoff::resolve(&cfg, 1_000_000);
         approx_equal(at_gate.recall_scale, 1.0);
-        approx_equal(at_gate.standard, at_gate.safeguard);
-        assert_eq!(at_gate.standard.to_bits(), at_gate.safeguard.to_bits());
+        assert_eq!(at_gate.cutoff.to_bits(), at_gate.user_scaled.to_bits());
 
-        let two_million = resolve_community_chunk_breadth(&cfg, 2_000_000);
+        let two_million = ChunkCutoff::resolve(&cfg, 2_000_000);
         approx_equal(two_million.recall_scale, 0.85);
         approx_equal(
-            two_million.standard,
-            two_million.safeguard * two_million.recall_scale,
+            two_million.cutoff,
+            two_million.user_scaled * two_million.recall_scale,
         );
 
-        let five_million = resolve_community_chunk_breadth(&cfg, 5_000_000);
+        let five_million = ChunkCutoff::resolve(&cfg, 5_000_000);
         approx_equal(five_million.recall_scale, 0.76);
-        let deep = resolve_community_chunk_breadth(&cfg, 16_600_000);
+        let deep = ChunkCutoff::resolve(&cfg, 16_600_000);
         approx_equal(deep.recall_scale, 0.70 + 0.30 / 16.6);
         assert!(deep.recall_scale > SHORT_RECALL_CHUNK_SCALE_FLOOR);
 
         cfg.sequencer = Sequencer::Nanopore;
-        let long_at_gate = resolve_community_chunk_breadth(&cfg, 1_000_000);
+        let long_at_gate = ChunkCutoff::resolve(&cfg, 1_000_000);
         approx_equal(long_at_gate.recall_scale, 1.0);
-        let long_deep = resolve_community_chunk_breadth(&cfg, 1_000_001);
+        let long_deep = ChunkCutoff::resolve(&cfg, 1_000_001);
         approx_equal(long_deep.recall_scale, LONG_RECALL_CHUNK_SCALE);
         approx_equal(
-            long_deep.standard,
-            long_deep.safeguard * LONG_RECALL_CHUNK_SCALE,
+            long_deep.cutoff,
+            long_deep.user_scaled * LONG_RECALL_CHUNK_SCALE,
         );
 
         cfg.sequencer = Sequencer::PacBio;
         approx_equal(
-            resolve_community_chunk_breadth(&cfg, 5_000_000).recall_scale,
+            ChunkCutoff::resolve(&cfg, 5_000_000).recall_scale,
             LONG_RECALL_CHUNK_SCALE,
         );
     }
 
     #[test]
-    fn recall_chunk_scaling_respects_user_and_nonstandard_policy_boundaries() {
-        let mut cfg = make_cfg(Sequencer::Illumina, None);
+    fn a_given_cutoff_and_low_biomass_are_not_scaled() {
+        let mut cfg = cfg(Sequencer::Illumina);
         cfg.mode = ProfileMode::Recall;
         cfg.chunk_breadth = Some(0.37);
-        let explicit = resolve_community_chunk_breadth(&cfg, 20_000_000);
-        approx_equal(explicit.standard, 0.37);
-        approx_equal(explicit.safeguard, 0.37);
-        approx_equal(explicit.recall_scale, 1.0);
-        assert_eq!(explicit.standard.to_bits(), explicit.safeguard.to_bits());
+        let given = ChunkCutoff::resolve(&cfg, 20_000_000);
+        assert_eq!(given.source, ChunkSource::User);
+        assert_eq!(given.cutoff, 0.37);
+        approx_equal(given.recall_scale, 1.0);
 
         cfg.chunk_breadth = None;
         cfg.lowbiomass = true;
-        let low_biomass = resolve_community_chunk_breadth(&cfg, 20_000_000);
-        approx_equal(low_biomass.standard, 0.0);
-        approx_equal(low_biomass.safeguard, 0.0);
+        let low_biomass = ChunkCutoff::resolve(&cfg, 20_000_000);
+        assert_eq!(low_biomass.source, ChunkSource::LowBiomass);
+        assert_eq!(low_biomass.cutoff, 0.0);
         approx_equal(low_biomass.recall_scale, 1.0);
 
-        // A read minimum adds to the automatic cutoff and leaves it unchanged.
+        // A read minimum leaves the automatic cutoff unchanged.
         cfg.lowbiomass = false;
-        let without_min_reads = resolve_community_chunk_breadth(&cfg, 20_000_000);
+        let without_min_reads = ChunkCutoff::resolve(&cfg, 20_000_000);
+        assert_eq!(without_min_reads.source, ChunkSource::Automatic);
         cfg.min_reads = Some(3);
-        assert_eq!(
-            resolve_community_chunk_breadth(&cfg, 20_000_000),
-            without_min_reads
-        );
+        assert_eq!(ChunkCutoff::resolve(&cfg, 20_000_000), without_min_reads);
 
+        // Only recall mode scales.
         cfg.min_reads = None;
-        cfg.mode = ProfileMode::Default;
-        let default = resolve_community_chunk_breadth(&cfg, 20_000_000);
-        approx_equal(default.recall_scale, 1.0);
-        assert_eq!(default.standard.to_bits(), default.safeguard.to_bits());
-        cfg.mode = ProfileMode::Precision;
-        let precision = resolve_community_chunk_breadth(&cfg, 20_000_000);
-        approx_equal(precision.recall_scale, 1.0);
-        assert_eq!(precision.standard.to_bits(), precision.safeguard.to_bits());
+        for mode in [ProfileMode::Default, ProfileMode::Precision] {
+            cfg.mode = mode;
+            let cutoff = ChunkCutoff::resolve(&cfg, 20_000_000);
+            approx_equal(cutoff.recall_scale, 1.0);
+            assert_eq!(cutoff.cutoff.to_bits(), cutoff.curve.to_bits());
+        }
     }
 
     #[test]
-    fn user_chunk_scale_adjusts_automatic_standard_and_safeguard_cutoffs() {
-        let mut cfg = make_cfg(Sequencer::Illumina, None);
-        cfg.chunk_breadth = None;
-
-        let unchanged = resolve_community_chunk_breadth(&cfg, 5_000_000);
-        assert_eq!(unchanged.automatic.to_bits(), unchanged.safeguard.to_bits());
-        assert_eq!(unchanged.automatic.to_bits(), unchanged.standard.to_bits());
+    fn the_user_scale_adjusts_the_automatic_cutoff_up_to_one() {
+        let mut cfg = cfg(Sequencer::Illumina);
+        let unchanged = ChunkCutoff::resolve(&cfg, 5_000_000);
+        assert_eq!(unchanged.curve.to_bits(), unchanged.user_scaled.to_bits());
+        assert_eq!(unchanged.curve.to_bits(), unchanged.cutoff.to_bits());
 
         cfg.chunk_breadth_scale = 0.5;
-        let relaxed = resolve_community_chunk_breadth(&cfg, 5_000_000);
-        approx_equal(relaxed.safeguard, relaxed.automatic * 0.5);
-        assert_eq!(relaxed.standard.to_bits(), relaxed.safeguard.to_bits());
+        let relaxed = ChunkCutoff::resolve(&cfg, 5_000_000);
+        approx_equal(relaxed.user_scaled, relaxed.curve * 0.5);
+        assert_eq!(relaxed.cutoff.to_bits(), relaxed.user_scaled.to_bits());
 
         cfg.chunk_breadth_scale = 10.0;
-        let capped = resolve_community_chunk_breadth(&cfg, 5_000_000);
-        approx_equal(capped.safeguard, 1.0);
-        approx_equal(capped.standard, 1.0);
+        let capped = ChunkCutoff::resolve(&cfg, 5_000_000);
+        approx_equal(capped.user_scaled, 1.0);
+        approx_equal(capped.cutoff, 1.0);
     }
 
     #[test]
     fn recall_scaling_composes_after_user_chunk_scaling() {
-        let mut cfg = make_cfg(Sequencer::Illumina, None);
-        cfg.chunk_breadth = None;
+        let mut cfg = cfg(Sequencer::Illumina);
         cfg.chunk_breadth_scale = 0.5;
         cfg.mode = ProfileMode::Recall;
 
-        let thresholds = resolve_community_chunk_breadth(&cfg, 5_000_000);
-        approx_equal(thresholds.user_scale, 0.5);
-        approx_equal(thresholds.recall_scale, 0.76);
-        approx_equal(thresholds.safeguard, thresholds.automatic * 0.5);
-        approx_equal(
-            thresholds.standard,
-            thresholds.safeguard * thresholds.recall_scale,
+        let cutoff = ChunkCutoff::resolve(&cfg, 5_000_000);
+        approx_equal(cutoff.user_scale, 0.5);
+        approx_equal(cutoff.recall_scale, 0.76);
+        approx_equal(cutoff.user_scaled, cutoff.curve * 0.5);
+        approx_equal(cutoff.cutoff, cutoff.user_scaled * cutoff.recall_scale);
+        assert_eq!(
+            cutoff.source_in_words(&ChunkBasis {
+                mapped: false,
+                scaled: false,
+                reads: 5_000_000
+            }),
+            "recall-scaled auto-estimate from total reads"
         );
     }
 }

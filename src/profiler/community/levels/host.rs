@@ -28,10 +28,10 @@ enum Verdict {
     OtherHosts,
 }
 
-/// The host and the pathogen table (none: every taxon unlisted).
+/// The host and the pathogen table.
 pub(super) struct HostFilter<'a> {
     pub(super) host: u32,
-    pub(super) table: Option<&'a HashMap<u32, PathogenEntry>>,
+    pub(super) table: &'a HashMap<u32, PathogenEntry>,
     pub(super) taxonomy: &'a Taxonomy,
 }
 
@@ -52,7 +52,7 @@ fn items(field: &str) -> Option<Vec<&str>> {
 
 impl HostFilter<'_> {
     fn verdict(&self, taxid: u32) -> Verdict {
-        let Some(entry) = self.table.and_then(|table| table.get(&taxid)) else {
+        let Some(entry) = self.table.get(&taxid) else {
             return Verdict::Unlisted;
         };
         let hosts = items(&entry.host_taxids).map_or_else(Vec::new, |items| {
@@ -114,10 +114,10 @@ impl HostFilter<'_> {
                     listed => listed,
                 };
                 let kept = Self::keep(row, &verdict);
-                if let (false, Some(best_fit)) = (kept, &row.best_fit) {
+                if !kept {
                     dropped
                         .genomes
-                        .insert(Arc::clone(&best_fit.genome), removal);
+                        .insert(Arc::clone(&row.best_fit.genome), removal);
                 }
                 kept
             });
@@ -191,7 +191,7 @@ mod tests {
             (10.0, 1.0),
             &EvidenceCoverage::default(),
             Arc::from(format!("GCF_{genome}")),
-            Some((f64::NAN, f64::NAN)),
+            (f64::NAN, f64::NAN),
         )
     }
 
@@ -211,7 +211,7 @@ mod tests {
         let taxonomy = taxonomy();
         let filter = |host| HostFilter {
             host,
-            table: Some(&table),
+            table: &table,
             taxonomy: &taxonomy,
         };
         let pathogen = filter(9606).verdict(1);
@@ -228,13 +228,6 @@ mod tests {
         assert_eq!(filter(9606).verdict(2), Verdict::OtherHosts);
         assert_eq!(filter(10090).verdict(1), Verdict::OtherHosts);
         assert_eq!(filter(9606).verdict(3), Verdict::Unlisted);
-        // Without a table every taxon is unlisted.
-        let no_table = HostFilter {
-            host: 9606,
-            table: None,
-            taxonomy: &taxonomy,
-        };
-        assert_eq!(no_table.verdict(2), Verdict::Unlisted);
     }
 
     #[test]
@@ -260,7 +253,7 @@ mod tests {
         let mut dropped = Dropped::default();
         HostFilter {
             host: 9606,
-            table: Some(&table),
+            table: &table,
             taxonomy: &taxonomy,
         }
         .apply(&mut blocks, &mut dropped);
@@ -312,7 +305,7 @@ mod tests {
         ];
         HostFilter {
             host: 9606,
-            table: Some(&table),
+            table: &table,
             taxonomy: &taxonomy,
         }
         .apply(&mut blocks, &mut Dropped::default());

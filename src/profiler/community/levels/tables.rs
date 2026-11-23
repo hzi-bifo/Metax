@@ -86,39 +86,14 @@ use super::higher::{
 };
 use super::{
     strain_label, wins_enough, within, Dropped, FragmentCounts, GenomeEvidence, SpeciesTests,
-    TaxonBlock, MIN_WON_SHARE,
+    TaxonBlock, MAX_BREADTH_RATIO, MIN_WON_SHARE,
 };
 use crate::db::DatabaseMetadata;
-use crate::profiler::evidence::{EvidenceCoverage, STANDARD_RATIO_UPPER};
+use crate::profiler::evidence::EvidenceCoverage;
 use crate::profiler::output::format_five;
 use crate::profiler::{ProfileRank, ProfilerConfig};
 use crate::sequencer::Sequencer;
 use crate::taxonomy::Taxonomy;
-
-/// Columns that `--host` appends to every row of the profile.
-pub(super) const HOST_COLUMNS: [&str; 3] = ["host_names", "host_taxids", "diseases"];
-
-/// Columns of the profile. Every row has all of them, the
-/// unclassified row included.
-pub(super) const PROFILE_COLUMNS: [&str; 17] = [
-    "name",
-    "taxid",
-    "rank",
-    "reads",
-    "depth",
-    "abundance",
-    "breadth",
-    "expected_breadth",
-    "breadth_pvalue",
-    "fixed_chunk_breadth",
-    "flex_chunk_breadth",
-    "expected_flex_chunk_breadth",
-    "chunk_pvalue",
-    "evidence_depth",
-    "best_fit_genome",
-    "mean_identity",
-    "estimated_ani",
-];
 
 /// Columns of the decisions table (see the module documentation).
 const DECISION_COLUMNS: [&str; 31] = [
@@ -167,7 +142,7 @@ pub(super) struct TableHeader {
 }
 
 impl TableHeader {
-    pub(super) fn of(cfg: &ProfilerConfig, host: Option<u32>) -> Self {
+    pub(super) fn of(cfg: &ProfilerConfig) -> Self {
         Self {
             fingerprint: cfg
                 .db_metadata
@@ -175,7 +150,7 @@ impl TableHeader {
                 .map(DatabaseMetadata::fingerprint),
             sequencer: cfg.sequencer,
             paired: cfg.is_paired,
-            host,
+            host: cfg.host.as_ref().map(|host| host.taxid),
         }
     }
 
@@ -260,11 +235,9 @@ impl FinalRows {
                 total[1] += row.abundance;
             }
             for row in &block.genomes {
-                if let Some(best_fit) = &row.best_fit {
-                    finals
-                        .strains
-                        .insert(Arc::clone(&best_fit.genome), amount(row));
-                }
+                finals
+                    .strains
+                    .insert(Arc::clone(&row.best_fit.genome), amount(row));
             }
             finals.species.insert(block.taxid, total);
         }
@@ -557,8 +530,8 @@ fn coverage_failures(tests: &SpeciesTests, coverage: &EvidenceCoverage) -> Vec<S
         ("COEBR", coverage.coebr, tests.ratio_bounds.1),
     ] {
         if !within(ratio, lower) {
-            failed.push(if ratio > STANDARD_RATIO_UPPER {
-                format!("evenness: {name} {ratio:.4} > {STANDARD_RATIO_UPPER}")
+            failed.push(if ratio > MAX_BREADTH_RATIO {
+                format!("evenness: {name} {ratio:.4} > {MAX_BREADTH_RATIO}")
             } else {
                 format!("evenness: {name} {ratio:.4} < {lower}")
             });
@@ -1156,7 +1129,7 @@ mod tests {
     use super::super::profile_row;
     use super::*;
     use crate::profiler::evidence::PresenceAssembly;
-    use crate::profiler::output::ProfileRow;
+    use crate::profiler::output::{ProfileRow, HOST_COLUMNS, PROFILE_COLUMNS};
     use crate::profiler::unclassified;
 
     fn header() -> TableHeader {
@@ -1204,7 +1177,7 @@ mod tests {
             (reads, 1.0),
             &EvidenceCoverage::default(),
             Arc::from(format!("GCF_{genome}")),
-            Some((f64::NAN, f64::NAN)),
+            (f64::NAN, f64::NAN),
         );
         row.abundance = abundance;
         row
@@ -1970,7 +1943,7 @@ mod tests {
             assert_eq!(found[0]["final_reads"], five(total));
             matched += 1;
             for row in &block.genomes {
-                let genome = &row.best_fit.as_ref().unwrap().genome;
+                let genome = &row.best_fit.genome;
                 let found = rows
                     .iter()
                     .filter(|r| {
@@ -2070,7 +2043,7 @@ mod tests {
         let taxonomy = taxonomy();
         super::super::host::HostFilter {
             host: 9606,
-            table: Some(&table),
+            table: &table,
             taxonomy: &taxonomy,
         }
         .apply(&mut fixture.blocks, &mut fixture.dropped);

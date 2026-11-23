@@ -692,11 +692,8 @@ pub struct ProfilerConfig {
     /// is strict. Default 0.30.
     pub low_map_rate_threshold: f64,
 
-    /// Path to pathogen-host mapping TSV (optional)
-    pub pathogen_host: Option<String>,
-
-    /// Host taxonomy ID for pathogen filtering (optional)
-    pub host: Option<String>,
+    /// `--host` with its pathogen table.
+    pub host: Option<Host>,
 
     /// Number of threads for parallel processing
     pub threads: usize,
@@ -727,6 +724,14 @@ pub struct ProfilerConfig {
     /// Skip references whose taxids the taxonomy dump cannot resolve instead
     /// of failing (--skip-missing-taxa).
     pub ignore_unresolved_references: bool,
+}
+
+/// `--host`: the host's NCBI taxid, and the pathogen table
+/// (`--pathogen-table`) that says which taxa are its pathogens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Host {
+    pub taxid: u32,
+    pub pathogen_table: String,
 }
 
 /// Combine the mapped-length and mapped-fraction coverage checks per the
@@ -774,18 +779,6 @@ impl ProfilerConfig {
         }
     }
 
-    /// Resolve the effective mapped-vs-total basis for chunk-breadth
-    /// estimation.
-    ///
-    /// - If the user passed `--by-mapped`, always use mapped basis.
-    /// - Otherwise auto-force mapped basis for low-map read-platform
-    ///   (Illumina/Nanopore/PacBio) non-pathogen runs (see
-    ///   [`Self::is_low_map_run`]).
-    /// - Fall back to total-read basis in all other cases.
-    pub fn resolve_by_aligned(&self, mapping_rate: f64) -> bool {
-        self.by_aligned || self.is_low_map_run(mapping_rate)
-    }
-
     /// Whether `classify.txt.gz` is written: when requested, for any database
     /// except a fractional one, whose scaled counts do not match single reads.
     /// Warns when the database has marker-gene references, because the file
@@ -816,6 +809,56 @@ impl ProfilerConfig {
             );
         }
         true
+    }
+}
+
+/// A configuration for unit tests: Illumina single-end reads in the default
+/// mode, nothing optional; tests set the fields they need.
+#[cfg(test)]
+impl ProfilerConfig {
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            genome_level: false,
+            mapper_mappings: None,
+            mapping_profile_memory: None,
+            db_metadata: None,
+            sequencer: Sequencer::Illumina,
+            max_em_iterations: 200,
+            lenient_mapping_input: false,
+            is_paired: false,
+            identity: 0.95,
+            identity_check_accuracy: None,
+            noisy_long_reads: false,
+            mapped_len: 50,
+            breadth: None,
+            chunk_breadth: None,
+            chunk_breadth_scale: 1.0,
+            min_reads: None,
+            min_oebr: None,
+            min_coebr: None,
+            min_marker_genes: 3,
+            relative_identity_gap: None,
+            removed_to_genus: false,
+            estimate_unclassified: false,
+            identity_margin: None,
+            fraction: 0.6,
+            lowbiomass: false,
+            save_decisions: false,
+            save_classifications: false,
+            by_aligned: false,
+            family_identity: 0.80,
+            low_map_rate_threshold: 0.30,
+            host: None,
+            threads: 1,
+            verbose: false,
+            very_verbose: false,
+            progress: ProgressOptions::default(),
+            suppress_mapping_load_progress: false,
+            outprefix: "test".to_string(),
+            mode: ProfileMode::Default,
+            dmp_dir: None,
+            ignore_unresolved_references: false,
+        }
     }
 }
 
@@ -928,8 +971,8 @@ pub(crate) fn log_resolved_profiler_parameters(
         resolved.total_reads,
         resolved.mapped_reads,
         resolved.mapping_rate,
-        display_option(cfg.pathogen_host.as_deref()),
-        display_option(cfg.host.as_deref()),
+        display_option(cfg.host.as_ref().map(|host| &host.pathogen_table)),
+        display_option(cfg.host.as_ref().map(|host| host.taxid)),
         display_option(cfg.dmp_dir.as_deref()),
         cfg.outprefix,
     );
@@ -1235,56 +1278,9 @@ mod chunk_basis_tests {
     use std::sync::Arc;
 
     use crate::db::{DatabaseMetadata, ReferenceMetadata, ReferenceType};
-    use crate::progress::ProgressOptions;
     use crate::sequencer::Sequencer;
 
-    use super::{scale_automatic_chunk_breadth, ProfileMode, ProfilerConfig};
-
-    fn minimal_cfg() -> ProfilerConfig {
-        ProfilerConfig {
-            genome_level: false,
-            mapper_mappings: None,
-            mapping_profile_memory: None,
-            db_metadata: None,
-            sequencer: Sequencer::Illumina,
-            max_em_iterations: 200,
-            lenient_mapping_input: false,
-            is_paired: false,
-            identity: 0.97,
-            noisy_long_reads: false,
-            identity_check_accuracy: None,
-            mapped_len: 50,
-            breadth: None,
-            chunk_breadth: None,
-            chunk_breadth_scale: 1.0,
-            min_reads: None,
-            min_oebr: None,
-            min_coebr: None,
-            min_marker_genes: 3,
-            relative_identity_gap: None,
-            removed_to_genus: false,
-            estimate_unclassified: false,
-            identity_margin: None,
-            fraction: 0.7,
-            lowbiomass: false,
-            save_decisions: false,
-            save_classifications: false,
-            by_aligned: false,
-            family_identity: 0.80,
-            low_map_rate_threshold: 0.30,
-            pathogen_host: None,
-            host: None,
-            threads: 1,
-            verbose: false,
-            very_verbose: false,
-            progress: ProgressOptions::default(),
-            suppress_mapping_load_progress: false,
-            outprefix: "t".to_string(),
-            mode: ProfileMode::Default,
-            dmp_dir: None,
-            ignore_unresolved_references: false,
-        }
-    }
+    use super::{scale_automatic_chunk_breadth, Host, ProfilerConfig};
 
     #[test]
     fn automatic_chunk_scale_preserves_default_and_caps_at_one() {
@@ -1298,30 +1294,31 @@ mod chunk_basis_tests {
     }
 
     #[test]
-    fn mapped_reads_are_the_chunk_basis_on_low_map_runs_or_when_asked() {
-        let mut cfg = minimal_cfg();
-        assert!(!cfg.resolve_by_aligned(0.99));
-        assert!(cfg.resolve_by_aligned(0.10));
-        cfg.by_aligned = true;
-        assert!(cfg.resolve_by_aligned(0.99));
-    }
-
-    #[test]
-    fn low_map_run_covers_read_platforms_but_not_assembly() {
-        let mut cfg = minimal_cfg();
-        // Every read platform honours the low-map auto-trigger, so the
-        // mapped-read basis reaches long reads without an explicit flag.
-        for seq in [Sequencer::Illumina, Sequencer::Nanopore, Sequencer::PacBio] {
-            cfg.sequencer = seq;
-            assert!(cfg.is_low_map_run(0.10), "{seq}: low rate must be low-map");
-            assert!(!cfg.is_low_map_run(0.99), "{seq}: high rate is not low-map");
-            // Low-map runs flip the chunk-breadth basis to aligned reads.
-            assert!(cfg.resolve_by_aligned(0.10), "{seq}");
+    fn a_low_map_run_maps_below_the_threshold_without_a_host() {
+        let mut cfg = ProfilerConfig::for_tests();
+        // Strictly below the threshold, on every read platform, single-end or
+        // paired.
+        for sequencer in [Sequencer::Illumina, Sequencer::Nanopore, Sequencer::PacBio] {
+            for paired in [false, true] {
+                cfg.sequencer = sequencer;
+                cfg.is_paired = paired;
+                assert!(cfg.is_low_map_run(0.0), "{sequencer}");
+                assert!(cfg.is_low_map_run(0.2999999), "{sequencer}");
+                assert!(!cfg.is_low_map_run(0.30), "{sequencer}");
+                assert!(!cfg.is_low_map_run(0.99), "{sequencer}");
+            }
         }
-        // Pathogen-detection mode (host set) suppresses it on any platform.
-        cfg.sequencer = Sequencer::Nanopore;
-        cfg.host = Some("human".to_string());
-        assert!(!cfg.is_low_map_run(0.10));
+        assert!(!cfg.is_low_map_run(f64::NAN));
+        // Another threshold.
+        cfg.low_map_rate_threshold = 0.50;
+        assert!(cfg.is_low_map_run(0.4999));
+        assert!(!cfg.is_low_map_run(0.50));
+        // A host switches it off.
+        cfg.host = Some(Host {
+            taxid: 9606,
+            pathogen_table: "pathogens.tsv".to_string(),
+        });
+        assert!(!cfg.is_low_map_run(0.0));
     }
 
     #[test]
@@ -1344,7 +1341,7 @@ mod chunk_basis_tests {
                 is_fractional,
             }))
         };
-        let mut cfg = minimal_cfg();
+        let mut cfg = ProfilerConfig::for_tests();
         cfg.db_metadata = database(&[ReferenceType::Genome], false);
         assert!(!cfg.writes_classifications(false));
 

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use metam::format::canonical_mapping_identity;
 
 use super::statistics::{calc_breadth_pvalue, Tail, NEUTRAL_RATIO};
-use super::{ProfileRank, ProfilerConfig};
+use super::ProfilerConfig;
 
 const SCORE_EPSILON: f64 = 1e-9;
 const FRACTION_F32_EPSILON: f64 = f32::EPSILON as f64;
@@ -30,8 +30,6 @@ pub(crate) enum MappingRole {
 #[derive(Clone, Debug)]
 pub(crate) struct EvidenceAlignment {
     pub(crate) profile_taxid: u32,
-    /// Most-specific rank supported by this reference's taxonomy metadata.
-    pub(crate) profile_rank: ProfileRank,
     pub(crate) reference_id: u32,
     pub(crate) assembly_id: u32,
     pub(crate) role: MappingRole,
@@ -72,8 +70,6 @@ pub(crate) enum EvidenceMode {
     Long,
 }
 
-impl EvidenceMode {}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EvidencePolicy {
     pub(crate) mode: EvidenceMode,
@@ -105,7 +101,6 @@ impl EvidencePolicy {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CandidatePlacement {
     pub(crate) taxid: u32,
-    pub(crate) profile_rank: ProfileRank,
     pub(crate) reference_id: u32,
     pub(crate) assembly_id: u32,
     pub(crate) sampling_scale: f64,
@@ -133,7 +128,6 @@ pub(crate) struct CandidatePlacement {
 #[derive(Clone, Debug)]
 pub(crate) struct TerminalCandidate {
     pub(crate) taxid: u32,
-    pub(crate) profile_rank: ProfileRank,
     pub(crate) best: CandidatePlacement,
     /// One independently evaluated placement per represented assembly.
     pub(crate) placements: Vec<CandidatePlacement>,
@@ -196,22 +190,6 @@ pub(crate) struct EvidenceCoverage {
     /// the even-coverage test and when there are enough reads.
     pub(crate) window_spread: Option<f64>,
 }
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct WitnessDecision {
-    pub(crate) metrics: EvidenceCoverage,
-    pub(crate) standard: bool,
-}
-
-impl WitnessDecision {
-    #[inline]
-    pub(crate) fn accepted(self) -> bool {
-        self.standard
-    }
-}
-
-/// Upper bound of both breadth ratios (OEBR and COEBR).
-pub(crate) const STANDARD_RATIO_UPPER: f64 = 1.50;
 
 /// Reduce one assembly in-place. Reusing the same interval vector for the
 /// three sorts avoids three full-size temporary vectors and keeps peak memory
@@ -382,33 +360,15 @@ pub(crate) fn adjusted_deviation_pvalue(
         .map(|value| (value * tests).min(1.0))
 }
 
-/// Prefer a passing coherent assembly over a failing one, then the largest
-/// fixed-chunk breadth.
-pub(crate) fn witness_is_better(left: WitnessDecision, right: WitnessDecision) -> bool {
-    if left.standard != right.standard {
-        return left.standard;
-    }
-    if left.metrics.fixed_chunk != right.metrics.fixed_chunk {
-        return left.metrics.fixed_chunk > right.metrics.fixed_chunk;
-    }
-    if left.metrics.breadth != right.metrics.breadth {
-        return left.metrics.breadth > right.metrics.breadth;
-    }
-    if left.metrics.depth != right.metrics.depth {
-        return left.metrics.depth > right.metrics.depth;
-    }
-    left.metrics.count > right.metrics.count
-}
-
 /// Reusable per-worker candidate storage. Hash-table capacities survive from
 /// one fragment to the next, avoiding allocator traffic in the hot loop.
 #[derive(Default)]
 pub(crate) struct CandidateScratch {
-    by_taxon_assembly: HashMap<(u32, ProfileRank, u32), CandidatePlacement>,
+    by_taxon_assembly: HashMap<(u32, u32), CandidatePlacement>,
     /// Best long-read placement per taxon, assembly and marker gene.
-    by_taxon_gene: HashMap<(u32, ProfileRank, u32, u32), CandidatePlacement>,
-    other_gene_hits: Vec<((u32, ProfileRank, u32), PresenceInterval)>,
-    by_taxon: HashMap<(u32, ProfileRank), TerminalCandidate>,
+    by_taxon_gene: HashMap<(u32, u32, u32), CandidatePlacement>,
+    other_gene_hits: Vec<((u32, u32), PresenceInterval)>,
+    by_taxon: HashMap<u32, TerminalCandidate>,
     paired_rows: HashMap<u32, ExplicitPairRows>,
     pair_order: Vec<u32>,
     half_pair_mates: Vec<usize>,
@@ -444,14 +404,10 @@ impl CandidateScratch {
         }
 
         for (_, placement) in self.by_taxon_assembly.drain() {
-            match self
-                .by_taxon
-                .entry((placement.taxid, placement.profile_rank))
-            {
+            match self.by_taxon.entry(placement.taxid) {
                 Entry::Vacant(entry) => {
                     entry.insert(TerminalCandidate {
                         taxid: placement.taxid,
-                        profile_rank: placement.profile_rank,
                         best: placement,
                         placements: vec![placement],
                         other_gene_hits: Vec::new(),
@@ -466,8 +422,8 @@ impl CandidateScratch {
                 }
             }
         }
-        for ((taxid, profile_rank, assembly_id), interval) in self.other_gene_hits.drain(..) {
-            if let Some(taxon) = self.by_taxon.get_mut(&(taxid, profile_rank)) {
+        for ((taxid, assembly_id), interval) in self.other_gene_hits.drain(..) {
+            if let Some(taxon) = self.by_taxon.get_mut(&taxid) {
                 taxon.other_gene_hits.push(GeneHit {
                     assembly_id,
                     interval,
@@ -526,7 +482,6 @@ impl CandidateScratch {
             let r2 = &rows[r2_index];
             if r1.reference_id != r2.reference_id
                 || r1.profile_taxid != r2.profile_taxid
-                || r1.profile_rank != r2.profile_rank
                 || r1.assembly_id != r2.assembly_id
             {
                 continue;
@@ -547,7 +502,6 @@ impl CandidateScratch {
             }
             let placement = CandidatePlacement {
                 taxid: r1.profile_taxid,
-                profile_rank: r1.profile_rank,
                 reference_id: r1.reference_id,
                 assembly_id: r1.assembly_id,
                 sampling_scale: f64::from(r1.sampling_scale),
@@ -597,7 +551,6 @@ impl CandidateScratch {
             }
             let placement = CandidatePlacement {
                 taxid: mapping.profile_taxid,
-                profile_rank: mapping.profile_rank,
                 reference_id: mapping.reference_id,
                 assembly_id: mapping.assembly_id,
                 sampling_scale: f64::from(mapping.sampling_scale),
@@ -626,7 +579,6 @@ impl CandidateScratch {
             }
             let placement = CandidatePlacement {
                 taxid: mapping.profile_taxid,
-                profile_rank: mapping.profile_rank,
                 reference_id: mapping.reference_id,
                 assembly_id: mapping.assembly_id,
                 sampling_scale: f64::from(mapping.sampling_scale),
@@ -659,7 +611,6 @@ impl CandidateScratch {
         if mapping.marker_gene_len > 0 {
             let gene = (
                 placement.taxid,
-                placement.profile_rank,
                 placement.assembly_id,
                 placement.reference_id,
             );
@@ -682,8 +633,8 @@ impl CandidateScratch {
     /// genes. Its placement keeps the best gene and counts the others, whose
     /// coverage the fragment adds as well.
     fn count_other_genes(&mut self) {
-        for ((taxid, profile_rank, assembly_id, reference_id), gene) in self.by_taxon_gene.drain() {
-            let key = (taxid, profile_rank, assembly_id);
+        for ((taxid, assembly_id, reference_id), gene) in self.by_taxon_gene.drain() {
+            let key = (taxid, assembly_id);
             let placement = self
                 .by_taxon_assembly
                 .get_mut(&key)
@@ -707,12 +658,10 @@ impl CandidateScratch {
     }
 
     fn insert_placement(&mut self, placement: CandidatePlacement, mode: EvidenceMode) {
-        let key = (
-            placement.taxid,
-            placement.profile_rank,
-            placement.assembly_id,
-        );
-        match self.by_taxon_assembly.entry(key) {
+        match self
+            .by_taxon_assembly
+            .entry((placement.taxid, placement.assembly_id))
+        {
             Entry::Vacant(entry) => {
                 entry.insert(placement);
             }
@@ -843,16 +792,14 @@ fn candidate_order(
             .pair_errors
             .partial_cmp(&right.best.pair_errors)
             .unwrap_or(Ordering::Equal)
-            .then_with(|| left.taxid.cmp(&right.taxid))
-            .then_with(|| left.profile_rank.cmp(&right.profile_rank)),
+            .then_with(|| left.taxid.cmp(&right.taxid)),
         EvidenceMode::Long => right
             .best
             .long_score
             .partial_cmp(&left.best.long_score)
             .unwrap_or(Ordering::Equal)
             .then_with(|| left.best.input_order.cmp(&right.best.input_order))
-            .then_with(|| left.taxid.cmp(&right.taxid))
-            .then_with(|| left.profile_rank.cmp(&right.profile_rank)),
+            .then_with(|| left.taxid.cmp(&right.taxid)),
     }
 }
 
@@ -869,32 +816,8 @@ mod tests {
         read_len: u32,
         role: MappingRole,
     ) -> EvidenceAlignment {
-        mapping_at_rank(
-            species,
-            ProfileRank::Species,
-            reference,
-            assembly,
-            identity,
-            mapped,
-            read_len,
-            role,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn mapping_at_rank(
-        species: u32,
-        profile_rank: ProfileRank,
-        reference: u32,
-        assembly: u32,
-        identity: f32,
-        mapped: u32,
-        read_len: u32,
-        role: MappingRole,
-    ) -> EvidenceAlignment {
         EvidenceAlignment {
             profile_taxid: species,
-            profile_rank,
             reference_id: reference,
             assembly_id: assembly,
             role,
@@ -922,24 +845,6 @@ mod tests {
             identity: 0.97,
             mapped_len: 50,
             fraction: 0.70,
-        }
-    }
-
-    fn metrics(oebr: f64, coebr: f64, fixed_chunk: f64) -> EvidenceCoverage {
-        EvidenceCoverage {
-            count: 100,
-            depth: 0.1,
-            breadth: 0.1,
-            expected_breadth: 0.1,
-            fixed_chunk,
-            flex_chunk: 0.1,
-            expected_flex_chunk: 0.1,
-            oebr,
-            coebr,
-            breadth_pvalue: Some(1.0),
-            chunk_pvalue: Some(1.0),
-            marker_genes_hit: None,
-            window_spread: None,
         }
     }
 
@@ -1340,19 +1245,5 @@ mod tests {
         assert!((coverage.fixed_chunk - 0.40).abs() < 1e-12);
         assert!((coverage.flex_chunk - 0.50).abs() < 1e-12);
         assert!((coverage.depth - 0.25).abs() < 1e-12);
-    }
-
-    #[test]
-    fn standard_witness_is_preferred_before_fixed_chunk_size() {
-        let standard = WitnessDecision {
-            metrics: metrics(1.0, 1.0, 0.61),
-            standard: true,
-        };
-        let larger_rejected = WitnessDecision {
-            metrics: metrics(0.1, 1.0, 0.90),
-            standard: false,
-        };
-        assert!(witness_is_better(standard, larger_rejected));
-        assert!(!witness_is_better(larger_rejected, standard));
     }
 }

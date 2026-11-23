@@ -15,7 +15,7 @@ use mapper::{
     existing_mapping_output, is_mapping_consumer_closed, Mapper, MappingOutput, MappingProgressLog,
     StreamingStructuredMappingOutput,
 };
-use profiler::{Profiler, ProfilerConfig};
+use profiler::{Host, Profiler, ProfilerConfig};
 use taxonomy::{Taxonomy, TaxonomyRecord};
 
 use crate::db::{
@@ -60,6 +60,8 @@ struct ResolvedProfilerThresholds {
 }
 
 impl ResolvedProfilerThresholds {
+    /// The settings a mapping file records; `strain` (`strain=`): the mapper
+    /// keeps the best mapping of every genome, for the genome level.
     fn mapping_metadata(self, strain: bool) -> MappingProfilerMetadata {
         MappingProfilerMetadata {
             strain,
@@ -136,8 +138,8 @@ pub struct AppConfig {
     pub stream_mappings: bool,
     /// Explicit directory for temporary staged mappings.
     pub temp_dir: Option<String>,
-    pub pathogen_host: Option<String>,
-    pub host: Option<String>,
+    /// `--host` with its pathogen table (`--pathogen-table`).
+    pub host: Option<Host>,
     pub verbose: bool,
     pub very_verbose: bool,
     pub progress: bool,
@@ -212,13 +214,6 @@ fn identity_below_accuracy(accuracy: f64, mode: ProfileMode) -> f64 {
 }
 
 impl AppConfig {
-    /// Whether the mapper keeps strain-level candidates, the best mapping of
-    /// every genome: for the genome level. Mapping files record it as
-    /// `strain=`.
-    fn strain_level_mapping(&self) -> bool {
-        self.genome_level
-    }
-
     /// Whether this run takes the read-level gates recorded in a reused
     /// mapping file: one made in the same mode, and, without the genome level,
     /// one made without strain-level candidates.
@@ -301,7 +296,7 @@ impl MetaxApp {
         let mapping_metadata = self.mapping_metadata_for_thresholds()?;
         let thresholds = self.resolve_thresholds(mapping_metadata.as_ref());
         let prepared_mapping =
-            self.prepare_mapping(thresholds.mapping_metadata(self.config.strain_level_mapping()))?;
+            self.prepare_mapping(thresholds.mapping_metadata(self.config.genome_level))?;
         if self.config.sequencer.is_illumina() {
             log::info!(
                 target: "MAIN",
@@ -709,8 +704,8 @@ impl MetaxApp {
             fmt_option(&self.config.relative_identity_gap),
             fmt_option(&self.config.identity_margin),
             fmt_option(&self.config.fraction),
-            fmt_option(&self.config.pathogen_host),
-            fmt_option(&self.config.host),
+            fmt_option(&self.config.host.as_ref().map(|host| &host.pathogen_table)),
+            fmt_option(&self.config.host.as_ref().map(|host| host.taxid)),
             bool_params,
             extra_args
         )
@@ -992,7 +987,6 @@ impl MetaxApp {
             by_aligned: self.config.by_aligned,
             family_identity: self.config.family_identity,
             low_map_rate_threshold: self.config.low_map_rate_threshold,
-            pathogen_host: self.config.pathogen_host.clone(),
             host: self.config.host.clone(),
             threads: self.config.threads,
             verbose: self.config.verbose,
@@ -1149,7 +1143,6 @@ mod tests {
             keep_mapping_output: false,
             stream_mappings: false,
             temp_dir: None,
-            pathogen_host: None,
             host: None,
             verbose: false,
             very_verbose: false,
@@ -1371,12 +1364,10 @@ mod tests {
         let mut strain_level = species_level.clone();
         strain_level.profiler.strain = true;
         // Without the genome level: species-level mappings, and only their gates.
-        assert!(!cfg.strain_level_mapping());
         assert!(cfg.takes_recorded_gates(&species_level));
         assert!(!cfg.takes_recorded_gates(&strain_level));
         // The genome level records strain-level mappings and takes the gates of both kinds.
         cfg.genome_level = true;
-        assert!(cfg.strain_level_mapping());
         assert!(cfg.takes_recorded_gates(&species_level));
         assert!(cfg.takes_recorded_gates(&strain_level));
         let resolved = MetaxApp {

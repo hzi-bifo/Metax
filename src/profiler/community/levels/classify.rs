@@ -80,10 +80,9 @@ impl<'r> ProfileTaxa<'r> {
                 .get(&block.taxid)
                 .map_or(&[][..], |g| &g.strains);
             for row in &block.genomes {
-                let genome = row.best_fit.as_ref().map(|b| &*b.genome);
                 if let Some(strain) = strains
                     .iter()
-                    .find(|s| Some(&*assembly_names[s.assembly_id as usize]) == genome)
+                    .find(|s| assembly_names[s.assembly_id as usize] == row.best_fit.genome)
                 {
                     taxa.strain_rows.insert(strain.assembly_id, row.taxid);
                 }
@@ -263,7 +262,7 @@ mod tests {
             (1.0, 1.0),
             &EvidenceCoverage::default(),
             Arc::from(format!("GCF_{genome}")),
-            Some((f64::NAN, f64::NAN)),
+            (f64::NAN, f64::NAN),
         )
     }
 

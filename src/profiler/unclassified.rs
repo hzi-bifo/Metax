@@ -17,7 +17,7 @@ use std::io::Write;
 use csv::Writer;
 
 use super::markers::MarkerModel;
-use super::output::ProfileRow;
+use super::output::{ProfileRow, PROFILE_COLUMNS};
 use crate::db::ReferenceType;
 
 /// Whole-genome fragments per fragment on marker genes, by species; `None` for
@@ -203,7 +203,7 @@ pub(crate) fn write_row<W: Write>(
     fields.push(fragments);
     fields.push("NA".to_string());
     fields.push(share);
-    fields.extend(std::iter::repeat_n("NA".to_string(), 11));
+    fields.resize(PROFILE_COLUMNS.len(), "NA".to_string());
     writer.write_record(fields)
 }
 
@@ -211,6 +211,8 @@ pub(crate) fn write_row<W: Write>(
 mod tests {
     use super::*;
     use crate::profiler::markers::{FragmentGeometry, FragmentLayout};
+    use crate::profiler::output::BestFitReport;
+    use std::sync::Arc;
 
     fn row(taxid: u32, fragments: f64) -> ProfileRow {
         ProfileRow {
@@ -227,7 +229,11 @@ mod tests {
             flex_chunk: 0.0,
             expected_flex_chunk: 0.0,
             chunk_pvalue: None,
-            best_fit: None,
+            best_fit: BestFitReport {
+                genome: Arc::from("GCF_1"),
+                evidence_depth: 0.0,
+                identity: (f64::NAN, f64::NAN),
+            },
             annotations: None,
         }
     }

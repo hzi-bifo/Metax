@@ -15,6 +15,31 @@ pub(crate) struct ProfileAnnotations {
     pub(crate) diseases: String,
 }
 
+/// Columns of the profile. Every row has all of them, the unclassified row
+/// included.
+pub(crate) const PROFILE_COLUMNS: [&str; 17] = [
+    "name",
+    "taxid",
+    "rank",
+    "reads",
+    "depth",
+    "abundance",
+    "breadth",
+    "expected_breadth",
+    "breadth_pvalue",
+    "fixed_chunk_breadth",
+    "flex_chunk_breadth",
+    "expected_flex_chunk_breadth",
+    "chunk_pvalue",
+    "evidence_depth",
+    "best_fit_genome",
+    "mean_identity",
+    "estimated_ani",
+];
+
+/// Columns that `--host` appends to every row of the profile.
+pub(crate) const HOST_COLUMNS: [&str; 3] = ["host_names", "host_taxids", "diseases"];
+
 /// The genome a taxon kept by the coverage evidence is reported on, and the
 /// depth of that evidence there before abundance estimation.
 #[derive(Clone, Debug, PartialEq)]
@@ -22,9 +47,9 @@ pub(crate) struct BestFitReport {
     pub(crate) genome: Arc<str>,
     pub(crate) evidence_depth: f64,
     /// Mean identity of the row's fragments to the genome and the estimated
-    /// ANI of the sample's strain to it; written as two more columns when set,
-    /// `NA` for a value that is not known.
-    pub(crate) identity: Option<(f64, f64)>,
+    /// ANI of the sample's strain to it; NaN, written `NA`, for a value that
+    /// is not known.
+    pub(crate) identity: (f64, f64),
 }
 
 /// Typed profile row retained at full precision until the final write.
@@ -47,7 +72,7 @@ pub(crate) struct ProfileRow {
     pub(crate) flex_chunk: f64,
     pub(crate) expected_flex_chunk: f64,
     pub(crate) chunk_pvalue: Option<f64>,
-    pub(crate) best_fit: Option<BestFitReport>,
+    pub(crate) best_fit: BestFitReport,
     pub(crate) annotations: Option<ProfileAnnotations>,
 }
 
@@ -74,7 +99,9 @@ pub(crate) fn finish_classification_writer(writer: ClassificationWriter) -> Resu
 
 impl ProfileRow {
     pub(crate) fn write<W: Write>(&self, writer: &mut Writer<W>) -> csv::Result<()> {
-        let mut fields = Vec::with_capacity(if self.annotations.is_some() { 18 } else { 15 });
+        let mut fields = Vec::with_capacity(
+            PROFILE_COLUMNS.len() + self.annotations.as_ref().map_or(0, |_| HOST_COLUMNS.len()),
+        );
         fields.push(self.taxname.clone());
         fields.push(self.taxid.to_string());
         fields.push(self.rank.clone());
@@ -88,17 +115,10 @@ impl ProfileRow {
         fields.push(format_five(self.flex_chunk));
         fields.push(format_five(self.expected_flex_chunk));
         fields.push(format_probability(self.chunk_pvalue));
-        match &self.best_fit {
-            Some(best_fit) => {
-                fields.push(format_five(best_fit.evidence_depth));
-                fields.push(best_fit.genome.to_string());
-                if let Some((mean_identity, ani)) = best_fit.identity {
-                    fields.push(format_known(mean_identity));
-                    fields.push(format_known(ani));
-                }
-            }
-            None => fields.extend(["NA".to_string(), "NA".to_string()]),
-        }
+        fields.push(format_five(self.best_fit.evidence_depth));
+        fields.push(self.best_fit.genome.to_string());
+        fields.push(format_known(self.best_fit.identity.0));
+        fields.push(format_known(self.best_fit.identity.1));
         if let Some(annotations) = &self.annotations {
             fields.push(annotations.host_names.clone());
             fields.push(annotations.host_taxids.clone());
@@ -139,7 +159,7 @@ fn format_known(value: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BestFitReport, ProfileAnnotations, ProfileRow};
+    use super::{BestFitReport, ProfileAnnotations, ProfileRow, HOST_COLUMNS, PROFILE_COLUMNS};
     use std::sync::Arc;
 
     fn row() -> ProfileRow {
@@ -157,7 +177,11 @@ mod tests {
             flex_chunk: 0.12,
             expected_flex_chunk: 0.13,
             chunk_pvalue: None,
-            best_fit: None,
+            best_fit: BestFitReport {
+                genome: Arc::from("GCF_000000001.1"),
+                evidence_depth: 1.5,
+                identity: (f64::NAN, 0.99),
+            },
             annotations: None,
         }
     }
@@ -178,7 +202,7 @@ mod tests {
         let bytes = writer.into_inner().unwrap();
         let text = String::from_utf8(bytes).unwrap();
         let fields = text.trim_end().split('\t').collect::<Vec<_>>();
-        assert_eq!(fields.len(), 18);
+        assert_eq!(fields.len(), PROFILE_COLUMNS.len() + HOST_COLUMNS.len());
         assert_eq!(fields[5], "0.25000");
         assert_eq!(fields[8], "1.00000");
         assert_eq!(fields[12], "NA");
@@ -199,12 +223,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let mut row = row();
-        assert_eq!(write(&row)[13..], ["NA", "NA"]);
-        row.best_fit = Some(BestFitReport {
-            identity: None,
-            genome: Arc::from("GCF_000000001.1"),
-            evidence_depth: 1.5,
-        });
+        assert_eq!(
+            write(&row)[13..],
+            ["1.50000", "GCF_000000001.1", "NA", "0.99000"]
+        );
         row.annotations = Some(ProfileAnnotations {
             host_names: "host".to_string(),
             host_taxids: "7".to_string(),
@@ -213,7 +235,15 @@ mod tests {
         let fields = write(&row);
         assert_eq!(
             fields[13..],
-            ["1.50000", "GCF_000000001.1", "host", "7", "condition"]
+            [
+                "1.50000",
+                "GCF_000000001.1",
+                "NA",
+                "0.99000",
+                "host",
+                "7",
+                "condition"
+            ]
         );
     }
 

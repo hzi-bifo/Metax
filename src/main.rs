@@ -75,7 +75,7 @@ fn parse_positive_float(s: &str) -> Result<f64, String> {
 use metax::db::{MetamIndexOptions, ReferenceType, ReferenceTypes, DEFAULT_SEED_CHUNK_MIB};
 use metax::mapper::mapper_options_help;
 use metax::mapper::tsv::load_mapping_run_metadata;
-use metax::profiler::ProfileMode;
+use metax::profiler::{Host, ProfileMode};
 use metax::sequencer::Sequencer;
 use metax::{
     attach_taxonomy, build_index, info::run_info, report_genera_with_both_types, AppConfig,
@@ -471,7 +471,7 @@ struct ProfileArgs {
         help_heading = "Pathogen-focused analysis",
         help = "TSV that associates pathogen taxids with host metadata; used with --host."
     )]
-    pathogen_host: Option<String>,
+    pathogen_table: Option<String>,
 
     #[arg(
         short = 'r',
@@ -1124,16 +1124,20 @@ impl TryFrom<ProfileArgs> for AppConfig {
         let genome_level = args.strain;
         // A host filters nothing without the pathogen table, and the table
         // nothing without a host: they are given together, the host as a taxid.
-        match (args.host.as_deref(), args.pathogen_host.is_some()) {
-            (Some(_), false) => {
+        let host = match (args.host, args.pathogen_table) {
+            (Some(_), None) => {
                 bail!("--host needs --pathogen-table: without the table no row is filtered")
             }
-            (None, true) => bail!("--pathogen-table needs --host"),
-            (Some(host), true) if host.parse::<u32>().is_err() => {
-                bail!("--host takes an NCBI taxid, not '{host}'")
-            }
-            _ => {}
-        }
+            (None, Some(_)) => bail!("--pathogen-table needs --host"),
+            (Some(host), Some(pathogen_table)) => match host.parse::<u32>() {
+                Ok(taxid) => Some(Host {
+                    taxid,
+                    pathogen_table,
+                }),
+                Err(_) => bail!("--host takes an NCBI taxid, not '{host}'"),
+            },
+            (None, None) => None,
+        };
         let identity_margin = if args.no_identity_margin {
             None
         } else {
@@ -1183,8 +1187,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             keep_mapping_output: args.keep_mapping_output,
             stream_mappings: args.stream_mappings,
             temp_dir: args.temp_dir,
-            pathogen_host: args.pathogen_host,
-            host: args.host,
+            host,
             verbose: args.verbose,
             very_verbose: args.very_verbose,
             progress: args.progress,
@@ -1989,7 +1992,7 @@ mod tests {
         assert_eq!(args.identity, Some(0.97));
         assert_eq!(args.fraction, Some(0.80));
         assert_eq!(args.chunk_breadth, Some(0.10));
-        assert_eq!(args.pathogen_host.as_deref(), Some("pathogens.tsv"));
+        assert_eq!(args.pathogen_table.as_deref(), Some("pathogens.tsv"));
         assert!(args.lowbiomass);
         assert!(args.keep_mapping_output);
     }
