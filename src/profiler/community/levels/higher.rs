@@ -37,6 +37,11 @@
 //!    to the next taxon above it at one of those ranks, and stay unexplained
 //!    above domain.
 //!
+//! A row's depth sums what each of its fragments adds: the fragment's share
+//! of its first-read bases over the indexed length of the genomes it lies on
+//! in the row's taxon, averaged over its placements there that are within the
+//! tie margin of its best one there.
+//!
 //! On a database of sampled genomes, reads from the unindexed parts of a kept
 //! genome land on the sampled segments of its relatives, while the kept
 //! species already stands for its whole genome: no taxon that holds a kept
@@ -389,8 +394,8 @@ impl TaxonCandidate {
 }
 
 /// A row above species: its fragments (a pair counting once), of a genus row
-/// those unique to the genus by kind, and their full-index equivalents, their
-/// depth on the genome of its evidence, and that evidence.
+/// those unique to the genus by kind, and their full-index equivalents, its
+/// depth (see the [module documentation](self)), and its evidence.
 pub(super) struct HigherRow {
     pub(super) taxid: u32,
     pub(super) rank: Rank,
@@ -675,40 +680,25 @@ pub(super) fn place(level: &Level) -> HigherLevels {
     for candidate in candidates.iter().filter(|candidate| candidate.shown) {
         evidence.insert((Rank::Genus, candidate.genus), candidate.measured);
     }
-    let mut totals: HashMap<u32, [f64; 3]> = HashMap::new();
-    let mut shares = Vec::new();
-    for (fragment, to) in placed.iter().zip(&destination) {
-        let whole;
-        let parts: &[(u32, f64)] = match *to {
-            Destination::Unexplained => continue,
-            Destination::Taxon(taxid) => {
-                whole = [(taxid, 1.0)];
-                &whole
-            }
-            Destination::Shared(index) => &tied_shares[index as usize],
-        };
-        let scale = genomes[&fragment.assembly].1;
-        for &(taxid, share) in parts {
-            let total = totals.entry(taxid).or_default();
-            total[0] += share;
-            total[1] += share * scale;
-            total[2] += share * f64::from(fragment.bases);
-        }
-        if level.keep_shares {
-            shares.push((fragment.read, parts.to_vec()));
-        }
-    }
+    let RowAmounts { totals, shares } = row_amounts(
+        level,
+        &placed,
+        &destination,
+        &tied_shares,
+        &genomes,
+        &mut lineages,
+    );
     let rows = evidence
         .into_iter()
         .map(|((rank, taxid), measured)| {
-            let [reads, equivalent, bases] = totals[&taxid];
+            let [reads, equivalent, depth] = totals[&taxid];
             HigherRow {
                 taxid,
                 rank,
                 reads,
                 unique: with_row.get(&taxid).copied().unwrap_or_default(),
                 equivalent,
-                depth: bases / genomes[&measured.genome].0.max(1.0),
+                depth,
                 measured,
             }
         })
@@ -728,6 +718,116 @@ pub(super) fn place(level: &Level) -> HigherLevels {
         moved,
         genus_start,
     }
+}
+
+/// What the placed fragments add to the rows that hold them: by taxon, reads
+/// (a pair counting once), their full-index equivalents and depth ([module
+/// documentation](self)); with `keep_shares`, each fragment's read and shares.
+struct RowAmounts {
+    totals: HashMap<u32, [f64; 3]>,
+    shares: Vec<(usize, Vec<(u32, f64)>)>,
+}
+
+/// A placement of a fragment: its estimated errors, aligned bases and the
+/// indexed length of its genome.
+struct Placement {
+    errors: f64,
+    both_mapped: u32,
+    length: f64,
+}
+
+/// The amounts of the rows from the `placed` fragments with a `destination`
+/// (a taxon, or one of the `tied_shares`), with the sampling scale of each
+/// best genome in `genomes`.
+fn row_amounts(
+    level: &Level,
+    placed: &[Placed],
+    destination: &[Destination],
+    tied_shares: &[Vec<(u32, f64)>],
+    genomes: &HashMap<u32, (f64, f64)>,
+    lineages: &mut Lineages,
+) -> RowAmounts {
+    let mut amounts = RowAmounts {
+        totals: HashMap::new(),
+        shares: Vec::new(),
+    };
+    // Whether a candidate taxon lies in a row's taxon.
+    let mut inside: HashMap<(u32, u32), bool> = HashMap::new();
+    for kind in [Kind::BelowSpecies, Kind::NotKept] {
+        let policy = level.policy(kind);
+        let list = (0..placed.len())
+            .filter(|&i| {
+                placed[i].kind == kind && !matches!(destination[i], Destination::Unexplained)
+            })
+            .collect::<Vec<_>>();
+        fold_candidates(
+            level.data,
+            policy,
+            &list,
+            |&i| placed[i].read,
+            |_, candidates| {
+                let longest = longest_alignment(candidates);
+                candidates
+                    .iter()
+                    .filter(|candidate| level.takes_part(candidate))
+                    .map(|candidate| {
+                        let placements = candidate
+                            .placements
+                            .iter()
+                            .map(|p| Placement {
+                                errors: candidate_errors(p, longest),
+                                both_mapped: p.both_mapped,
+                                length: p.asm_len.max(1.0),
+                            })
+                            .collect::<Vec<_>>();
+                        (candidate.taxid, placements)
+                    })
+                    .collect::<Vec<_>>()
+            },
+            |&i, found| {
+                let fragment = &placed[i];
+                let whole;
+                let parts: &[(u32, f64)] = match destination[i] {
+                    Destination::Unexplained => return,
+                    Destination::Taxon(taxid) => {
+                        whole = [(taxid, 1.0)];
+                        &whole
+                    }
+                    Destination::Shared(index) => &tied_shares[index as usize],
+                };
+                let scale = genomes[&fragment.assembly].1;
+                for &(taxon, share) in parts {
+                    let there = found
+                        .iter()
+                        .filter(|(taxid, _)| {
+                            *inside.entry((*taxid, taxon)).or_insert_with(|| {
+                                lineages.of(*taxid).iter().any(|node| node.0 == taxon)
+                            })
+                        })
+                        .flat_map(|(_, placements)| placements)
+                        .collect::<Vec<_>>();
+                    let best = there
+                        .iter()
+                        .min_by(|a, b| a.errors.total_cmp(&b.errors))
+                        .expect("a fragment lies on a genome of the taxon that holds it");
+                    let margin =
+                        tie_margin(policy.mode, f64::from(best.both_mapped), LONG_TIE_SHARE);
+                    let (inverse, genomes) = there
+                        .iter()
+                        .filter(|p| p.errors - best.errors < margin)
+                        .fold((0.0, 0.0), |(sum, n), p| (sum + 1.0 / p.length, n + 1.0));
+                    let total = amounts.totals.entry(taxon).or_default();
+                    total[0] += share;
+                    total[1] += share * scale;
+                    total[2] += share * f64::from(fragment.bases) * inverse / genomes;
+                }
+                if level.keep_shares {
+                    amounts.shares.push((fragment.read, parts.to_vec()));
+                }
+            },
+        );
+    }
+    amounts
 }
 
 /// Step 2's shares of the fragments `list`, tied across genera: the
@@ -1031,6 +1131,21 @@ mod tests {
             .collect()
     }
 
+    /// A read as [`read`], with genome 5 of 100 kb.
+    fn read_small(on: &[(u32, u32, f32)], start: u32) -> Vec<EvidenceAlignment> {
+        read(on, start)
+            .into_iter()
+            .map(|a| EvidenceAlignment {
+                asm_len: if a.assembly_id == 5 {
+                    100_000.0
+                } else {
+                    a.asm_len
+                },
+                ..a
+            })
+            .collect()
+    }
+
     /// `n` reads on `on`, spread evenly along its 1 Mb genomes, or clustered in 10 kb.
     fn reads(on: &[(u32, u32, f32)], n: u32, spread: bool) -> Vec<Vec<EvidenceAlignment>> {
         (0..n)
@@ -1073,7 +1188,9 @@ mod tests {
             markers: None,
             min_marker_genes: 0,
         };
-        let layout = GenomeLayout::new((0..=60).map(|id| (id, 1_000_000)));
+        // Genome 5 has 100 kb, the others 1 Mb.
+        let layout =
+            GenomeLayout::new((0..=60).map(|id| (id, if id == 5 { 100_000 } else { 1_000_000 })));
         let taxonomy = taxonomy();
         place(&Level {
             data: &data,
@@ -1379,6 +1496,40 @@ mod tests {
         let found = place_reads(Vec::new(), not_kept, &none);
         assert_eq!(rows(&found), [(30, Rank::Order, 250.0)]);
         assert_eq!(found.end_of(40).map(|row| row.taxid), Some(30));
+    }
+
+    #[test]
+    fn a_row_s_depth_takes_each_read_over_the_genomes_it_lies_on() {
+        let depth = |found: &HigherLevels| found.rows[0].depth;
+        // Genus 100: 150 reads on genome 1 (1 Mb) and 100 on genome 5 (100 kb). Each read counts over its own
+        // genome, not over genome 1, which holds most of them.
+        let mut not_kept = reads(&[(1001, 1, 0.99)], 150, true);
+        not_kept.extend((0..100).map(|i| read_small(&[(1002, 5, 0.99)], i * 990)));
+        let found = place_reads(Vec::new(), not_kept, &HashSet::new());
+        assert_eq!(rows(&found), [(100, Rank::Genus, 250.0)]);
+        assert!((depth(&found) - (150.0 * 100.0 / 1e6 + 100.0 * 100.0 / 1e5)).abs() < 1e-12);
+        // A read tied on both genomes counts over their mean; a placement beyond the tie margin does not count.
+        let on_both = |small_identity: f32| {
+            (0..250)
+                .map(|i| {
+                    let mut alignments = read(&[(1001, 1, 0.99)], i * 3_900);
+                    alignments.extend(read_small(&[(1001, 5, small_identity)], i * 390));
+                    alignments
+                })
+                .collect::<Vec<_>>()
+        };
+        let found = place_reads(Vec::new(), on_both(0.99), &HashSet::new());
+        assert!((depth(&found) - 250.0 * 100.0 * (1.0 / 1e6 + 1.0 / 1e5) / 2.0).abs() < 1e-12);
+        let worse = on_both(0.97);
+        let found = place_reads(Vec::new(), worse, &HashSet::new());
+        assert!((depth(&found) - 250.0 * 100.0 / 1e6).abs() < 1e-12);
+        // A row above genus: reads tied across genera 100 and 101, on genome 5 (100 kb) and genome 11 (1 Mb).
+        let across = (0..250)
+            .map(|i| read_small(&[(1001, 5, 0.99), (1011, 11, 0.99)], i * 390))
+            .collect();
+        let found = place_reads(Vec::new(), across, &HashSet::new());
+        assert_eq!(rows(&found), [(40, Rank::Family, 250.0)]);
+        assert!((depth(&found) - 250.0 * 100.0 * (1.0 / 1e5 + 1.0 / 1e6) / 2.0).abs() < 1e-12);
     }
 
     #[test]
