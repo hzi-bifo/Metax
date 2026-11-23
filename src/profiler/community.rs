@@ -46,8 +46,7 @@ use super::{
     StableReadMap, UnresolvedReferences,
 };
 
-/// Fixed coordinate radius around each accepted read span for fixed-chunk
-/// coverage.
+/// Fixed coordinate radius around each read span for fixed-chunk coverage.
 const NATIVE_FIXED_FLANK_LEN: usize = 1_000;
 
 fn record_terminal_rank(
@@ -672,7 +671,7 @@ impl Profiler {
 
 /// Mapped fragments as a share of the input fragments, each counting as the
 /// share of a genome it represents: the sampling scale of the genome of its
-/// best placement, so that an index of sampled genomes is not mistaken for a
+/// best placement, so that a fractional database is not mistaken for a
 /// sample of unknown or host DNA. Fragments placed only on marker genes, whose
 /// genome size is unknown, are left out. Equals the plain mapping rate for a
 /// database of whole genomes.
@@ -970,11 +969,11 @@ pub(super) struct MappingData {
     /// Per-read alignment bundles
     read_alignments: Vec<ReadBundle>,
 
-    /// Chunk-breadth cutoff of the species amount test. In deep recall-mode
-    /// runs this may be lower than the original automatic cutoff.
+    /// Chunk-breadth cutoff of the species amount test.
     min_chunk_breadth: f64,
 
-    /// Whether at least one genome has a full/effective size multiplier > 1.
+    /// Whether at least one genome is indexed in part (its full size exceeds
+    /// its indexed size).
     has_scaled_genomes: bool,
 
     /// Total reads in the input.
@@ -992,9 +991,8 @@ pub(super) struct MappingData {
     /// Marker genes and fragment geometry when the database has marker genomes.
     marker_model: Option<Arc<MarkerModel>>,
 
-    /// A database of sampled genomes (fractional): reads not placed at a
-    /// species are not reported above species, and no species is kept for
-    /// even coverage.
+    /// A fractional database: reads not placed at a species are not reported
+    /// above species, and no species is kept for even coverage.
     fractional: bool,
 
     /// Inputs of the levels above species and of the even-coverage species;
@@ -1102,7 +1100,7 @@ mod tests {
     fn reads_not_placed_at_a_species_go_above_species_only_on_a_full_database() {
         // Genus 100 (family 40) holds species 1001 and 1002, each with 125 reads spread along its 1 Mb genome. Both
         // fail the amount test, so their 250 reads, unique to genus 100, make a genus row on a full database and no
-        // row on a database of sampled genomes.
+        // row on a fractional database.
         let directory = tempfile::tempdir().unwrap();
         let node = |parent: u32, rank: &str| (parent, rank.to_string());
         let taxonomy = || {

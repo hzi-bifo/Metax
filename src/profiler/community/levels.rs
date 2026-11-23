@@ -1,57 +1,68 @@
 //! The level-wise profiling engine: species, then the levels below and above.
 //!
-//! Each fragment's candidates are the species whose genomes it aligns to
-//! within the read-level gates; candidates whose estimated errors exceed the
-//! fragment's best by less than a margin count as tied. A first EM, weighted
-//! by how well each fragment matches each species ([`likelihood_em`]), gives a
-//! fragment to a species when its posterior there is at least 0.9; such a
-//! fragment supports every genome of that species it aligns to. A species is
-//! kept when one of its genomes shows enough evenly spread coverage and the
-//! species wins enough of the fragments it could explain, and is reported on
-//! the kept genome where most of its fragments fit best. Removed species are
-//! then judged again, strongest first, against the species kept so far, so
-//! that a removed sister no longer splits the fragments it ties on
-//! ([`second_look`]); a removed species is also kept when the fragments it won
-//! that list no kept species cover one of its genomes on their own
-//! ([`own_evidence_look`]), and a kept virus is removed when its own fragments
-//! do not cover the part of its genome that no kept bacterium or archaeon
-//! explains ([`prophage_look`]). A second EM shares the fragments among the
-//! kept species, and abundance is the
-//! resulting depth on each species' best-fit genome; a fragment on a marker
-//! genome counts as one on the whole genome ([`fragment_depth`]). Read counts
-//! are given as full-index equivalents, scaled up for genomes indexed in
-//! sampled segments. On a database with such genomes, a species whose reads
-//! are far less identical than the sample's typical species is left out beside
-//! a kept congener and otherwise reported at its genus; with
-//! `--relative-identity-gap` (on by default for single-end reads on such a
-//! database) a species is left out beside a deeper congener whose reads are
-//! that much more identical ([`identity_relatives`]). A genome represented by
-//! marker genes is measured gene by gene ([`MarkerModel`]); the tests are the
-//! same. The genomes whose references are labelled only above species (a
-//! genus, a family or higher) form one unit per labelled taxon, judged and
-//! reported like a species at that rank, without the identity rules. Named
-//! units come first: on the second look they are judged before the labelled
-//! unit of their taxon and do not lose to it the reads they share with it
-//! ([`named_units_first`]); after the looks, a kept labelled unit must cover
-//! its genome beyond the part that the kept named units of its taxon explain,
-//! or it is removed and its reads go to them ([`named_first_look`]). Its row
-//! counts the taxon's row above species as well. The fragments that no kept
-//! species takes go to rows above species: a genus when their matches lie in
-//! one and their evidence supports it, otherwise the lowest common ancestor of
-//! their matches when enough of them spread over a genome ([`higher`]); not on
-//! a database of sampled genomes, where they are not reported above species.
-//! On noisy long reads, fragments without a species-level candidate whose
-//! best match is a kept species count for it instead ([`credited_reads`]).
-//! `--host` drops the rows of taxa that the pathogen table lists for
-//! other hosts only and annotates the others ([`host`]), and `--min-reads` and
-//! `--min-breadth` drop a taxon whose rows hold fewer reads (a species with its
-//! genome rows) or whose breadth is lower ([`drop_below_minimums`]), both
-//! before abundance is normalised. The profile opens with two `#` lines: the
-//! run's metadata and the column names. With `--save-decisions` the engine
-//! also writes `<prefix>.decisions.tsv`: how every taxon it judged, at every
-//! rank, was decided, with the tests behind it ([`tables`]), and with
-//! `--save-classification` `<prefix>.classify.txt.gz`: each fragment's shares
-//! of the profile's rows ([`classify`]).
+//! A *fragment* is a read, or a read pair counted once. Its candidates are the
+//! taxa whose genomes it aligns to within the read-level gates; candidates
+//! whose estimated errors exceed the fragment's best by less than a margin
+//! count as tied. A *unit* is a species, or one taxon above species holding
+//! the genomes whose references are labelled only at that taxon; it is judged
+//! and reported like a species at its rank, without the identity rules.
+//!
+//! 1. **First EM.** An EM weighted by how well each fragment matches each unit
+//!    ([`likelihood_em`]) gives a fragment to a unit when its posterior there
+//!    is at least 0.9; such a fragment supports every genome of that unit it
+//!    aligns to.
+//! 2. **Species tests.** A unit is kept when one of its genomes shows enough
+//!    evenly spread coverage and the unit wins enough of the fragments whose
+//!    read group in the first EM lists it.
+//! 3. **Looks.** Removed units are judged again, strongest first, against the
+//!    units kept so far, so that a removed sister no longer splits the
+//!    fragments it ties on ([`second_look`]); named units are judged before
+//!    the labelled unit of their taxon and do not lose to it the fragments
+//!    they share with it ([`named_units_first`]). A removed unit is also kept
+//!    when the fragments it won that list no kept unit cover one of its
+//!    genomes on their own ([`own_evidence_look`]). A kept virus is removed
+//!    when its own fragments do not cover the part of its genome that no kept
+//!    bacterium or archaeon explains ([`prophage_look`]), and a kept labelled
+//!    unit when they do not cover its genome beyond the part that the kept
+//!    named units of its taxon explain ([`named_first_look`]); the reads of a
+//!    removed unit go to the kept units in the second EM.
+//! 4. **Even coverage.** A removed species whose fragments cover its strongest
+//!    genome evenly, but too thinly for the amount test, is kept when no taxon
+//!    of its genus is kept; not on a fractional database.
+//! 5. **Second EM.** It shares the fragments among the kept units. A unit's
+//!    abundance is the resulting depth on its best-fit genome. A fragment on a
+//!    marker genome counts as one on the whole genome ([`fragment_depth`]),
+//!    and such a genome is measured gene by gene with the same tests
+//!    ([`MarkerModel`]).
+//! 6. **Rows above species.** The fragments that no kept unit takes go to a
+//!    genus when their matches lie in one and their evidence supports it,
+//!    otherwise to the lowest common ancestor of their matches when enough of
+//!    them spread over a genome ([`higher`]); not on a fractional database,
+//!    where they are not reported above species. On noisy long reads, a
+//!    fragment without a species-level candidate whose best match is a kept
+//!    species counts for it instead ([`credited_reads`]).
+//! 7. **Genomes.** The fragments of each kept species are shared among its
+//!    genomes; the genome with the largest share is its best-fit genome, and
+//!    with `--strain` a genome is also reported on its own ([`genomes`]).
+//! 8. **Identity rules.** On a fractional database, a species whose reads are
+//!    far less identical than the sample's typical species is left out beside
+//!    a kept congener and otherwise reported at its genus; with
+//!    `--relative-identity-gap` (on by default for single-end reads on such a
+//!    database) a species is left out beside a deeper congener whose reads are
+//!    that much more identical ([`identity_relatives`]).
+//! 9. **Filters and abundance.** `--host` drops the rows of taxa that the
+//!    pathogen table lists for other hosts only and annotates the others
+//!    ([`host`]); `--min-reads` and `--min-breadth` drop a taxon whose rows
+//!    hold fewer reads (a species with its genome rows) or whose breadth is
+//!    lower ([`drop_below_minimums`]). Abundance is normalised over the rows
+//!    left. Read counts are full-index equivalents: on a fractional database
+//!    they are scaled up by each genome's indexed share.
+//! 10. **Outputs.** The profile opens with two `#` lines: the run's metadata
+//!     and the column names. `--save-decisions` writes
+//!     `<prefix>.decisions.tsv`, how every taxon judged at every rank was
+//!     decided, with the tests behind it ([`tables`]), and
+//!     `--save-classification` writes `<prefix>.classify.txt.gz`, each
+//!     fragment's shares of the profile's rows ([`classify`]).
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -104,8 +115,8 @@ const LONG_TIE_SHARE: f64 = 0.005;
 /// posterior.
 const RESOLVE_POSTERIOR: f64 = 0.9;
 /// A species is kept only when it wins (posterior >= RESOLVE_POSTERIOR) at
-/// least this share of the fragments that list it among their candidates: a
-/// species that only collects reads which a present relative explains wins
+/// least this share of the fragments whose read group in the first EM lists
+/// it (candidates within [`MIN_RELATIVE_LIKELIHOOD`] of the best): a species that only collects reads which a present relative explains wins
 /// few of them, while a present species wins most of its reads even when its
 /// strain differs from every genome of it in the database.
 const MIN_WON_SHARE: f64 = 0.3;
@@ -238,8 +249,8 @@ fn profile_levels(profiler: &Profiler, data: MappingData) -> Result<()> {
             "the profiler takes Illumina reads, single-end or paired, or single-end long reads"
         )
     })?;
-    // With `--save-classification` (not on a database of sampled genomes),
-    // each level keeps how it shares the fragments.
+    // With `--save-classification` (not on a fractional database), each level
+    // keeps how it shares the fragments.
     let classify_path = classification_path(cfg, &data);
     // Units labelled above species: the taxa of references whose most
     // specific label is a genus, family or higher taxon. Their genomes form
@@ -432,7 +443,8 @@ struct SpeciesJudgment {
     best_fit: HashMap<u32, u32>,
     /// Kept on the second look, with the fragments each took.
     taken: HashMap<u32, Vec<usize>>,
-    /// Kept on the last look, with whether each is reported at its genus.
+    /// Kept on their own fragments ([`own_evidence_look`]), with whether each
+    /// is reported at its genus.
     rescued: HashMap<u32, bool>,
     /// Kept viruses removed by the prophage check.
     removed_viruses: Vec<u32>,
@@ -744,10 +756,9 @@ impl Run<'_> {
 
     /// The fragments that no kept species takes, placed above species
     /// ([`higher`]), when the levels above species run (not with
-    /// `--strict-coverage`); not on a database of sampled genomes, where the
-    /// reads of a genome missing from the database land on the sampled
-    /// segments of many relatives and cannot be counted as full-index
-    /// equivalents. On noisy long reads, the fragments without a species-level
+    /// `--strict-coverage`); not on a fractional database, where the reads of a
+    /// genome missing from the database land on the indexed segments of many
+    /// relatives and cannot be counted as full-index equivalents. On noisy long reads, the fragments without a species-level
     /// candidate (`unmatched`) whose best match is a kept species are that
     /// species' reads, credited to it ([`credited_reads`]), not reads of the
     /// levels above species. Returns the levels above species when they ran,
@@ -919,9 +930,9 @@ impl Run<'_> {
     /// The identity rules for relatives ([`identity_relatives`]) over the
     /// kept species (not the units labelled above species) with their mean
     /// identity to their `reported` genome and their depth from their
-    /// `(bases, marker_depth)`. Reads from the unindexed parts of a sampled
-    /// genome land on its relatives: the margin applies on a database with
-    /// sampled genomes, and the relative identity gap where it is on. Returns
+    /// `(bases, marker_depth)`. Reads from the unindexed parts of a genome land
+    /// on its relatives: the margin applies where genomes are indexed in part,
+    /// and the relative identity gap where it is on. Returns
     /// the species left out and those reported at their genus.
     fn identity_rules(
         &self,
@@ -1373,8 +1384,8 @@ fn estimated_ani(baseline: f64, identity: f64) -> f64 {
 
 /// The identity rules for relatives, over the kept `species` with their mean
 /// identity to their best-fit genome and their depth. With a `margin` (on a
-/// database whose genomes are indexed in sampled segments, where the reads of a
-/// genome's unindexed parts land on the segments of its relatives), a species
+/// fractional database, where the reads of a genome's unindexed parts land on
+/// the indexed segments of its relatives), a species
 /// whose reads are more than the margin less identical than the sample's
 /// `baseline` is left out (first set) when a congener within the margin is
 /// kept, whose read count already stands for its whole genome, and is
@@ -1656,9 +1667,9 @@ fn add_fragment_hits(
     );
 }
 
-/// Fragments listing each species among their candidates, those resolved to
-/// it, those it took on the second look, and those it won with no kept
-/// species among their candidates.
+/// Fragments whose read group in the first EM lists each species, those
+/// resolved to it, those it took on the second look, and those it won with no
+/// kept species among their candidates.
 #[derive(Default)]
 struct FragmentCounts {
     candidates: HashMap<u32, u64>,
@@ -1753,8 +1764,8 @@ impl<'a> FirstEm<'a> {
         }
     }
 
-    /// Fragments listing each species among their candidates and those
-    /// resolved to it, counted per read group.
+    /// Fragments whose read group lists each species and those resolved to
+    /// it, counted per read group.
     fn counts(&self) -> FragmentCounts {
         let mut counts = FragmentCounts::default();
         for (group, (posteriors, &resolved)) in
@@ -1934,7 +1945,7 @@ fn second_look(
     taken_by
 }
 
-/// Last look at the removed species that cover one of their genomes well
+/// Own-evidence look at the removed species that cover one of their genomes well
 /// enough but win too small a share of their candidate fragments, largest
 /// first-EM weight first; `coverage` measures a species' genomes on a list of
 /// fragments alone.
@@ -3620,7 +3631,7 @@ mod tests {
     }
 
     #[test]
-    fn the_last_look_keeps_species_with_reads_of_their_own() {
+    fn the_own_evidence_look_keeps_species_with_reads_of_their_own() {
         // Species 1 is kept. Species 2 won 10 fragments: one shared with species
         // 1, one tied with removed species 5, eight its own. Species 3 won 10
         // fragments that all list species 1.

@@ -1,10 +1,10 @@
 //! Database-wide inputs of the levels above species: the genome layout on
-//! which the window spread of reads is measured, the genus of every species
-//! with genome references, and whether the database is fractional.
+//! which the window spread of fragments is measured, and the species
+//! represented only by marker genes.
 //!
-//! A species that the coverage evidence removed although its reads cover its
-//! whole genome evenly, but too thinly for the amount tests, is reported at
-//! species instead, when no taxon of its genus is kept
+//! A species that the coverage tests removed although its fragments cover its
+//! whole genome evenly, but too thinly for the amount test, is kept at species
+//! when no taxon of its genus is kept
 //! ([`AboveSpeciesInputs::even_coverage_species`]).
 
 use std::collections::{HashMap, HashSet};
@@ -90,7 +90,7 @@ pub(crate) struct AboveSpeciesInputs {
 }
 
 impl AboveSpeciesInputs {
-    /// Species that the coverage evidence removed although their reads cover
+    /// Species that the coverage tests removed although their fragments cover
     /// their genome evenly, among the measured `species`, each given with the
     /// coverage of its strongest genome and whether it is kept: at least
     /// [`EVEN_MIN_FRAGMENTS`] fragments, OEBR and COEBR within

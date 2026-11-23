@@ -23,8 +23,8 @@
 //!   above genus, or shared among the tied genera with genus rows.
 //!
 //! Shares on taxa without a row in the profile are dropped and the others
-//! renormalised; a fragment without any is not written, as are those of a
-//! database of sampled genomes (no file is written). Rows follow the mapping
+//! renormalised; a fragment without any is not written, and no file is written
+//! for a fractional database. Rows follow the mapping
 //! file's read order.
 //!
 //! Summed over the file, a taxon's shares equal its reads in the profile

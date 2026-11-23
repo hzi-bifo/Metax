@@ -1,7 +1,7 @@
 //! Expectation–maximization over candidate units weighted by how well each
 //! read matches each unit.
 //!
-//! A read r that aligns to several units (species, families or genomes) is
+//! A read r that aligns to several units (species, genera or genomes) is
 //! shared among them in proportion to `share(u) · L(r | u)`, where
 //! `L(r | u) = exp(−λ · errors(r, u))`. The caller gives `errors(r, u)`: the
 //! estimated errors of the read's best alignment to the unit (both mates of a

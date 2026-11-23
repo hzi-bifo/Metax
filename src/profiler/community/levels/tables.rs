@@ -46,8 +46,9 @@
 //!   genome (for species reported at the genus, their reads);
 //! - `depth` to `chunk_pvalue`: the coverage on `genome` and the chunk-breadth
 //!   cutoff of the tests (as in the profile; ratios to four decimals);
-//! - `candidate_reads`, `won_reads`: reads listing the species and those
-//!   resolved to it; genus rows: reads of the kind whose tie set lists the
+//! - `candidate_reads`, `won_reads`: reads whose read group in the first EM
+//!   lists the species (candidates within the EM's likelihood cutoff of the
+//!   best) and those resolved to it; genus rows: reads of the kind whose tie set lists the
 //!   genus and those unique to it; rows above genus: reads that reach the
 //!   taxon; `second_look_reads`: reads the species took on the second look;
 //!   `own_reads`: reads it won that no kept species lists;
@@ -267,11 +268,11 @@ pub(super) enum SpeciesDecision {
     KeptTests,
     /// Kept on the second look.
     KeptSecondLook,
-    /// Kept on the last look, on its own reads.
+    /// Kept on the own-evidence look, on its own reads.
     KeptOwnEvidence,
     /// Kept for even coverage.
     KeptEvenCoverage,
-    /// Kept on the last look, reported at its genus as its reads tie with
+    /// Kept on the own-evidence look, reported at its genus as its reads tie with
     /// relatives along its genome.
     AtGenusTie,
     /// Reported at its genus by the identity rules for relatives.
@@ -333,7 +334,8 @@ impl SpeciesDecision {
 pub(super) struct Looks<'a> {
     /// Kept on the second look, with the fragments each took.
     pub(super) second_look: &'a HashMap<u32, Vec<usize>>,
-    /// Kept on the last look, with whether each is reported at its genus.
+    /// Kept on the own-evidence look, with whether each is reported at its
+    /// genus.
     pub(super) own_evidence: &'a HashMap<u32, bool>,
     /// Kept viruses removed by the prophage check.
     pub(super) prophage: &'a [u32],

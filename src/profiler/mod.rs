@@ -3,9 +3,10 @@
 //! The mappings of a sample are loaded with the reference metadata
 //! (`community.rs`) and profiled by the level-wise engine
 //! (`community/levels.rs`): species first, then the genomes within each kept
-//! species (`--strain`), the genera of removed species and the families of
-//! reads without a species-level match. Each reference is reported at the most
-//! specific rank its taxonomy label supports.
+//! species (`--strain`), and the fragments that no kept species takes at the
+//! lowest rank above species that their matches and evidence support. Each
+//! reference is reported at the most specific rank its taxonomy label
+//! supports.
 //!
 //! # Coverage Metrics
 //!
@@ -42,10 +43,10 @@ mod unclassified;
 
 /// Read-name aggregation map with a stable, high-throughput hash builder.
 ///
-/// Native mapping records arrive in a repeatable stream, but `HashMap`'s
-/// per-process random seed made the later `into_iter()` order vary and changed
-/// floating-point reduction order. XXH3 is already a project dependency and
-/// is faster than the standard keyed hasher for short sequencing identifiers.
+/// Its hasher has a fixed seed, so that the reads of a mapping stream come out
+/// in the same order in every run, and the sums taken in that order are the
+/// same. XXH3 is also faster than the default keyed hasher on short read
+/// names.
 pub(crate) type StableReadMap<T> = HashMap<String, Vec<T>, Xxh3DefaultBuilder>;
 
 #[repr(u8)]
@@ -561,7 +562,7 @@ impl ProfileMode {
 ///
 /// This structure holds all parameters that control profiling behavior,
 /// from input/output paths to filtering thresholds to algorithm options.
-/// Values here are the resolved defaults used by the profilers.
+/// Values here are the resolved settings of the run.
 ///
 /// # Filtering Thresholds
 ///
@@ -672,7 +673,7 @@ pub struct ProfilerConfig {
     /// Disables chunk breadth threshold
     pub lowbiomass: bool,
 
-    /// Keep raw (unfiltered) profile output
+    /// Write how every taxon judged was decided (`<prefix>.decisions.tsv`).
     pub save_decisions: bool,
 
     /// Write optional per-read taxonomic assignments.

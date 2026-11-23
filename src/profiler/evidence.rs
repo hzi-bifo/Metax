@@ -200,7 +200,7 @@ impl TerminalCandidate {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PresenceAssembly {
     /// Effective indexed assembly size. This is the coordinate space that can
-    /// actually receive mappings in a fractional index.
+    /// actually receive mappings on a fractional database.
     pub(crate) asm_len: f64,
     pub(crate) count: u64,
     /// Marker genes hit beyond one per fragment: the other genes that
@@ -211,7 +211,7 @@ pub(crate) struct PresenceAssembly {
     /// Resolved fragments whose best placement within their taxon is on this
     /// genome.
     pub(crate) fits: u64,
-    /// Full-index equivalents of one fragment on this genome (§4.2).
+    /// Full-index equivalents of one fragment on this genome.
     pub(crate) sampling_scale: f64,
 }
 
@@ -264,14 +264,12 @@ pub(crate) fn calculate_coverage(
     let fixed_chunk = (fixed_bases as f64 / genome_size).min(1.0);
     let flex_chunk = (flex_bases as f64 / genome_size).min(1.0);
     let expected_breadth = expected_breadth(read_depth, assembly.count as f64);
-    // Deliberately an assembly-level expectation: it assumes a full window per
-    // mapping, while observed chunks are clamped to the contig each mapping
-    // landed on. The mismatch is load-bearing rather than an approximation to
-    // tidy up -- coverage confined to short contigs then yields a small
-    // observed chunk against a genome-wide expectation, and that collapsing
-    // ratio is how contamination and cross-mapping are rejected. Deriving the
-    // bin count per contig instead would raise COEBR for exactly those cases,
-    // so it needs joint recalibration of the ratio floors, not a local fix.
+    // The expectation is per assembly: a full window per mapping, while
+    // observed chunks are clamped to the contig each mapping landed on.
+    // Coverage confined to short contigs thus has a small observed chunk
+    // against a genome-wide expectation, and the low ratio rejects
+    // contamination and cross-mapping. The ratio floors assume this
+    // expectation.
     let flex_bins = (genome_size.sqrt() / 2.0).floor().max(1.0);
     let expected_flex_chunk = 1.0 - (1.0 - 1.0 / flex_bins).powf(assembly.count as f64);
     let oebr = ratio_or_nan(breadth, expected_breadth);

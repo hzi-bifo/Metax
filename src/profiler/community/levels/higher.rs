@@ -23,7 +23,8 @@
 //!    [`GENUS_IDENTITY_BELOW_SPECIES`], and their chunk ratio (COEBR) on the
 //!    genome holding most of them is at least [`GENUS_MIN_CHUNK_RATIO`]. Its
 //!    row then holds the fragments of both kinds unique to it; the unique
-//!    fragments of a genus without a row go to its family (step 3).
+//!    fragments of a genus without a row go to the first taxon above the genus
+//!    at family, order, class, phylum or domain rank (step 3).
 //! 2. Ties between genera. A fragment whose tie set spans several genera, one
 //!    or more of them with a genus row, goes to the genera with a genus row,
 //!    shared by the likelihood EM over those genera, as the species level's EM
@@ -600,7 +601,8 @@ impl Placing<'_> {
             });
         }
         // A genus with a row from either kind holds the fragments of both
-        // kinds unique to it; those of the others go to their family.
+        // kinds unique to it; those of the others go to the first taxon above
+        // their genus at family, order, class, phylum or domain rank.
         let mut with_row: BTreeMap<u32, [usize; 2]> = candidates
             .iter()
             .filter(|candidate| candidate.failures.is_empty())

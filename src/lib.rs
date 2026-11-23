@@ -103,7 +103,7 @@ pub struct AppConfig {
     pub breadth: Option<f64>,
     pub chunk_breadth: Option<f64>,
     /// Multiplicative adjustment for an automatically estimated chunk-breadth
-    /// cutoff. A value of 1.0 preserves the calibrated policy exactly.
+    /// cutoff; 1.0 leaves it as estimated.
     pub chunk_breadth_scale: f64,
     pub min_reads: Option<usize>,
     pub min_oebr: Option<f64>,
@@ -1551,8 +1551,8 @@ mod tests {
 
     #[test]
     fn user_overrides_beat_any_default() {
-        // Explicit CLI values must pass through untouched regardless of
-        // the Illumina Default tightening.
+        // Explicit values pass through as given, whatever the sequencer's
+        // defaults.
         let mut cfg = test_app_config();
         cfg.sequencer = Sequencer::Illumina;
         cfg.mode = ProfileMode::Default;
