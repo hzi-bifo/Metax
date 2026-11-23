@@ -546,10 +546,6 @@ impl Profiler {
         log::info!(target: "PROFILER", "Metam reported mapped read records: {}", profile.mapped_reads);
         log::info!(target: "PROFILER", "Metam emitted mapping records: {}", profile.emitted_records);
         match chunk_cutoff.source {
-            ChunkSource::LowBiomass => log::info!(
-                target: "PROFILER",
-                "Automatic minimum chunk breadth filter disabled by --low-biomass."
-            ),
             ChunkSource::Automatic if basis.mapped => log::info!(
                 target: "PROFILER",
                 "Minimum chunk breadth estimated from mapped {} ({}).",
@@ -787,10 +783,8 @@ const LONG_RECALL_CHUNK_SCALE: f64 = 0.80;
 /// Where the chunk-breadth cutoff of the species amount test comes from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChunkSource {
-    /// `--min-chunk-breadth`.
+    /// `--min-chunk-breadth`, or `--low-biomass`, its shorthand for 0.
     User,
-    /// `--low-biomass` without `--min-chunk-breadth`: no cutoff.
-    LowBiomass,
     /// The automatic curve at the run's read count.
     Automatic,
 }
@@ -826,9 +820,6 @@ impl ChunkCutoff {
         if let Some(cutoff) = cfg.chunk_breadth {
             return fixed(ChunkSource::User, cutoff);
         }
-        if cfg.lowbiomass {
-            return fixed(ChunkSource::LowBiomass, 0.0);
-        }
         let curve = chunk_breadth_curve(basis_reads, cfg.sequencer.is_illumina());
         let user_scaled = scale_automatic_chunk_breadth(curve, cfg.chunk_breadth_scale);
         let recall_scale = recall_chunk_scale(cfg, basis_reads);
@@ -854,7 +845,6 @@ impl ChunkCutoff {
     fn source_in_words(&self, basis: &ChunkBasis) -> &'static str {
         match self.source {
             ChunkSource::User => "user-supplied --min-chunk-breadth",
-            ChunkSource::LowBiomass => "disabled by --low-biomass",
             ChunkSource::Automatic => {
                 let scaled = self.is_user_scaled() || self.is_recall_scaled();
                 match (scaled, basis.scaled, basis.mapped) {
@@ -1474,7 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn a_given_cutoff_and_low_biomass_are_not_scaled() {
+    fn a_given_cutoff_is_not_scaled() {
         let mut cfg = cfg(Sequencer::Illumina);
         cfg.mode = ProfileMode::Recall;
         cfg.chunk_breadth = Some(0.37);
@@ -1483,15 +1473,14 @@ mod tests {
         assert_eq!(given.cutoff, 0.37);
         approx_equal(given.recall_scale, 1.0);
 
-        cfg.chunk_breadth = None;
-        cfg.lowbiomass = true;
-        let low_biomass = ChunkCutoff::resolve(&cfg, 20_000_000);
-        assert_eq!(low_biomass.source, ChunkSource::LowBiomass);
-        assert_eq!(low_biomass.cutoff, 0.0);
-        approx_equal(low_biomass.recall_scale, 1.0);
+        cfg.chunk_breadth = Some(0.0);
+        let no_cutoff = ChunkCutoff::resolve(&cfg, 20_000_000);
+        assert_eq!(no_cutoff.source, ChunkSource::User);
+        assert_eq!(no_cutoff.cutoff, 0.0);
+        approx_equal(no_cutoff.recall_scale, 1.0);
 
         // A read minimum leaves the automatic cutoff unchanged.
-        cfg.lowbiomass = false;
+        cfg.chunk_breadth = None;
         let without_min_reads = ChunkCutoff::resolve(&cfg, 20_000_000);
         assert_eq!(without_min_reads.source, ChunkSource::Automatic);
         cfg.min_reads = Some(3);

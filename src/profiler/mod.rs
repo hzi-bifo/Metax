@@ -670,10 +670,6 @@ pub struct ProfilerConfig {
     /// Minimum fraction of read that must map (0.0-1.0)
     pub fraction: f64,
 
-    /// Enable low-biomass sample heuristics
-    /// Disables chunk breadth threshold
-    pub lowbiomass: bool,
-
     /// Write how every taxon judged was decided (`<prefix>.decisions.tsv`).
     pub save_decisions: bool,
 
@@ -845,7 +841,6 @@ impl ProfilerConfig {
             estimate_unclassified: false,
             identity_margin: None,
             fraction: 0.6,
-            lowbiomass: false,
             save_decisions: false,
             save_classifications: false,
             by_aligned: false,
@@ -930,7 +925,6 @@ pub(crate) fn log_resolved_profiler_parameters(
          \tby_mapped                    {}\n\
          \tgenus_identity               {:.3}\n\
          \tlow_map_rate_threshold       {:.3}\n\
-         \tlowbiomass                   {}\n\
          \tsave_decisions               {}\n\
          \tsave_classifications         {}\n\
          \tlenient_mapping_input        {}\n\
@@ -966,7 +960,6 @@ pub(crate) fn log_resolved_profiler_parameters(
         cfg.by_aligned,
         cfg.genus_identity,
         cfg.low_map_rate_threshold,
-        cfg.lowbiomass,
         cfg.save_decisions,
         cfg.save_classifications,
         cfg.lenient_mapping_input,

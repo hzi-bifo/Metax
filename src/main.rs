@@ -252,7 +252,7 @@ struct ProfileArgs {
         alias = "lowbiomass",
         action = ArgAction::SetTrue,
         help_heading = "Analysis mode and resources",
-        help = "Disable the automatic chunk-breadth cutoff of the species amount test, for samples with few reads. An explicit --min-chunk-breadth remains authoritative."
+        help = "Shorthand for --min-chunk-breadth 0: no chunk-breadth cutoff in the species amount test, for samples with few reads. A value given with --min-chunk-breadth takes precedence."
     )]
     lowbiomass: bool,
 
@@ -1138,7 +1138,7 @@ impl TryFrom<ProfileArgs> for AppConfig {
             base_accuracy: args.base_accuracy,
             mapped_len: args.mapped_len,
             breadth: args.breadth,
-            chunk_breadth: args.chunk_breadth,
+            chunk_breadth: args.chunk_breadth.or(args.lowbiomass.then_some(0.0)),
             chunk_breadth_scale: args.chunk_breadth_scale.unwrap_or(1.0),
             min_reads: args.min_reads,
             min_oebr: args.min_oebr,
@@ -1151,7 +1151,6 @@ impl TryFrom<ProfileArgs> for AppConfig {
             identity_margin: args.identity_margin,
             no_identity_margin: args.no_identity_margin,
             fraction: args.fraction,
-            lowbiomass: args.lowbiomass,
             save_decisions: args.save_decisions,
             save_classifications: args.save_classifications,
             by_aligned: args.by_aligned,
@@ -1953,6 +1952,26 @@ mod tests {
         assert_eq!(value(&["--genus-identity", "0.9"]), 0.9);
         assert!(parse(&["--genus-identity"]).is_err());
         assert!(parse(&["--genus-identity", "1.5"]).is_err());
+    }
+
+    #[test]
+    fn low_biomass_is_a_minimum_chunk_breadth_of_zero() {
+        let chunk_breadth = |extra: &[&str]| {
+            let argv = ["metax", "profile", "-d", "db", "-o", "out", "-i", "r1.fq"];
+            let cli = Cli::try_parse_from(argv.iter().chain(extra)).unwrap();
+            let Commands::Profile(args) = cli.command else {
+                panic!("expected profile command");
+            };
+            AppConfig::try_from(args).unwrap().chunk_breadth
+        };
+        assert_eq!(chunk_breadth(&[]), None);
+        assert_eq!(chunk_breadth(&["--low-biomass"]), Some(0.0));
+        assert_eq!(chunk_breadth(&["-l"]), Some(0.0));
+        assert_eq!(chunk_breadth(&["--min-chunk-breadth", "0"]), Some(0.0));
+        assert_eq!(
+            chunk_breadth(&["--low-biomass", "--min-chunk-breadth", "0.2"]),
+            Some(0.2)
+        );
     }
 
     #[test]

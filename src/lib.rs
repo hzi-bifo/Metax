@@ -120,7 +120,6 @@ pub struct AppConfig {
     /// `--no-identity-margin`: no default margin either.
     pub no_identity_margin: bool,
     pub fraction: Option<f64>,
-    pub lowbiomass: bool,
     pub save_decisions: bool,
     /// Write the optional per-read classification table.
     pub save_classifications: bool,
@@ -359,17 +358,10 @@ impl MetaxApp {
                 "chunk-breadth scale must be a finite value greater than zero, got {factor}"
             ));
         }
-        if factor != 1.0 {
-            if self.config.chunk_breadth.is_some() {
-                return Err(anyhow!(
-                    "chunk-breadth scale cannot be combined with an explicit minimum chunk breadth"
-                ));
-            }
-            if self.config.lowbiomass {
-                return Err(anyhow!(
-                    "chunk-breadth scale cannot be combined with low-biomass mode, which disables automatic chunk-breadth estimation"
-                ));
-            }
+        if factor != 1.0 && self.config.chunk_breadth.is_some() {
+            return Err(anyhow!(
+                "chunk-breadth scale cannot be combined with an explicit minimum chunk breadth"
+            ));
         }
         Ok(())
     }
@@ -606,9 +598,6 @@ impl MetaxApp {
             }
             if self.config.genome_level {
                 flags.push("--strain".to_string());
-            }
-            if self.config.lowbiomass {
-                flags.push("--low-biomass".to_string());
             }
             if self.config.save_decisions {
                 flags.push("--save-decisions".to_string());
@@ -985,7 +974,6 @@ impl MetaxApp {
             estimate_unclassified: self.config.estimate_unclassified,
             identity_margin,
             fraction,
-            lowbiomass: self.config.lowbiomass,
             save_decisions: self.config.save_decisions,
             save_classifications: self.config.save_classifications,
             by_aligned: self.config.by_aligned,
@@ -1138,7 +1126,6 @@ mod tests {
             identity_margin: None,
             no_identity_margin: false,
             fraction: None,
-            lowbiomass: false,
             save_decisions: false,
             save_classifications: false,
             by_aligned: false,
@@ -1227,15 +1214,6 @@ mod tests {
         assert!(MetaxApp { config: min_reads }
             .validate_chunk_breadth_configuration()
             .is_ok());
-
-        let mut low_biomass = test_app_config();
-        low_biomass.chunk_breadth_scale = 0.5;
-        low_biomass.lowbiomass = true;
-        assert!(MetaxApp {
-            config: low_biomass
-        }
-        .validate_chunk_breadth_configuration()
-        .is_err());
     }
 
     fn resolve(cfg: AppConfig) -> (f64, usize, f64) {
