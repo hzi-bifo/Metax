@@ -252,7 +252,7 @@ struct ProfileArgs {
         alias = "lowbiomass",
         action = ArgAction::SetTrue,
         help_heading = "Analysis mode and resources",
-        help = "Shorthand for --min-chunk-breadth 0: no chunk-breadth cutoff in the species amount test, for samples with few reads. A value given with --min-chunk-breadth takes precedence."
+        help = "Shorthand for --min-chunk-breadth 0: no chunk-breadth cutoff in the species amount test, for samples with few reads. Cannot be combined with --min-chunk-breadth or --chunk-breadth-scale."
     )]
     lowbiomass: bool,
 
@@ -379,7 +379,7 @@ struct ProfileArgs {
         value_name = "FRACTION",
         value_parser = parse_probability,
         help_heading = "Coverage evidence and filters",
-        help = "Minimum chunk breadth of the species amount test (0-1): the fraction of a genome within a fixed distance of the fragments placed on it. Automatically estimated when omitted; an explicit value is never mode-scaled."
+        help = "Minimum chunk breadth of the species amount test (0-1): the fraction of a genome within a fixed distance of the fragments placed on it. Automatically estimated when omitted; an explicit value is never mode-scaled. Cannot be combined with --low-biomass or --chunk-breadth-scale."
     )]
     chunk_breadth: Option<f64>,
 
@@ -1069,6 +1069,14 @@ impl TryFrom<ProfileArgs> for AppConfig {
             bail!("SAM/BAM input is no longer supported. Save the Metax mappings of a run with --save-mapping and profile them again with --reuse-mapping.");
         }
         reject_removed_options(&args)?;
+        if args.lowbiomass && args.chunk_breadth.is_some() {
+            bail!(
+                "--low-biomass and --min-chunk-breadth cannot be used together.\n\
+                 --low-biomass already sets the minimum chunk breadth to 0.\n\
+                 Use only --low-biomass for no minimum, or only --min-chunk-breadth <FRACTION> \
+                 for a specific minimum."
+            );
+        }
         let outprefix = args
             .outprefix
             .context("--output is required for profiling")?;
@@ -1968,10 +1976,30 @@ mod tests {
         assert_eq!(chunk_breadth(&["--low-biomass"]), Some(0.0));
         assert_eq!(chunk_breadth(&["-l"]), Some(0.0));
         assert_eq!(chunk_breadth(&["--min-chunk-breadth", "0"]), Some(0.0));
-        assert_eq!(
-            chunk_breadth(&["--low-biomass", "--min-chunk-breadth", "0.2"]),
-            Some(0.2)
-        );
+    }
+
+    #[test]
+    fn low_biomass_and_a_minimum_chunk_breadth_cannot_be_combined() {
+        for given in [
+            ["--low-biomass", "--min-chunk-breadth", "0.2"],
+            ["--min-chunk-breadth", "0.2", "--low-biomass"],
+            ["-l", "-c", "0"],
+        ] {
+            let argv = ["metax", "profile", "-d", "db", "-o", "out", "-i", "r1.fq"];
+            let cli = Cli::try_parse_from(argv.iter().chain(&given)).unwrap();
+            let Commands::Profile(args) = cli.command else {
+                panic!("expected profile command");
+            };
+            let Err(error) = AppConfig::try_from(args) else {
+                panic!("{given:?} must be refused");
+            };
+            let message = error.to_string();
+            assert!(message
+                .starts_with("--low-biomass and --min-chunk-breadth cannot be used together."));
+            assert!(message.contains("already sets the minimum chunk breadth to 0"));
+            assert!(message.contains("Use only --low-biomass for no minimum"));
+            assert!(message.contains("only --min-chunk-breadth <FRACTION> for a specific minimum"));
+        }
     }
 
     #[test]
