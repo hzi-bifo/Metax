@@ -1329,6 +1329,7 @@ mod tests {
             fragments,
             coverage,
             spread,
+            length: 1_000_000.0,
         };
         let genus = measured(50, 240, coverage(0.1, 0.9), Some(0.8));
         let family = measured(80, 300, coverage(0.2, 0.9), Some(0.7));
