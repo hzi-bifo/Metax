@@ -1,33 +1,6 @@
 # Metax
 
-Metax is a cross-domain metagenomic taxonomic profiler designed to deliver accurate, robust, and interpretable community composition analyses across bacteria, archaea, eukaryotes, and viruses. Unlike existing profilers, Metax integrates probabilistic modeling of genome coverage to distinguish true community members from artifacts caused by reference contamination, local genomic similarity, or reagent-derived DNA fragments.
-
-Through comprehensive benchmarks on more than 600 samples, Metax demonstrated:
-
-🧬 Species-level accuracy across all domains of life
-
-⚡ Robustness to shallow sequencing and low-biomass, host-dominated samples
-
-🔍 Contamination detection, including reagent-borne DNA and reference misassemblies
-
-🦠 Clinical and environmental relevance, e.g. enables identifying cross kingdom interactions and clarifying tumor microbiome signals
-
-By unifying coverage-informed presence probability estimation with EM-based abundance refinement, Metax overcomes challenges of ambiguous read mapping, database contamination and kitome DNA fragments. These properties make it a powerful tool for microbiome research, clinical metagenomics, and identifying genome misassemblies.
-
-## What's new in Metax 2
-
-- **Built-in read mapper.** Metax no longer depends on the external MA aligner (`maCMD`). Indexing, mapping, and profiling run inside a single `metax` executable.
-- **Native short- and long-read evidence.** Single-end and paired-end Illumina, Nanopore, and PacBio reads are profiled with platform-specific coordinate-evidence rules applied to Metax's own coordinate mappings. SAM/BAM files from other mappers are no longer read.
-- **Marker-gene and mixed databases.** Genomes can be represented by their assembled sequences or by a set of marker genes, also mixed within one database (`--reference-type`, `--reference-type-table`). Marker genomes are evaluated by the genes their reads hit.
-- **Reads of removed species.** A species that the coverage evidence removes is reported at species when its reads cover its whole genome evenly, as for large genomes at low depth, and its reads are otherwise reported at its genus when they spread over its genome, as for divergent strains and new species of a genus in the database (paired-end short reads and long reads; `--strict-coverage` turns both off).
-- **Identity relative to the sample.** A species whose reads are clearly less identical than those of the sample's typical species is reported at its genus, as for relatives that receive the reads of an organism missing from the database (paired-end Illumina by default; `--no-identity-margin` turns it off).
-- **Rank-aware reference labels.** References may be labelled at strain, species, genus, or any higher rank, and Metax reports each genome at the lowest rank its label supports.
-- **Lower peak memory.** Mapping and profiling run as separate stages, so the mapping index is released before the profiler starts.
-- **Reusable mapping output.** Save compressed coordinate mappings once and re-profile them with different thresholds without remapping.
-- **Taxonomy stored with the database.** `metax index` stores the taxonomy dump with the database, and profiling uses it by default; another dump given with `--dmp-dir` is checked against the database's taxa. Without a stored dump, the NCBI taxonomy dump is downloaded and cached automatically.
-- **More platforms.** Conda packages are published for Linux x86-64, Linux ARM64, and macOS Apple Silicon.
-
-Databases built for Metax 0.9 use a different index format and must be rebuilt with `metax index` (see [Reference database](#reference-database)).
+Metax is a cross-domain metagenomic taxonomic profiler for bacteria, archaea, eukaryotes and viruses. It maps short or long reads to reference genomes and uses how evenly the reads cover each genome to separate true community members from artifacts of reference contamination, local genomic similarity and reagent-derived DNA. Reads that align to several taxa are shared among them by a likelihood-based EM.
 
 ## Installation
 
@@ -38,161 +11,95 @@ conda create -n metax -c zldeng metax
 conda activate metax
 ```
 
-Packages are available for `linux-64`, `linux-aarch64`, and `osx-arm64`. The package is self-contained: no separate aligner or runtime library is required.
+Packages are available for `linux-64`, `linux-aarch64` and `osx-arm64`. The package is a single self-contained executable.
 
 ### Compile from source
 
-Metax requires Rust 1.89 or newer and a C compiler (used for the bundled zstd library).
+Metax requires Rust 1.89 or later and a C compiler (for the bundled zstd library).
 
 ```bash
 cargo build --release
-```
-
-This produces the binary at `target/release/metax`. Run the bundled smoke tests to verify the build:
-
-```bash
 smoke_tests/run_smoke_tests.sh
 ```
 
-## Download databases
+The binary is `target/release/metax`.
 
-### Taxonomy dmp files
+## Databases
 
-Metax uses NCBI-style taxonomy dump files (`nodes.dmp`, `names.dmp`, `merged.dmp`, `delnodes.dmp`).
+### Pre-built database
 
-- A database built by `metax index` stores the dump it was built with as `taxdmp.tar.gz`, which `metax profile` reads without unpacking when `--dmp-dir` is omitted. Without a stored dump, Metax downloads the official NCBI [taxdump](https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz) to `~/.metax/taxdmp` on first use and reuses it afterwards.
-- Pass `--dmp-dir <dir>` to use an offline installation, a pinned taxonomy snapshot, or an alternative taxonomy (e.g. GTDB or ICTV) converted to the same dump-file format. An explicit directory is never modified by Metax. For a database with a stored dump, the given dump is checked against the database's taxa before mapping: taxa that are merged or renamed in it give a warning, and taxa missing from it stop the run unless `--skip-missing-taxa` is given.
-
-### Reference database
-
-Databases built for Metax 0.9 are not compatible with Metax 2 and must be rebuilt.
-
-- **2026 RefSeq database**: A pre-built database for Metax 2 is available [here](https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2_refseq_202607_k16w37.tar.gz) (38 GiB). It is based on the **July 2026 NCBI RefSeq snapshot** and covers bacteria, archaea, viruses, fungi, protozoa and the human reference genome (GRCh38), with up to three genomes per species for bacteria and archaea. Unnamed "sp." isolates are included only where GTDB (release 232) places them in a species of their own. In total, it contains **29,112 genomes**. Unpack it and pass the folder to `-d`:
-
-  ```shell
-  tar -xzf metax2_refseq_202607_k16w37.tar.gz
-  metax profile -d metax2_refseq_202607_k16w37 -i <reads_1.fq.gz> -I <reads_2.fq.gz> -o <prefix> -t 20
-  ```
-
-  This archive holds no taxonomy dump, so Metax uses `--dmp-dir` or the managed NCBI dump. The first run writes an index cache of about 50 GiB into the unpacked folder, which must therefore be writable (or place the cache elsewhere with `-- --index-cache <path>`; see the [manual](MANUAL.md#31-pre-built-database)).
-
-To build a custom database:
-
-1. Prepare the reference genomes in FASTA format. Each sequence header must follow
-
-   ```text
-   >genome_id|sequence_id|taxonomy[|genome_size]
-   ```
-
-   where `taxonomy` lists the lowest confidently known rank(s) as `prefix:taxid` pairs separated by `;`, for example `t:1234;s:9606` (strain and species), `s:562` (species only), or `g:561` (genus only). Supported prefixes are `t` (strain/subspecies), `s`, `g`, `f`, `o`, `c`, `p`, and `k`. All contigs of one genome share the same `genome_id` and need not be adjacent in the file; `genome_size` is optional.
-
-2. Build the database:
-
-   ```shell
-   metax index <fasta_file> -o <database_dir> --dmp-dir <dump_dir> -t 20
-   ```
-
-   Gzip-compressed input is accepted. Every reference taxid must be in the taxonomy dump (`--dmp-dir`, or the managed NCBI dump when omitted), which is stored in the database as `taxdmp.tar.gz`. A database built as a directory is complete; publish it without the index cache (`metax_db.mxi.metamcache`). A database built without a dump can be given one with `metax attach-taxonomy -d <database_dir> --dmp-dir <dump_dir>`. For machines with limited RAM, `-f <fraction>` builds a **fractional index** from an evenly distributed fraction of each large genome; see the [manual](MANUAL.md#42-fractional-index).
-
-   For marker genes (one FASTA record per gene) add `--reference-type markers`, or list single genomes in `--reference-type-table` to mix genomes and marker genes; see the [manual](MANUAL.md#43-marker-gene-and-mixed-databases). The read counts of marker genomes are the reads mapped to their marker genes, because the size of the full genome is not used; depth and relative abundance remain comparable with genome taxa.
-
-## How to run profiling
+A pre-built [RefSeq database](https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2_refseq_202607_k16w37.tar.gz) (38 GiB) covers bacteria, archaea, viruses, fungi, protozoa and the human reference genome. Unpack it and pass the folder to `-d`:
 
 ```shell
-metax profile --help
+tar -xzf metax2_refseq_202607_k16w37.tar.gz
+metax profile -d metax2_refseq_202607_k16w37 -i reads_1.fq.gz -I reads_2.fq.gz -o sample -t 20
 ```
 
-Paired-end Illumina reads:
+The archive holds no taxonomy dump, so Metax uses `--dmp-dir` or downloads the NCBI dump to `~/.metax/taxdmp`. The first run writes an index cache of about 50 GiB into the folder, which must be writable; to place the cache elsewhere, see the [manual](MANUAL.md#31-pre-built-database).
+
+### Custom database
+
+Each sequence header of the reference FASTA follows
+
+```text
+>genome_id|sequence_id|taxonomy[|genome_size]
+```
+
+where `taxonomy` lists the lowest known ranks as `prefix:taxid` pairs separated by `;`, for example `t:1234;s:9606`, `s:562` or `g:561`. Build the database with:
 
 ```shell
-metax profile -d <database_dir> \
-    -i <r1.fq.gz> -I <r2.fq.gz> \
-    -o <output_prefix> \
-    -t 20
+metax index references.fa -o database --dmp-dir taxonomy -t 20
 ```
 
-Single-end Illumina reads:
+The manual describes [fractional indexes](MANUAL.md#42-fractional-index), which index a share of each large genome, and [marker-gene and mixed databases](MANUAL.md#43-marker-gene-and-mixed-databases).
+
+## Run profiling
 
 ```shell
-metax profile -d <database_dir> -i <reads.fq.gz> -o <output_prefix> -t 20
+# Paired-end Illumina reads
+metax profile -d database -i r1.fq.gz -I r2.fq.gz -o sample -t 20
+
+# Single-end Illumina reads
+metax profile -d database -i reads.fq.gz -o sample -t 20
+
+# Nanopore or PacBio reads
+metax profile -d database -i reads.fq.gz -s Nanopore -o sample -t 20
 ```
 
-Nanopore or PacBio reads:
+Useful options:
 
-```shell
-metax profile -d <database_dir> -i <reads.fq.gz> -s Nanopore -o <output_prefix> -t 20
-```
+- `--strain`: report the genomes within each kept species.
+- `--save-decisions` (`-k`): write how every judged taxon was decided.
+- `--save-classification`: write per-read assignments.
+- `--save-mapping`, then `--reuse-mapping`: map once and profile several ways.
+- `--host` with `--pathogen-table`: filter and annotate the profile for one host.
+- `--estimate-unclassified`: add the share of the input that the profile does not explain.
 
-Add `--dmp-dir <dump_dir>` to use another taxonomy directory than the one stored with the database. The first run against a database builds a memory-mapped index cache beside it; subsequent runs start faster.
-
-## Test datasets
-
-- [CAMI II marine](https://frl.publisso.de/data/frl:6425521/marine/short_read/)
-- [CAMI II pathogen detection](https://frl.publisso.de/data/frl:6425521/patmgCAMI2.tar.gz)
-- [Other benchmark datasets](https://research.bifo.helmholtz-hzi.de/downloads/metax/benchmark_datasets/)
+Run `metax profile --help` for every option.
 
 ## Output
 
-- Final taxonomy profile: `<output_prefix>.profile.txt`
-
-  ```text
-  column 1:  Taxon name
-  column 2:  Taxon ID
-  column 3:  Taxon rank
-  column 4:  Number of reads (full-index equivalents; reads on the marker genes for marker genomes)
-  column 5:  Depth of coverage from abundance estimation
-  column 6:  Relative abundance (%)
-  column 7:  Breadth of coverage
-  column 8:  Expected breadth of coverage
-  column 9:  P-value of the breadth deviation
-  column 10: Fixed chunk breadth of coverage
-  column 11: Flex chunk breadth of coverage
-  column 12: Expected flex chunk breadth of coverage
-  column 13: P-value of the flex chunk breadth deviation
-  column 14: Depth of the coverage evidence on the best-fit genome, before abundance estimation
-  column 15: Accession of the best-fit genome
-  ```
-
-  Columns 7 to 15 of a species come from its best-fit genome; columns 14 and 15 are `NA` for rows not kept by the coverage evidence.
-
-  For species represented by marker genes, columns 10 and 11 hold the fraction of marker genes hit, column 12 the expected fraction, and column 13 the p-value of the genes hit.
-
-  When `--host` is used, three columns are appended:
-
-  ```text
-  column 16: Host names
-  column 17: Host taxonomy IDs
-  column 18: Associated diseases
-  ```
-
-- Run log: `<output_prefix>.log`
-
-Optional outputs:
-
-- `--save-raw-profile`: `<output_prefix>.rprofile.txt`, the post-EM profile before taxon-level filters.
-- `--save-classification`: `<output_prefix>.classify.txt.gz`, per-read taxonomic assignments, gzip-compressed (not written for fractional databases; for species represented by marker genes, only the reads placed on those genes).
-- `--save-mapping`: `<output_prefix>.mapping.tsv.gz`, the coordinate mappings for `--reuse-mapping`.
+- `<prefix>.profile.txt`: the profile, with two header lines and one row per reported taxon. Its columns are name, taxid, rank, reads, depth, abundance, seven coverage columns, the depth of the coverage evidence, the best-fit genome, its mean identity and the estimated identity of the sample's strain to it. `--host` adds three annotation columns.
+- `<prefix>.log`: the run log.
+- `<prefix>.decisions.tsv`, `<prefix>.classify.txt.gz` and `<prefix>.mapping.tsv.gz`: optional tables, written with the options above.
 
 ## Manual
 
-For detailed installation, indexing, profiling, output, and method descriptions, see [MANUAL.md](MANUAL.md).
+[MANUAL.md](MANUAL.md) describes installation, databases, every option, the output files and the method.
 
 ## FAQ
 
 1. **Which platforms are supported?**
-   Conda packages are provided for Linux x86-64, Linux ARM64, and macOS Apple Silicon. Other Unix-like systems can build from source. On Windows, use WSL.
+   Conda packages are provided for Linux x86-64, Linux ARM64 and macOS Apple Silicon. Other Unix-like systems can build from source. On Windows, use WSL.
 
-2. **Can I use a database built for Metax 0.9?**
-   No. Metax 2 uses a different index format. Rebuild the database with `metax index`.
+2. **Why is the first profiling run against a database slower?**
+   The first run creates a memory-mapped cache (`metax_db.mxi.metamcache`) beside the index. Later runs open it directly.
 
-3. **Why is the first profiling run against a database slower?**
-   The first run creates a memory-mapped cache (`metax_db.mxi.metamcache`) beside the index. Later runs open the completed cache directly.
+3. **Can I reuse alignments produced by another tool?**
+   No. Metax profiles its own coordinate mappings. Save them with `--save-mapping` and profile them again with `--reuse-mapping`.
 
-4. **Can I reuse alignments produced by another tool?**
-   No. Metax profiles its own coordinate mappings. To profile one run several ways, save its mappings with `--save-mapping` and profile them again with `--reuse-mapping`, which avoids remapping.
-
-5. **A species appears in `rprofile.txt` but not in `profile.txt`. Why?**
-   `rprofile.txt` is written before the coverage-evidence and support filters. The columns of that row show which criterion the taxon failed.
+4. **A species is not in `profile.txt`. Why?**
+   Run with `--save-decisions`: `<prefix>.decisions.tsv` lists every judged taxon with the tests it passed or failed.
 
 ## Acknowledgement
 
