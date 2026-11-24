@@ -216,7 +216,7 @@ Marker genomes:
 - have the summed marker length as genome size: read counts (profile column 4) are the reads mapped to the marker genes, not full-genome equivalents, and coverage refers to the marker genes. Depth (profile column 5) is that of the whole genome: a fragment on a marker gene adds the length of its read over the placements that the genome's genes offer (§7.11). Marker genes are largely single-copy, so relative abundances of marker and genome taxa are comparable even though their read counts are not;
 - keep a `genome_size` from the FASTA header that is larger than their summed marker length as the size of the whole genome. It is used only for the unclassified estimate (§7.12) and never scales read counts; `metax info` reports how many marker genomes have one;
 - have as chunk breadth the share of their genes that reads hit (§7.4);
-- do not take part in the levels above species (§7.8).
+- take part in the levels above species, where a row whose fragments fit a marker genome best is judged by the genes they hit (§7.8).
 
 A read counts on a marker gene only when enough of it lies inside the gene; a long read also counts on a gene when it aligns to more than half of the gene (§7.4).
 
@@ -718,7 +718,7 @@ Both are capped at `0.95`. The basis is all input fragments.
 
 ### 7.8 Levels above species
 
-The fragments that no kept unit takes are placed at the lowest rank their matches and evidence support. `--strict-coverage` turns this off, and these fragments are then dropped. Placements on marker genomes take no part.
+The fragments that no kept unit takes are placed at the lowest rank their matches and evidence support. `--strict-coverage` turns this off, and these fragments are then dropped. Placements on genome references and on marker genomes take part alike.
 
 Two kinds of fragments come here:
 
@@ -729,15 +729,26 @@ Two kinds of fragments come here:
 
 A fragment's *tie set* holds the taxa whose placements lie within the tie margin of its best one.
 
-1. **Genus rows.** A fragment whose tie set lies in one genus is unique to it. A genus gets a row when, for at least one kind of fragment, at least `200` fragments are unique to it, their mean identity is at least the species identity cutoff minus `0.09`, and their COEBR on the genome holding most of them is at least `0.40`. The row then holds the unique fragments of both kinds.
-2. **Ties between genera.** A fragment tied across several genera, at least one with a genus row, is shared by an EM over the genera with a row among all its candidates.
-3. **Lowest common ancestor rows.** The other fragments go to the lowest common ancestor of their tie set, or the first taxon above it at family, order, class, phylum or domain rank. A taxon gets a row when at least `200` fragments reach it and they reach at least `50 %` of the windows of the genome holding most of them. Otherwise they move up one of these ranks, and they stay unexplained above domain.
+A candidate row is measured on its *evidence genome*, the genome holding most of its fragments' best placements, with that genome's model (§7.4), and its tests depend on the model:
 
-A row's depth is the first-read bases of all its fragments over the indexed length of the genome holding most of their best placements; for a genus row, that genome comes from the unique fragments of the kind its row shows, the passing kind with most of them. Genomes tied exactly on that number share the depth.
+| Test | Evidence on a genome reference | Evidence on a marker genome |
+| --- | --- | --- |
+| Amount | at least `200` fragments | at least `10` genes hit (a fragment counts on every gene it covers) |
+| Genus row: mean identity | at least the species identity cutoff minus `0.09` | at least the species identity cutoff minus `0.09` |
+| Genus row: COEBR | at least `0.40` | at least `0.40` over the genes |
+| Row above genus: spread | reads in at least `50 %` of the genome's windows | COEBR of at least `0.40` over the genes |
+
+1. **Genus rows.** A fragment whose tie set lies in one genus is unique to it. A genus gets a row when, for at least one kind of fragment, the fragments unique to it pass the amount, mean identity and COEBR tests. The row then holds the unique fragments of both kinds.
+2. **Ties between genera.** A fragment tied across several genera, at least one with a genus row, is shared by an EM over the genera with a row among all its candidates.
+3. **Lowest common ancestor rows.** The other fragments go to the lowest common ancestor of their tie set, or the first taxon above it at family, order, class, phylum or domain rank. A taxon gets a row when the fragments that reach it pass the amount and spread tests. Otherwise they move up one of these ranks, and they stay unexplained above domain.
+
+**Kept species on marker genes.** The marker genes of a kept species miss most of its genome and clip reads at their ends, and those reads land on relatives. A taxon holding kept species represented by marker genes therefore gets a row only when its fragments (for a genus, its unique fragments of both kinds) number at least `0.15` times the fragments of those species, counted in whole-genome equivalents (§7.12) when the row's evidence genome is a genome reference. Otherwise its fragments move up like those of any taxon without a row.
+
+A row's depth is that of its evidence genome; for a genus row, that genome comes from the unique fragments of the kind its row shows, the passing kind with most of them. On a genome reference it is the first-read bases of all its fragments over the indexed length; on a marker genome each fragment adds its read length on every gene it covers over the placements of the genes, as for a species (§7.11). Genomes tied exactly on that number share the depth.
 
 **Noisy long reads.** A fragment without a species-level match whose best match, or one tied with it, is a kept species counts for that species and does not go above species. `--strict-coverage` turns this off.
 
-**Limitation.** The reads of a genus missing from the database land on its closest genera. When a sister genus takes them as unique fragments and passes the tests, the missing genus is reported as that sister genus.
+**Limitation.** The reads of a genus missing from the database land on its closest genera. When a sister genus takes them as unique fragments and passes the tests, the missing genus is reported as that sister genus. This holds for rows on marker genomes as for rows on genome references.
 
 **References labelled above species.** A genome whose most specific label is a genus, family or higher taxon belongs to a unit of that taxon, judged like a species and reported at that rank and taxid. It has no identity rules of §7.10. A row above species of the same taxon is merged with it. When the genomes of a species are only partly labelled at species, and the sample's strain is closest to a genome labelled only at the genus, its reads can be reported at the genus.
 
@@ -782,7 +793,7 @@ With `--estimate-unclassified`, Metax estimates how much of the input the profil
 unclassified share = 1 − min(1, explained fragments / input fragments)
 ```
 
-The estimate is taken over the rows of the profile, after every filter; a species counts once with its genome rows. Rows above species (§7.8) explain their fragments; other fragments of removed species, fragments of dropped rows, and fragments that fail the read-level gates count as unexplained. For short reads the estimate is unavailable when any marker genome of a reported marker species has no declared size or no gene that can hold a read of the sample's length; for long reads, when one of its genomes with resolved reads has no declared size or no read is resolved to its marker genomes: the log says which species, and the row holds `NA`. The share is also written to the log. The option cannot be combined with `--host`.
+The estimate is taken over the rows of the profile, after every filter; a species counts once with its genome rows. Rows above species (§7.8) explain their fragments, those on a marker evidence genome times that genome's whole-genome ratio, computed as for a species on it; other fragments of removed species, fragments of dropped rows, and fragments that fail the read-level gates count as unexplained. For short reads the estimate is unavailable when any marker genome of a reported marker species has no declared size or no gene that can hold a read of the sample's length; for long reads, when one of its genomes with resolved reads has no declared size or no read is resolved to its marker genomes: the log says which species, and the row holds `NA`. The share is also written to the log. The option cannot be combined with `--host`.
 
 ### 7.13 Fixed values
 
@@ -800,10 +811,13 @@ The estimate is taken over the rows of the profile, after every filter; a specie
 | fixed chunk radius in bases | `1000` |
 | fewest fragments of an even-coverage species | `200` |
 | lowest window spread of an even-coverage species | `0.9` |
-| fewest fragments of a row above species | `200` |
+| fewest fragments of a row above species on a genome reference | `200` |
+| fewest genes hit of a row above species on a marker genome | `10` |
 | distance of a genus row's mean identity below the species cutoff | `0.09` |
 | lowest COEBR of a genus row | `0.4` |
-| lowest window spread of a row above genus | `0.5` |
+| lowest window spread of a row above genus on a genome reference | `0.5` |
+| lowest COEBR of a row above genus on a marker genome | `0.4` |
+| share of the fragments of kept species on marker genes that a row above them needs | `0.15` |
 | floor mapped bases of a short read | `50` |
 | floor mapped fraction | `0.6` |
 | strain-level identity margin | `0.005` |
