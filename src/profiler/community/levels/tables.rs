@@ -1019,6 +1019,12 @@ impl Decisions<'_> {
                 failed(|f| matches!(f, higher::Failure::ChunkRatio { .. })),
                 measured.rules().genus_min_chunk_ratio,
             );
+            if let Some(bound) = candidate.spill {
+                tests.push_str(&format!(
+                    ", unique reads of both kinds {} {bound:.1} spilled by kept units beneath",
+                    failed(|f| matches!(f, higher::Failure::Spill { .. }))
+                ));
+            }
             if !candidate.failures.is_empty() {
                 if parts.row.is_some() {
                     tests.push_str(&format!("; they joined the genus row from reads {passed}"));
@@ -1091,8 +1097,11 @@ impl Decisions<'_> {
                         } else {
                             String::new()
                         };
+                        let spill = candidate.spill.map_or_else(String::new, |bound| {
+                            format!(", reads >= {bound:.1} spilled by kept units beneath")
+                        });
                         format!(
-                            "kept: {made_of}; {}{unit}",
+                            "kept: {made_of}; {}{spill}{unit}",
                             higher::taxon_evidence(&candidate.measured)
                         )
                     }
@@ -1381,6 +1390,7 @@ mod tests {
                     identity: 0.9,
                     identity_floor: 0.886,
                     measured: measured(51, 200, coverage(0.05, 0.2), Some(0.6)),
+                    spill: None,
                     failures: vec![Failure::ChunkRatio {
                         ratio: 0.2,
                         bound: 0.4,
@@ -1395,6 +1405,7 @@ mod tests {
                     identity: 0.99,
                     identity_floor: 0.886,
                     measured: genus,
+                    spill: None,
                     failures: Vec::new(),
                     shown: true,
                 },
@@ -1408,6 +1419,7 @@ mod tests {
                     from_below: 0,
                     tied_genera: vec![100],
                     measured: family,
+                    spill: None,
                     failures: Vec::new(),
                 },
                 TaxonCandidate {
@@ -1418,6 +1430,7 @@ mod tests {
                     from_below: 0,
                     tied_genera: vec![100],
                     measured: measured(90, 20, coverage(0.01, 0.5), None),
+                    spill: None,
                     failures: vec![Failure::Windows {
                         spread: None,
                         bound: 0.5,

@@ -38,6 +38,9 @@ pub(crate) struct MarkerModel {
     /// Gene lengths of every marker genome by assembly id, for the
     /// placements of each long read's own length; empty for other reads.
     long_read_genes: HashMap<u32, GeneLengths>,
+    /// The whole-genome size that each marker genome declares, by assembly
+    /// id.
+    declared: HashMap<u32, usize>,
     geometry: FragmentGeometry,
 }
 
@@ -94,21 +97,27 @@ impl MarkerModel {
         geometry: FragmentGeometry,
     ) -> Option<Self> {
         let mut genes: HashMap<u32, Vec<Gene>> = HashMap::new();
+        let mut declared = HashMap::new();
         for (reference_id, reference) in db.references.iter().enumerate() {
             if reference.reference_type == ReferenceType::Markers {
-                genes
-                    .entry(assembly_of[reference_id])
-                    .or_default()
-                    .push(Gene {
-                        reference_id: u32::try_from(reference_id).ok()?,
-                        len: u32::try_from(reference.length).ok()?,
-                    });
+                let assembly_id = assembly_of[reference_id];
+                genes.entry(assembly_id).or_default().push(Gene {
+                    reference_id: u32::try_from(reference_id).ok()?,
+                    len: u32::try_from(reference.length).ok()?,
+                });
+                if let Some(size) = reference.declared_genome_size {
+                    declared.insert(assembly_id, size);
+                }
             }
         }
-        (!genes.is_empty()).then(|| Self::new(genes, geometry))
+        (!genes.is_empty()).then(|| Self::new(genes, declared, geometry))
     }
 
-    fn new(genes: HashMap<u32, Vec<Gene>>, geometry: FragmentGeometry) -> Self {
+    fn new(
+        genes: HashMap<u32, Vec<Gene>>,
+        declared: HashMap<u32, usize>,
+        geometry: FragmentGeometry,
+    ) -> Self {
         let placements = genes
             .iter()
             .filter_map(|(&assembly_id, genes)| {
@@ -136,11 +145,13 @@ impl MarkerModel {
             genes,
             placements,
             long_read_genes,
+            declared,
             geometry,
         }
     }
 
-    /// A model of marker genomes given as `(assembly id, gene lengths)`.
+    /// A model of marker genomes given as `(assembly id, gene lengths)`,
+    /// without declared genome sizes.
     #[cfg(test)]
     pub(crate) fn from_gene_lengths(genomes: &[(u32, &[u32])], geometry: FragmentGeometry) -> Self {
         let mut reference_id = 0;
@@ -157,7 +168,13 @@ impl MarkerModel {
                 (assembly_id, genes)
             })
             .collect();
-        Self::new(genes, geometry)
+        Self::new(genes, HashMap::new(), geometry)
+    }
+
+    /// The model with the whole-genome sizes `declared` by assembly id.
+    #[cfg(test)]
+    pub(crate) fn with_declared(self, declared: HashMap<u32, usize>) -> Self {
+        Self { declared, ..self }
     }
 
     pub(crate) fn is_marker_genome(&self, assembly_id: u32) -> bool {
@@ -237,6 +254,12 @@ impl MarkerModel {
         let on_genes = self.fragment_placements(assembly_id)?;
         let genome = self.geometry.placements(i64::try_from(genome_size).ok()?);
         Some(genome / on_genes)
+    }
+
+    /// [`Self::genome_scale`] at the genome size that genome `assembly_id`
+    /// declares; `None` also without a declared size.
+    pub(crate) fn declared_genome_scale(&self, assembly_id: u32) -> Option<f64> {
+        self.genome_scale(assembly_id, *self.declared.get(&assembly_id)?)
     }
 
     /// Coverage of a marker genome, or `None` for a genome of another type or
@@ -746,6 +769,10 @@ mod tests {
         let scale = model.genome_scale(0, 10_000).unwrap();
         assert!((scale - 9_601.0 / 702.0).abs() < 1e-9);
         assert_eq!(model.genome_scale(1, 10_000), None);
+        // The same at the size the genome declares; none without one.
+        assert_eq!(model.declared_genome_scale(0), None);
+        let model = model.with_declared(HashMap::from([(0, 10_000)]));
+        assert_eq!(model.declared_genome_scale(0), Some(scale));
     }
 
     #[test]
@@ -764,6 +791,7 @@ mod tests {
         };
         let model = MarkerModel::new(
             HashMap::from([(0, genes(&[1_000, 250, 100])), (1, genes(&[100]))]),
+            HashMap::new(),
             geometry(FragmentLayout::PairsAndLoneMates),
         );
         assert_eq!(model.fragment_placements(0), Some(1_191.0 + 382.0));

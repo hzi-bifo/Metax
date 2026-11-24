@@ -22,15 +22,24 @@
 //! [`MARKER_ROWS`] for a genome represented by marker genes, whose genes stand
 //! for its chunks and on which a fragment counts on every gene it covers.
 //!
+//! A kept unit represented by marker genes leaves part of its own fragments
+//! to its relatives: its marker set misses genes of its genome, and its genes
+//! clip reads at their ends; those fragments land on relatives' genes or
+//! genomes. A taxon above such kept units therefore gets a row only when its
+//! fragments reach the model's spill share of theirs ([`kept_beneath`]),
+//! counted in whole-genome equivalents when the row's evidence is a genome
+//! reference. Kept units on genome references leave no such share.
+//!
 //! 1. Genus rows. A fragment whose tie set lies in one genus is unique to it.
 //!    A genus gets a row when, for one kind of fragment or both, the fragments
 //!    of that kind unique to it meet the amount of their evidence model, their
 //!    mean identity is at least the run's species identity cutoff minus the
 //!    model's margin, and their chunk ratio (COEBR) on the evidence genome
-//!    reaches the model's bound. Its row then holds the fragments of both kinds
-//!    unique to it; the unique fragments of a genus without a row go to the
-//!    first taxon above the genus at family, order, class, phylum or domain
-//!    rank (step 3).
+//!    reaches the model's bound; its unique fragments of both kinds must also
+//!    reach the spill bound of the kept units beneath the genus. Its row then
+//!    holds the fragments of both kinds unique to it; the unique fragments of
+//!    a genus without a row go to the first taxon above the genus at family,
+//!    order, class, phylum or domain rank (step 3).
 //! 2. Ties between genera. A fragment whose tie set spans several genera, one
 //!    or more of them with a genus row, goes to the genera with a genus row,
 //!    shared by the likelihood EM over those genera, as the species level's EM
@@ -40,9 +49,10 @@
 //!    their tie set's taxa, or the first taxon above it at family, order,
 //!    class, phylum or domain rank; a fragment with none below the root stays
 //!    unexplained. A taxon gets a row when the fragments that reach it meet
-//!    the amount and the evenness of their evidence model ([`taxon_failures`]);
-//!    otherwise they move to the next taxon above it at one of those ranks,
-//!    and stay unexplained above domain.
+//!    the amount and the evenness of their evidence model ([`taxon_failures`])
+//!    and reach the spill bound of the kept units beneath it; otherwise they
+//!    move to the next taxon above it at one of those ranks, and stay
+//!    unexplained above domain.
 //!
 //! A row's depth is the first-read bases of all its fragments over the indexed
 //! length of the genome they fit best as a set: the genome holding most of
@@ -86,6 +96,10 @@ pub(super) struct RowRules {
     pub(super) genus_min_chunk_ratio: f64,
     /// How the fragments of a row above genus spread over the evidence genome.
     pub(super) above_genus: Spread,
+    /// Share of a kept unit's fragments that may land on its relatives: a row
+    /// of a taxon above kept units of this model needs at least this share of
+    /// their fragments.
+    pub(super) spill_share: f64,
 }
 
 /// The evenness test of a row above genus.
@@ -104,6 +118,7 @@ pub(super) const GENOME_ROWS: RowRules = RowRules {
     genus_identity_margin: 0.09,
     genus_min_chunk_ratio: 0.40,
     above_genus: Spread::Windows(0.50),
+    spill_share: 0.0,
 };
 
 /// Rows on a genome represented by marker genes: fragments spread over its
@@ -115,6 +130,7 @@ pub(super) const MARKER_ROWS: RowRules = RowRules {
     genus_identity_margin: 0.09,
     genus_min_chunk_ratio: 0.40,
     above_genus: Spread::ChunkRatio(0.40),
+    spill_share: 0.15,
 };
 
 /// The evidence model of a genome.
@@ -126,7 +142,7 @@ pub(super) enum Model {
 
 impl Model {
     /// The model of genome `assembly_id`.
-    fn of(data: &MappingData, assembly_id: u32) -> Self {
+    pub(super) fn of(data: &MappingData, assembly_id: u32) -> Self {
         if data
             .marker_model
             .as_deref()
@@ -145,6 +161,53 @@ impl Model {
             Self::Markers => &MARKER_ROWS,
         }
     }
+}
+
+/// The spill bound of a taxon from the kept units beneath it: the fragments
+/// they may leave to relatives, counted on marker genes and in whole-genome
+/// equivalents.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct Beneath {
+    pub(super) marker_fragments: f64,
+    pub(super) whole_genome: f64,
+}
+
+impl Beneath {
+    /// The bound of a row whose evidence has `model`.
+    fn bound(&self, model: Model) -> f64 {
+        match model {
+            Model::Markers => self.marker_fragments,
+            Model::Genome => self.whole_genome,
+        }
+    }
+}
+
+/// The spill bound of every taxon at genus to domain rank above the kept
+/// `units`, each given as (taxid, model of its reported genome, fragments,
+/// whole-genome fragments per fragment): the spill share of their model of
+/// their fragments, summed; a unit without a whole-genome scale counts its
+/// fragments as they are. Units are summed in taxid order.
+pub(super) fn kept_beneath(
+    units: impl IntoIterator<Item = (u32, Model, f64, Option<f64>)>,
+    lineages: &Lineages,
+) -> HashMap<u32, Beneath> {
+    let mut units = units.into_iter().collect::<Vec<_>>();
+    units.sort_unstable_by_key(|unit| unit.0);
+    let mut beneath: HashMap<u32, Beneath> = HashMap::new();
+    for (taxid, model, fragments, scale) in units {
+        let spill = model.rules().spill_share * fragments;
+        if spill <= 0.0 {
+            continue;
+        }
+        for &(ancestor, rank) in lineages.of(taxid).iter() {
+            if rank.is_some() {
+                let bound = beneath.entry(ancestor).or_default();
+                bound.marker_fragments += spill;
+                bound.whole_genome += spill * scale.unwrap_or(1.0);
+            }
+        }
+    }
+    beneath
 }
 
 /// The two kinds of fragments placed above species.
@@ -287,6 +350,9 @@ pub(super) struct Level<'a> {
     pub(super) em: EmSettings,
     /// Keep each fragment's shares for the per-read classifications.
     pub(super) keep_shares: bool,
+    /// The fragments of the kept units of each taxon that may land on
+    /// relatives ([`kept_beneath`]).
+    pub(super) kept_beneath: &'a HashMap<u32, Beneath>,
 }
 
 impl Level<'_> {
@@ -361,6 +427,7 @@ pub(super) enum Failure {
     Identity { identity: f64, floor: f64 },
     ChunkRatio { ratio: f64, bound: f64 },
     Windows { spread: Option<f64>, bound: f64 },
+    Spill { fragments: usize, bound: f64 },
 }
 
 impl fmt::Display for Failure {
@@ -377,8 +444,20 @@ impl fmt::Display for Failure {
                 spread: Some(spread),
                 bound,
             } => write!(f, "window spread: {spread:.4} < {bound}"),
+            Self::Spill { fragments, bound } => write!(
+                f,
+                "spill of kept units beneath: {fragments} fragments < {bound:.1}"
+            ),
         }
     }
+}
+
+/// The spill test: a row's `fragments` at least the `bound` of the kept units
+/// beneath it, when there are any.
+fn spill_failure(fragments: usize, bound: Option<f64>) -> Option<Failure> {
+    bound
+        .filter(|&bound| (fragments as f64) < bound)
+        .map(|bound| Failure::Spill { fragments, bound })
 }
 
 /// The chunk ratio test: `ratio` at least `bound`.
@@ -449,6 +528,9 @@ pub(super) struct GenusCandidate {
     pub(super) identity: f64,
     pub(super) identity_floor: f64,
     pub(super) measured: Measured,
+    /// The spill bound of the kept units beneath the genus, if any, which
+    /// its unique fragments of both kinds must reach.
+    pub(super) spill: Option<f64>,
     pub(super) failures: Vec<Failure>,
     pub(super) shown: bool,
 }
@@ -466,6 +548,8 @@ pub(super) struct TaxonCandidate {
     pub(super) from_below: usize,
     pub(super) tied_genera: Vec<u32>,
     pub(super) measured: Measured,
+    /// The spill bound of the kept units beneath the taxon, if any.
+    pub(super) spill: Option<f64>,
     pub(super) failures: Vec<Failure>,
 }
 
@@ -650,6 +734,14 @@ impl Placing<'_> {
         measure(self, list)
     }
 
+    /// The spill bound of taxon `taxid` for a row measured as `measured`.
+    fn spill(&self, taxid: u32, measured: &Measured) -> Option<f64> {
+        self.level
+            .kept_beneath
+            .get(&taxid)
+            .map(|beneath| beneath.bound(measured.model))
+    }
+
     /// The fragments waiting at `taxid` of `rank`.
     fn arrivals(&mut self, taxid: u32, rank: Rank) -> &mut Arrivals {
         &mut self
@@ -678,6 +770,10 @@ impl Placing<'_> {
                 }
             }
         }
+        let mut of_genus: HashMap<u32, usize> = HashMap::new();
+        for (&(genus, _), list) in &unique {
+            *of_genus.entry(genus).or_default() += list.len();
+        }
         let cutoff = self.level.not_kept.1.identity;
         let mut candidates = Vec::new();
         for (&(genus, kind), list) in &unique {
@@ -690,6 +786,9 @@ impl Placing<'_> {
                 .sum::<f64>()
                 / list.len() as f64;
             let identity_floor = cutoff - measured.rules().genus_identity_margin;
+            let spill = self.spill(genus, &measured);
+            let mut failures = genus_failures(identity, identity_floor, &measured);
+            failures.extend(spill_failure(of_genus[&genus], spill));
             candidates.push(GenusCandidate {
                 genus,
                 kind,
@@ -698,7 +797,8 @@ impl Placing<'_> {
                 identity,
                 identity_floor,
                 measured,
-                failures: genus_failures(identity, identity_floor, &measured),
+                spill,
+                failures,
                 shown: false,
             });
         }
@@ -818,7 +918,9 @@ impl Placing<'_> {
             for taxid in here {
                 let (_, arrivals) = self.pending.remove(&taxid).expect("listed above");
                 let passed = self.measure(&arrivals.fragments).is_some_and(|measured| {
-                    let failures = taxon_failures(&measured);
+                    let spill = self.spill(taxid, &measured);
+                    let mut failures = taxon_failures(&measured);
+                    failures.extend(spill_failure(arrivals.fragments.len(), spill));
                     let passed = failures.is_empty();
                     if passed {
                         evidence.insert((rank, taxid), measured);
@@ -831,6 +933,7 @@ impl Placing<'_> {
                         from_below: arrivals.from_below,
                         tied_genera: most_listed(&arrivals.sets, self.genera),
                         measured,
+                        spill,
                         failures,
                     });
                     passed
@@ -1264,6 +1367,7 @@ mod tests {
                     max_iterations: 1000,
                 },
                 keep_shares: true,
+                kept_beneath: &HashMap::new(),
             },
             &Lineages::new(&taxonomy),
         )
@@ -1299,6 +1403,14 @@ mod tests {
 
     /// The level over reads of species not kept on marker genome 60.
     fn place_marker_reads(not_kept: Vec<Vec<EvidenceAlignment>>) -> HigherLevels {
+        place_marker_reads_beside(not_kept, &HashMap::new())
+    }
+
+    /// [`place_marker_reads`] with the spill bounds `kept_beneath`.
+    fn place_marker_reads_beside(
+        not_kept: Vec<Vec<EvidenceAlignment>>,
+        kept_beneath: &HashMap<u32, Beneath>,
+    ) -> HigherLevels {
         let reads = (0..not_kept.len()).collect::<Vec<_>>();
         let mut data = data(not_kept);
         let model = marker_model();
@@ -1325,9 +1437,71 @@ mod tests {
                     max_iterations: 1000,
                 },
                 keep_shares: false,
+                kept_beneath,
             },
             &Lineages::new(&taxonomy),
         )
+    }
+
+    #[test]
+    fn kept_units_on_marker_genes_bound_the_rows_of_the_taxa_above_them() {
+        let taxonomy = taxonomy();
+        let lineages = Lineages::new(&taxonomy);
+        // Species 1001 (genus 100) on marker genes with 400 fragments, each standing for 20 whole-genome
+        // fragments; species 1011 (genus 101) on a genome reference leaves no spill.
+        let beneath = kept_beneath(
+            [
+                (1001, Model::Markers, 400.0, Some(20.0)),
+                (1011, Model::Genome, 1_000.0, None),
+            ],
+            &lineages,
+        );
+        let share = MARKER_ROWS.spill_share;
+        assert_eq!(GENOME_ROWS.spill_share, 0.0);
+        let expected = Beneath {
+            marker_fragments: share * 400.0,
+            whole_genome: share * 8_000.0,
+        };
+        for taxon in [100, 40, 30, 20, 10, 2] {
+            assert_eq!(beneath[&taxon], expected, "{taxon}");
+        }
+        assert!(!beneath.contains_key(&101) && !beneath.contains_key(&1001));
+        // A row on marker genes compares with their fragments, a row on a genome reference with their whole-genome
+        // equivalents.
+        assert_eq!(expected.bound(Model::Markers), share * 400.0);
+        assert_eq!(expected.bound(Model::Genome), share * 8_000.0);
+    }
+
+    #[test]
+    fn a_genus_row_beside_kept_marker_units_needs_more_than_their_spill() {
+        // 72 reads over 24 genes of genus 100: a row alone, but not beside kept units spilling 100 fragments.
+        let bound = |marker_fragments| {
+            HashMap::from([(
+                100,
+                Beneath {
+                    marker_fragments,
+                    whole_genome: 50.0 * marker_fragments,
+                },
+            )])
+        };
+        let found = place_marker_reads_beside(marker_reads(24, 3), &bound(100.0));
+        // The genus fails; its reads move up to the family, which has no kept units beneath here.
+        assert_eq!(rows(&found), [(40, Rank::Family, 72.0)]);
+        let candidate = &found.genera[0];
+        assert_eq!(candidate.spill, Some(100.0));
+        assert_eq!(
+            candidate.failures,
+            [Failure::Spill {
+                fragments: 72,
+                bound: 100.0
+            }]
+        );
+        assert_eq!(
+            candidate.failures[0].to_string(),
+            "spill of kept units beneath: 72 fragments < 100.0"
+        );
+        let found = place_marker_reads_beside(marker_reads(24, 3), &bound(72.0));
+        assert_eq!(rows(&found), [(100, Rank::Genus, 72.0)]);
     }
 
     #[test]
@@ -1404,6 +1578,7 @@ mod tests {
                 max_iterations: 1000,
             },
             keep_shares: false,
+            kept_beneath: &HashMap::new(),
         };
         let genomes = HashMap::from([(60, 40_000.0)]);
         let placing = Placing {

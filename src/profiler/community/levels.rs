@@ -794,6 +794,20 @@ impl Run<'_> {
                 .filter(|(_, group)| group.is_none())
                 .map(|(fragment, _)| fragment.read)
                 .collect::<Vec<_>>();
+            // Each kept unit with the model of its best-fit genome, its
+            // fragments and their whole-genome scale.
+            let markers = data.marker_model.as_deref();
+            let kept_beneath = higher::kept_beneath(
+                species.best_fit.iter().map(|(&taxid, &genome)| {
+                    (
+                        taxid,
+                        higher::Model::of(data, genome),
+                        kept.em.weight.get(&taxid).copied().unwrap_or(0.0),
+                        markers.and_then(|model| model.declared_genome_scale(genome)),
+                    )
+                }),
+                self.names.lineages,
+            );
             let level = higher::Level {
                 data,
                 tests: &species.tests,
@@ -802,6 +816,7 @@ impl Run<'_> {
                 not_kept: (&not_kept, self.policy),
                 em: self.em,
                 keep_shares: self.keep_shares,
+                kept_beneath: &kept_beneath,
             };
             let found = higher::place(&level, self.names.lineages);
             let genus_rows = found

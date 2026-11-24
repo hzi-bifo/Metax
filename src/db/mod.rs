@@ -252,7 +252,8 @@ pub struct ReferenceMetadata {
     pub reference_type: ReferenceType,
     /// Size of the whole genome as declared in the reference FASTA, kept for
     /// marker genomes only, whose `full_genome_size` is their summed marker
-    /// length. Used for the unclassified estimate, never for scaling.
+    /// length. Used for the unclassified estimate and to bound rows above
+    /// species beside kept marker genomes, never for scaling read counts.
     pub declared_genome_size: Option<usize>,
 }
 
