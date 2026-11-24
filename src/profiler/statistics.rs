@@ -275,7 +275,7 @@ fn pvalue_binomial_approx(
 
 /// Compute p-value using normal approximation to binomial.
 ///
-/// For large samples where np(1-p) ≥ 20 and 0.05 ≤ p ≤ 0.95,
+/// For large samples where min(np, n(1-p)) ≥ 20 and 0.05 ≤ p ≤ 0.95,
 /// the binomial distribution is well-approximated by a normal.
 ///
 /// Uses continuity correction (+/- 0.5) for better accuracy.

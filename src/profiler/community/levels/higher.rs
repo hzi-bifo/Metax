@@ -40,7 +40,8 @@
 //!
 //! A row's depth is the first-read bases of all its fragments over the indexed
 //! length of the genome they fit best as a set: the genome holding most of
-//! their best placements, on which the row's tests measure them. Genomes tied
+//! their best placements, on which the row's tests measure them. For a genus
+//! row these are the unique fragments of the kind its row shows. Genomes tied
 //! exactly with it on that number share the depth: it is the mean of the
 //! depths over each of them.
 

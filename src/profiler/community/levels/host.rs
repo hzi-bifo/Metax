@@ -4,10 +4,10 @@
 //! the entry's host names, host taxids and diseases; a taxon the table lists
 //! for other hosts only is dropped. A taxon the table does not list, or lists
 //! without hosts (an empty or `unknown` host field), is kept and annotated
-//! `unknown`; a strain row with such a taxid follows its species. Rows are dropped before abundance is normalised;
-//! their reads go to no other taxon. The profile gains the three annotation
-//! columns, and its files (profile, decisions) take the prefix
-//! `<prefix>.pathogen`.
+//! `unknown`; a strain row with such a taxid follows its species. Rows are
+//! dropped before abundance is normalised; their reads go to no other taxon.
+//! The profile gains the three annotation columns, and its files (profile,
+//! decisions) take the prefix `<prefix>.pathogen`.
 
 use std::collections::HashMap;
 

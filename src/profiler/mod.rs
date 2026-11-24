@@ -14,7 +14,8 @@
 //!
 //! - **Breadth**: Fraction of genome covered by at least one read
 //! - **Depth**: Average number of reads covering each position
-//! - **Chunk breadth**: Coverage of fixed-size genome chunks (for QC)
+//! - **Chunk breadth**: Share of the genome within 1,000 bases of a fragment's
+//!   first read; the species amount test compares it with the chunk-breadth cutoff
 //! - **Flex chunk breadth**: Coverage of variable-size chunks (based on √genome_size)
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -685,10 +686,10 @@ pub struct ProfilerConfig {
     /// identity of its fragments.
     pub genus_identity: f64,
 
-    /// Mapping-rate cut-off for the low-map path. A run is considered
-    /// low-map (auto `--by-mapped` forced on) when
-    /// `mapped_reads / total_reads < low_map_rate_threshold`. The comparison
-    /// is strict. Default 0.30.
+    /// Mapping-rate cut-off of the low-map rule. A run is low-map (its
+    /// automatic chunk-breadth cutoff is read at the mapped fragments, as with
+    /// `--by-mapped`) when its genome-equivalent mapping rate is below this
+    /// value, and never with `--host`. Default 0.30.
     pub low_map_rate_threshold: f64,
 
     /// `--host` with its pathogen table.

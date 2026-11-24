@@ -765,7 +765,7 @@ impl Profiler {
 
 /// Mapped fragments as a share of the input fragments, each counting as the
 /// share of a genome it represents: the sampling scale of the genome of its
-/// best placement, so that a fractional database is not mistaken for a
+/// first mapping record that is not on a marker genome, so that a fractional database is not mistaken for a
 /// sample of unknown or host DNA. Fragments placed only on marker genes, whose
 /// genome size is unknown, are left out. Equals the plain mapping rate for a
 /// database of whole genomes.
