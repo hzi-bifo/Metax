@@ -238,7 +238,7 @@ struct ProfileArgs {
         long = "strain",
         action = ArgAction::SetTrue,
         help_heading = "Analysis mode and resources",
-        help = "Also profile the genomes within each kept species: a genome whose own reads match it at strain-level identity and cover it evenly gets a strain row, named by its strain taxid or accession. The mapper then keeps the best mapping of every genome, and a saved mapping records strain=true."
+        help = "Also profile the genomes within each kept species: a genome whose own reads match it at strain-level identity and cover it evenly gets a strain row, named by its strain taxid or accession. The mapper then keeps at least 50 mappings per read or mate, and a saved mapping records strain=true."
     )]
     strain: bool,
 
@@ -314,7 +314,7 @@ struct ProfileArgs {
         action = ArgAction::SetTrue,
         conflicts_with = "host",
         help_heading = "Above-species and low-map behavior",
-        help = "Estimate the share of input reads or fragments that the profile does not explain and append it as an 'unclassified' row (taxid 0; column 4 the unexplained fragments, column 6 their share in percent). Species represented by marker genes count as their whole genome, from the genome size declared in the reference FASTA. Off by default."
+        help = "Estimate the share of input reads or fragments that the profile does not explain and append it as an 'unclassified' row (taxid 0; column 4 the unexplained fragments, column 6 their share in percent). Species represented by marker genes count as their whole genome, from the genome size declared in the reference FASTA. Off by default; not with --host."
     )]
     estimate_unclassified: bool,
 
@@ -354,7 +354,7 @@ struct ProfileArgs {
         default_value_t = 0.30,
         value_parser = parse_probability,
         help_heading = "Above-species and low-map behavior",
-        help = "Mapping rate below which the automatic chunk-breadth cutoff is estimated from the mapped reads or fragments instead of all input (0-1), from 1.5 times their number on a full database. Not with --host."
+        help = "Mapping rate below which the automatic chunk-breadth cutoff is estimated from the mapped reads or fragments instead of all input (0-1), from 1.5 times their number on a full database. Has no effect with --host."
     )]
     low_map_rate_threshold: f64,
 
@@ -456,7 +456,7 @@ struct ProfileArgs {
         long = "host",
         value_name = "TAXID",
         help_heading = "Pathogen-focused analysis",
-        help = "Host NCBI taxid; report only pathogens associated with this host."
+        help = "Host taxid; needs --pathogen-table. A taxon the table lists for this host, or for a host below it in the taxonomy, is kept and annotated; a taxon listed for other hosts only is dropped; an unlisted taxon is kept and annotated unknown. A strain row whose taxid is unlisted follows its species. Turns off the low-map rule (--low-map-rate-threshold) and appends three columns to the profile."
     )]
     host: Option<String>,
 
@@ -465,7 +465,7 @@ struct ProfileArgs {
         alias = "pathogen-host",
         value_name = "TSV",
         help_heading = "Pathogen-focused analysis",
-        help = "TSV that associates pathogen taxids with host metadata; used with --host."
+        help = "Tab-separated table with a header line and the columns pathogen_taxid, host_taxids, host_names, diseases (lists separated by semicolons). Needs --host."
     )]
     pathogen_table: Option<String>,
 
