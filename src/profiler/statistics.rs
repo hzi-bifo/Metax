@@ -133,6 +133,28 @@ pub(crate) enum Tail {
     Upper,
 }
 
+/// The expected breadth `p` (clamped) and the number of genome positions `n`
+/// that a breadth test runs on; `None` without reads, with an expected breadth
+/// of 0 or 1, or when `n` cannot be inferred.
+fn breadth_test_inputs(
+    read_count: usize,
+    depth: Option<f64>,
+    exp_breadth: f64,
+) -> Option<(f64, usize)> {
+    if read_count == 0 {
+        return None;
+    }
+    let p = clamp01(exp_breadth);
+    if p <= 0.0 || p >= 1.0 {
+        return None;
+    }
+    let n = depth
+        .filter(|d| *d > 0.0)
+        .and_then(|d| infer_n_from_depth(read_count, d))
+        .or_else(|| infer_n_from_exp_breadth(read_count, p))?;
+    Some((p, n))
+}
+
 /// Compute exact p-value using Stirling numbers.
 ///
 /// For small sample sizes (n ≤ 3000, m ≤ 100), computes the exact
@@ -149,22 +171,7 @@ fn pvalue_exact_stirling(
     max_n: usize,
     max_m: usize,
 ) -> Option<f64> {
-    if read_count == 0 {
-        return None;
-    }
-
-    let p = clamp01(exp_breadth);
-    if p <= 0.0 || p >= 1.0 {
-        return None;
-    }
-
-    let mut n = depth
-        .filter(|d| *d > 0.0)
-        .and_then(|d| infer_n_from_depth(read_count, d));
-    if n.is_none() {
-        n = infer_n_from_exp_breadth(read_count, p);
-    }
-    let n = n?;
+    let (_, n) = breadth_test_inputs(read_count, depth, exp_breadth)?;
 
     if n > max_n || read_count > max_m {
         return None;
@@ -244,22 +251,7 @@ fn pvalue_binomial_approx(
     exp_breadth: f64,
     side: Tail,
 ) -> Option<f64> {
-    if read_count == 0 {
-        return None;
-    }
-
-    let p = clamp01(exp_breadth);
-    if p <= 0.0 || p >= 1.0 {
-        return None;
-    }
-
-    let mut n = depth
-        .filter(|d| *d > 0.0)
-        .and_then(|d| infer_n_from_depth(read_count, d));
-    if n.is_none() {
-        n = infer_n_from_exp_breadth(read_count, p);
-    }
-    let n = n?;
+    let (p, n) = breadth_test_inputs(read_count, depth, exp_breadth)?;
 
     let k_obs = k_from_breadth(breadth, n)?;
 
@@ -294,22 +286,7 @@ fn pvalue_normal_approx(
     exp_breadth: f64,
     side: Tail,
 ) -> Option<f64> {
-    if read_count == 0 {
-        return None;
-    }
-
-    let p = clamp01(exp_breadth);
-    if p <= 0.0 || p >= 1.0 {
-        return None;
-    }
-
-    let mut n = depth
-        .filter(|d| *d > 0.0)
-        .and_then(|d| infer_n_from_depth(read_count, d));
-    if n.is_none() {
-        n = infer_n_from_exp_breadth(read_count, p);
-    }
-    let n = n?;
+    let (p, n) = breadth_test_inputs(read_count, depth, exp_breadth)?;
 
     let k_obs = k_from_breadth(breadth, n)? as f64;
 

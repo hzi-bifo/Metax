@@ -17,7 +17,6 @@
 //!    genomes within them and the levels above, and writes the outputs.
 
 use std::collections::{hash_map::Entry, HashMap, HashSet};
-use std::io::BufRead;
 use std::path::Path;
 use std::str;
 use std::sync::Arc;
@@ -277,7 +276,16 @@ impl Profiler {
                 .as_ref()
                 .ok_or_else(|| anyhow!("missing reference metadata for native mappings"))?,
         );
-        self.load_metam(Path::new(&mappings), &db)
+        let path = Path::new(&mappings);
+        if !path.exists() {
+            bail!("Metam mapping file {} does not exist", path.display());
+        }
+        let reader = open_metam_mapping_reader(path)?;
+        let source = path.display().to_string();
+        let lenient = self.cfg.lenient_mapping_input;
+        self.load_metam_records(&source, &db, |on_mapping| {
+            for_each_metam_mapping_record(reader, &source, lenient, on_mapping)
+        })
     }
 
     /// The mappings streamed from the mapper.
@@ -292,7 +300,9 @@ impl Profiler {
                 .as_ref()
                 .ok_or_else(|| anyhow!("missing Metax database metadata for streamed mappings"))?,
         );
-        self.load_metam_mappings(receiver, source, &db)
+        self.load_metam_records(source, &db, |on_mapping| {
+            for_each_structured_mapping_record(receiver, source, on_mapping)
+        })
     }
 
     /// Lower an automatic long-read identity cutoff when the reads align worse
@@ -349,40 +359,6 @@ impl Profiler {
             return load_shared_metam_profile(shared);
         }
         bail!("mapping file is missing embedded profile counters; rerun mapping with this Metax version")
-    }
-
-    fn load_metam(&mut self, mappings_path: &Path, db: &DatabaseMetadata) -> Result<MappingData> {
-        if !mappings_path.exists() {
-            bail!(
-                "Metam mapping file {} does not exist",
-                mappings_path.display()
-            );
-        }
-        let reader = open_metam_mapping_reader(mappings_path)?;
-        self.load_metam_reader(reader, &mappings_path.display().to_string(), db)
-    }
-
-    fn load_metam_reader<R: BufRead>(
-        &mut self,
-        reader: R,
-        source: &str,
-        db: &DatabaseMetadata,
-    ) -> Result<MappingData> {
-        let lenient = self.cfg.lenient_mapping_input;
-        self.load_metam_records(source, db, |on_mapping| {
-            for_each_metam_mapping_record(reader, source, lenient, on_mapping)
-        })
-    }
-
-    fn load_metam_mappings(
-        &mut self,
-        receiver: MetamMappingReceiver,
-        source: &str,
-        db: &DatabaseMetadata,
-    ) -> Result<MappingData> {
-        self.load_metam_records(source, db, |on_mapping| {
-            for_each_structured_mapping_record(receiver, source, on_mapping)
-        })
     }
 
     /// One sample's mappings: the database references resolved, the mapping
@@ -638,15 +614,7 @@ impl Profiler {
         records: &LoadedRecords,
         marker_model: Option<&MarkerModel>,
     ) -> f64 {
-        let LoadedRecords {
-            read_alignments,
-            total_reads,
-            mapping_records,
-            profile,
-            ..
-        } = records;
-        let total_reads = *total_reads;
-        let aligned_reads = read_alignments.len();
+        let (total_reads, aligned_reads) = (records.total_reads, records.read_alignments.len());
         let mapped_unit = if self.cfg.is_paired {
             "fragments"
         } else {
@@ -659,7 +627,8 @@ impl Profiler {
         };
         // The low-map gate asks how much of the sample the reference explains, so
         // fragments count as the genome share they represent.
-        let gate_rate = genome_equivalent_mapping_rate(read_alignments, total_reads, marker_model);
+        let gate_rate =
+            genome_equivalent_mapping_rate(&records.read_alignments, total_reads, marker_model);
         if gate_rate != mapping_rate {
             log::info!(
                 target: "PROFILER",
@@ -676,15 +645,15 @@ impl Profiler {
         let chunk_cutoff = ChunkCutoff::resolve(&self.cfg, basis.reads);
 
         log::info!(target: "PROFILER", "Total number of reads: {}", total_reads);
-        log::info!(target: "PROFILER", "Number of mapping records: {}", mapping_records);
+        log::info!(target: "PROFILER", "Number of mapping records: {}", records.mapping_records);
         log::info!(
             target: "PROFILER",
             "Number of mapped {}: {}",
             mapped_unit,
             aligned_reads
         );
-        log::info!(target: "PROFILER", "Metam reported mapped read records: {}", profile.mapped_reads);
-        log::info!(target: "PROFILER", "Metam emitted mapping records: {}", profile.emitted_records);
+        log::info!(target: "PROFILER", "Metam reported mapped read records: {}", records.profile.mapped_reads);
+        log::info!(target: "PROFILER", "Metam emitted mapping records: {}", records.profile.emitted_records);
         match chunk_cutoff.source {
             ChunkSource::Automatic if basis.mapped => log::info!(
                 target: "PROFILER",

@@ -6,6 +6,7 @@
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::hash::Hash;
 
 use metam::format::canonical_mapping_identity;
 
@@ -652,24 +653,7 @@ impl CandidateScratch {
             {
                 continue;
             }
-            let placement = CandidatePlacement {
-                taxid: mapping.profile_taxid,
-                reference_id: mapping.reference_id,
-                assembly_id: mapping.assembly_id,
-                sampling_scale: f64::from(mapping.sampling_scale),
-                asm_len: mapping.asm_len,
-                r1_mapped: mapping.mapped_len,
-                both_mapped: mapping.mapped_len,
-                read_len: mapping.read_len,
-                other_genes: 0,
-                pair_errors: estimated_errors(mapping),
-                long_score: 0.0,
-                span: mapping.span,
-                mate_span: (0, 0),
-                fixed_chunk: mapping.fixed_chunk,
-                flex_chunk: mapping.flex_chunk,
-                input_order,
-            };
+            let placement = single_row_placement(mapping, input_order, 0.0);
             self.insert_row_placement(placement, mapping, policy.mode);
         }
         self.count_other_genes();
@@ -689,24 +673,7 @@ impl CandidateScratch {
             {
                 continue;
             }
-            let placement = CandidatePlacement {
-                taxid: mapping.profile_taxid,
-                reference_id: mapping.reference_id,
-                assembly_id: mapping.assembly_id,
-                sampling_scale: f64::from(mapping.sampling_scale),
-                asm_len: mapping.asm_len,
-                r1_mapped: mapping.mapped_len,
-                both_mapped: mapping.mapped_len,
-                read_len: mapping.read_len,
-                other_genes: 0,
-                pair_errors: estimated_errors(mapping),
-                long_score: long_score(mapping),
-                span: mapping.span,
-                mate_span: (0, 0),
-                fixed_chunk: mapping.fixed_chunk,
-                flex_chunk: mapping.flex_chunk,
-                input_order,
-            };
+            let placement = single_row_placement(mapping, input_order, long_score(mapping));
             self.insert_row_placement(placement, mapping, policy.mode);
         }
         self.count_other_genes();
@@ -726,16 +693,7 @@ impl CandidateScratch {
                 placement.assembly_id,
                 placement.reference_id,
             );
-            match self.by_taxon_gene.entry(gene) {
-                Entry::Vacant(entry) => {
-                    entry.insert(placement);
-                }
-                Entry::Occupied(mut entry) => {
-                    if placement_is_better(&placement, entry.get(), mode) {
-                        entry.insert(placement);
-                    }
-                }
-            }
+            keep_better(&mut self.by_taxon_gene, gene, placement, mode);
         }
         self.insert_placement(placement, mode);
     }
@@ -770,17 +728,54 @@ impl CandidateScratch {
     }
 
     fn insert_placement(&mut self, placement: CandidatePlacement, mode: EvidenceMode) {
-        match self
-            .by_taxon_assembly
-            .entry((placement.taxid, placement.assembly_id))
-        {
-            Entry::Vacant(entry) => {
+        let key = (placement.taxid, placement.assembly_id);
+        keep_better(&mut self.by_taxon_assembly, key, placement, mode);
+    }
+}
+
+/// The placement of one row of a single or long read.
+#[inline]
+fn single_row_placement(
+    mapping: &EvidenceAlignment,
+    input_order: usize,
+    long_score: f64,
+) -> CandidatePlacement {
+    CandidatePlacement {
+        taxid: mapping.profile_taxid,
+        reference_id: mapping.reference_id,
+        assembly_id: mapping.assembly_id,
+        sampling_scale: f64::from(mapping.sampling_scale),
+        asm_len: mapping.asm_len,
+        r1_mapped: mapping.mapped_len,
+        both_mapped: mapping.mapped_len,
+        read_len: mapping.read_len,
+        other_genes: 0,
+        pair_errors: estimated_errors(mapping),
+        long_score,
+        span: mapping.span,
+        mate_span: (0, 0),
+        fixed_chunk: mapping.fixed_chunk,
+        flex_chunk: mapping.flex_chunk,
+        input_order,
+    }
+}
+
+/// Hold `placement` under `key`, unless the placement there is at least as
+/// good.
+#[inline]
+fn keep_better<K: Eq + Hash>(
+    placements: &mut HashMap<K, CandidatePlacement>,
+    key: K,
+    placement: CandidatePlacement,
+    mode: EvidenceMode,
+) {
+    match placements.entry(key) {
+        Entry::Vacant(entry) => {
+            entry.insert(placement);
+        }
+        Entry::Occupied(mut entry) => {
+            if placement_is_better(&placement, entry.get(), mode) {
                 entry.insert(placement);
-            }
-            Entry::Occupied(mut entry) => {
-                if placement_is_better(&placement, entry.get(), mode) {
-                    entry.insert(placement);
-                }
             }
         }
     }

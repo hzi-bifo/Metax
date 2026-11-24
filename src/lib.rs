@@ -596,52 +596,25 @@ impl MetaxApp {
         }
 
         // Render boolean flags as CLI switches for logging/debugging.
-        let bool_params = {
-            let mut flags = Vec::new();
-            if self.config.resume {
-                flags.push("-r".to_string());
-            }
-            if self.config.genome_level {
-                flags.push("--strain".to_string());
-            }
-            if self.config.save_decisions {
-                flags.push("--save-decisions".to_string());
-            }
-            if self.config.save_classifications {
-                flags.push("--save-classification".to_string());
-            }
-            if self.config.by_aligned {
-                flags.push("--by-mapped".to_string());
-            }
-            if !self.config.above_species {
-                flags.push("--strict-coverage".to_string());
-            }
-            if self.config.estimate_unclassified {
-                flags.push("--estimate-unclassified".to_string());
-            }
-            if self.config.lenient_mapping_input {
-                flags.push("--lenient-mapping-input".to_string());
-            }
-            if self.config.keep_mapping_output {
-                flags.push("--save-mapping".to_string());
-            }
-            if self.config.stream_mappings {
-                flags.push("--stream-mappings".to_string());
-            }
-            if self.config.verbose {
-                flags.push("--verbose".to_string());
-            }
-            if self.config.very_verbose {
-                flags.push("--very-verbose".to_string());
-            }
-            flags.join(" ")
-        };
-
-        let extra_args = if self.config.extra_args.is_empty() {
-            String::new()
-        } else {
-            self.config.extra_args.join(" ")
-        };
+        let bool_params = [
+            (self.config.resume, "-r"),
+            (self.config.genome_level, "--strain"),
+            (self.config.save_decisions, "--save-decisions"),
+            (self.config.save_classifications, "--save-classification"),
+            (self.config.by_aligned, "--by-mapped"),
+            (!self.config.above_species, "--strict-coverage"),
+            (self.config.estimate_unclassified, "--estimate-unclassified"),
+            (self.config.lenient_mapping_input, "--lenient-mapping-input"),
+            (self.config.keep_mapping_output, "--save-mapping"),
+            (self.config.stream_mappings, "--stream-mappings"),
+            (self.config.verbose, "--verbose"),
+            (self.config.very_verbose, "--very-verbose"),
+        ]
+        .iter()
+        .filter(|(given, _)| *given)
+        .map(|(_, flag)| *flag)
+        .collect::<Vec<_>>()
+        .join(" ");
 
         // Render mode as CLI string for logging/debugging.
         let mode = match self.config.mode {
@@ -704,7 +677,7 @@ impl MetaxApp {
             fmt_option(&self.config.host.as_ref().map(|host| &host.pathogen_table)),
             fmt_option(&self.config.host.as_ref().map(|host| host.taxid)),
             bool_params,
-            extra_args
+            self.config.extra_args.join(" ")
         )
     }
 

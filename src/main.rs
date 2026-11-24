@@ -28,16 +28,22 @@ use std::{
 use anyhow::{bail, Context, Result};
 use clap::{ArgAction, Args, Parser, Subcommand};
 
-/// Parser for a probability-valued CLI option. Rejects non-finite values
-/// and values outside `[0.0, 1.0]` at parse time so misuse is caught
-/// before any I/O work begins.
-fn parse_probability(s: &str) -> Result<f64, String> {
+/// A finite floating-point option value.
+fn parse_finite(s: &str) -> Result<f64, String> {
     let value: f64 = s
         .parse()
         .map_err(|e: std::num::ParseFloatError| format!("not a floating-point number: {e}"))?;
     if !value.is_finite() {
         return Err(format!("expected a finite value, got {s}"));
     }
+    Ok(value)
+}
+
+/// Parser for a probability-valued CLI option. Rejects non-finite values
+/// and values outside `[0.0, 1.0]` at parse time so misuse is caught
+/// before any I/O work begins.
+fn parse_probability(s: &str) -> Result<f64, String> {
+    let value = parse_finite(s)?;
     if !(0.0..=1.0).contains(&value) {
         return Err(format!("expected a value in [0.0, 1.0], got {value}"));
     }
@@ -46,12 +52,7 @@ fn parse_probability(s: &str) -> Result<f64, String> {
 
 /// Parser for non-negative finite floating-point thresholds.
 fn parse_nonnegative_float(s: &str) -> Result<f64, String> {
-    let value: f64 = s
-        .parse()
-        .map_err(|e: std::num::ParseFloatError| format!("not a floating-point number: {e}"))?;
-    if !value.is_finite() {
-        return Err(format!("expected a finite value, got {s}"));
-    }
+    let value = parse_finite(s)?;
     if value < 0.0 {
         return Err(format!("expected a non-negative value, got {value}"));
     }
@@ -60,12 +61,7 @@ fn parse_nonnegative_float(s: &str) -> Result<f64, String> {
 
 /// Parser for positive finite multiplicative factors.
 fn parse_positive_float(s: &str) -> Result<f64, String> {
-    let value: f64 = s
-        .parse()
-        .map_err(|e: std::num::ParseFloatError| format!("not a floating-point number: {e}"))?;
-    if !value.is_finite() {
-        return Err(format!("expected a finite value, got {s}"));
-    }
+    let value = parse_finite(s)?;
     if value <= 0.0 {
         return Err(format!("expected a value greater than zero, got {value}"));
     }
