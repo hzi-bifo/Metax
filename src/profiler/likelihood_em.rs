@@ -59,6 +59,12 @@ impl ReadGroups {
     /// candidates is not added. `candidates` is left sorted by unit, one per
     /// unit.
     pub(crate) fn add(&mut self, candidates: &mut Candidates) -> Option<usize> {
+        self.add_reads(candidates, 1.0)
+    }
+
+    /// Add `reads` reads with the same `candidates`, as [`Self::add`] adds
+    /// one.
+    pub(crate) fn add_reads(&mut self, candidates: &mut Candidates, reads: f64) -> Option<usize> {
         if candidates.is_empty() {
             return None;
         }
@@ -72,11 +78,11 @@ impl ReadGroups {
             }),
         );
         if let Some(&slot) = self.index.get(self.key.as_slice()) {
-            self.weights[slot] += 1.0;
+            self.weights[slot] += reads;
             return Some(slot);
         }
         let slot = self.weights.len();
-        self.weights.push(1.0);
+        self.weights.push(reads);
         self.index.insert(self.key.as_slice().into(), slot);
         Some(slot)
     }

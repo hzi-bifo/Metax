@@ -973,7 +973,7 @@ impl Decisions<'_> {
                         candidate.kind.words(),
                         tests_in_words(&failures_in_words(&candidate.failures))
                     ),
-                    ..row(measured.genome, decided == Some(index))
+                    ..row(measured.genome(), decided == Some(index))
                 });
             }
             rows.sort_by_key(|row| !row.decided);
@@ -1115,7 +1115,7 @@ impl Decisions<'_> {
                 (
                     candidate.rank,
                     DecisionRow {
-                        genome: Some(names.genome(measured.genome)),
+                        genome: Some(names.genome(measured.genome())),
                         decided: true,
                         reads: measured.fragments.to_string(),
                         coverage: Some(measured.coverage),
@@ -1353,13 +1353,11 @@ mod tests {
         };
         let species = HashMap::from([(1, genomes_of(10)), (4, genomes_of(40))]);
         let measured = |genome: u32, fragments, coverage, spread| Measured {
-            genome,
             model: Model::Genome,
             fragments,
             coverage,
             spread,
             tied: Arc::from([genome]),
-            length: 1_000_000.0,
             whole_genome_scale: None,
         };
         let genus = measured(50, 240, coverage(0.1, 0.9), Some(0.8));

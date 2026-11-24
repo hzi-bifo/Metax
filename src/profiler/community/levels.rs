@@ -335,7 +335,7 @@ fn profile_levels(profiler: &Profiler, data: MappingData) -> Result<()> {
                     row.rank.as_str(),
                     (row.reads, row.depth),
                     &row.measured.coverage,
-                    names.genome_entry(row.measured.genome),
+                    names.genome_entry(row.measured.genome()),
                     (f64::NAN, f64::NAN),
                 ),
             )
@@ -1303,11 +1303,21 @@ fn fragment_of(
 /// dropping candidates whose likelihood is below [`MIN_RELATIVE_LIKELIHOOD`]
 /// of the fragment's best allowed candidate.
 fn share_reads(fragments: &[Fragment], allowed: impl Fn(u32) -> bool, penalty: f64) -> SharedReads {
+    share_reads_after(ReadGroups::default(), fragments, allowed, penalty)
+}
+
+/// [`share_reads`] after the read groups `groups`, whose reads have no bases.
+fn share_reads_after(
+    groups: ReadGroups,
+    fragments: &[Fragment],
+    allowed: impl Fn(u32) -> bool,
+    penalty: f64,
+) -> SharedReads {
     let max_excess_errors = -MIN_RELATIVE_LIKELIHOOD.ln() / penalty;
     let mut shared = SharedReads {
-        groups: ReadGroups::default(),
         group_of: Vec::with_capacity(fragments.len()),
-        group_bases: Vec::new(),
+        group_bases: vec![0.0; groups.len()],
+        groups,
     };
     let mut candidates: likelihood_em::Candidates = Vec::new();
     for fragment in fragments {
