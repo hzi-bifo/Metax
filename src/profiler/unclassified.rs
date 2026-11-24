@@ -61,6 +61,12 @@ impl GenomeReads {
         self.reads
     }
 
+    /// The whole-genome reads per read of long reads on a genome of `size`
+    /// bases; `None` without a read.
+    pub(crate) fn whole_genome_per_read(&self, size: usize) -> Option<f64> {
+        (self.reads > 0).then(|| (self.per_base * size as f64 + self.fixed) / self.reads as f64)
+    }
+
     /// Gene hits per short-read fragment, 1 without fragments.
     fn hits_per_fragment(&self) -> f64 {
         if self.reads == 0 {

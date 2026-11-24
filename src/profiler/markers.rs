@@ -259,7 +259,27 @@ impl MarkerModel {
     /// [`Self::genome_scale`] at the genome size that genome `assembly_id`
     /// declares; `None` also without a declared size.
     pub(crate) fn declared_genome_scale(&self, assembly_id: u32) -> Option<f64> {
-        self.genome_scale(assembly_id, *self.declared.get(&assembly_id)?)
+        self.genome_scale(assembly_id, self.declared_size(assembly_id)?)
+    }
+
+    /// The whole-genome size that genome `assembly_id` declares.
+    pub(crate) fn declared_size(&self, assembly_id: u32) -> Option<usize> {
+        self.declared.get(&assembly_id).copied()
+    }
+
+    /// Whether the sample's reads are long reads, whose placements on the
+    /// genes depend on each read's own length.
+    pub(crate) fn long_reads(&self) -> bool {
+        self.geometry.layout == FragmentLayout::LongReads
+    }
+
+    /// The depth that a read of `read_len` bases on `genes` genes of genome
+    /// `assembly_id` adds to the whole genome: its length on each gene over
+    /// the placements that the genome's genes offer such a read
+    /// ([`Self::placements_for_read`]); `None` when no gene can hold it.
+    pub(crate) fn read_depth(&self, assembly_id: u32, read_len: u32, genes: u32) -> Option<f64> {
+        self.placements_for_read(assembly_id, read_len)
+            .map(|placements| f64::from(genes) * f64::from(read_len) / placements)
     }
 
     /// Coverage of a marker genome, or `None` for a genome of another type or

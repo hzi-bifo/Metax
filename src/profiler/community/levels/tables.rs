@@ -1352,13 +1352,15 @@ mod tests {
             shares: StrainShares::default(),
         };
         let species = HashMap::from([(1, genomes_of(10)), (4, genomes_of(40))]);
-        let measured = |genome, fragments, coverage, spread| Measured {
+        let measured = |genome: u32, fragments, coverage, spread| Measured {
             genome,
             model: Model::Genome,
             fragments,
             coverage,
             spread,
+            tied: Arc::from([genome]),
             length: 1_000_000.0,
+            whole_genome_scale: None,
         };
         let genus = measured(50, 240, coverage(0.1, 0.9), Some(0.8));
         let family = measured(80, 300, coverage(0.2, 0.9), Some(0.7));
@@ -1370,7 +1372,7 @@ mod tests {
                     reads: 475.0,
                     unique: [220, 250],
                     depth: 0.1,
-                    measured: genus,
+                    measured: genus.clone(),
                 },
                 HigherRow {
                     taxid: 1000,
@@ -1378,7 +1380,7 @@ mod tests {
                     reads: 320.0,
                     unique: [0, 0],
                     depth: 0.1,
-                    measured: family,
+                    measured: family.clone(),
                 },
             ],
             genera: vec![

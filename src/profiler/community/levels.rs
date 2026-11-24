@@ -374,7 +374,7 @@ fn profile_levels(profiler: &Profiler, data: MappingData) -> Result<()> {
         cfg,
         &data,
         &profile_rows,
-        &amounts.genome_reads,
+        (&amounts.genome_reads, above.as_ref()),
         run.long_reads,
     );
     let header = TableHeader::of(cfg);
@@ -2897,14 +2897,15 @@ fn fragment_depth(
     mapped: u32,
     markers: Option<&MarkerModel>,
 ) -> f64 {
-    match markers
-        .and_then(|model| model.placements_for_read(placement.assembly_id, placement.read_len))
-    {
-        Some(placements) => {
-            f64::from(1 + placement.other_genes) * f64::from(placement.read_len) / placements
-        }
-        None => f64::from(mapped) / placement.asm_len.max(1.0),
-    }
+    markers
+        .and_then(|model| {
+            model.read_depth(
+                placement.assembly_id,
+                placement.read_len,
+                1 + placement.other_genes,
+            )
+        })
+        .unwrap_or_else(|| f64::from(mapped) / placement.asm_len.max(1.0))
 }
 
 /// Record a resolved fragment's `placement` on a marker genome for the
@@ -2948,18 +2949,23 @@ fn estimate_unclassified(
     cfg: &ProfilerConfig,
     data: &MappingData,
     rows: &[ProfileRow],
-    marker_genome_reads: &HashMap<u32, GenomeReads>,
+    (marker_genome_reads, above): (&HashMap<u32, GenomeReads>, Option<&higher::HigherLevels>),
     long_reads: bool,
 ) -> Option<Option<unclassified::UnclassifiedEstimate>> {
     data.unclassified_species.as_ref().map(|species| {
         // Long reads differ in length and in the genes each covers, so
         // their scales come from the reads themselves.
-        let scales = unclassified::marker_scales(
+        let mut scales = unclassified::marker_scales(
             species,
             data.marker_model.as_deref(),
             marker_genome_reads,
             long_reads,
         );
+        // Rows above species on marker genomes count like species rows.
+        scales.extend(above.iter().flat_map(|found| &found.rows).filter_map(|row| {
+            (row.measured.model == higher::Model::Markers)
+                .then_some((row.taxid, row.measured.whole_genome_scale))
+        }));
         let estimate = unclassified::estimate(rows, &scales, data.total_reads);
         match estimate {
             Ok(estimate) => log::info!(
