@@ -84,7 +84,6 @@ use anyhow::{Context, Result};
 use super::genomes::{SpeciesGenomes, StrainDiagnostic};
 use super::higher::{
     self, GenusCandidate, HigherLevels, HigherRow, Lineages, Rank, TaxonCandidate,
-    GENUS_MIN_CHUNK_RATIO,
 };
 use super::{
     strain_label, unit_rank, wins_enough, within, CoverageTests, Dropped, FragmentCounts,
@@ -986,7 +985,6 @@ impl Decisions<'_> {
     /// its row took, and the species reported at the genus.
     fn genus_parts_in_words(&self, genus: u32, parts: &GenusParts, names: &Names) -> String {
         let mut words = Vec::new();
-        let floor = self.higher.map_or(f64::NAN, |higher| higher.identity_floor);
         // The kinds of reads whose evidence gave the genus its row.
         let passed = parts
             .candidates
@@ -1003,15 +1001,21 @@ impl Decisions<'_> {
                     ">="
                 }
             };
+            let measured = &candidate.measured;
+            let genes = measured
+                .coverage
+                .marker_genes_hit
+                .map_or_else(String::new, |genes| format!(", {genes} genes hit"));
             let mut tests = format!(
-                "{} reads {} unique to it, identity {:.4} {} {floor:.4}, chunk ratio {:.4} {} \
-                 {GENUS_MIN_CHUNK_RATIO}",
+                "{} reads {} unique to it{genes}, identity {:.4} {} {:.4}, chunk ratio {:.4} {} {}",
                 candidate.unique,
                 candidate.kind.words(),
                 candidate.identity,
                 failed(|f| matches!(f, higher::Failure::Identity { .. })),
-                candidate.measured.coverage.coebr,
-                failed(|f| matches!(f, higher::Failure::ChunkRatio(_))),
+                candidate.identity_floor,
+                measured.coverage.coebr,
+                failed(|f| matches!(f, higher::Failure::ChunkRatio { .. })),
+                measured.rules().genus_min_chunk_ratio,
             );
             if !candidate.failures.is_empty() {
                 if parts.row.is_some() {
@@ -1168,7 +1172,7 @@ fn taxon_parts_in_words(candidate: &TaxonCandidate, names: &Names) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::genomes::{StrainGenome, StrainShares};
-    use super::super::higher::{Failure, Kind, Measured};
+    use super::super::higher::{Failure, Kind, Measured, Model};
     use super::super::profile_row;
     use super::*;
     use crate::profiler::evidence::PresenceAssembly;
@@ -1339,6 +1343,7 @@ mod tests {
         let species = HashMap::from([(1, genomes_of(10)), (4, genomes_of(40))]);
         let measured = |genome, fragments, coverage, spread| Measured {
             genome,
+            model: Model::Genome,
             fragments,
             coverage,
             spread,
@@ -1372,8 +1377,12 @@ mod tests {
                     unique: 220,
                     tied: 30,
                     identity: 0.9,
+                    identity_floor: 0.886,
                     measured: measured(51, 200, coverage(0.05, 0.2), Some(0.6)),
-                    failures: vec![Failure::ChunkRatio(0.2)],
+                    failures: vec![Failure::ChunkRatio {
+                        ratio: 0.2,
+                        bound: 0.4,
+                    }],
                     shown: false,
                 },
                 GenusCandidate {
@@ -1382,6 +1391,7 @@ mod tests {
                     unique: 250,
                     tied: 20,
                     identity: 0.99,
+                    identity_floor: 0.886,
                     measured: genus,
                     failures: Vec::new(),
                     shown: true,
@@ -1406,10 +1416,12 @@ mod tests {
                     from_below: 0,
                     tied_genera: vec![100],
                     measured: measured(90, 20, coverage(0.01, 0.5), None),
-                    failures: vec![Failure::Spread(None)],
+                    failures: vec![Failure::Windows {
+                        spread: None,
+                        bound: 0.5,
+                    }],
                 },
             ],
-            identity_floor: 0.886,
             fragments: [620, 270],
             unexplained: 250,
             shares: Vec::new(),
