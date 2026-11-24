@@ -2,9 +2,9 @@
 //! (`--pathogen-table`). A taxon the table lists is kept when one of its hosts
 //! is the given host or lies below it in the taxonomy, and is annotated with
 //! the entry's host names, host taxids and diseases; a taxon the table lists
-//! for other hosts only is dropped. A taxon the table does not list is kept
-//! and annotated `unknown`. A strain row whose taxid the table does not list
-//! follows its species. Rows are dropped before abundance is normalised;
+//! for other hosts only is dropped. A taxon the table does not list, or lists
+//! without hosts (an empty or `unknown` host field), is kept and annotated
+//! `unknown`; a strain row with such a taxid follows its species. Rows are dropped before abundance is normalised;
 //! their reads go to no other taxon. The profile gains the three annotation
 //! columns, and its files (profile, decisions) take the prefix
 //! `<prefix>.pathogen`.
@@ -54,12 +54,14 @@ impl HostFilter<'_> {
         let Some(entry) = self.table.get(&taxid) else {
             return Verdict::Unlisted;
         };
-        let hosts = items(&entry.host_taxids).map_or_else(Vec::new, |items| {
-            items
-                .into_iter()
-                .filter_map(|item| item.parse::<u32>().ok())
-                .collect::<Vec<_>>()
-        });
+        // A taxon listed without hosts is judged as an unlisted one.
+        let Some(listed) = items(&entry.host_taxids) else {
+            return Verdict::Unlisted;
+        };
+        let hosts = listed
+            .into_iter()
+            .filter_map(|item| item.parse::<u32>().ok())
+            .collect::<Vec<_>>();
         let of_host = hosts.iter().any(|&listed| {
             listed == self.host
                 || self
@@ -290,6 +292,53 @@ mod tests {
             dropped.taxa[&2].reason(),
             "removed by --host: not a pathogen of host 9606"
         );
+    }
+
+    #[test]
+    fn a_taxon_listed_without_hosts_is_judged_as_unlisted() {
+        let table = HashMap::from([
+            (4, entry("", "Homo sapiens", "sepsis")),
+            (5, entry("unknown", "unknown", "unknown")),
+            (41, entry("", "", "")),
+        ]);
+        let taxonomy = taxonomy();
+        let lineages = Lineages::new(&taxonomy);
+        let filter = HostFilter {
+            host: 9606,
+            table: &table,
+            lineages: &lineages,
+        };
+        assert_eq!(filter.verdict(4), Verdict::Unlisted);
+        assert_eq!(filter.verdict(5), Verdict::Unlisted);
+        let mut dropped = Dropped::default();
+        let mut blocks = vec![block(
+            4,
+            Some(row(4, "species", 40)),
+            vec![row(41, "strain", 41)],
+        )];
+        filter.apply(&mut blocks, &mut dropped);
+        let host_taxids = |row: &ProfileRow| row.annotations.as_ref().unwrap().host_taxids.clone();
+        assert_eq!(host_taxids(blocks[0].taxon.as_ref().unwrap()), "unknown");
+        assert_eq!(host_taxids(&blocks[0].genomes[0]), "unknown");
+        // A strain row listed without hosts follows its species, here one
+        // listed for mice only.
+        let mice = HashMap::from([
+            (2, entry("10090", "Mus musculus", "unknown")),
+            (41, entry("", "", "")),
+        ]);
+        let mut blocks = vec![block(
+            2,
+            Some(row(2, "species", 20)),
+            vec![row(41, "strain", 42)],
+        )];
+        HostFilter {
+            host: 9606,
+            table: &mice,
+            lineages: &lineages,
+        }
+        .apply(&mut blocks, &mut dropped);
+        assert!(blocks.is_empty());
+        assert_eq!(dropped.genomes.keys().copied().collect::<Vec<_>>(), [42]);
     }
 
     #[test]

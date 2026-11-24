@@ -456,7 +456,7 @@ struct ProfileArgs {
         long = "host",
         value_name = "TAXID",
         help_heading = "Pathogen-focused analysis",
-        help = "Host taxid; needs --pathogen-table. A taxon the table lists for this host, or for a host below it in the taxonomy, is kept and annotated; a taxon listed for other hosts only is dropped; an unlisted taxon is kept and annotated unknown. A strain row whose taxid is unlisted follows its species. Turns off the low-map rule (--low-map-rate-threshold) and appends three columns to the profile."
+        help = "Host taxid; needs --pathogen-table. A taxon the table lists for this host, or for a host below it in the taxonomy, is kept and annotated; a taxon listed for other hosts only is dropped; a taxon not listed, or listed without a known host (an empty or unknown host field), is kept and annotated unknown. A strain row whose taxid has no entry with a known host follows its species. Turns off the low-map rule (--low-map-rate-threshold) and appends three columns to the profile."
     )]
     host: Option<String>,
 
