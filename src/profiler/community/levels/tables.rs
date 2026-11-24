@@ -166,7 +166,7 @@ impl TableHeader {
             .host
             .map_or_else(String::new, |host| format!("\thost={host}"));
         format!(
-            "#metax_{table}\tversion={}\tengine=level\tdatabase_fingerprint={fingerprint}\tsequencer={}\tpaired={}{host}\n#{}\n",
+            "#metax_{table}\tversion={}\tdatabase_fingerprint={fingerprint}\tsequencer={}\tpaired={}{host}\n#{}\n",
             env!("CARGO_PKG_VERSION"),
             self.sequencer,
             self.paired,
@@ -1545,7 +1545,7 @@ mod tests {
         assert_eq!(
             lines[0],
             format!(
-                "#metax_profile\tversion={}\tengine=level\tdatabase_fingerprint=NA\tsequencer=Illumina\tpaired=true",
+                "#metax_profile\tversion={}\tdatabase_fingerprint=NA\tsequencer=Illumina\tpaired=true",
                 env!("CARGO_PKG_VERSION")
             )
         );
@@ -1588,12 +1588,41 @@ mod tests {
     }
 
     #[test]
+    fn the_first_header_line_holds_the_run_fields_only() {
+        let fields = |header: &TableHeader| {
+            let text = header.lines("profile", &PROFILE_COLUMNS);
+            let first = text.lines().next().unwrap().to_string();
+            first
+                .split('\t')
+                .skip(1)
+                .map(|field| field.split('=').next().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let mut header = header();
+        assert_eq!(
+            fields(&header),
+            ["version", "database_fingerprint", "sequencer", "paired"]
+        );
+        header.host = Some(9606);
+        assert_eq!(
+            fields(&header),
+            [
+                "version",
+                "database_fingerprint",
+                "sequencer",
+                "paired",
+                "host"
+            ]
+        );
+    }
+
+    #[test]
     fn the_decisions_table_opens_with_its_run_and_its_columns() {
         let (lines, rows) = decisions(&fixture());
         assert_eq!(
             lines[0],
             format!(
-                "#metax_decisions\tversion={}\tengine=level\tdatabase_fingerprint=NA\tsequencer=Illumina\tpaired=true",
+                "#metax_decisions\tversion={}\tdatabase_fingerprint=NA\tsequencer=Illumina\tpaired=true",
                 env!("CARGO_PKG_VERSION")
             )
         );
