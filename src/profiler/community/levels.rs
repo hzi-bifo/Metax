@@ -1230,32 +1230,26 @@ fn longest_alignment<'p>(placements: impl Iterator<Item = &'p CandidatePlacement
         .fold(0.0, f64::max)
 }
 
-/// The `candidates` of a fragment that take part, each with its errors: its
-/// best placement's estimated errors and the bases it aligns less than the
-/// longest alignment of all the candidates ([`candidate_errors`]); in
-/// candidate order.
-fn with_errors(
-    candidates: &[TerminalCandidate],
-    takes_part: impl Fn(&TerminalCandidate) -> bool,
-) -> Vec<(f64, &TerminalCandidate)> {
+/// The `candidates` of a fragment, each with its errors: its best
+/// placement's estimated errors and the bases it aligns less than the longest
+/// alignment of all the candidates ([`candidate_errors`]); in candidate order.
+fn with_errors(candidates: &[TerminalCandidate]) -> Vec<(f64, &TerminalCandidate)> {
     let longest = longest_alignment(candidates.iter().map(|c| &c.best));
     candidates
         .iter()
-        .filter(|c| takes_part(c))
         .map(|c| (candidate_errors(&c.best, longest), c))
         .collect()
 }
 
-/// A fragment's `candidates` that take part, ranked: each taxon with its
-/// errors ([`with_errors`]), those within the tie margin of the best
-/// ([`tie_margin`] of its aligned bases) with the best's errors, by errors,
-/// then taxid; and the best candidate. `None` without a candidate.
+/// A fragment's `candidates` ranked: each taxon with its errors
+/// ([`with_errors`]), those within the tie margin of the best ([`tie_margin`]
+/// of its aligned bases) with the best's errors, by errors, then taxid; and
+/// the best candidate. `None` without a candidate.
 fn ranked(
     candidates: &[TerminalCandidate],
     mode: EvidenceMode,
-    takes_part: impl Fn(&TerminalCandidate) -> bool,
 ) -> Option<(Vec<(u32, f64)>, &TerminalCandidate)> {
-    let mut ranked = with_errors(candidates, takes_part);
+    let mut ranked = with_errors(candidates);
     ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.taxid.cmp(&b.1.taxid)));
     let &(fewest, best) = ranked.first()?;
     let margin = tie_margin(mode, f64::from(best.best.both_mapped), LONG_TIE_SHARE);
@@ -1280,7 +1274,7 @@ fn fragment_of(
     candidates: &[TerminalCandidate],
     policy: EvidencePolicy,
 ) -> Option<(Fragment, (f32, f32))> {
-    let (candidates, best) = ranked(candidates, policy.mode, |_| true)?;
+    let (candidates, best) = ranked(candidates, policy.mode)?;
     let fewest = candidates[0].1;
     let fragment = Fragment {
         read,

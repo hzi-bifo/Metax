@@ -407,7 +407,7 @@ fn best_fit_identities(
     best_fit: &HashMap<u32, u32>,
     mode: EvidenceMode,
 ) -> Vec<(u32, f64)> {
-    let species = with_errors(candidates, |_| true);
+    let species = with_errors(candidates);
     // The best is the first candidate with the fewest errors, in candidate
     // order; its aligned bases set the tie margin of long reads.
     let Some(&(fewest, best)) = species.iter().min_by(|a, b| a.0.total_cmp(&b.0)) else {

@@ -12,9 +12,8 @@
 //!   the species gates.
 //!
 //! A fragment's tie set holds the taxa (species, or units labelled above
-//! species) whose placements lie within the tie margin of its best one.
-//! Placements on marker genomes take no part: a marker gene holds too little
-//! of a genome for its reads to stand for a taxon above species.
+//! species) whose placements lie within the tie margin of its best one, on
+//! genome references and marker genomes alike.
 //!
 //! A candidate row's fragments are measured on the genome they fit best as a
 //! set, its evidence genome: the genome holding most of their best
@@ -64,7 +63,7 @@ use super::{
 };
 use crate::profiler::community::MappingData;
 use crate::profiler::evidence::{
-    EvidenceCoverage, EvidencePolicy, PresenceAssembly, PresenceInterval, TerminalCandidate,
+    EvidenceCoverage, EvidencePolicy, PresenceAssembly, PresenceInterval,
 };
 use crate::profiler::likelihood_em;
 use crate::profiler::rollup::GenomeLayout;
@@ -297,14 +296,6 @@ impl Level<'_> {
             Kind::BelowSpecies => self.below_species.1,
             Kind::NotKept => self.not_kept.1,
         }
-    }
-
-    /// Whether a candidate takes part: not on a marker genome.
-    fn takes_part(&self, candidate: &TerminalCandidate) -> bool {
-        self.data
-            .marker_model
-            .as_deref()
-            .is_none_or(|model| !model.is_marker_genome(candidate.best.assembly_id))
     }
 }
 
@@ -955,9 +946,7 @@ fn share_tied(
             policy,
             &of_kind,
             |&i| placed[i as usize].read,
-            |_, candidates| {
-                ranked(candidates, policy.mode, |c| level.takes_part(c)).map(|found| found.0)
-            },
+            |_, candidates| ranked(candidates, policy.mode).map(|found| found.0),
             |&i, found| {
                 let fragment = &placed[i as usize];
                 let candidates = found
@@ -1003,7 +992,7 @@ fn collect(level: &Level) -> Collected {
             reads,
             |&read| read,
             |_, candidates| {
-                ranked(candidates, policy.mode, |c| level.takes_part(c)).map(|(ranked, best)| {
+                ranked(candidates, policy.mode).map(|(ranked, best)| {
                     let hits = best
                         .other_gene_hits
                         .iter()
@@ -1288,6 +1277,85 @@ mod tests {
         ))
     }
 
+    /// A read of 100 bases of species 1001 at `start` of gene `gene` of marker genome 60.
+    fn marker_read(gene: u32, start: u32, identity: f32) -> Vec<EvidenceAlignment> {
+        vec![EvidenceAlignment {
+            reference_id: gene,
+            asm_len: 40_000.0,
+            span: (start, start + 100),
+            fixed_chunk: (start, start + 100),
+            flex_chunk: (start, start + 100),
+            marker_gene_len: 1_000,
+            ..row(1001, 60, identity)
+        }]
+    }
+
+    /// `per_gene` reads of species 1001 on each of the first `genes` genes of marker genome 60.
+    fn marker_reads(genes: u32, per_gene: u32) -> Vec<Vec<EvidenceAlignment>> {
+        (1..=genes)
+            .flat_map(|gene| (0..per_gene).map(move |i| marker_read(gene, 50 + i * 150, 0.99)))
+            .collect()
+    }
+
+    /// The level over reads of species not kept on marker genome 60.
+    fn place_marker_reads(not_kept: Vec<Vec<EvidenceAlignment>>) -> HigherLevels {
+        let reads = (0..not_kept.len()).collect::<Vec<_>>();
+        let mut data = data(not_kept);
+        let model = marker_model();
+        data.marker_model = Some(Arc::clone(&model));
+        let tests = CoverageTests {
+            multiple_tests: 1,
+            chunk_cutoff: 0.0,
+            ratio_bounds: (0.6, 0.75),
+            markers: Some(model),
+            min_marker_genes: 3,
+        };
+        let layout =
+            GenomeLayout::new(std::iter::once((0, 1)).chain((1..=40).map(|_| (60, 1_000))));
+        let taxonomy = taxonomy();
+        place(
+            &Level {
+                data: &data,
+                tests: &tests,
+                layout: &layout,
+                below_species: (&[], policy(0.80)),
+                not_kept: (&reads, policy(0.95)),
+                em: EmSettings {
+                    penalty: 3.0,
+                    max_iterations: 1000,
+                },
+                keep_shares: false,
+            },
+            &Lineages::new(&taxonomy),
+        )
+    }
+
+    #[test]
+    fn reads_on_marker_genes_make_a_genus_row_from_ten_genes_hit() {
+        // 72 reads over 24 of the 40 genes: far fewer than 200 reads, but 24 genes hit, evenly.
+        let found = place_marker_reads(marker_reads(24, 3));
+        assert_eq!(rows(&found), [(100, Rank::Genus, 72.0)]);
+        let candidate = &found.genera[0];
+        assert_eq!(candidate.measured.model, Model::Markers);
+        assert_eq!(candidate.measured.coverage.marker_genes_hit, Some(24));
+        assert!(candidate.measured.coverage.coebr >= MARKER_ROWS.genus_min_chunk_ratio);
+        // Reads on 6 genes: too few genes for a candidate at the genus or above it; they stay unexplained.
+        let found = place_marker_reads(marker_reads(6, 12));
+        assert!(found.rows.is_empty() && found.genera.is_empty() && found.taxa.is_empty());
+        assert_eq!(found.unexplained, 72);
+        // 400 reads piled on 12 genes: enough genes, but their chunk ratio fails; the family above fails it too.
+        let found = place_marker_reads(marker_reads(12, 34));
+        assert!(found.rows.is_empty());
+        assert!(matches!(
+            found.genera[0].failures[..],
+            [Failure::ChunkRatio { ratio, bound }] if ratio < bound
+        ));
+        assert!(matches!(
+            found.taxa[0].failures[..],
+            [Failure::ChunkRatio { .. }]
+        ));
+    }
+
     #[test]
     fn a_fragment_counts_on_every_further_marker_gene_it_covers() {
         // Four reads on genes 1-4 of marker genome 60, each also covering two further genes: 12 genes hit.
@@ -1384,7 +1452,7 @@ mod tests {
         let mut scratch = CandidateScratch::default();
         let candidates = scratch.build(&alignments, policy(0.95));
         let mode = policy(0.95).mode;
-        let (found, best) = ranked(candidates, mode, |_| true).unwrap();
+        let (found, best) = ranked(candidates, mode).unwrap();
         // Species 1021 has two more errors: not tied; the best is the first tied species by taxid.
         assert_eq!(
             found.iter().map(|c| c.0).collect::<Vec<_>>(),
@@ -1394,10 +1462,7 @@ mod tests {
         assert!((found[2].1 - 3.0).abs() < 1e-9);
         assert_eq!(tie_set(&found), [1001, 1011]);
         assert_eq!(best.taxid, 1001);
-        // Candidates that take no part are left out before the ranking.
-        let (found, best) = ranked(candidates, mode, |c| c.taxid != 1001).unwrap();
-        assert_eq!((tie_set(&found), best.taxid), (vec![1011], 1011));
-        assert!(ranked(candidates, mode, |_| false).is_none());
+        assert!(ranked(&[], mode).is_none());
     }
 
     #[test]

@@ -12,13 +12,15 @@
 //!   (`genus`, `family`, ...);
 //! - `strain` (with `--strain`): one row per genome the genome level considered;
 //! - `genus`: one row per kind of fragment (without a species-level match, or
-//!   of species not kept) with at least 200 fragments unique to the genus, kept
-//!   or not ([`super::higher`]), and one for the species reported at the genus
-//!   when no such row's evidence is the genus row's; counted in the row of a
-//!   kept unit labelled at that genus when there is one;
+//!   of species not kept) whose fragments unique to the genus meet the amount
+//!   of their evidence model (at least 200 of them on a genome, at least 10
+//!   genes hit on a marker genome), kept or not ([`super::higher`]), and one
+//!   for the species reported at the genus when no such row's evidence is the
+//!   genus row's; counted in the row of a kept unit labelled at that genus when
+//!   there is one;
 //! - `family`, `order`, `class`, `phylum`, `domain`: one row per taxon above
-//!   genus that at least 200 fragments reach, kept or not; counted in the row
-//!   of a kept unit labelled at that taxon when there is one.
+//!   genus whose fragments meet that amount, kept or not; counted in the row of
+//!   a kept unit labelled at that taxon when there is one.
 //!
 //! Species rows come first, by the species' abundance in the profile (largest
 //! first, then taxid; species not in the profile last), each species' decided
@@ -1065,8 +1067,8 @@ impl Decisions<'_> {
         words.join(" + ")
     }
 
-    /// One row per taxon above genus that at least 200 fragments reach, kept
-    /// or not, with its rank.
+    /// One row per taxon above genus whose fragments meet the amount of their
+    /// evidence model, kept or not, with its rank.
     fn taxon_rows<'n>(&self, names: &'n Names, finals: &FinalRows) -> Vec<(Rank, DecisionRow<'n>)> {
         let Some(higher) = self.higher else {
             return Vec::new();
