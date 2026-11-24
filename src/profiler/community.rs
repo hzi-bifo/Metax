@@ -129,6 +129,139 @@ impl<'a> MetamReferences<'a> {
     }
 }
 
+/// The database references resolved against the taxonomy, by reference or
+/// by assembly id.
+struct ResolvedReferences {
+    /// Assembly id of each reference.
+    assembly_of: Vec<u32>,
+    /// Genome accession of each assembly id.
+    assembly_names: Vec<Arc<str>>,
+    /// Taxonomy of each reference; `None` when it could not be resolved.
+    taxonomies: Vec<Option<ReferenceTaxonomy>>,
+    /// Summed length of each genome's resolved references.
+    lengths: Vec<Option<f64>>,
+    /// Sampling scale of each genome with a resolved reference.
+    scales: Vec<Option<f64>>,
+    /// The strain taxid that each genome declares.
+    strain_taxids: Vec<Option<u32>>,
+    terminal_ranks: HashMap<u32, ProfileRank>,
+    profile_taxids: HashSet<u32>,
+    /// Profile taxa with at least one genome-type reference.
+    taxids_with_genomes: HashSet<u32>,
+}
+
+impl ResolvedReferences {
+    /// The species represented only by marker genomes, with those genomes.
+    fn marker_species(&self, db: &DatabaseMetadata) -> MarkerSpecies {
+        unclassified::marker_species(
+            db.references
+                .iter()
+                .zip(&self.assembly_of)
+                .zip(&self.taxonomies)
+                .filter_map(|((reference, &assembly_id), taxonomy)| {
+                    Some(ReferenceKind {
+                        taxid: taxonomy.as_ref()?.profile_taxid,
+                        assembly_id,
+                        reference_type: reference.reference_type,
+                        declared_genome_size: reference.declared_genome_size,
+                    })
+                }),
+        )
+    }
+
+    /// The lookup that mapping records find their reference in. A reference
+    /// without a resolved taxonomy, or of a genome without length, takes no
+    /// mapping records.
+    fn mapping_lookup<'a>(&self, db: &'a DatabaseMetadata) -> Result<MetamReferences<'a>> {
+        let assemblies = self
+            .lengths
+            .iter()
+            .zip(&self.scales)
+            .map(|(&length, &scale)| MetamAssembly {
+                asm_len: length.unwrap_or(0.0),
+                flex_len: length.map_or(NATIVE_FIXED_FLANK_LEN, |len| {
+                    (len.sqrt().round() as usize).max(1)
+                }),
+                sampling_scale: scale.unwrap_or(1.0) as f32,
+            })
+            .collect::<Vec<_>>();
+        let mut ids = HashMap::with_capacity(db.references.len());
+        let mut entries = Vec::with_capacity(db.references.len());
+        for (reference_index, ((reference, &assembly_id), taxonomy)) in db
+            .references
+            .iter()
+            .zip(&self.assembly_of)
+            .zip(&self.taxonomies)
+            .enumerate()
+        {
+            let has_length = assemblies[assembly_id as usize].asm_len > 0.0;
+            let Some(taxonomy) = (*taxonomy).filter(|_| has_length) else {
+                entries.push(None);
+                continue;
+            };
+            let reference_id = u32::try_from(reference_index)
+                .context("database contains more than 2^32 references")?;
+            match ids.entry(reference.name.as_str()) {
+                Entry::Occupied(_) => bail!(
+                    "database metadata contains duplicate reference name '{}'",
+                    reference.name
+                ),
+                Entry::Vacant(slot) => {
+                    slot.insert(reference_id);
+                }
+            }
+            entries.push(Some(MetamReferenceEntry {
+                ref_len: reference.length,
+                profile_taxid: taxonomy.profile_taxid,
+                assembly_id,
+                is_marker: reference.reference_type == ReferenceType::Markers,
+            }));
+        }
+        Ok(MetamReferences {
+            ids,
+            entries,
+            assemblies,
+        })
+    }
+}
+
+/// The assembly id of each reference, numbered by the genomes' first
+/// appearance, and the genome accession of each id.
+fn assign_assembly_ids(db: &DatabaseMetadata) -> Result<(Vec<u32>, Vec<Arc<str>>)> {
+    let mut ids: HashMap<&str, u32> = HashMap::new();
+    let mut names: Vec<Arc<str>> = Vec::new();
+    let mut assembly_of = Vec::with_capacity(db.references.len());
+    for reference in &db.references {
+        let id = match ids.entry(&*reference.genome) {
+            Entry::Occupied(id) => *id.get(),
+            Entry::Vacant(slot) => {
+                let id = u32::try_from(names.len())
+                    .context("database contains more than 2^32 assemblies")?;
+                names.push(Arc::clone(&reference.genome));
+                *slot.insert(id)
+            }
+        };
+        assembly_of.push(id);
+    }
+    Ok((assembly_of, names))
+}
+
+/// A callback that takes the mapping records one by one.
+type OnMapping<'c> = dyn for<'a> FnMut(MetamMappingRecord<'a>) -> Result<()> + 'c;
+
+/// A sample's mapping records in per-read bundles, with what the run-level
+/// settings need of them.
+struct LoadedRecords {
+    read_alignments: Vec<ReadBundle>,
+    /// Input reads or fragments.
+    total_reads: usize,
+    mapping_records: usize,
+    read_lengths: LengthHistogram,
+    /// Some mate lies beyond the end of its reference.
+    lone_mates: bool,
+    profile: MetamProfile,
+}
+
 /// Loading the mappings of a sample.
 impl Profiler {
     /// The saved or staged mapping file's mappings.
@@ -252,6 +385,9 @@ impl Profiler {
         })
     }
 
+    /// One sample's mappings: the database references resolved, the mapping
+    /// records read into per-read bundles, and the run-level settings that
+    /// the reads decide.
     fn load_metam_records<F>(
         &mut self,
         source: &str,
@@ -259,38 +395,75 @@ impl Profiler {
         feed: F,
     ) -> Result<MappingData>
     where
-        F: FnOnce(
-            &mut dyn for<'a> FnMut(MetamMappingRecord<'a>) -> Result<()>,
-        ) -> Result<MetamParseStats>,
+        F: FnOnce(&mut OnMapping<'_>) -> Result<MetamParseStats>,
     {
         log::info!(target: "PROFILER", "Loading Metam coordinate mappings ...");
-        let mut assembly_ids: HashMap<&str, u32> = HashMap::new();
-        let mut assembly_names: Vec<Arc<str>> = Vec::new();
-        for reference in &db.references {
-            if !assembly_ids.contains_key(&*reference.genome) {
-                let next = u32::try_from(assembly_ids.len())
-                    .context("database contains more than 2^32 assemblies")?;
-                assembly_ids.insert(&*reference.genome, next);
-                assembly_names.push(Arc::clone(&reference.genome));
-            }
-        }
-        let mut asm_lengths_raw: HashMap<String, f64> = HashMap::new();
-        let mut genome_sampling_scales: HashMap<String, f64> = HashMap::new();
-        let mut profile_taxids: HashSet<u32> = HashSet::new();
-        let mut terminal_ranks: HashMap<u32, ProfileRank> = HashMap::new();
-        let mut reference_taxonomies = Vec::with_capacity(db.references.len());
-        let mut taxonomy_adjustments = ReferenceTaxonomyAdjustments::new();
-        let mut taxonomy_resolver = ReferenceTaxonomyResolver::new(&self.taxonomy);
-        let mut unresolved = UnresolvedReferences::default();
         let has_marker_genomes = db.uniform_reference_type() != Some(ReferenceType::Genome);
-        let mut taxids_with_genomes: HashSet<u32> = HashSet::new();
-        let mut strain_taxids = vec![None; assembly_names.len()];
+        let references = self.resolve_references(db)?;
+        let marker_species = if has_marker_genomes {
+            references.marker_species(db)
+        } else {
+            MarkerSpecies::new()
+        };
+        let (genus_of_species, above_species) =
+            self.above_species_inputs(db, &references, &marker_species, has_marker_genomes);
+        let lookup = references.mapping_lookup(db)?;
+        let records = self.read_mapping_records(source, &lookup, has_marker_genomes, feed)?;
+        self.lower_identity_to_alignments(&records.read_alignments);
+        let marker_model = if has_marker_genomes {
+            let geometry = sample_fragment_geometry(
+                &self.cfg,
+                &records.read_alignments,
+                &records.read_lengths,
+                records.lone_mates,
+            );
+            log::info!(target: "PROFILER", "Marker genes: {geometry}.");
+            MarkerModel::from_database(db, &references.assembly_of, geometry).map(Arc::new)
+        } else {
+            None
+        };
+        // The identity margin judges only where genomes are indexed in part.
+        let has_scaled_genomes = references.scales.iter().flatten().any(|&scale| scale > 1.0);
+        self.cfg.identity_margin = self.cfg.identity_margin.filter(|_| has_scaled_genomes);
+        let min_chunk_breadth = self.resolve_chunk_cutoff(db, &records, marker_model.as_deref());
+        Ok(MappingData {
+            read_alignments: records.read_alignments,
+            min_chunk_breadth,
+            has_scaled_genomes,
+            total_reads: records.total_reads,
+            genus_of_species,
+            terminal_ranks: references.terminal_ranks,
+            marker_model,
+            fractional: db.is_fractional,
+            above_species,
+            unclassified_species: self.cfg.estimate_unclassified.then_some(marker_species),
+            assembly_names: references.assembly_names,
+            strain_taxids: references.strain_taxids,
+        })
+    }
+
+    /// The database references resolved against the taxonomy. A reference it
+    /// cannot place stops the run, unless the run allows skipping it.
+    fn resolve_references(&self, db: &DatabaseMetadata) -> Result<ResolvedReferences> {
+        let (assembly_of, assembly_names) = assign_assembly_ids(db)?;
+        let genomes = assembly_names.len();
+        let mut lengths: Vec<Option<f64>> = vec![None; genomes];
+        let mut scales = vec![None; genomes];
+        let mut strain_taxids = vec![None; genomes];
+        let mut taxonomies = Vec::with_capacity(db.references.len());
+        let mut profile_taxids = HashSet::new();
+        let mut taxids_with_genomes = HashSet::new();
+        let mut terminal_ranks = HashMap::new();
+        let mut adjustments = ReferenceTaxonomyAdjustments::new();
+        let mut resolver = ReferenceTaxonomyResolver::new(&self.taxonomy);
+        let mut unresolved = UnresolvedReferences::default();
         let mut previous_genome = None;
         // The references of a genome share its taxonomy field, so a field
         // equal to the previous one is not parsed again.
         let mut previous_taxonomy: Option<(&str, ReferenceTaxonomy)> = None;
-        for reference in &db.references {
-            let declared_taxonomy = match previous_taxonomy {
+        for (reference, &assembly_id) in db.references.iter().zip(&assembly_of) {
+            let assembly = assembly_id as usize;
+            let declared = match previous_taxonomy {
                 Some((field, taxonomy)) if field == &*reference.taxonomy_field => taxonomy,
                 _ => {
                     let taxonomy = parse_reference_taxonomy(&reference.taxonomy_field)
@@ -306,14 +479,13 @@ impl Profiler {
             };
             // The strain that a genome's references declare, read where they
             // start; the dump may not know it.
-            let assembly_id = assembly_ids[&*reference.genome];
             if previous_genome != Some(assembly_id) {
-                if let Some(strain) = declared_taxonomy.primary_taxid {
-                    strain_taxids[assembly_id as usize] = Some(strain);
+                if let Some(strain) = declared.primary_taxid {
+                    strain_taxids[assembly] = Some(strain);
                 }
                 previous_genome = Some(assembly_id);
             }
-            let taxonomy = match taxonomy_resolver.resolve(declared_taxonomy, &reference.name) {
+            let taxonomy = match resolver.resolve(declared, &reference.name) {
                 Ok(taxonomy) => taxonomy,
                 Err(error) => {
                     unresolved.skip(
@@ -321,21 +493,12 @@ impl Profiler {
                         error,
                         self.cfg.ignore_unresolved_references,
                     )?;
-                    reference_taxonomies.push(None);
+                    taxonomies.push(None);
                     continue;
                 }
             };
-            record_reference_taxonomy_adjustment(
-                &mut taxonomy_adjustments,
-                declared_taxonomy,
-                taxonomy,
-            );
-            match asm_lengths_raw.get_mut(&*reference.genome) {
-                Some(length) => *length += reference.length as f64,
-                None => {
-                    asm_lengths_raw.insert(reference.genome.to_string(), reference.length as f64);
-                }
-            }
+            record_reference_taxonomy_adjustment(&mut adjustments, declared, taxonomy);
+            *lengths[assembly].get_or_insert(0.0) += reference.length as f64;
             profile_taxids.insert(taxonomy.profile_taxid);
             if reference.reference_type == ReferenceType::Genome {
                 taxids_with_genomes.insert(taxonomy.profile_taxid);
@@ -350,114 +513,80 @@ impl Profiler {
                 reference.full_genome_size,
                 reference.effective_indexed_size,
             );
-            record_genome_sampling_scale(&mut genome_sampling_scales, &reference.genome, scale)?;
-            reference_taxonomies.push(Some(taxonomy));
+            record_genome_sampling_scale(&mut scales[assembly], &reference.genome, scale)?;
+            taxonomies.push(Some(taxonomy));
         }
         unresolved.log();
-        log_reference_taxonomy_adjustments(
-            &taxonomy_adjustments,
-            self.cfg.verbose || self.cfg.very_verbose,
-        );
-        // The species represented only by marker genomes, with those genomes.
-        let marker_species = if has_marker_genomes {
-            unclassified::marker_species(
-                db.references.iter().zip(&reference_taxonomies).filter_map(
-                    |(reference, taxonomy)| {
-                        Some(ReferenceKind {
-                            taxid: taxonomy.as_ref()?.profile_taxid,
-                            assembly_id: assembly_ids[&*reference.genome],
-                            reference_type: reference.reference_type,
-                            declared_genome_size: reference.declared_genome_size,
-                        })
-                    },
-                ),
-            )
-        } else {
-            MarkerSpecies::new()
-        };
-        let mut genus_of_species = self.genus_of_taxa(&profile_taxids);
-        let marker_only = if self.cfg.above_species {
-            marker_species
+        log_reference_taxonomy_adjustments(&adjustments, self.cfg.verbose || self.cfg.very_verbose);
+        Ok(ResolvedReferences {
+            assembly_of,
+            assembly_names,
+            taxonomies,
+            lengths,
+            scales,
+            strain_taxids,
+            terminal_ranks,
+            profile_taxids,
+            taxids_with_genomes,
+        })
+    }
+
+    /// The genus of each species that the levels above species may use, and
+    /// the inputs of those levels (`None` under `--strict-coverage`).
+    fn above_species_inputs(
+        &self,
+        db: &DatabaseMetadata,
+        references: &ResolvedReferences,
+        marker_species: &MarkerSpecies,
+        has_marker_genomes: bool,
+    ) -> (HashMap<u32, u32>, Option<AboveSpeciesInputs>) {
+        let mut genus_of_species = self.genus_of_taxa(&references.profile_taxids);
+        let above_species = self.cfg.above_species.then(|| AboveSpeciesInputs {
+            marker_only: marker_species
                 .keys()
                 .map(|&species| (species, genus_of_species.get(&species).copied()))
-                .collect()
-        } else {
-            HashMap::new()
-        };
+                .collect(),
+            layout: GenomeLayout::new(
+                references
+                    .assembly_of
+                    .iter()
+                    .zip(&db.references)
+                    .map(|(&assembly, reference)| (assembly, reference.length as u64)),
+            ),
+        });
         if has_marker_genomes {
             // A marker gene holds too little of a genome for its reads to
             // stand for a genus or family: reads failing every species there
             // come mostly from the homologous genes of relatives. Only species
             // with genome-type references have a genus here.
-            genus_of_species.retain(|species, _| taxids_with_genomes.contains(species));
+            genus_of_species.retain(|species, _| references.taxids_with_genomes.contains(species));
         }
-        let above_species = self.cfg.above_species.then(|| AboveSpeciesInputs {
-            marker_only,
-            layout: GenomeLayout::new(
-                db.references
-                    .iter()
-                    .map(|reference| (assembly_ids[&*reference.genome], reference.length as u64)),
-            ),
-        });
-        let assemblies = assembly_names
-            .iter()
-            .map(|asm| MetamAssembly {
-                asm_len: asm_lengths_raw.get(&**asm).copied().unwrap_or(0.0),
-                flex_len: asm_lengths_raw
-                    .get(&**asm)
-                    .map_or(NATIVE_FIXED_FLANK_LEN, |len| {
-                        (len.sqrt().round() as usize).max(1)
-                    }),
-                sampling_scale: genome_sampling_scales.get(&**asm).copied().unwrap_or(1.0) as f32,
-            })
-            .collect::<Vec<_>>();
-        let mut metam_refs = MetamReferences {
-            ids: HashMap::with_capacity(db.references.len()),
-            entries: Vec::with_capacity(db.references.len()),
-            assemblies,
-        };
-        for (reference_index, (reference, taxonomy)) in
-            db.references.iter().zip(&reference_taxonomies).enumerate()
-        {
-            let assembly_id = assembly_ids[&*reference.genome];
-            let has_length = metam_refs.assemblies[assembly_id as usize].asm_len > 0.0;
-            // A reference without a resolvable taxonomy, or of a genome without
-            // length, takes no mapping records.
-            let Some(taxonomy) = (*taxonomy).filter(|_| has_length) else {
-                metam_refs.entries.push(None);
-                continue;
-            };
-            let reference_id = u32::try_from(reference_index)
-                .context("database contains more than 2^32 references")?;
-            match metam_refs.ids.entry(reference.name.as_str()) {
-                Entry::Occupied(_) => bail!(
-                    "database metadata contains duplicate reference name '{}'",
-                    reference.name
-                ),
-                Entry::Vacant(slot) => {
-                    slot.insert(reference_id);
-                }
-            }
-            metam_refs.entries.push(Some(MetamReferenceEntry {
-                ref_len: reference.length,
-                profile_taxid: taxonomy.profile_taxid,
-                assembly_id,
-                is_marker: reference.reference_type == ReferenceType::Markers,
-            }));
-        }
+        (genus_of_species, above_species)
+    }
 
+    /// The mapping records, read into per-read bundles.
+    fn read_mapping_records<F>(
+        &self,
+        source: &str,
+        references: &MetamReferences,
+        has_marker_genomes: bool,
+        feed: F,
+    ) -> Result<LoadedRecords>
+    where
+        F: FnOnce(&mut OnMapping<'_>) -> Result<MetamParseStats>,
+    {
         let mut read_map: StableReadMap<EvidenceAlignment> = StableReadMap::default();
-        let mut num_alignments = 0usize;
+        let mut mapping_records = 0usize;
         let mut read_lengths = LengthHistogram::default();
         let mut lone_mates = false;
         let load_progress_options = self.cfg.mapping_load_progress_options();
         let load_progress = progress::counter(load_progress_options, "Loading mapping records");
         let parse_result = feed(&mut |mapping| {
-            num_alignments += 1;
+            mapping_records += 1;
             progress::tick_count(
                 &load_progress,
                 "Loading mapping records",
-                num_alignments as u64,
+                mapping_records as u64,
                 load_progress_options.interval(),
             );
             if self.cfg.is_paired && !mapping.is_paired_evidence() {
@@ -467,7 +596,7 @@ impl Profiler {
                 read_lengths.add(mapping.read_len);
                 lone_mates |= mapping.is_mate_beyond_reference_end();
             }
-            if let Some((read_id, entry)) = self.entry_from_metam_mapping(mapping, &metam_refs) {
+            if let Some((read_id, entry)) = self.entry_from_metam_mapping(mapping, references) {
                 push_string_keyed_value(&mut read_map, read_id, entry);
             }
             Ok(())
@@ -482,32 +611,47 @@ impl Profiler {
                 source
             );
         }
-
-        let aligned_reads = read_map.len();
-        let mapped_unit = if self.cfg.is_paired {
-            "fragments"
-        } else {
-            "reads"
-        };
         let profile = self.load_metam_profile(parse_stats.profile)?;
-        let total_reads = total_input_units(&profile, self.cfg.is_paired).max(aligned_reads);
+        let total_reads = total_input_units(&profile, self.cfg.is_paired).max(read_map.len());
         let read_alignments = read_map
             .into_iter()
             .map(|(read_name, alignments)| ReadBundle {
                 read_name: Box::<str>::from(read_name),
                 alignments,
             })
-            .collect::<Vec<_>>();
-        self.lower_identity_to_alignments(&read_alignments);
-        let marker_model = if has_marker_genomes {
-            let geometry =
-                sample_fragment_geometry(&self.cfg, &read_alignments, &read_lengths, lone_mates);
-            log::info!(target: "PROFILER", "Marker genes: {geometry}.");
-            MarkerModel::from_database(db, |genome| assembly_ids[genome], geometry).map(Arc::new)
-        } else {
-            None
-        };
+            .collect();
+        Ok(LoadedRecords {
+            read_alignments,
+            total_reads,
+            mapping_records,
+            read_lengths,
+            lone_mates,
+            profile,
+        })
+    }
 
+    /// The chunk-breadth cutoff of the species amount test for this run,
+    /// logged with the mapping summary it rests on.
+    fn resolve_chunk_cutoff(
+        &self,
+        db: &DatabaseMetadata,
+        records: &LoadedRecords,
+        marker_model: Option<&MarkerModel>,
+    ) -> f64 {
+        let LoadedRecords {
+            read_alignments,
+            total_reads,
+            mapping_records,
+            profile,
+            ..
+        } = records;
+        let total_reads = *total_reads;
+        let aligned_reads = read_alignments.len();
+        let mapped_unit = if self.cfg.is_paired {
+            "fragments"
+        } else {
+            "reads"
+        };
         let mapping_rate = if total_reads == 0 {
             0.0
         } else {
@@ -515,8 +659,7 @@ impl Profiler {
         };
         // The low-map gate asks how much of the sample the reference explains, so
         // fragments count as the genome share they represent.
-        let gate_rate =
-            genome_equivalent_mapping_rate(&read_alignments, total_reads, marker_model.as_deref());
+        let gate_rate = genome_equivalent_mapping_rate(read_alignments, total_reads, marker_model);
         if gate_rate != mapping_rate {
             log::info!(
                 target: "PROFILER",
@@ -524,9 +667,6 @@ impl Profiler {
                 gate_rate
             );
         }
-        // The identity margin judges only where genomes are indexed in part.
-        let has_scaled_genomes = genome_sampling_scales.values().any(|scale| *scale > 1.0);
-        self.cfg.identity_margin = self.cfg.identity_margin.filter(|_| has_scaled_genomes);
         let basis = ChunkBasis::of(
             &self.cfg,
             gate_rate,
@@ -536,7 +676,7 @@ impl Profiler {
         let chunk_cutoff = ChunkCutoff::resolve(&self.cfg, basis.reads);
 
         log::info!(target: "PROFILER", "Total number of reads: {}", total_reads);
-        log::info!(target: "PROFILER", "Number of mapping records: {}", num_alignments);
+        log::info!(target: "PROFILER", "Number of mapping records: {}", mapping_records);
         log::info!(
             target: "PROFILER",
             "Number of mapped {}: {}",
@@ -572,21 +712,7 @@ impl Profiler {
                 mapping_rate,
             },
         );
-
-        Ok(MappingData {
-            read_alignments,
-            min_chunk_breadth: chunk_cutoff.cutoff,
-            has_scaled_genomes,
-            total_reads,
-            genus_of_species,
-            terminal_ranks,
-            marker_model,
-            fractional: db.is_fractional,
-            above_species,
-            unclassified_species: self.cfg.estimate_unclassified.then_some(marker_species),
-            assembly_names,
-            strain_taxids,
-        })
+        chunk_cutoff.cutoff
     }
 
     fn entry_from_metam_mapping<'a>(

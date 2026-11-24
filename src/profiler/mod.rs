@@ -469,14 +469,14 @@ pub(crate) fn sampling_scale_from_sizes(
 
 /// Record one scale per genome and reject internally inconsistent metadata.
 pub(crate) fn record_genome_sampling_scale(
-    scales: &mut HashMap<String, f64>,
+    recorded: &mut Option<f64>,
     genome: &str,
     scale: f64,
 ) -> Result<()> {
     if genome.is_empty() || !scale.is_finite() || scale < 1.0 {
         anyhow::bail!("invalid sampling scale {scale} for genome '{genome}'");
     }
-    if let Some(previous) = scales.get(genome).copied() {
+    if let Some(previous) = *recorded {
         let tolerance = 1e-12 * previous.abs().max(scale.abs()).max(1.0);
         if (previous - scale).abs() > tolerance {
             anyhow::bail!(
@@ -487,7 +487,7 @@ pub(crate) fn record_genome_sampling_scale(
             );
         }
     } else {
-        scales.insert(genome.to_owned(), scale);
+        *recorded = Some(scale);
     }
     Ok(())
 }
@@ -1223,14 +1223,14 @@ mod subsample_scaling_tests {
 
     #[test]
     fn scaling_is_independent_per_genome_and_rejects_inconsistency() {
-        let mut scaling = HashMap::new();
-        record_genome_sampling_scale(&mut scaling, "full", 1.0).unwrap();
-        record_genome_sampling_scale(&mut scaling, "sampled", 4.0).unwrap();
-        record_genome_sampling_scale(&mut scaling, "sampled", 4.0).unwrap();
+        let (mut full, mut sampled) = (None, None);
+        record_genome_sampling_scale(&mut full, "full", 1.0).unwrap();
+        record_genome_sampling_scale(&mut sampled, "sampled", 4.0).unwrap();
+        record_genome_sampling_scale(&mut sampled, "sampled", 4.0).unwrap();
 
-        assert_close(*scaling.get("full").unwrap(), 1.0);
-        assert_close(*scaling.get("sampled").unwrap(), 4.0);
-        assert!(record_genome_sampling_scale(&mut scaling, "sampled", 2.0).is_err());
+        assert_close(full.unwrap(), 1.0);
+        assert_close(sampled.unwrap(), 4.0);
+        assert!(record_genome_sampling_scale(&mut sampled, "sampled", 2.0).is_err());
     }
 
     #[test]

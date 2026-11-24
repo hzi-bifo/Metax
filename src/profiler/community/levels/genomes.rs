@@ -436,17 +436,37 @@ fn strain_genomes(
     level: &GenomeLevel,
     diagnostics: &mut Vec<StrainDiagnostic>,
 ) -> (Vec<StrainGenome>, StrainShares) {
-    let (taxid, members, group_of, posteriors) = (
-        share.taxid,
-        &share.members,
-        &share.group_of,
-        &share.em.posteriors,
-    );
-    let strain_identity = strain.identity;
-    let mut resolved: HashMap<u32, (u64, u64)> = HashMap::new();
+    let resolved = members_resolved_to_genomes(data, share, strain.identity);
+    let evidence = strain_level_evidence(data, share.taxid, &resolved.strain_level, level);
+    push_genome_diagnostics(share, &resolved.counts, &evidence, diagnostics);
+    let kept = evidence
+        .into_iter()
+        .filter(|(_, genome)| genome.kept)
+        .map(|(assembly, genome)| {
+            let coverage = genome.coverage.expect("measured above");
+            (assembly, (coverage, genome.assembly.asm_len))
+        })
+        .collect();
+    genomes_within_ani(&share.members, kept, strain, level)
+}
+
+/// The fragments of a species that resolve to one of its genomes.
+struct ResolvedMembers {
+    /// Per genome, their number and how many match it at strain-level identity.
+    counts: HashMap<u32, (u64, u64)>,
+    /// The strain-level fragments with their genome.
+    strain_level: Vec<(usize, u32)>,
+}
+
+fn members_resolved_to_genomes(
+    data: &MappingData,
+    share: &SpeciesShare,
+    strain_identity: f64,
+) -> ResolvedMembers {
+    let mut counts_of: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut strain_level = Vec::new();
-    for (member, group) in members.iter().zip(group_of) {
-        let Some(assembly) = group.and_then(|g| resolved_unit(&posteriors[g])) else {
+    for (member, group) in share.members.iter().zip(&share.group_of) {
+        let Some(assembly) = group.and_then(|g| resolved_unit(&share.em.posteriors[g])) else {
             continue;
         };
         if data
@@ -461,7 +481,7 @@ fn strain_genomes(
             .iter()
             .find(|g| g.0 == assembly)
             .map_or(0.0, |g| g.2);
-        let counts = resolved.entry(assembly).or_insert((0, 0));
+        let counts = counts_of.entry(assembly).or_insert((0, 0));
         counts.0 += 1;
         if identity < strain_identity {
             continue;
@@ -469,11 +489,25 @@ fn strain_genomes(
         counts.1 += 1;
         strain_level.push((member.read, assembly));
     }
+    ResolvedMembers {
+        counts: counts_of,
+        strain_level,
+    }
+}
+
+/// Each genome's coverage from its strain-level fragments, with the outcome
+/// of the coverage tests.
+fn strain_level_evidence(
+    data: &MappingData,
+    taxid: u32,
+    strain_level: &[(usize, u32)],
+    level: &GenomeLevel,
+) -> HashMap<u32, GenomeEvidence> {
     let mut evidence: HashMap<u32, GenomeEvidence> = HashMap::new();
     fold_candidate_of(
         data,
         level.policy,
-        &strain_level,
+        strain_level,
         (|r| r.0, |_| taxid),
         |&(_, assembly), candidate| candidate.and_then(|c| c.placement_on(assembly)).copied(),
         |_, placement| {
@@ -488,6 +522,17 @@ fn strain_genomes(
         genome.kept = tests.covers(&coverage);
         genome.coverage = Some(coverage);
     }
+    evidence
+}
+
+/// One decision row for each genome of the species that fragments resolved
+/// to, and for its best-fit genome, in assembly-id order.
+fn push_genome_diagnostics(
+    share: &SpeciesShare,
+    resolved: &HashMap<u32, (u64, u64)>,
+    evidence: &HashMap<u32, GenomeEvidence>,
+    diagnostics: &mut Vec<StrainDiagnostic>,
+) {
     let total_weight = share.em.total_weight().max(1e-12);
     let mut listed = resolved.keys().copied().collect::<Vec<_>>();
     if !resolved.contains_key(&share.best_fit) {
@@ -500,7 +545,7 @@ fn strain_genomes(
             .get(&assembly)
             .map_or((None, false), |genome| (genome.coverage, genome.kept));
         diagnostics.push(StrainDiagnostic {
-            taxid,
+            taxid: share.taxid,
             assembly_id: assembly,
             best_fit: assembly == share.best_fit,
             em_share: share.em.weight.get(&assembly).copied().unwrap_or(0.0) / total_weight,
@@ -510,18 +555,18 @@ fn strain_genomes(
             kept,
         });
     }
-    // Second genome EM over the kept genomes, with the fragments that match at
-    // least one of them at strain-level identity; the rest stay with the
-    // species. A genome whose fragments do not match it within sequencing
-    // error is dropped and the EM rerun over the rest.
-    let mut kept: HashMap<u32, (EvidenceCoverage, f64)> = evidence
-        .into_iter()
-        .filter(|(_, genome)| genome.kept)
-        .map(|(assembly, genome)| {
-            let coverage = genome.coverage.expect("measured above");
-            (assembly, (coverage, genome.assembly.asm_len))
-        })
-        .collect();
+}
+
+/// Second genome EM over the `kept` genomes, with the fragments that match at
+/// least one of them at strain-level identity; the rest stay with the
+/// species. A genome whose fragments do not match it within sequencing error
+/// is dropped and the EM rerun over the rest.
+fn genomes_within_ani(
+    members: &[GenomeFragment],
+    mut kept: HashMap<u32, (EvidenceCoverage, f64)>,
+    strain: StrainIdentity,
+    level: &GenomeLevel,
+) -> (Vec<StrainGenome>, StrainShares) {
     loop {
         if kept.is_empty() {
             return (Vec::new(), StrainShares::default());
@@ -532,7 +577,7 @@ fn strain_genomes(
             reads,
             bases,
             identity,
-        } = share_among_kept(members, &kept, strain_identity, level);
+        } = share_among_kept(members, &kept, strain.identity, level);
         let mean_identity = |assembly: &u32| {
             identity
                 .get(assembly)

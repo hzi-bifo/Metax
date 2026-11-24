@@ -424,44 +424,8 @@ impl MetaxApp {
     }
 
     fn prepare_mapping(&self, profiler: MappingProfilerMetadata) -> Result<PreparedMapping> {
-        // Respect explicit reuse and resume-before-aligning behavior.
-        if let Some(ref reuse) = self.config.reuse_mappings {
-            let db =
-                self.config.db.as_ref().ok_or_else(|| {
-                    anyhow!("--reuse-mapping requires the matching --db directory")
-                })?;
-            log::info!(
-                target: "MAIN",
-                "Profiling mapping records from {} against database metadata in {} without running the mapper.",
-                reuse,
-                db
-            );
-            return Ok(PreparedMapping::Metam {
-                output: MappingOutput::reused(Path::new(reuse).to_path_buf()),
-                db: db.clone(),
-            });
-        }
-        if self.config.resume {
-            if let Some(output) = existing_mapping_output(&self.config.outprefix) {
-                log::info!(
-                    target: "MAIN",
-                    "Resume taxonomy profiling with existing mapping output."
-                );
-                let db = self
-                    .config
-                    .db
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("--resume requires the matching --db directory"))?;
-                return Ok(PreparedMapping::Metam {
-                    output,
-                    db: db.clone(),
-                });
-            }
-            log::warn!(
-                target: "MAIN",
-                "Resume requested, but {}.mapping.tsv.gz was not found; running mapping from scratch.",
-                self.config.outprefix
-            );
+        if let Some(existing) = self.existing_mapping()? {
+            return Ok(existing);
         }
         let input_sequences = self
             .config
@@ -504,17 +468,16 @@ impl MetaxApp {
                 self.config.threads
             );
         }
-        let progress_log = MappingProgressLog::streamed_default(!self.config.no_progress);
         if self.config.stream_mappings {
-            let profile = new_shared_metam_profile();
             return Ok(PreparedMapping::MetamStream {
                 mapper,
-                profile,
+                profile: new_shared_metam_profile(),
                 db: db.clone(),
             });
         }
-        if self.config.keep_mapping_output {
-            let output = mapper.run_saved(
+        let progress_log = MappingProgressLog::streamed_default(!self.config.no_progress);
+        let output = if self.config.keep_mapping_output {
+            mapper.run_saved(
                 self.config.threads,
                 self.config.sequencer,
                 self.config.is_paired,
@@ -524,13 +487,70 @@ impl MetaxApp {
                 &self.config.extra_args,
                 self.profile_progress_options(),
                 progress_log,
-            )?;
-            return Ok(PreparedMapping::Metam {
-                output,
-                db: db.clone(),
-            });
-        }
+            )?
+        } else {
+            self.run_staged(&mapper, profiler, progress_log)?
+        };
+        Ok(PreparedMapping::Metam {
+            output,
+            db: db.clone(),
+        })
+    }
 
+    /// A saved mapping to profile without running the mapper: the file of
+    /// `--reuse-mapping`, or with `--resume` the `<PREFIX>.mapping.tsv.gz`
+    /// when it exists.
+    fn existing_mapping(&self) -> Result<Option<PreparedMapping>> {
+        if let Some(ref reuse) = self.config.reuse_mappings {
+            let db =
+                self.config.db.as_ref().ok_or_else(|| {
+                    anyhow!("--reuse-mapping requires the matching --db directory")
+                })?;
+            log::info!(
+                target: "MAIN",
+                "Profiling mapping records from {} against database metadata in {} without running the mapper.",
+                reuse,
+                db
+            );
+            return Ok(Some(PreparedMapping::Metam {
+                output: MappingOutput::reused(Path::new(reuse).to_path_buf()),
+                db: db.clone(),
+            }));
+        }
+        if !self.config.resume {
+            return Ok(None);
+        }
+        let Some(output) = existing_mapping_output(&self.config.outprefix) else {
+            log::warn!(
+                target: "MAIN",
+                "Resume requested, but {}.mapping.tsv.gz was not found; running mapping from scratch.",
+                self.config.outprefix
+            );
+            return Ok(None);
+        };
+        log::info!(
+            target: "MAIN",
+            "Resume taxonomy profiling with existing mapping output."
+        );
+        let db = self
+            .config
+            .db
+            .as_ref()
+            .ok_or_else(|| anyhow!("--resume requires the matching --db directory"))?;
+        Ok(Some(PreparedMapping::Metam {
+            output,
+            db: db.clone(),
+        }))
+    }
+
+    /// Run the mapper into a temporary file. When the temporary storage fills
+    /// up, the mapping runs again in the output directory.
+    fn run_staged(
+        &self,
+        mapper: &Mapper,
+        profiler: MappingProfilerMetadata,
+        progress_log: MappingProgressLog,
+    ) -> Result<MappingOutput> {
         let plan = plan_staging_directory(self.config.temp_dir.as_deref(), &self.config.outprefix)?;
         log::info!(
             target: "MAPPER",
@@ -540,46 +560,31 @@ impl MetaxApp {
                 .map(|bytes| format!(" ({} available)", human_bytes(bytes)))
                 .unwrap_or_default()
         );
-        let staged = mapper.run_temporary(
-            &plan.directory,
-            self.config.threads,
-            self.config.sequencer,
-            self.config.is_paired,
-            self.config.mode,
-            profiler,
-            self.config.very_verbose,
-            &self.config.extra_args,
-            self.profile_progress_options(),
-            progress_log,
-        );
-        let output = match staged {
-            Ok(output) => output,
-            Err(error) if plan.fallback_directory.is_some() && is_storage_exhausted(&error) => {
-                let fallback = plan.fallback_directory.as_ref().expect("checked above");
+        let run_in = |directory: &Path| {
+            mapper.run_temporary(
+                directory,
+                self.config.threads,
+                self.config.sequencer,
+                self.config.is_paired,
+                self.config.mode,
+                profiler,
+                self.config.very_verbose,
+                &self.config.extra_args,
+                self.profile_progress_options(),
+                progress_log,
+            )
+        };
+        match (run_in(&plan.directory), &plan.fallback_directory) {
+            (Err(error), Some(fallback)) if is_storage_exhausted(&error) => {
                 log::warn!(
                     target: "MAPPER",
                     "Temporary mapping storage filled while mapping; retrying in output directory '{}'. The mapping stage will run again.",
                     fallback.display()
                 );
-                mapper.run_temporary(
-                    fallback,
-                    self.config.threads,
-                    self.config.sequencer,
-                    self.config.is_paired,
-                    self.config.mode,
-                    profiler,
-                    self.config.very_verbose,
-                    &self.config.extra_args,
-                    self.profile_progress_options(),
-                    progress_log,
-                )?
+                run_in(fallback)
             }
-            Err(error) => return Err(error),
-        };
-        Ok(PreparedMapping::Metam {
-            output,
-            db: db.clone(),
-        })
+            (staged, _) => staged,
+        }
     }
 
     fn build_main_command(&self) -> String {

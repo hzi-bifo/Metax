@@ -90,14 +90,14 @@ impl MarkerModel {
     /// `assembly_id` gives the profiler's id of a genome.
     pub(crate) fn from_database(
         db: &DatabaseMetadata,
-        assembly_id: impl Fn(&str) -> u32,
+        assembly_of: &[u32],
         geometry: FragmentGeometry,
     ) -> Option<Self> {
         let mut genes: HashMap<u32, Vec<Gene>> = HashMap::new();
         for (reference_id, reference) in db.references.iter().enumerate() {
             if reference.reference_type == ReferenceType::Markers {
                 genes
-                    .entry(assembly_id(&reference.genome))
+                    .entry(assembly_of[reference_id])
                     .or_default()
                     .push(Gene {
                         reference_id: u32::try_from(reference_id).ok()?,
