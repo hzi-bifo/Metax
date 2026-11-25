@@ -26,7 +26,7 @@
 //! to its relatives: its marker set misses genes of its genome, and its genes
 //! clip reads at their ends; those fragments land on relatives' genes or
 //! genomes. A taxon above such kept units therefore gets a row only when its
-//! fragments reach the model's spill share of theirs ([`kept_beneath`]),
+//! fragments reach the model's spill share of theirs ([`spill_bounds`]),
 //! counted in whole-genome equivalents when the row's evidence is a genome
 //! reference. Kept units on genome references leave no such share.
 //!
@@ -73,22 +73,21 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::{
-    best_tied, fold_candidates, placement_identity, ranked, share_reads_after, CoverageTests,
-    EmSettings, Fragment,
+    best_tied, fold_candidates, fragment_depth, placement_identity, ranked, share_reads_after,
+    CoverageTests, EmSettings, Fragment,
 };
 use crate::profiler::community::MappingData;
 use crate::profiler::evidence::{
-    EvidenceCoverage, EvidencePolicy, PresenceAssembly, PresenceInterval,
+    EvidenceCoverage, EvidenceMode, EvidencePolicy, PresenceAssembly, PresenceInterval,
 };
 use crate::profiler::likelihood_em::{self, ReadGroups};
-use crate::profiler::markers::MarkerModel;
 use crate::profiler::rollup::GenomeLayout;
 use crate::profiler::unclassified::GenomeReads;
 use crate::taxonomy::Taxonomy;
 
-/// What a row above species must show, by the evidence model of its
-/// evidence genome. A candidate's amount comes first: fragments short of it
-/// are not judged.
+/// What a row above species must show, and how it is counted, by the
+/// evidence model of its evidence genome. A candidate's amount comes first:
+/// fragments short of it are not judged.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct RowRules {
     /// What a genus row's unique fragments of one kind, or the fragments
@@ -100,11 +99,18 @@ pub(super) struct RowRules {
     /// Lowest chunk ratio (COEBR) of a genus row's unique fragments.
     pub(super) genus_min_chunk_ratio: f64,
     /// How the fragments of a row above genus spread over the evidence genome.
-    pub(super) above_genus: Spread,
+    pub(super) above_genus: Evenness,
     /// Share of a kept unit's fragments that may land on its relatives: a row
     /// of a taxon above kept units of this model needs at least this share of
     /// their fragments.
     pub(super) spill_share: f64,
+    /// What a row's fragments are compared with in the spill test.
+    pub(super) spill_counted: SpillCounted,
+    /// How a row's depth is taken.
+    pub(super) depth: Depth,
+    /// Whether the unclassified estimate counts a row's fragments times its
+    /// evidence genome's whole-genome scale, rather than as they are.
+    pub(super) whole_genome_scaled: bool,
 }
 
 /// The amount test of a candidate row.
@@ -118,11 +124,31 @@ pub(super) enum Amount {
 
 /// The evenness test of a row above genus.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) enum Spread {
+pub(super) enum Evenness {
     /// Lowest share of the evidence genome's windows that the fragments reach.
     Windows(f64),
     /// Lowest chunk ratio (COEBR) of the fragments.
     ChunkRatio(f64),
+}
+
+/// The spill of kept units that a row's fragments are compared with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SpillCounted {
+    /// Their fragments on marker genes.
+    OnMarkerGenes,
+    /// Their whole-genome equivalents.
+    WholeGenome,
+}
+
+/// How a row's depth is taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Depth {
+    /// Its fragments' first-read bases over the evidence genome's indexed
+    /// length.
+    BasesOverLength,
+    /// The depths its fragments add to the evidence genome, each as to a
+    /// species on it ([`super::fragment_depth`]).
+    OfEachFragment,
 }
 
 /// Rows on a genome reference: fragments spread over its sequence.
@@ -130,8 +156,11 @@ pub(super) const GENOME_ROWS: RowRules = RowRules {
     amount: Amount::Fragments(200),
     genus_identity_margin: 0.09,
     genus_min_chunk_ratio: 0.40,
-    above_genus: Spread::Windows(0.50),
+    above_genus: Evenness::Windows(0.50),
     spill_share: 0.0,
+    spill_counted: SpillCounted::WholeGenome,
+    depth: Depth::BasesOverLength,
+    whole_genome_scaled: false,
 };
 
 /// Rows on a genome represented by marker genes: fragments spread over its
@@ -141,11 +170,14 @@ pub(super) const MARKER_ROWS: RowRules = RowRules {
     amount: Amount::Genes(10),
     genus_identity_margin: 0.09,
     genus_min_chunk_ratio: 0.40,
-    above_genus: Spread::ChunkRatio(0.40),
+    above_genus: Evenness::ChunkRatio(0.40),
     spill_share: 0.15,
+    spill_counted: SpillCounted::OnMarkerGenes,
+    depth: Depth::OfEachFragment,
+    whole_genome_scaled: true,
 };
 
-/// The evidence model of a genome.
+/// The evidence model of a genome ([`CoverageTests::model_of`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Model {
     Genome,
@@ -153,19 +185,6 @@ pub(super) enum Model {
 }
 
 impl Model {
-    /// The model of genome `assembly_id`.
-    pub(super) fn of(data: &MappingData, assembly_id: u32) -> Self {
-        if data
-            .marker_model
-            .as_deref()
-            .is_some_and(|model| model.is_marker_genome(assembly_id))
-        {
-            Self::Markers
-        } else {
-            Self::Genome
-        }
-    }
-
     /// Its row rules.
     pub(super) fn rules(self) -> &'static RowRules {
         match self {
@@ -189,17 +208,17 @@ impl Model {
 /// they may leave to relatives, counted on marker genes and in whole-genome
 /// equivalents.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(super) struct Beneath {
+pub(super) struct SpillBound {
     pub(super) marker_fragments: f64,
     pub(super) whole_genome: f64,
 }
 
-impl Beneath {
-    /// The bound of a row whose evidence has `model`.
-    fn bound(&self, model: Model) -> f64 {
-        match model {
-            Model::Markers => self.marker_fragments,
-            Model::Genome => self.whole_genome,
+impl SpillBound {
+    /// The bound of a row with `rules`.
+    fn of_row(&self, rules: &RowRules) -> f64 {
+        match rules.spill_counted {
+            SpillCounted::OnMarkerGenes => self.marker_fragments,
+            SpillCounted::WholeGenome => self.whole_genome,
         }
     }
 }
@@ -209,13 +228,13 @@ impl Beneath {
 /// whole-genome fragments per fragment): the spill share of their model of
 /// their fragments, summed; a unit without a whole-genome scale counts its
 /// fragments as they are. Units are summed in taxid order.
-pub(super) fn kept_beneath(
+pub(super) fn spill_bounds(
     units: impl IntoIterator<Item = (u32, Model, f64, Option<f64>)>,
     lineages: &Lineages,
-) -> HashMap<u32, Beneath> {
+) -> HashMap<u32, SpillBound> {
     let mut units = units.into_iter().collect::<Vec<_>>();
     units.sort_unstable_by_key(|unit| unit.0);
-    let mut beneath: HashMap<u32, Beneath> = HashMap::new();
+    let mut bounds: HashMap<u32, SpillBound> = HashMap::new();
     for (taxid, model, fragments, scale) in units {
         let spill = model.rules().spill_share * fragments;
         if spill <= 0.0 {
@@ -223,13 +242,13 @@ pub(super) fn kept_beneath(
         }
         for &(ancestor, rank) in lineages.of(taxid).iter() {
             if rank.is_some() {
-                let bound = beneath.entry(ancestor).or_default();
+                let bound = bounds.entry(ancestor).or_default();
                 bound.marker_fragments += spill;
                 bound.whole_genome += spill * scale.unwrap_or(1.0);
             }
         }
     }
-    beneath
+    bounds
 }
 
 /// The two kinds of fragments placed above species.
@@ -373,8 +392,8 @@ pub(super) struct Level<'a> {
     /// Keep each fragment's shares for the per-read classifications.
     pub(super) keep_shares: bool,
     /// The fragments of the kept units of each taxon that may land on
-    /// relatives ([`kept_beneath`]).
-    pub(super) kept_beneath: &'a HashMap<u32, Beneath>,
+    /// relatives ([`spill_bounds`]).
+    pub(super) spill_bounds: &'a HashMap<u32, SpillBound>,
 }
 
 impl Level<'_> {
@@ -384,6 +403,11 @@ impl Level<'_> {
             Kind::BelowSpecies => self.below_species.1,
             Kind::NotKept => self.not_kept.1,
         }
+    }
+
+    /// Whether the reads are long reads.
+    fn long_reads(&self) -> bool {
+        self.not_kept.1.mode == EvidenceMode::Long
     }
 }
 
@@ -449,6 +473,15 @@ impl Measured {
     pub(super) fn genome(&self) -> u32 {
         self.tied[0]
     }
+
+    /// What the unclassified estimate counts each of a row's fragments as,
+    /// when its rules scale them ([`RowRules::whole_genome_scaled`]): its
+    /// whole-genome scale, `None` when unknown.
+    pub(super) fn unclassified_scale(&self) -> Option<Option<f64>> {
+        self.rules()
+            .whole_genome_scaled
+            .then_some(self.whole_genome_scale)
+    }
 }
 
 /// A test a candidate row fails, with its bound.
@@ -482,14 +515,6 @@ impl fmt::Display for Failure {
     }
 }
 
-/// The spill test: a row's `fragments` at least the `bound` of the kept units
-/// beneath it, when there are any.
-fn spill_failure(fragments: usize, bound: Option<f64>) -> Option<Failure> {
-    bound
-        .filter(|&bound| (fragments as f64) < bound)
-        .map(|bound| Failure::Spill { fragments, bound })
-}
-
 /// The chunk ratio test: `ratio` at least `bound`.
 fn chunk_ratio_failure(ratio: f64, bound: f64) -> Option<Failure> {
     (ratio.is_nan() || ratio < bound).then_some(Failure::ChunkRatio { ratio, bound })
@@ -514,7 +539,7 @@ fn genus_failures(identity: f64, floor: f64, measured: &Measured) -> Vec<Failure
 /// they spread over the evidence genome, by its model.
 pub(super) fn taxon_failures(measured: &Measured) -> Vec<Failure> {
     match measured.rules().above_genus {
-        Spread::Windows(bound) => measured
+        Evenness::Windows(bound) => measured
             .spread
             .is_none_or(|spread| spread < bound)
             .then_some(Failure::Windows {
@@ -523,7 +548,7 @@ pub(super) fn taxon_failures(measured: &Measured) -> Vec<Failure> {
             })
             .into_iter()
             .collect(),
-        Spread::ChunkRatio(bound) => chunk_ratio_failure(measured.coverage.coebr, bound)
+        Evenness::ChunkRatio(bound) => chunk_ratio_failure(measured.coverage.coebr, bound)
             .into_iter()
             .collect(),
     }
@@ -533,11 +558,11 @@ pub(super) fn taxon_failures(measured: &Measured) -> Vec<Failure> {
 /// words.
 pub(super) fn taxon_evidence(measured: &Measured) -> String {
     match measured.rules().above_genus {
-        Spread::Windows(bound) => format!(
+        Evenness::Windows(bound) => format!(
             "window spread {:.4} >= {bound}",
             measured.spread.unwrap_or(f64::NAN)
         ),
-        Spread::ChunkRatio(bound) => format!(
+        Evenness::ChunkRatio(bound) => format!(
             "{} genes hit, chunk ratio {:.4} >= {bound}",
             measured.coverage.marker_genes_hit.unwrap_or(0),
             measured.coverage.coebr
@@ -761,10 +786,136 @@ struct Placing<'p> {
 }
 
 impl Placing<'_> {
-    /// The evidence of the fragments `list` when they meet the amount of
-    /// their evidence model ([`measure`]).
+    /// The evidence of the fragments `list` ([`Measured`]) when they meet the
+    /// amount of their evidence model, otherwise `None`.
     fn measure(&self, list: &[u32]) -> Option<Measured> {
-        measure(self, list)
+        if list.len() < self.fewest_fragments {
+            return None;
+        }
+        let (tied, on_genome) = self.evidence_genome(list);
+        let genome = tied[0];
+        let model = self.level.tests.model_of(genome);
+        let amount = model.rules().amount;
+        if !self.may_meet(amount, list, &on_genome) {
+            return None;
+        }
+        let (coverage, spread) = self.coverage(genome, &on_genome);
+        if matches!(amount, Amount::Genes(fewest) if coverage.marker_genes_hit.unwrap_or(0) < fewest)
+        {
+            return None;
+        }
+        Some(Measured {
+            model,
+            fragments: on_genome.len(),
+            coverage,
+            spread,
+            whole_genome_scale: self.whole_genome_scale(genome, &on_genome),
+            tied: tied.into(),
+        })
+    }
+
+    /// The genomes holding most of the fragments `list`'s best placements, by
+    /// assembly id, the evidence genome first, and the fragments there.
+    fn evidence_genome(&self, list: &[u32]) -> (Vec<u32>, Vec<&Placed>) {
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        for &i in list {
+            *counts.entry(self.placed[i as usize].assembly).or_default() += 1;
+        }
+        let most = counts
+            .values()
+            .copied()
+            .max()
+            .expect("a candidate row has fragments");
+        let mut tied = counts
+            .into_iter()
+            .filter(|&(_, n)| n == most)
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        tied.sort_unstable();
+        let on_genome = list
+            .iter()
+            .map(|&i| &self.placed[i as usize])
+            .filter(|fragment| fragment.assembly == tied[0])
+            .collect();
+        (tied, on_genome)
+    }
+
+    /// Whether the fragments `list`, with `on_genome` on the evidence genome,
+    /// can meet `amount`. The genes hit can be no more than the genes the
+    /// fragments cover, which spares measuring the coverage of most
+    /// candidates.
+    fn may_meet(&self, amount: Amount, list: &[u32], on_genome: &[&Placed]) -> bool {
+        match amount {
+            Amount::Fragments(fewest) => list.len() >= fewest,
+            Amount::Genes(fewest) => {
+                let mut genes = on_genome
+                    .iter()
+                    .flat_map(|fragment| {
+                        std::iter::once(fragment.interval.reference_id)
+                            .chain(self.hits_of(fragment).iter().map(|hit| hit.reference_id))
+                    })
+                    .collect::<Vec<_>>();
+                genes.sort_unstable();
+                genes.dedup();
+                genes.len() >= fewest
+            }
+        }
+    }
+
+    /// The coverage of the fragments `on_genome` on genome `genome`, a
+    /// fragment counting on every further marker gene it covers, and the
+    /// window spread of their placements.
+    fn coverage(&self, genome: u32, on_genome: &[&Placed]) -> (EvidenceCoverage, Option<f64>) {
+        let mut assembly = PresenceAssembly {
+            asm_len: self.genomes[&genome],
+            count: on_genome.len() as u64,
+            intervals: Vec::with_capacity(on_genome.len()),
+            ..PresenceAssembly::default()
+        };
+        for fragment in on_genome {
+            assembly.add_interval(fragment.interval);
+        }
+        let spread = self.level.layout.window_spread(genome, &assembly.intervals);
+        for fragment in on_genome {
+            let hits = self.hits_of(fragment);
+            assembly.other_gene_hits += hits.len() as u64;
+            for &hit in hits {
+                assembly.add_interval(hit);
+            }
+        }
+        (self.level.tests.measure(genome, &mut assembly), spread)
+    }
+
+    /// With the unclassified estimate, the whole-genome fragments that a
+    /// fragment on marker genome `genome` stands for, from the fragments
+    /// `on_genome` placed there, as a species reported on the genome counts
+    /// its fragments in the estimate: for short reads the genome's scale times
+    /// their gene hits per fragment, for long reads the whole-genome reads of
+    /// each read over their number. `None` without the estimate, for a genome
+    /// without marker genes or a declared size, or without a gene that can
+    /// hold a read.
+    fn whole_genome_scale(&self, genome: u32, on_genome: &[&Placed]) -> Option<f64> {
+        let data = self.level.data;
+        data.unclassified_species.as_ref()?;
+        let markers = data.marker_model.as_deref()?;
+        let size = markers.declared_size(genome)?;
+        let mut reads = GenomeReads::default();
+        if !self.level.long_reads() {
+            for fragment in on_genome {
+                reads.add_fragment(1 + fragment.gene_hits.len() as u32);
+            }
+            return Some(reads.short_read_scale(markers.genome_scale(genome, size)?));
+        }
+        for fragment in on_genome {
+            let genes = std::iter::once(fragment.interval.reference_id)
+                .chain(self.hits_of(fragment).iter().map(|hit| hit.reference_id));
+            if let Some((hits, per_hit)) =
+                markers.whole_genome_reads(genome, fragment.read_len, genes)
+            {
+                reads.add(hits, per_hit);
+            }
+        }
+        reads.whole_genome_per_read(size)
     }
 
     /// The hits of `fragment` on further marker genes.
@@ -772,27 +923,56 @@ impl Placing<'_> {
         &self.gene_hits[fragment.gene_hits.start as usize..fragment.gene_hits.end as usize]
     }
 
-    /// The depth that `fragment` adds to a row on marker genomes `tied`: the
-    /// mean over them of its depth on each ([`MarkerModel::read_depth`]),
-    /// mapped bases over the indexed length where no gene can hold its read.
-    fn marker_depth(&self, markers: &MarkerModel, fragment: &Placed, tied: &[u32]) -> f64 {
-        let genes = 1 + fragment.gene_hits.len() as u32;
-        tied.iter()
-            .map(|&genome| {
-                markers
-                    .read_depth(genome, fragment.read_len, genes)
-                    .unwrap_or_else(|| f64::from(fragment.bases) / self.genomes[&genome].max(1.0))
-            })
-            .sum::<f64>()
-            / tied.len() as f64
+    /// What `fragment` adds to the depth of a row measured as `measured`,
+    /// before [`Self::depth`] ([`RowRules::depth`]): its first-read bases, or
+    /// the mean over the tied genomes of the depth it adds to each
+    /// ([`fragment_depth`]).
+    fn depth_part(&self, measured: &Measured, fragment: &Placed) -> f64 {
+        let bases = f64::from(fragment.bases);
+        match measured.rules().depth {
+            Depth::BasesOverLength => bases,
+            Depth::OfEachFragment => {
+                let markers = self.level.data.marker_model.as_deref();
+                let genes = 1 + fragment.gene_hits.len() as u32;
+                let tied = &measured.tied;
+                tied.iter()
+                    .map(|&genome| {
+                        let at = (genome, self.genomes[&genome]);
+                        fragment_depth(markers, at, fragment.read_len, genes, bases)
+                    })
+                    .sum::<f64>()
+                    / tied.len() as f64
+            }
+        }
     }
 
-    /// The spill bound of taxon `taxid` for a row measured as `measured`.
-    fn spill(&self, taxid: u32, measured: &Measured) -> Option<f64> {
-        self.level
-            .kept_beneath
+    /// The depth of a row measured as `measured`, from the summed parts of
+    /// its fragments ([`Self::depth_part`]).
+    fn depth(&self, measured: &Measured, parts: f64) -> f64 {
+        match measured.rules().depth {
+            Depth::BasesOverLength => parts / self.depth_length(&measured.tied),
+            Depth::OfEachFragment => parts,
+        }
+    }
+
+    /// The spill test of taxon `taxid` with `fragments` fragments measured as
+    /// `measured`: the bound of the kept units beneath it, when there are
+    /// any, and its failure.
+    fn spill_test(
+        &self,
+        taxid: u32,
+        measured: &Measured,
+        fragments: usize,
+    ) -> (Option<f64>, Option<Failure>) {
+        let bound = self
+            .level
+            .spill_bounds
             .get(&taxid)
-            .map(|beneath| beneath.bound(measured.model))
+            .map(|bound| bound.of_row(measured.rules()));
+        let failure = bound
+            .filter(|&bound| (fragments as f64) < bound)
+            .map(|bound| Failure::Spill { fragments, bound });
+        (bound, failure)
     }
 
     /// The fragments waiting at `taxid` of `rank`.
@@ -839,9 +1019,9 @@ impl Placing<'_> {
                 .sum::<f64>()
                 / list.len() as f64;
             let identity_floor = cutoff - measured.rules().genus_identity_margin;
-            let spill = self.spill(genus, &measured);
+            let (spill, spill_failure) = self.spill_test(genus, &measured, of_genus[&genus]);
             let mut failures = genus_failures(identity, identity_floor, &measured);
-            failures.extend(spill_failure(of_genus[&genus], spill));
+            failures.extend(spill_failure);
             candidates.push(GenusCandidate {
                 genus,
                 kind,
@@ -971,9 +1151,10 @@ impl Placing<'_> {
             for taxid in here {
                 let (_, arrivals) = self.pending.remove(&taxid).expect("listed above");
                 let passed = self.measure(&arrivals.fragments).is_some_and(|measured| {
-                    let spill = self.spill(taxid, &measured);
+                    let (spill, spill_failure) =
+                        self.spill_test(taxid, &measured, arrivals.fragments.len());
                     let mut failures = taxon_failures(&measured);
-                    failures.extend(spill_failure(arrivals.fragments.len(), spill));
+                    failures.extend(spill_failure);
                     let passed = failures.is_empty();
                     if passed {
                         evidence.insert((rank, taxid), measured.clone());
@@ -1032,17 +1213,8 @@ impl Placing<'_> {
             .enumerate()
             .map(|(row, &(_, taxid))| (taxid, row))
             .collect::<HashMap<_, _>>();
-        // The marker genomes of each row on marker evidence, by row.
-        let markers = self.level.data.marker_model.as_deref();
-        let on_markers = evidence
-            .values()
-            .map(|measured| {
-                markers
-                    .filter(|_| measured.model == Model::Markers)
-                    .map(|markers| (markers, &measured.tied[..]))
-            })
-            .collect::<Vec<_>>();
-        // Reads, and first-read bases or depth on marker genomes, by row.
+        let measured = evidence.values().collect::<Vec<_>>();
+        // Reads and depth parts, by row.
         let mut totals = vec![[0.0; 2]; evidence.len()];
         let mut shares = Vec::new();
         for (fragment, to) in self.placed.iter().zip(&self.destination) {
@@ -1059,10 +1231,7 @@ impl Placing<'_> {
                 let row = index[&taxid];
                 let total = &mut totals[row];
                 total[0] += share;
-                total[1] += match on_markers[row] {
-                    Some((markers, tied)) => share * self.marker_depth(markers, fragment, tied),
-                    None => share * f64::from(fragment.bases),
-                };
+                total[1] += share * self.depth_part(measured[row], fragment);
             }
             if self.level.keep_shares {
                 shares.push((fragment.read, parts.to_vec()));
@@ -1071,15 +1240,12 @@ impl Placing<'_> {
         let rows = evidence
             .into_iter()
             .zip(totals)
-            .map(|(((rank, taxid), measured), [reads, depth])| HigherRow {
+            .map(|(((rank, taxid), measured), [reads, parts])| HigherRow {
                 taxid,
                 rank,
                 reads,
                 unique: with_row.get(&taxid).copied().unwrap_or_default(),
-                depth: match measured.model {
-                    Model::Genome => depth / self.depth_length(&measured.tied),
-                    Model::Markers => depth,
-                },
+                depth: self.depth(&measured, parts),
                 measured,
             })
             .collect();
@@ -1253,125 +1419,6 @@ fn genera_of(taxa: &[u32], lineages: &Lineages) -> Genera {
     Genera { genera, unique }
 }
 
-/// The evidence of the fragments `list` ([`Measured`]) when they meet the
-/// amount of their evidence model, otherwise `None`.
-fn measure(placing: &Placing, list: &[u32]) -> Option<Measured> {
-    let (placed, genomes, level) = (placing.placed, placing.genomes, placing.level);
-    if list.len() < placing.fewest_fragments {
-        return None;
-    }
-    let mut counts: HashMap<u32, usize> = HashMap::new();
-    for &i in list {
-        *counts.entry(placed[i as usize].assembly).or_default() += 1;
-    }
-    let (&genome, &fragments) = counts
-        .iter()
-        .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
-        .expect("a candidate row has fragments");
-    let model = Model::of(level.data, genome);
-    let on_genome = list
-        .iter()
-        .map(|&i| &placed[i as usize])
-        .filter(|fragment| fragment.assembly == genome)
-        .collect::<Vec<_>>();
-    // The amount first: the genes hit can be no more than the genes the
-    // fragments cover, which spares measuring the coverage of most candidates.
-    let amount = model.rules().amount;
-    let enough = match amount {
-        Amount::Fragments(fewest) => list.len() >= fewest,
-        Amount::Genes(fewest) => {
-            let mut genes = on_genome
-                .iter()
-                .flat_map(|fragment| {
-                    std::iter::once(fragment.interval.reference_id)
-                        .chain(placing.hits_of(fragment).iter().map(|hit| hit.reference_id))
-                })
-                .collect::<Vec<_>>();
-            genes.sort_unstable();
-            genes.dedup();
-            genes.len() >= fewest
-        }
-    };
-    if !enough {
-        return None;
-    }
-    let mut tied = counts
-        .iter()
-        .filter(|&(_, &n)| n == fragments)
-        .map(|(&id, _)| id)
-        .collect::<Vec<_>>();
-    tied.sort_unstable();
-    let mut assembly = PresenceAssembly {
-        asm_len: genomes[&genome],
-        count: fragments as u64,
-        intervals: Vec::with_capacity(fragments),
-        ..PresenceAssembly::default()
-    };
-    for fragment in &on_genome {
-        assembly.add_interval(fragment.interval);
-    }
-    let spread = level.layout.window_spread(genome, &assembly.intervals);
-    // A fragment counts on every further marker gene it covers.
-    for fragment in &on_genome {
-        let hits = placing.hits_of(fragment);
-        assembly.other_gene_hits += hits.len() as u64;
-        for &hit in hits {
-            assembly.add_interval(hit);
-        }
-    }
-    let coverage = level.tests.measure(genome, &mut assembly);
-    if matches!(amount, Amount::Genes(fewest) if coverage.marker_genes_hit.unwrap_or(0) < fewest) {
-        return None;
-    }
-    // Only the unclassified estimate reads the whole-genome scale.
-    let whole_genome_scale = level
-        .data
-        .marker_model
-        .as_deref()
-        .filter(|_| model == Model::Markers && level.data.unclassified_species.is_some())
-        .and_then(|markers| whole_genome_scale(placing, markers, genome, &on_genome));
-    Some(Measured {
-        model,
-        fragments,
-        coverage,
-        spread,
-        tied: tied.into(),
-        whole_genome_scale,
-    })
-}
-
-/// The whole-genome fragments that a fragment on marker genome `genome`
-/// stands for, from the fragments `on_genome` placed there, as a species
-/// reported on the genome counts its fragments in the unclassified estimate:
-/// for short reads the genome's scale times their gene hits per fragment, for
-/// long reads the whole-genome reads of each read over their number. `None`
-/// without a declared genome size or a gene that can hold a read.
-fn whole_genome_scale(
-    placing: &Placing,
-    markers: &MarkerModel,
-    genome: u32,
-    on_genome: &[&Placed],
-) -> Option<f64> {
-    let size = markers.declared_size(genome)?;
-    if !markers.long_reads() {
-        let hits = on_genome
-            .iter()
-            .map(|fragment| 1 + fragment.gene_hits.len())
-            .sum::<usize>();
-        return Some(markers.genome_scale(genome, size)? * hits as f64 / on_genome.len() as f64);
-    }
-    let mut reads = GenomeReads::default();
-    for fragment in on_genome {
-        let genes = std::iter::once(fragment.interval.reference_id)
-            .chain(placing.hits_of(fragment).iter().map(|hit| hit.reference_id));
-        if let Some((hits, per_hit)) = markers.whole_genome_reads(genome, fragment.read_len, genes)
-        {
-            reads.add(hits, per_hit);
-        }
-    }
-    reads.whole_genome_per_read(size)
-}
-
 /// The genera that the tied fragments of the tie sets `sets` (each with its
 /// fragments) list most often, at most three, most first, then by taxid.
 fn most_listed(sets: &HashMap<u32, usize>, genera: &[Genera]) -> Vec<u32> {
@@ -1513,7 +1560,7 @@ mod tests {
                     max_iterations: 1000,
                 },
                 keep_shares: true,
-                kept_beneath: &HashMap::new(),
+                spill_bounds: &HashMap::new(),
             },
             &Lineages::new(&taxonomy),
         )
@@ -1552,18 +1599,18 @@ mod tests {
         place_marker_reads_beside(not_kept, &HashMap::new())
     }
 
-    /// [`place_marker_reads`] with the spill bounds `kept_beneath`.
+    /// [`place_marker_reads`] with the spill bounds `spill_bounds`.
     fn place_marker_reads_beside(
         not_kept: Vec<Vec<EvidenceAlignment>>,
-        kept_beneath: &HashMap<u32, Beneath>,
+        spill_bounds: &HashMap<u32, SpillBound>,
     ) -> HigherLevels {
-        place_marker_reads_with(not_kept, kept_beneath, marker_model())
+        place_marker_reads_with(not_kept, spill_bounds, marker_model())
     }
 
     /// [`place_marker_reads_beside`] with the marker model `model`.
     fn place_marker_reads_with(
         not_kept: Vec<Vec<EvidenceAlignment>>,
-        kept_beneath: &HashMap<u32, Beneath>,
+        spill_bounds: &HashMap<u32, SpillBound>,
         model: Arc<MarkerModel>,
     ) -> HigherLevels {
         let reads = (0..not_kept.len()).collect::<Vec<_>>();
@@ -1593,7 +1640,7 @@ mod tests {
                     max_iterations: 1000,
                 },
                 keep_shares: false,
-                kept_beneath,
+                spill_bounds,
             },
             &Lineages::new(&taxonomy),
         )
@@ -1633,7 +1680,7 @@ mod tests {
         let lineages = Lineages::new(&taxonomy);
         // Species 1001 (genus 100) on marker genes with 400 fragments, each standing for 20 whole-genome
         // fragments; species 1011 (genus 101) on a genome reference leaves no spill.
-        let beneath = kept_beneath(
+        let beneath = spill_bounds(
             [
                 (1001, Model::Markers, 400.0, Some(20.0)),
                 (1011, Model::Genome, 1_000.0, None),
@@ -1642,7 +1689,7 @@ mod tests {
         );
         let share = MARKER_ROWS.spill_share;
         assert_eq!(GENOME_ROWS.spill_share, 0.0);
-        let expected = Beneath {
+        let expected = SpillBound {
             marker_fragments: share * 400.0,
             whole_genome: share * 8_000.0,
         };
@@ -1652,8 +1699,8 @@ mod tests {
         assert!(!beneath.contains_key(&101) && !beneath.contains_key(&1001));
         // A row on marker genes compares with their fragments, a row on a genome reference with their whole-genome
         // equivalents.
-        assert_eq!(expected.bound(Model::Markers), share * 400.0);
-        assert_eq!(expected.bound(Model::Genome), share * 8_000.0);
+        assert_eq!(expected.of_row(&MARKER_ROWS), share * 400.0);
+        assert_eq!(expected.of_row(&GENOME_ROWS), share * 8_000.0);
     }
 
     #[test]
@@ -1662,7 +1709,7 @@ mod tests {
         let bound = |marker_fragments| {
             HashMap::from([(
                 100,
-                Beneath {
+                SpillBound {
                     marker_fragments,
                     whole_genome: 50.0 * marker_fragments,
                 },
@@ -1763,7 +1810,7 @@ mod tests {
                 max_iterations: 1000,
             },
             keep_shares: false,
-            kept_beneath: &HashMap::new(),
+            spill_bounds: &HashMap::new(),
         };
         let genomes = HashMap::from([(60, 40_000.0)]);
         let placing = Placing {
@@ -1879,10 +1926,10 @@ mod tests {
         assert_eq!(Model::Markers.rules(), &MARKER_ROWS);
         // Genomes: an amount in fragments, spread over windows above genus.
         assert_eq!(GENOME_ROWS.amount, Amount::Fragments(200));
-        assert_eq!(GENOME_ROWS.above_genus, Spread::Windows(0.5));
+        assert_eq!(GENOME_ROWS.above_genus, Evenness::Windows(0.5));
         // Marker genomes: an amount in genes hit, spread over genes above genus.
         assert_eq!(MARKER_ROWS.amount, Amount::Genes(10));
-        assert_eq!(MARKER_ROWS.above_genus, Spread::ChunkRatio(0.4));
+        assert_eq!(MARKER_ROWS.above_genus, Evenness::ChunkRatio(0.4));
         assert_eq!(
             GENOME_ROWS.genus_min_chunk_ratio,
             MARKER_ROWS.genus_min_chunk_ratio

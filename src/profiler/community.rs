@@ -162,7 +162,6 @@ impl ResolvedReferences {
                         taxid: taxonomy.as_ref()?.profile_taxid,
                         assembly_id,
                         reference_type: reference.reference_type,
-                        declared_genome_size: reference.declared_genome_size,
                     })
                 }),
         )

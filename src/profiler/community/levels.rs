@@ -374,7 +374,8 @@ fn profile_levels(profiler: &Profiler, data: MappingData) -> Result<()> {
         cfg,
         &data,
         &profile_rows,
-        (&amounts.genome_reads, above.as_ref()),
+        &amounts.genome_reads,
+        above.as_ref(),
         run.long_reads,
     );
     let header = TableHeader::of(cfg);
@@ -797,11 +798,11 @@ impl Run<'_> {
             // Each kept unit with the model of its best-fit genome, its
             // fragments and their whole-genome scale.
             let markers = data.marker_model.as_deref();
-            let kept_beneath = higher::kept_beneath(
+            let spill_bounds = higher::spill_bounds(
                 species.best_fit.iter().map(|(&taxid, &genome)| {
                     (
                         taxid,
-                        higher::Model::of(data, genome),
+                        species.tests.model_of(genome),
                         kept.em.weight.get(&taxid).copied().unwrap_or(0.0),
                         markers.and_then(|model| model.declared_genome_scale(genome)),
                     )
@@ -816,7 +817,7 @@ impl Run<'_> {
                 not_kept: (&not_kept, self.policy),
                 em: self.em,
                 keep_shares: self.keep_shares,
-                kept_beneath: &kept_beneath,
+                spill_bounds: &spill_bounds,
             };
             let found = higher::place(&level, self.names.lineages);
             let genus_rows = found
@@ -1566,7 +1567,7 @@ fn marker_fragment_depth(
         EvidenceMode::Paired | EvidenceMode::Single => placement.r1_mapped,
         EvidenceMode::Long => placement.both_mapped,
     };
-    fragment_depth(placement, mapped, Some(model))
+    placement_depth(&placement, mapped, Some(model))
 }
 
 /// Build the candidates of each item's read on the profiler's threads, take
@@ -1710,11 +1711,21 @@ struct CoverageTests {
 }
 
 impl CoverageTests {
+    /// The evidence model of genome `assembly_id`.
+    fn model_of(&self, assembly_id: u32) -> higher::Model {
+        match &self.markers {
+            Some(model) if model.is_marker_genome(assembly_id) => higher::Model::Markers,
+            _ => higher::Model::Genome,
+        }
+    }
+
     /// Coverage of genome `assembly_id`: gene by gene for a marker genome,
-    /// otherwise over its sequence.
+    /// otherwise over its sequence (also on a marker genome whose genes
+    /// cannot hold a read).
     fn measure(&self, assembly_id: u32, assembly: &mut PresenceAssembly) -> EvidenceCoverage {
         self.markers
             .as_deref()
+            .filter(|_| self.model_of(assembly_id) == higher::Model::Markers)
             .and_then(|model| model.coverage(assembly_id, assembly, self.multiple_tests))
             .unwrap_or_else(|| calculate_coverage(assembly, self.multiple_tests))
     }
@@ -2902,20 +2913,35 @@ fn profile_row(
 /// read adds this for every gene of the genome it covers, as the placements
 /// count every gene. Marker genes that cannot hold a read keep mapped bases
 /// over their summed length.
+///
+/// The fragment lies on genome `assembly_id` of `asm_len` bases with a read of
+/// `read_len` bases on `genes` of its genes, `mapped` of them mapped.
 fn fragment_depth(
-    placement: CandidatePlacement,
+    markers: Option<&MarkerModel>,
+    (assembly_id, asm_len): (u32, f64),
+    read_len: u32,
+    genes: u32,
+    mapped: f64,
+) -> f64 {
+    markers
+        .and_then(|model| model.read_depth(assembly_id, read_len, genes))
+        .unwrap_or_else(|| mapped / asm_len.max(1.0))
+}
+
+/// [`fragment_depth`] of a fragment placed at `placement` with `mapped`
+/// bases mapped.
+fn placement_depth(
+    placement: &CandidatePlacement,
     mapped: u32,
     markers: Option<&MarkerModel>,
 ) -> f64 {
-    markers
-        .and_then(|model| {
-            model.read_depth(
-                placement.assembly_id,
-                placement.read_len,
-                1 + placement.other_genes,
-            )
-        })
-        .unwrap_or_else(|| f64::from(mapped) / placement.asm_len.max(1.0))
+    fragment_depth(
+        markers,
+        (placement.assembly_id, placement.asm_len),
+        placement.read_len,
+        1 + placement.other_genes,
+        f64::from(mapped),
+    )
 }
 
 /// Record a resolved fragment's `placement` on a marker genome for the
@@ -2959,7 +2985,8 @@ fn estimate_unclassified(
     cfg: &ProfilerConfig,
     data: &MappingData,
     rows: &[ProfileRow],
-    (marker_genome_reads, above): (&HashMap<u32, GenomeReads>, Option<&higher::HigherLevels>),
+    marker_genome_reads: &HashMap<u32, GenomeReads>,
+    above: Option<&higher::HigherLevels>,
     long_reads: bool,
 ) -> Option<Option<unclassified::UnclassifiedEstimate>> {
     data.unclassified_species.as_ref().map(|species| {
@@ -2972,10 +2999,12 @@ fn estimate_unclassified(
             long_reads,
         );
         // Rows above species on marker genomes count like species rows.
-        scales.extend(above.iter().flat_map(|found| &found.rows).filter_map(|row| {
-            (row.measured.model == higher::Model::Markers)
-                .then_some((row.taxid, row.measured.whole_genome_scale))
-        }));
+        scales.extend(
+            above
+                .iter()
+                .flat_map(|found| &found.rows)
+                .filter_map(|row| Some((row.taxid, row.measured.unclassified_scale()?))),
+        );
         let estimate = unclassified::estimate(rows, &scales, data.total_reads);
         match estimate {
             Ok(estimate) => log::info!(
@@ -3154,13 +3183,19 @@ mod tests {
         let geometry = FragmentGeometry::new(FragmentLayout::LongReads, 3_000, 3_000, 500, 0.2);
         let markers = MarkerModel::from_gene_lengths(&[(7, &[1_000, 1_000])], geometry);
         let mut read = placement(7, 900, 3_000);
-        approx_equal(fragment_depth(read, 900, Some(&markers)), 3_000.0 / 6_002.0);
+        approx_equal(
+            placement_depth(&read, 900, Some(&markers)),
+            3_000.0 / 6_002.0,
+        );
         read.other_genes = 1;
-        approx_equal(fragment_depth(read, 900, Some(&markers)), 6_000.0 / 6_002.0);
+        approx_equal(
+            placement_depth(&read, 900, Some(&markers)),
+            6_000.0 / 6_002.0,
+        );
         // A read of another length is placed by its own length.
         let short = placement(7, 900, 1_000);
         approx_equal(
-            fragment_depth(short, 900, Some(&markers)),
+            placement_depth(&short, 900, Some(&markers)),
             1_000.0 / (2.0 * (1_000.0 + 1_001.0 - 400.0)),
         );
     }
@@ -3173,7 +3208,7 @@ mod tests {
         let markers =
             MarkerModel::from_gene_lengths(&[(7, &[1_000, 1_000]), (8, &[100])], geometry);
         let depth = |assembly, mapped, markers| {
-            fragment_depth(placement(assembly, mapped, 150), mapped, markers)
+            placement_depth(&placement(assembly, mapped, 150), mapped, markers)
         };
         approx_equal(depth(7, 150, Some(&markers)), 150.0 / 2_382.0);
         // A read clipped at a gene end stands for its whole read.

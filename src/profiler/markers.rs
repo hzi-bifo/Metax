@@ -267,12 +267,6 @@ impl MarkerModel {
         self.declared.get(&assembly_id).copied()
     }
 
-    /// Whether the sample's reads are long reads, whose placements on the
-    /// genes depend on each read's own length.
-    pub(crate) fn long_reads(&self) -> bool {
-        self.geometry.layout == FragmentLayout::LongReads
-    }
-
     /// The depth that a read of `read_len` bases on `genes` genes of genome
     /// `assembly_id` adds to the whole genome: its length on each gene over
     /// the placements that the genome's genes offer such a read
