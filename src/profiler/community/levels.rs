@@ -3014,10 +3014,17 @@ fn estimate_unclassified(
                 data.total_reads,
                 if cfg.is_paired { "fragments" } else { "reads" }
             ),
-            Err(taxid) => log::warn!(
-                target: "PROFILER",
-                "Unclassified estimate unavailable: species {taxid} is represented by marker genes that declare no genome size, cannot hold a read of this length, or have no resolved long read."
-            ),
+            Err(taxid) => match above.and_then(|found| found.row(taxid)) {
+                Some(row) => log::warn!(
+                    target: "PROFILER",
+                    "Unclassified estimate unavailable: the {} row {taxid} rests on a marker genome that declares no genome size, cannot hold a read of this length, or has no resolved long read.",
+                    row.rank.as_str()
+                ),
+                None => log::warn!(
+                    target: "PROFILER",
+                    "Unclassified estimate unavailable: species {taxid} is represented by marker genes that declare no genome size, cannot hold a read of this length, or have no resolved long read."
+                ),
+            },
         }
         estimate.ok()
     })
