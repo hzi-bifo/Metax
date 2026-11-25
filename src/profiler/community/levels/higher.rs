@@ -12,8 +12,8 @@
 //!   the species gates.
 //!
 //! A fragment's tie set holds the taxa (species, or units labelled above
-//! species) whose placements lie within the tie margin of its best one, on
-//! genome references and marker genomes alike.
+//! species) whose placements, on genome references or marker genomes, lie
+//! within the tie margin of its best one.
 //!
 //! A candidate row's fragments are measured on the genome they fit best as a
 //! set, its evidence genome: the genome holding most of their best
@@ -26,20 +26,24 @@
 //! to its relatives: its marker set misses genes of its genome, and its genes
 //! clip reads at their ends; those fragments land on relatives' genes or
 //! genomes. A taxon above such kept units therefore gets a row only when its
-//! fragments reach the model's spill share of theirs ([`spill_bounds`]),
-//! counted in whole-genome equivalents when the row's evidence is a genome
-//! reference. Kept units on genome references leave no such share.
+//! fragments reach the model's spill share of theirs ([`spill_bounds`]); when
+//! the row's evidence is a genome reference, each of their fragments counts
+//! as the whole-genome fragments it stands for by its genome's declared size
+//! ([`SpillCounted::WholeGenome`]). Kept units on genome references leave no
+//! such share.
 //!
 //! 1. Genus rows. A fragment whose tie set lies in one genus is unique to it.
-//!    A genus gets a row when, for one kind of fragment or both, the fragments
-//!    of that kind unique to it meet the amount of their evidence model, their
-//!    mean identity is at least the run's species identity cutoff minus the
-//!    model's margin, and their chunk ratio (COEBR) on the evidence genome
-//!    reaches the model's bound; its unique fragments of both kinds must also
-//!    reach the spill bound of the kept units beneath the genus. Its row then
-//!    holds the fragments of both kinds unique to it; the unique fragments of
-//!    a genus without a row go to the first taxon above the genus at family,
-//!    order, class, phylum or domain rank (step 3).
+//!    The two kinds of fragments unique to a genus are judged separately, each
+//!    on its own evidence genome, never added together: the genus gets a row
+//!    when the unique fragments of one kind meet the amount of their evidence
+//!    model, their mean identity is at least the run's species identity cutoff
+//!    minus the model's margin, and their chunk ratio (COEBR) on the evidence
+//!    genome reaches the model's bound; its unique fragments of both kinds
+//!    together must also reach the spill bound of the kept units beneath the
+//!    genus. Its row then holds the fragments of both kinds unique to it, also
+//!    those of a kind that failed or was too few to judge; the unique
+//!    fragments of a genus without a row go to the first taxon above the genus
+//!    at family, order, class, phylum or domain rank (step 3).
 //! 2. Ties between genera. A fragment whose tie set spans several genera, one
 //!    or more of them with a genus row, goes to the genera with a genus row,
 //!    shared by the likelihood EM over those genera, as the species level's EM
@@ -136,7 +140,12 @@ pub(super) enum Evenness {
 pub(super) enum SpillCounted {
     /// Their fragments on marker genes.
     OnMarkerGenes,
-    /// Their whole-genome equivalents.
+    /// Their fragments, each times the placements of its marker genome's
+    /// declared size over those of the genome's genes
+    /// ([`MarkerModel::declared_genome_scale`]), or as it is when the genome
+    /// declares no size.
+    ///
+    /// [`MarkerModel::declared_genome_scale`]: crate::profiler::markers::MarkerModel::declared_genome_scale
     WholeGenome,
 }
 
@@ -205,8 +214,8 @@ impl Model {
 }
 
 /// The spill bound of a taxon from the kept units beneath it: the fragments
-/// they may leave to relatives, counted on marker genes and in whole-genome
-/// equivalents.
+/// they may leave to relatives, counted on marker genes and as whole-genome
+/// fragments ([`SpillCounted`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) struct SpillBound {
     pub(super) marker_fragments: f64,
@@ -223,11 +232,13 @@ impl SpillBound {
     }
 }
 
-/// The spill bound of every taxon at genus to domain rank above the kept
-/// `units`, each given as (taxid, model of its reported genome, fragments,
-/// whole-genome fragments per fragment): the spill share of their model of
-/// their fragments, summed; a unit without a whole-genome scale counts its
-/// fragments as they are. Units are summed in taxid order.
+/// The spill bound of every taxon at genus to domain rank in the lineages of
+/// the kept `units`, the unit's own taxon included when it is labelled at one
+/// of those ranks; each unit given as (taxid, model of its best-fit genome at
+/// the species level, fragments, whole-genome fragments per fragment on that
+/// genome): the spill share of their model of their fragments, summed; a unit
+/// without a whole-genome scale counts its fragments as they are. Units are
+/// summed in taxid order.
 pub(super) fn spill_bounds(
     units: impl IntoIterator<Item = (u32, Model, f64, Option<f64>)>,
     lineages: &Lineages,

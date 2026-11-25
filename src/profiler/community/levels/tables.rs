@@ -57,7 +57,8 @@
 //! - `em_share`, `strain_identity_reads`: a strain's share of its species' reads
 //!   in the genome EM, and its resolved reads at strain-level identity;
 //! - `window_spread`: share of the genome's windows that the reads of a genus
-//!   or higher row reach;
+//!   or higher row reach; on a marker genome the windows cut its genes laid
+//!   end to end, and the share is shown but not tested;
 //! - `genome_tests`: the row's own tests, `passed` or each failed test with its
 //!   value and bound (on a genus row, after the kind of reads it judges);
 //! - `decision`: `kept` when the taxon has rows of its own in the profile,
@@ -67,8 +68,9 @@
 //!   `removed by --host: …` for a taxon those options dropped; a labelled unit
 //!   says that its references are labelled only at its rank, and, when named
 //!   units of its taxon explain its reads, which ones; a genus or higher taxon
-//!   gives its reads, their mean identity and chunk ratio or window spread
-//!   against the bounds, and where the reads of a failed taxon went);
+//!   gives its reads, their mean identity, genes hit on a marker genome, chunk
+//!   ratio or window spread against the bounds, the spill bound of kept units
+//!   beneath it, and where the reads of a failed taxon went);
 //! - `reported_as`: the rank of the profile rows holding the taxon's reads
 //!   (the unit's rank for its row and its strain rows), `none` when none;
 //! - `final_reads`, `final_abundance`: columns 4 and 6 of the taxon's profile
