@@ -85,7 +85,7 @@ impl<'r> ProfileTaxa<'r> {
     }
 }
 
-/// How the engine's levels share the fragments.
+/// How the levels share the fragments.
 pub(super) struct Classifications<'a> {
     /// The fragments with candidate species, each with its read group in the
     /// second EM over the kept species (`None` without a kept candidate), and

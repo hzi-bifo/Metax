@@ -3,7 +3,7 @@
 //! opens with two lines starting with `#`: the run's metadata, in the style of
 //! the mapping file's header, then the column names.
 //!
-//! The decisions table has one row per taxon the engine judged, at every rank,
+//! The decisions table has one row per taxon the profiler judged, at every rank,
 //! kept or not:
 //!
 //! - `species`: one row per measured genome of every candidate species, its

@@ -1,7 +1,7 @@
 //! Profiler Module - Taxonomic abundance estimation from mapping data
 //!
 //! The mappings of a sample are loaded with the reference metadata
-//! (`community.rs`) and profiled by the level-wise engine
+//! (`community.rs`) and profiled level by level
 //! (`community/levels.rs`): species first, then the genomes within each kept
 //! species (`--strain`), and the fragments that no kept species takes at the
 //! lowest rank above species that their matches and evidence support. Each
@@ -987,7 +987,7 @@ fn display_option<T: ToString>(value: Option<T>) -> String {
 }
 
 /// The profiler of a sample: loads its mappings ([`community`]) and profiles
-/// them with the level-wise engine.
+/// them level by level.
 pub struct Profiler {
     cfg: ProfilerConfig,
     taxonomy: Taxonomy,

@@ -1,4 +1,4 @@
-//! The level-wise profiling engine: species, then the levels below and above.
+//! Level-wise profiling: species, then the levels below and above.
 //!
 //! A *fragment* is a read, or a read pair counted once. Its candidates are the
 //! taxa whose genomes it aligns to within the read-level gates; candidates
@@ -3097,7 +3097,7 @@ fn strain_label(names: &Names, strain: Option<u32>, taxid: u32, accession: &str)
     }
 }
 
-/// Mapping data for the tests of the level-wise engine and its genome level.
+/// Mapping data for the tests of the species and genome levels.
 #[cfg(test)]
 mod test_fixtures {
     use std::collections::HashMap;

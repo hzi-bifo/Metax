@@ -1,4 +1,5 @@
-//! Community profiling: loading the mappings for the level-wise engine.
+//! Community profiling: loading a sample's mappings and profiling them level
+//! by level.
 //!
 //! 1. **Reference metadata**: genome, taxonomy, size and reference type of
 //!    every reference come from the database metadata. MANUAL.md describes
@@ -13,7 +14,7 @@
 //!    cutoff of the species amount test, the inputs of the levels above
 //!    species and of `--estimate-unclassified`, and the marker-gene model.
 //!
-//! 4. **Profiling**: the level-wise engine ([`levels`]) judges species, the
+//! 4. **Profiling**: the level-wise profiler ([`levels`]) judges species, the
 //!    genomes within them and the levels above, and writes the outputs.
 
 use std::collections::{hash_map::Entry, HashMap, HashSet};
