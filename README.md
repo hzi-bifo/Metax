@@ -26,16 +26,25 @@ The binary is `target/release/metax`.
 
 ## Databases
 
-### Pre-built database
+### Pre-built databases
 
-A pre-built [RefSeq database](https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2.1_refseq_202607_k16w37.tar.gz) (40 GiB) covers bacteria, archaea, viruses, fungi, protozoa and the human reference genome. Unpack it and pass the folder to `-d`:
+| Database | Contents | Archive | Index cache |
+| --- | --- | --- | --- |
+| [RefSeq](https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2.1_refseq_202607_k16w37.tar.gz) | 29,112 genomes of bacteria, archaea, viruses, fungi, protozoa and the human reference genome | 40 GiB | 42 GiB |
+| [GTDB marker genes](https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2.1_gtdb_r232_reps_markers_k16w37.tar.gz) | the marker genes of the 199,923 species representatives of GTDB release 232 | 12 GiB | 15 GiB |
+| [GTDB fractional](https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2.1_gtdb_r232_reps_f010_k16w37.tar.gz) | a tenth of each of the same 199,923 genomes, small genomes whole | 32 GiB | 34 GiB |
+
+Download an archive, unpack it and pass the unpacked folder to `-d`:
 
 ```shell
+curl -LO https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2.1_refseq_202607_k16w37.tar.gz
 tar -xzf metax2.1_refseq_202607_k16w37.tar.gz
 metax profile -d metax2.1_refseq_202607_k16w37 -i reads_1.fq.gz -I reads_2.fq.gz -o sample -t 20
 ```
 
-The archive holds the taxonomy dump the database was built with, which Metax reads in place. The first run writes an index cache of about 42 GiB into the folder, which must be writable; to place the cache elsewhere, see the [manual](MANUAL.md#31-pre-built-database).
+The GTDB databases are used the same way, for example with `-d metax2.1_gtdb_r232_reps_markers_k16w37`. Each archive holds the taxonomy dump its database was built with, NCBI for RefSeq and GTDB for the GTDB databases, which Metax reads in place, so no `--dmp-dir` is needed. The first run writes the index cache into the folder, which must be writable; to place the cache elsewhere, see the [manual](MANUAL.md#31-pre-built-databases).
+
+RefSeq holds up to three genomes per bacterial or archaeal species, so `--strain` can tell the genomes of a species apart. The GTDB databases represent each bacterial and archaeal species by one genome, its GTDB representative. The marker-gene database is the smallest; it reports species and the levels above them. On the fractional database, reads not placed at a species are not reported above species. The [manual](MANUAL.md#31-pre-built-databases) describes each database.
 
 ### Custom database
 

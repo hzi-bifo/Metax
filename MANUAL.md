@@ -72,18 +72,34 @@ An explicit directory, like a dump stored with a database, is never downloaded, 
 
 ## 3. Reference Databases
 
-### 3.1 Pre-built database
+### 3.1 Pre-built databases
 
-A pre-built database is available [here](https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2.1_refseq_202607_k16w37.tar.gz) (40 GiB). It is based on the July 2026 NCBI RefSeq snapshot and covers bacteria, archaea, viruses, fungi, protozoa and the human reference genome (GRCh38), with up to three genomes per species for bacteria and archaea. Unnamed "sp." isolates are included only where GTDB (release 232) places them in a species of their own. In total, it contains 29,112 genomes.
+Three databases are available, each as one archive:
+
+| Database | Archive | Size | Index cache |
+| --- | --- | --- | --- |
+| RefSeq | [metax2.1_refseq_202607_k16w37.tar.gz](https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2.1_refseq_202607_k16w37.tar.gz) | 40 GiB | about 42 GiB |
+| GTDB marker genes | [metax2.1_gtdb_r232_reps_markers_k16w37.tar.gz](https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2.1_gtdb_r232_reps_markers_k16w37.tar.gz) | 12 GiB | about 15 GiB |
+| GTDB fractional | [metax2.1_gtdb_r232_reps_f010_k16w37.tar.gz](https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2.1_gtdb_r232_reps_f010_k16w37.tar.gz) | 32 GiB | about 34 GiB |
+
+- **RefSeq** is based on the July 2026 NCBI RefSeq snapshot and covers bacteria, archaea, viruses, fungi, protozoa and the human reference genome (GRCh38), with up to three genomes per species for bacteria and archaea. Unnamed "sp." isolates are included only where GTDB (release 232) places them in a species of their own. In total, it contains 29,112 genomes. Taxa are named by the NCBI taxonomy.
+- **GTDB marker genes** holds the marker genes that GTDB builds its trees from, of the 199,923 species representatives of GTDB release 232: the bac120 genes of 189,801 bacteria and the ar53 genes of 10,122 archaea, 20,078,456 genes of 22.7 Gbp in total, one reference per gene (§4.3). Read counts are the reads on the marker genes, and depth is that of the whole genome. Species and the levels above them are reported (§7.8), but no genome rows (§7.9). Every genome declares its whole-genome size, so `--estimate-unclassified` is available (§7.12).
+- **GTDB fractional** is a fractional index (§4.2) of the same 199,923 representative genomes: genomes of at least 500 kb are sampled to a tenth in segments of 50 kb, and smaller genomes are indexed whole, 69.1 of their 654.7 Gbp in total. Read counts are full-index equivalents. Reads not placed at a species are not reported above species, the identity rules of §7.10 apply, and per-read classification is not written.
+
+Both GTDB databases name taxa by the GTDB taxonomy of release 232, converted to NCBI-style dump files with TaxonKit, so their taxids are not NCBI taxids. Each species is represented by one genome, its GTDB representative.
+
+To use a database, download its archive, unpack it, and pass the unpacked folder to `-d`:
 
 ```bash
-tar -xzf metax2.1_refseq_202607_k16w37.tar.gz
-metax profile -d metax2.1_refseq_202607_k16w37 \
+curl -LO https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2.1_gtdb_r232_reps_markers_k16w37.tar.gz
+tar -xzf metax2.1_gtdb_r232_reps_markers_k16w37.tar.gz
+(cd metax2.1_gtdb_r232_reps_markers_k16w37 && md5sum -c md5sums.txt)
+metax profile -d metax2.1_gtdb_r232_reps_markers_k16w37 \
   -i sample_R1.fastq.gz -I sample_R2.fastq.gz \
   -o sample_pe -t 32
 ```
 
-The archive holds `metax_db.mxi`, `metax_db.tsv.gz`, `metax_taxonomy.tsv.gz`, the taxonomy dump `taxdmp.tar.gz` that the database was built with, and `md5sums.txt` with the checksums of these four files. Profiling reads this dump in place unless `--dmp-dir` is given, and checks the dump it uses against the database (§2). The first run writes an index cache of about 42 GiB into the unpacked folder, which must therefore be writable; to keep the folder read-only, place the cache elsewhere with the mapper option `--index-cache PATH`, given after `--` (§5.4).
+Each archive unpacks into one folder of the same name that holds `metax_db.mxi`, `metax_db.tsv.gz`, `metax_taxonomy.tsv.gz`, the taxonomy dump `taxdmp.tar.gz` that the database was built with, and `md5sums.txt` with the checksums of these four files, which `md5sum -c` checks. Unpacking needs about as much space again as the archive, and the archive is not needed afterwards. Profiling reads the dump in place unless `--dmp-dir` is given, and checks the dump it uses against the database (§2). The first run writes the index cache into the unpacked folder, which must therefore be writable; to keep the folder read-only, place the cache elsewhere with the mapper option `--index-cache PATH`, given after `--` (§5.4).
 
 Databases built by earlier Metax 2 releases are read as they are, and the log warns that their index format is older. Build such a database again with `metax index` for the current format, which keeps the same seeds in identical sequence of different genomes and so tells close genomes and strains apart more reliably. Databases of Metax 0.9 and earlier cannot be read; build them again with `metax index`.
 
