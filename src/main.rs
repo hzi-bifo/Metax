@@ -229,7 +229,7 @@ struct ProfileArgs {
         long = "mode",
         value_name = "MODE",
         help_heading = "Analysis mode and resources",
-        help = "Evidence preset: default (balanced), recall, or precision. For deep samples (over one million reads or fragments), recall also lowers the automatic chunk-breadth cutoff; explicit coverage thresholds remain authoritative. Reused mappings default to their recorded mapper mode; an explicit override changes profiler thresholds only."
+        help = "Evidence preset: default (balanced), recall, or precision. For deep samples (over one million reads, a read pair counting once), recall also lowers the automatic chunk-breadth cutoff; explicit coverage thresholds remain authoritative. Reused mappings default to their recorded mapper mode; an explicit override changes profiler thresholds only."
     )]
     mode: Option<ProfileMode>,
 
@@ -305,7 +305,7 @@ struct ProfileArgs {
         long = "strict-coverage",
         action = ArgAction::SetTrue,
         help_heading = "Above-species and low-map behavior",
-        help = "Report only the species kept by the species tests; the fragments (a read pair counts once) that no kept species takes are dropped, and noisy long reads below the species gates are not credited to the kept species they match best. By default a removed species whose fragments cover its whole genome evenly (at least 200 fragments, both coverage ratios 0.9-1.1, fragments in at least 90 % of its windows, both coverage p-values at least 1e-5) is reported at species when no taxon of its genus is kept. The other fragments that no kept species takes (of removed species, and without a species-level match down to --genus-identity) go above species. A fragment whose matches within the tie margin of its best lie in one genus counts for that genus, which gets a row when at least 200 such fragments of one kind (of removed species, or without a species-level match) have a mean identity at most 0.09 below the species identity cutoff and a chunk ratio of at least 0.40 on the genome holding most of them; the row then holds the unique fragments of both kinds. A fragment tied across genera goes to those of them with a genus row, shared by the likelihood EM over the genera with a row. The other fragments go to the lowest common ancestor of their matches at family, order, class, phylum or domain rank, which gets a row when at least 200 fragments reach it and reach at least half of the windows of the genome holding most of them; otherwise they move up a rank. When the genome holding most of a row's fragments is represented by marker genes, the row needs at least 10 of its genes hit instead of 200 fragments, and a row above genus a chunk ratio of at least 0.40 over its genes instead of the window share; a row of a taxon holding kept species represented by marker genes needs at least 0.15 of their fragments, as their marker genes miss and clip part of their genomes; when its own evidence is a genome reference, each such fragment counts by the ratio of the placements of its genome's declared size to those of its marker genes (as one fragment without a declared size). These recover large genomes at low depth, divergent strains, and new species and genera of taxa in the database; a reference that consists mostly of foreign DNA can still produce a false row. On a fractional database, fragments not placed at a species are not reported above species, and no species is kept for even coverage."
+        help = "Report only the species kept by the species tests; the reads (a read pair counts once) that no kept species takes are dropped, and noisy long reads below the species gates are not credited to the kept species they match best. By default a removed species whose reads cover its whole genome evenly (at least 200 reads, both coverage ratios 0.9-1.1, reads in at least 90 % of its windows, both coverage p-values at least 1e-5) is reported at species when no taxon of its genus is kept. The other reads that no kept species takes (of removed species, and without a species-level match down to --genus-identity) go above species. A read whose matches within the tie margin of its best lie in one genus counts for that genus, which gets a row when at least 200 such reads of one kind (of removed species, or without a species-level match) have a mean identity at most 0.09 below the species identity cutoff and a chunk ratio of at least 0.40 on the genome holding most of them; the row then holds the unique reads of both kinds. A read tied across genera goes to those of them with a genus row, shared by the likelihood EM over the genera with a row. The other reads go to the lowest common ancestor of their matches at family, order, class, phylum or domain rank, which gets a row when at least 200 reads reach it and reach at least half of the windows of the genome holding most of them; otherwise they move up a rank. When the genome holding most of a row's reads is represented by marker genes, the row needs at least 10 of its genes hit instead of 200 reads, and a row above genus a chunk ratio of at least 0.40 over its genes instead of the window share; a row of a taxon holding kept species represented by marker genes needs at least 0.15 of their reads, as their marker genes miss and clip part of their genomes; when its own evidence is a genome reference, each such read counts by the ratio of the placements of its genome's declared size to those of its marker genes (as one read without a declared size). These recover large genomes at low depth, divergent strains, and new species and genera of taxa in the database; a reference that consists mostly of foreign DNA can still produce a false row. On a fractional database, reads not placed at a species are not reported above species, and no species is kept for even coverage."
     )]
     strict_coverage: bool,
 
@@ -325,7 +325,7 @@ struct ProfileArgs {
         default_missing_value = "0.025",
         value_parser = parse_probability,
         help_heading = "Above-species and low-map behavior",
-        help = "On a fractional database, judge each kept species by the mean identity of the reads placed best on it. A species more than FRACTION below the sample's typical species (the median over the species, weighted by their fragments) is mostly a relative that receives the reads of an organism missing from the database: it is left out when a species of its genus within the margin is kept, and otherwise reported at its genus. Needs at least 3 species with a measured identity. Default there 0.025 for Illumina reads, paired or single-end; other inputs use it only when it is given (without a value: 0.025). It has no effect on a full database."
+        help = "On a fractional database, judge each kept species by the mean identity of the reads placed best on it. A species more than FRACTION below the sample's typical species (the median over the species, weighted by their reads) is mostly a relative that receives the reads of an organism missing from the database: it is left out when a species of its genus within the margin is kept, and otherwise reported at its genus. Needs at least 3 species with a measured identity. Default there 0.025 for Illumina reads, paired or single-end; other inputs use it only when it is given (without a value: 0.025). It has no effect on a full database."
     )]
     identity_margin: Option<f64>,
 
@@ -344,7 +344,7 @@ struct ProfileArgs {
         default_value_t = 0.80,
         value_parser = parse_probability,
         help_heading = "Above-species and low-map behavior",
-        help = "Minimum identity (0-1) a read without a species-level match needs to count above species at all (at genus or a higher rank), independent of --min-identity. A genus row has its own, stricter test: the mean identity of its fragments must be at least the species identity cutoff minus 0.09."
+        help = "Minimum identity (0-1) a read without a species-level match needs to count above species at all (at genus or a higher rank), independent of --min-identity. A genus row has its own, stricter test: the mean identity of its reads must be at least the species identity cutoff minus 0.09."
     )]
     genus_identity: f64,
 
@@ -354,7 +354,7 @@ struct ProfileArgs {
         default_value_t = 0.30,
         value_parser = parse_probability,
         help_heading = "Above-species and low-map behavior",
-        help = "Mapping rate below which the automatic chunk-breadth cutoff is estimated from the mapped reads or fragments instead of all input (0-1), from 1.5 times their number on a full database. Has no effect with --host."
+        help = "Mapping rate below which the automatic chunk-breadth cutoff is estimated from the mapped reads instead of all input (0-1), from 1.5 times their number on a full database. Has no effect with --host."
     )]
     low_map_rate_threshold: f64,
 
@@ -364,7 +364,7 @@ struct ProfileArgs {
         value_name = "FRACTION",
         value_parser = parse_probability,
         help_heading = "Coverage evidence and filters",
-        help = "Minimum breadth (0-1): the fraction of its genome that a taxon's fragments cover. A taxon below it is dropped from the profile and its reads go to no other taxon."
+        help = "Minimum breadth (0-1): the fraction of its genome that a taxon's reads cover. A taxon below it is dropped from the profile and its reads go to no other taxon."
     )]
     breadth: Option<f64>,
 
@@ -375,7 +375,7 @@ struct ProfileArgs {
         value_name = "FRACTION",
         value_parser = parse_probability,
         help_heading = "Coverage evidence and filters",
-        help = "Minimum chunk breadth of the species amount test (0-1): the fraction of a genome within a fixed distance of the fragments placed on it. Automatically estimated when omitted; an explicit value is never mode-scaled. Cannot be combined with --low-biomass or --chunk-breadth-scale."
+        help = "Minimum chunk breadth of the species amount test (0-1): the fraction of a genome within a fixed distance of the reads placed on it. Automatically estimated when omitted; an explicit value is never mode-scaled. Cannot be combined with --low-biomass or --chunk-breadth-scale."
     )]
     chunk_breadth: Option<f64>,
 
@@ -394,7 +394,7 @@ struct ProfileArgs {
         alias = "by-aligned",
         action = ArgAction::SetTrue,
         help_heading = "Coverage evidence and filters",
-        help = "Estimate the automatic chunk-breadth cutoff from mapped reads/fragments instead of all input. Auto-applied on low-map runs (see --low-map-rate-threshold)."
+        help = "Estimate the automatic chunk-breadth cutoff from mapped reads instead of all input. Auto-applied on low-map runs (see --low-map-rate-threshold)."
     )]
     by_aligned: bool,
 

@@ -251,10 +251,10 @@ metax index genomes_and_markers.fa -o db_mixed --reference-type-table types.tsv 
 Marker genomes:
 
 - are indexed whole, also with `--fraction`;
-- have the summed marker length as genome size: read counts (profile column 4) are the reads mapped to the marker genes, not full-genome equivalents, and coverage refers to the marker genes. Depth (profile column 5) is that of the whole genome: a fragment on a marker gene adds the length of its read over the placements that the genome's genes offer (§7.11). Marker genes are largely single-copy, so relative abundances of marker and genome taxa are comparable even though their read counts are not;
+- have the summed marker length as genome size: read counts (profile column 4) are the reads mapped to the marker genes, not full-genome equivalents, and coverage refers to the marker genes. Depth (profile column 5) is that of the whole genome: a read on a marker gene adds its length, for a pair that of its first mate, over the placements that the genome's genes offer (§7.11). Marker genes are largely single-copy, so relative abundances of marker and genome taxa are comparable even though their read counts are not;
 - keep a `genome_size` from the FASTA header that is larger than their summed marker length as the size of the whole genome. It is used only for the unclassified estimate (§7.12) and never scales read counts; `metax info` reports how many marker genomes have one;
 - have as chunk breadth the share of their genes that reads hit (§7.4);
-- take part in the levels above species, where a row whose fragments fit a marker genome best is judged by the genes they hit (§7.8).
+- take part in the levels above species, where a row whose reads fit a marker genome best is judged by the genes they hit (§7.8).
 
 A read counts on a marker gene only when enough of it lies inside the gene; a long read also counts on a gene when it aligns to more than half of the gene (§7.4).
 
@@ -319,7 +319,7 @@ metax profile -d db -i ont_reads.fastq.gz -s Nanopore -o sample_ont -t 32
 metax profile -d db -i pacbio_reads.fastq.gz -s PacBio -o sample_pacbio -t 32
 ```
 
-A *fragment* is a read, or a read pair counted once.
+A *read* is a single-end or long read, or a read pair counted once; a *mate* is one read of a pair.
 
 ### 5.2 Profile modes and read-level gates
 
@@ -439,9 +439,9 @@ Index cache: the first run against a database writes a memory-mapped cache of th
 
 Note that `--min-identity` appears on both sides of `--` with different meanings: before it, the profiler's species/strain threshold; after it, the mapper's emission cutoff.
 
-Paired-end emission: `--paired-emission concordant-only` (default) emits same-reference pairs and, for a fragment without any pair, its mates whose mate may lie beyond the end of their reference (§7.1); `concordant-first` emits same-reference pairs when present and otherwise discordant rows; `all` emits every mate mapping. The latter two are mainly useful together with `--save-mapping` for diagnostics. A pair is written once, also when mate rescue finds again a placement that a mate already has.
+Paired-end emission: `--paired-emission concordant-only` (default) emits same-reference pairs and, for a read whose mates form no pair, its mates whose mate may lie beyond the end of their reference (§7.1); `concordant-first` emits same-reference pairs when present and otherwise discordant rows; `all` emits every mate mapping. The latter two are mainly useful together with `--save-mapping` for diagnostics. A pair is written once, also when mate rescue finds again a placement that a mate already has.
 
-Mate rescue: a mate that seeding did not place is searched for in the insert window of its partner's placements. `--mate-rescue-taxa N` (default `8`) extends this search to fragments that already have a proper pair: for up to `N` other taxa per mate placed on that mate only, the missing mate is searched for and kept when that pair matches at least as many bases as the best seeded pair (§7.1). `--mate-rescue-taxa 0` restricts mate rescue to fragments without any proper pair.
+Mate rescue: a mate that seeding did not place is searched for in the insert window of its partner's placements. `--mate-rescue-taxa N` (default `8`) extends this search to reads that already have a proper pair: for up to `N` other taxa per mate placed on that mate only, the missing mate is searched for and kept when that pair matches at least as many bases as the best seeded pair (§7.1). `--mate-rescue-taxa 0` restricts mate rescue to reads whose mates form no proper pair.
 
 ### 5.5 Saved and reused data
 
@@ -537,19 +537,19 @@ Columns, with `NA` where a value does not apply. Numbers have five decimals, and
 | 1 | `name` | taxon name |
 | 2 | `taxid` | taxid; a genome row without a strain taxid carries its species' taxid |
 | 3 | `rank` | rank of the row |
-| 4 | `reads` | fragments, as full-index equivalents (on a fractional database scaled up by the indexed share of the row's genome; for a marker genome, the fragments on its marker genes) |
-| 5 | `depth` | depth from abundance estimation, each fragment counted once (§7.11) |
+| 4 | `reads` | reads, as full-index equivalents (on a fractional database scaled up by the indexed share of the row's genome; for a marker genome, the reads on its marker genes) |
+| 5 | `depth` | depth from abundance estimation, a read pair counted once (§7.11) |
 | 6 | `abundance` | relative abundance in percent, over the rows of the profile |
 | 7 | `breadth` | observed breadth on the row's genome |
-| 8 | `expected_breadth` | breadth expected from the row's fragments |
+| 8 | `expected_breadth` | breadth expected from the row's reads |
 | 9 | `breadth_pvalue` | p-value of the breadth against its expectation |
-| 10 | `fixed_chunk_breadth` | share of the genome within 1,000 bases of a fragment's first read; for a marker genome, the share of genes hit |
+| 10 | `fixed_chunk_breadth` | share of the genome within 1,000 bases of a read, or of the first mate of a pair; for a marker genome, the share of genes hit |
 | 11 | `flex_chunk_breadth` | breadth in chunks scaled to the genome; for a marker genome, the share of genes hit |
 | 12 | `expected_flex_chunk_breadth` | expected value of column 11 |
 | 13 | `chunk_pvalue` | p-value of column 11 against column 12 |
 | 14 | `evidence_depth` | depth of the coverage evidence on the row's genome, before abundance estimation |
 | 15 | `best_fit_genome` | accession of the genome that columns 7 to 14 describe |
-| 16 | `mean_identity` | mean identity of the taxon's fragments to its best-fit genome (§7.9 says which fragments count) |
+| 16 | `mean_identity` | mean identity of the taxon's reads to its best-fit genome (§7.9 says which reads count) |
 | 17 | `estimated_ani` | estimated average nucleotide identity of the sample's strain to that genome, at most 1: the mean identity relative to the sample's baseline identity |
 
 Every profile has these 17 columns, whatever the reads, the database and the options; only `--host` adds columns. The options and the database change the rows instead: `--strain` adds genome rows of rank `strain` (§7.9), `--estimate-unclassified` adds two fields to the first line, and on a marker-gene or fractional database columns 4, 10 and 11 count as stated above.
@@ -558,9 +558,9 @@ What columns 7 to 17 describe depends on the row:
 
 | Row | Columns 7 to 15 | Columns 16 and 17 |
 | --- | --- | --- |
-| species, or a unit labelled above species (§7.8) | its best-fit genome | its identity to that genome; `NA` when none of its fragments has it as best match (§7.9) |
+| species, or a unit labelled above species (§7.8) | its best-fit genome | its identity to that genome; `NA` when none of its reads has it as best match (§7.9) |
 | genome row (rank `strain`) | the genome itself | its identity to the genome |
-| row above species, built from the fragments that no kept unit takes (§7.8), or a species reported at its genus (§7.10) | the genome its evidence is measured on | `NA` |
+| row above species, built from the reads that no kept unit takes (§7.8), or a species reported at its genus (§7.10) | the genome its evidence is measured on | `NA` |
 
 With `--host`, three columns follow:
 
@@ -580,8 +580,8 @@ Row kinds:
 
 - `species`: one row per measured genome of every candidate species. A unit labelled above species has these rows at its rank.
 - `strain` (with `--strain`): one row per genome the genome level considered.
-- `genus`: one row per kind of fragment (without a species-level match, or of species not kept) whose fragments unique to the genus meet the amount of their evidence model (at least 200 fragments on a genome reference, at least 10 genes hit on a marker genome, §7.8), and one for species reported at the genus when no such row holds the evidence of the genus row.
-- `family`, `order`, `class`, `phylum`, `domain`: one row per taxon whose fragments meet that amount.
+- `genus`: one row per kind of read (without a species-level match, or of species not kept) whose reads unique to the genus meet the amount of their evidence model (at least 200 reads on a genome reference, at least 10 genes hit on a marker genome, §7.8), and one for species reported at the genus when no such row holds the evidence of the genus row.
+- `family`, `order`, `class`, `phylum`, `domain`: one row per taxon whose reads meet that amount.
 
 Columns, with `NA` where a value does not apply:
 
@@ -591,21 +591,21 @@ Columns, with `NA` where a value does not apply:
 | `parent_taxid` | the species of a strain, the genus of a species, the family of a genus |
 | `genome` | the genome the row's evidence is measured on |
 | `decided` | `true` on the row the taxon's decision rests on: for a species, the genome it is reported on when kept, otherwise its genome with most reads; for strains, each genome with a row in the profile; for a genus, the row whose evidence the profile shows, otherwise the one with most unique reads; `true` on rows above genus |
-| `reads` | observed fragments behind the evidence, not scaled. A strain row counts all fragments resolved to the genome, and a row for species reported at the genus their summed EM reads |
+| `reads` | observed reads behind the evidence, not scaled. A strain row counts all reads resolved to the genome, and a row for species reported at the genus their summed EM reads |
 | `depth`, `breadth`, `expected_breadth` | coverage on `genome` |
 | `oebr` | observed over expected breadth |
 | `fixed_chunk_breadth`, `flex_chunk_breadth`, `expected_flex_chunk_breadth` | chunk coverage on `genome` |
 | `coebr` | observed over expected flexible chunk breadth |
 | `chunk_cutoff` | chunk-breadth cutoff of the tests |
 | `breadth_pvalue`, `chunk_pvalue` | p-values as in the profile |
-| `candidate_reads` | fragments whose read group in the first EM lists the species; for a genus, fragments of the kind whose tie set lists it; above genus, fragments reaching the taxon |
-| `won_reads` | fragments resolved to the species; for a genus, those unique to it |
-| `second_look_reads` | fragments the species would take on the second look (§7.7), whether or not it was then kept |
-| `own_reads` | fragments it won that list no kept species, counted for species that reach this step of the own-evidence look (§7.7), `0` for the others |
+| `candidate_reads` | reads whose read group in the first EM lists the species; for a genus, reads of the kind whose tie set lists it; above genus, reads reaching the taxon |
+| `won_reads` | reads resolved to the species; for a genus, those unique to it |
+| `second_look_reads` | reads the species would take on the second look (§7.7), whether or not it was then kept |
+| `own_reads` | reads it won that list no kept species, counted for species that reach this step of the own-evidence look (§7.7), `0` for the others |
 | `em_share` | a strain's share of its species' reads in the genome EM |
-| `strain_identity_reads` | a strain's resolved fragments at strain-level identity |
-| `window_spread` | share of the genome's windows that the fragments of a genus or higher row reach; on a marker genome the windows cut its genes laid end to end, and the share is shown but not tested |
-| `genome_tests` | `passed`, each failed test with its value and bound, or why the row was not tested; a genus row names the kind of fragment first |
+| `strain_identity_reads` | a strain's resolved reads at strain-level identity |
+| `window_spread` | share of the genome's windows that the reads of a genus or higher row reach; on a marker genome the windows cut its genes laid end to end, and the share is shown but not tested |
+| `genome_tests` | `passed`, each failed test with its value and bound, or why the row was not tested; a genus row names the kind of read first |
 | `decision` | `kept` when the taxon has rows of its own in the profile, otherwise `removed` |
 | `reason` | the outcome in words; a genus or higher taxon gives its reads, their mean identity, genes hit on a marker genome, chunk ratio or window spread against the bounds, the spill bound of kept units beneath it, and where the reads of a failed taxon went |
 | `reported_as` | rank of the profile rows holding the taxon's reads, or `none` |
@@ -615,9 +615,9 @@ Every decisions table has these 31 columns, whatever the reads, the database and
 
 ### 6.3 Per-read classification
 
-`<prefix>.classify.txt.gz` is gzip-compressed and tab-separated. It opens with a `#metax_classify` line with the fields of §6.1 from `version` to `host`, then the column names. It has one row per fragment and five columns: `read_id`; `taxid` and `rank` of its largest share; `taxids`, the taxids of its shares; and `shares`, in the same order, largest first, with five decimals. Several taxids or shares are separated by `;`, and a fragment with a single share has share `1`.
+`<prefix>.classify.txt.gz` is gzip-compressed and tab-separated. It opens with a `#metax_classify` line with the fields of §6.1 from `version` to `host`, then the column names. It has one row per read and five columns: `read_id`; `taxid` and `rank` of its largest share; `taxids`, the taxids of its shares; and `shares`, in the same order, largest first, with five decimals. Several taxids or shares are separated by `;`, and a read with a single share has share `1`.
 
-The shares are the ones the profile's rows count the fragment with. Shares on taxa without a profile row are dropped and the others renormalised, and a fragment without any share is not written. For a species represented by marker genes, the file lists only the reads placed on those genes, and the log says so. The file is not written for a fractional database.
+The shares are the ones the profile's rows count the read with. Shares on taxa without a profile row are dropped and the others renormalised, and a read without any share is not written. For a species represented by marker genes, the file lists only the reads placed on those genes, and the log says so. The file is not written for a fractional database.
 
 ### 6.4 Mapping file
 
@@ -645,37 +645,37 @@ A long read on a marker gene is also accepted when it aligns to more than half o
 
 Only the candidates with the highest seed scores are evaluated (`top-n` × 4, at least 16 for short reads). Before applying `top-n`, the mapper reserves the strongest accepted mapping for each represented profile endpoint (normally species) and each most-specific endpoint (strain when known), then fills the remaining slots with the next best mappings. Among the evaluated candidates, repeated placements from one taxon therefore do not hide another eligible taxon while slots remain. For single-end and long reads, a candidate-boundary mask in the mapping file records whether endpoints may have been omitted.
 
-Paired-end mapping is pair-aware: mates are scored together, preferring pairs within the insert-size window, and by default only pairs on one reference are emitted, whatever their insert size or orientation. A mate without a seeded placement, or a fragment without any proper pair, triggers mate rescue: the read is searched for in the insert window around its partner's placements. A placement found there is evaluated and accepted like a seeded one, so its identity and mapped bases describe the aligned interval. For a short-read mate without any placement of its own, a longer window in which it has no seed hit at all is scanned without gaps for its best position within the sample's species identity cutoff (§5.2), and that position is evaluated like a seeded one. When no placement is found, the read is aligned as a whole at every position of a window of at most 256 bases.
+Paired-end mapping is pair-aware: mates are scored together, preferring pairs within the insert-size window, and by default only pairs on one reference are emitted, whatever their insert size or orientation. A mate without a seeded placement, or a read whose mates form no proper pair, triggers mate rescue: the mate is searched for in the insert window around its partner's placements. A placement found there is evaluated and accepted like a seeded one, so its identity and mapped bases describe the aligned interval. For a short-read mate without any placement of its own, a longer window in which it has no seed hit at all is scanned without gaps for its best position within the sample's species identity cutoff (§5.2), and that position is evaluated like a seeded one. When no placement is found, the mate is aligned as a whole at every position of a window of at most 256 bases.
 
-A mate that remains without a mate on its reference after rescue is kept as a lone mate when the insert window on the side where its mate must lie (downstream of a forward read, upstream of a reverse one) runs past the end of the reference: its mate may come from sequence that the reference does not contain. This applies to marker genes and to every reference of a fractional index, whose ends cut the sequence a fragment came from; in a mixed database each reference follows its own type. On genome references of a full index no mate is kept this way, since the end of an assembled sequence mostly does not cut a fragment. Lone mates are emitted only for fragments without any pair and are marked `>` in mapping files. Other lone mates are dropped.
+A mate that remains without a mate on its reference after rescue is kept as a lone mate when the insert window on the side where its mate must lie (downstream of a forward mate, upstream of a reverse one) runs past the end of the reference: its mate may come from sequence that the reference does not contain. This applies to marker genes and to every reference of a fractional index, whose ends cut the sequence a pair came from; in a mixed database each reference follows its own type. On genome references of a full index no mate is kept this way, since the end of an assembled sequence mostly does not cut the sequence of a pair. Lone mates are emitted only for reads whose mates form no pair and are marked `>` in mapping files. Other lone mates are dropped.
 
-A proper pair on one taxon does not end the search. Seeding can place a second taxon on one mate only, for example a close relative for which the other mate has too few seed hits, and concordant-only emission would then drop that taxon although it may explain the fragment equally well or better. For each such taxon (profile endpoint, up to `--mate-rescue-taxa` per mate) the missing mate is searched for beside the taxon's best placement. The recovered pair is kept only if it matches at least as many bases as the best pair that seeding placed on one reference, so rescue can add an equally good or better explanation of the fragment but never a worse one. Kept mates are appended after the `top-n` cut and therefore never take a `top-n` slot from a seeded placement.
+A proper pair on one taxon does not end the search. Seeding can place a second taxon on one mate only, for example a close relative for which the other mate has too few seed hits, and concordant-only emission would then drop that taxon although it may explain the pair equally well or better. For each such taxon (profile endpoint, up to `--mate-rescue-taxa` per mate) the missing mate is searched for beside the taxon's best placement. The recovered pair is kept only if it matches at least as many bases as the best pair that seeding placed on one reference, so rescue can add an equally good or better explanation of the pair but never a worse one. Kept mates are appended after the `top-n` cut and therefore never take a `top-n` slot from a seeded placement.
 
 ### 7.2 Profiling workflow
 
-1. **Candidates.** Each fragment gets its candidate units, with their errors (§7.3).
-2. **First EM.** An EM over all candidates shares the fragments. A fragment *resolves* to a unit when its posterior there is at least `0.9`, and then adds to the coverage of each genome of that unit it aligns to.
+1. **Candidates.** Each read gets its candidate units, with their errors (§7.3).
+2. **First EM.** An EM over all candidates shares the reads. A read *resolves* to a unit when its posterior there is at least `0.9`, and then adds to the coverage of each genome of that unit it aligns to.
 3. **Species tests.** A unit is kept when one of its genomes passes the tests of §7.5.
 4. **Second judgment.** Removed units are judged again and some kept units are checked on their own reads (§7.7).
 5. **Even coverage.** A removed species that covers its genome evenly but too thinly for the amount test can be kept (§7.7).
-6. **Second EM.** It shares the fragments among the kept units.
-7. **Rows above species.** The fragments that no kept unit takes are placed at a genus or a higher rank (§7.8).
-8. **Genomes.** The fragments of each kept species are shared among its genomes. The genome with the largest share is its best-fit genome, and with `--strain` a genome can get a row of its own (§7.9).
+6. **Second EM.** It shares the reads among the kept units.
+7. **Rows above species.** The reads that no kept unit takes are placed at a genus or a higher rank (§7.8).
+8. **Genomes.** The reads of each kept species are shared among its genomes. The genome with the largest share is its best-fit genome, and with `--strain` a genome can get a row of its own (§7.9).
 9. **Identity rules.** On a fractional database, species whose reads are far less identical than expected are left out or reported at their genus (§7.10).
 10. **Filters and abundance.** `--host`, `--min-reads` and `--min-breadth` drop rows, and abundance is normalised over the rows left (§7.11).
 11. **Outputs.** The profile and the optional tables are written (§6).
 
-### 7.3 Fragments, candidates and the EM
+### 7.3 Reads, candidates and the EM
 
-A *unit* is a species, or one taxon above species holding the genomes whose references are labelled only at that taxon (§7.8). A fragment's candidates are the units whose genomes it aligns to within the read-level gates (§5.2).
+A *unit* is a species, or one taxon above species holding the genomes whose references are labelled only at that taxon (§7.8). A read's candidates are the units whose genomes it aligns to within the read-level gates (§5.2).
 
-The errors of a candidate are the estimated errors of its best placement, `(1 − identity) × mapped bases` over both mates of a pair, plus `0.5` for each base that this placement aligns less than the fragment's longest alignment. Candidates whose errors exceed the best by less than the tie margin count as tied and carry the best's errors. The tie margin is `0.5` errors for short reads and `0.5 %` of the best candidate's aligned bases for long reads.
+The errors of a candidate are the estimated errors of its best placement, `(1 − identity) × mapped bases` over both mates of a pair, plus `0.5` for each base that this placement aligns less than the read's longest alignment. Candidates whose errors exceed the best by less than the tie margin count as tied and carry the best's errors. The tie margin is `0.5` errors for short reads and `0.5 %` of the best candidate's aligned bases for long reads.
 
-The EM shares a fragment among its candidates in proportion to `share(u) × exp(−λ × errors(u))`, with `λ = ln((1 − e) / (e / 3))` for the sample's error rate `e`, measured on the three quarters of the fragments that match their best candidate best. A candidate whose likelihood is below `1e-6` of the fragment's best is dropped. Fragments with the same candidates and the same errors above their best, rounded to `0.5`, form one read group. The EM stops when the largest change of a single unit's weight is at most `1e-7` of the total weight, or at the limit of `--max-em-iterations`.
+The EM shares a read among its candidates in proportion to `share(u) × exp(−λ × errors(u))`, with `λ = ln((1 − e) / (e / 3))` for the sample's error rate `e`, measured on the three quarters of the reads that match their best candidate best. A candidate whose likelihood is below `1e-6` of the read's best is dropped. Reads with the same candidates and the same errors above their best, rounded to `0.5`, form one read group. The EM stops when the largest change of a single unit's weight is at most `1e-7` of the total weight, or at the limit of `--max-em-iterations`.
 
 ### 7.4 Coverage measures
 
-Each genome is measured on its own; coordinates from different genomes are never combined. For a genome of size `G` with `n` fragments, with `span_i` the bases of the first read and `read_bases_i` the bases both mates cover, counted once where they overlap:
+Each genome is measured on its own; coordinates from different genomes are never combined. For a genome of size `G` with `n` reads, with `span_i` the bases of read `i`, for a pair those of its first mate, and `read_bases_i` the bases both mates cover, counted once where they overlap:
 
 ```text
 observed_breadth   = merged bases of all reads, both mates of a pair / G
@@ -687,20 +687,20 @@ OEBR               = observed_breadth / expected_breadth
 
 **OEBR** is the observed over expected breadth: reads piled up in a few places give a value well below 1.
 
-The *fixed chunk breadth* is the share of the genome within 1,000 bases of a fragment's read, the first read of a pair. The *flexible chunk breadth* is the share within `√G` bases of that read's midpoint, clamped to its contig:
+The *fixed chunk breadth* is the share of the genome within 1,000 bases of a read, or of the first mate of a pair. The *flexible chunk breadth* is the share within `√G` bases of the midpoint of that read or mate, clamped to its contig:
 
 ```text
 expected_flex_chunk = 1 − (1 − 1 / ⌊√G / 2⌋)^n
 COEBR               = flex_chunk_breadth / expected_flex_chunk
 ```
 
-**COEBR** is the observed over expected flexible chunk breadth: it tests whether the fragments spread over the genome as a whole.
+**COEBR** is the observed over expected flexible chunk breadth: it tests whether the reads spread over the genome as a whole.
 
 For a fractional index, `G` is the indexed size of the genome.
 
 The p-values of the profile test the breadth and the flexible chunk breadth against their expectation. A ratio within `[0.9, 1.2]` gives `1`; otherwise the deviation is tested one-sided with an exact occupancy model or its binomial or normal approximation, multiplied by the number of genomes tested and capped at 1. The species tests do not use them; only the even-coverage rule does (§7.7).
 
-**Marker genomes.** Each reference sequence of a marker genome is one gene, and a fragment counts on a gene only when enough of a read lies inside it. Chunks of equal length would expect more coverage than reads can give, most of all for short genes, so the genes themselves serve as chunks. From the sample's mappings Metax takes the median read length `R`, the median template length `T` of the pairs, and the bases `a` that a read needs inside a gene to pass the mapped-length and mapped-fraction gates (both gates for short reads, either of them for long reads). A long read also counts on a gene when it aligns to more than half of the gene, so it needs `m = min(a, ⌊L/2⌋ + 1)` bases inside a gene of length `L`. A gene of length `L` then offers
+**Marker genomes.** Each reference sequence of a marker genome is one gene, and a read counts on a gene only when enough of it (of one of its mates, for a pair) lies inside the gene. Chunks of equal length would expect more coverage than reads can give, most of all for short genes, so the genes themselves serve as chunks. From the sample's mappings Metax takes the median read length `R`, the median template length `T` of the pairs, and the bases `a` that a read needs inside a gene to pass the mapped-length and mapped-fraction gates (both gates for short reads, either of them for long reads). A long read also counts on a gene when it aligns to more than half of the gene, so it needs `m = min(a, ⌊L/2⌋ + 1)` bases inside a gene of length `L`. A gene of length `L` then offers
 
 ```text
 reads:                 c = L − 2a + R + 1
@@ -709,10 +709,10 @@ pairs:                 c = L − T + 1
 pairs and lone mates:  c = min(L − 2a + T + 1, 2 × (L − 2a + R + 1))
 ```
 
-placements (none when `L < a`; every gene offers placements to long reads). A long read can run over several genes of the genome, and the two mates of a pair can lie on two neighbouring genes; such a fragment counts on each gene it covers. With `n` gene hits (fragments, counting every gene a fragment covers) on the genome and `p_i = c_i / Σc`:
+placements (none when `L < a`; every gene offers placements to long reads). A long read can run over several genes of the genome, and the two mates of a pair can lie on two neighbouring genes; such a read counts on each gene it covers. With `n` gene hits (reads, counting every gene a read covers) on the genome and `p_i = c_i / Σc`:
 
 ```text
-genes_hit                 = genes with at least one placed fragment
+genes_hit                 = genes with at least one placed read
 expected_genes_hit        = Σ_i 1 − (1 − p_i)^n
 fixed and flex chunk      = genes_hit / genes
 expected flex chunk       = expected_genes_hit / genes
@@ -720,7 +720,7 @@ COEBR                     = genes_hit / expected_genes_hit
 expected_breadth          = Σ over marker bases of 1 − (1 − p_i × k_b / s_i)^n, divided by the marker length
 ```
 
-where `k_b` is the number of the `s_i` possible read starts on gene `i` whose read covers base `b`, so bases near gene ends are expected to be covered less often. The p-value of the genes hit is `1.0` when COEBR lies within `[0.9, 1.2]`, as for the genome p-values (§7.4); outside it, it is the exact probability of hitting at most `genes_hit` genes (multiplied by the number of tests). The observed breadth of a marker genome merges the first read of each fragment only. The breadth p-value is computed as for genomes. A marker species must hit at least `--min-marker-genes` genes (default `3`).
+where `k_b` is the number of the `s_i` possible read starts on gene `i` whose read covers base `b`, so bases near gene ends are expected to be covered less often. The p-value of the genes hit is `1.0` when COEBR lies within `[0.9, 1.2]`, as for the genome p-values (§7.4); outside it, it is the exact probability of hitting at most `genes_hit` genes (multiplied by the number of tests). The observed breadth of a marker genome merges each read, for a pair only its first mate. The breadth p-value is computed as for genomes. A marker species must hit at least `--min-marker-genes` genes (default `3`).
 
 ### 7.5 Species tests
 
@@ -731,7 +731,7 @@ A unit is kept when one of its genomes passes all of:
 | Amount | fixed chunk breadth above the cutoff | automatic (§7.6) |
 | OEBR | between the lower bound and `1.50` | lower bound `0.60` |
 | COEBR | between the lower bound and `1.50` | lower bound `0.75` for short reads, `0.70` for long reads |
-| Won share | at least this share of the fragments whose read group in the first EM lists the unit resolve to it | `0.30` |
+| Won share | at least this share of the reads whose read group in the first EM lists the unit resolve to it | `0.30` |
 | Marker genes | a marker genome hits at least this many genes | `3` |
 
 `--min-oebr`, `--min-coebr` and `--min-marker-genes` set the bounds. A marker genome none of whose genes can hold a read of the sample's length is measured as one sequence, without the marker-gene test. The OEBR bound allows for amplified libraries, such as those made with PCR-based kits, which cover a genome unevenly base by base while their chunks stay evenly covered.
@@ -740,99 +740,99 @@ A kept species is reported on its best-fit genome (§7.9). Its coverage columns 
 
 ### 7.6 Chunk-breadth cutoff and the low-map rule
 
-Without `--min-chunk-breadth`, the cutoff of the amount test is estimated from the read count. With `m` the basis in millions of reads or fragments:
+Without `--min-chunk-breadth`, the cutoff of the amount test is estimated from the read count. With `m` the basis in millions of reads:
 
 | Reads | Cutoff |
 | --- | --- |
 | Illumina | `0.66·m/(m+1) + 0.24·m/(m+100)` |
 | Nanopore, PacBio | `0.85·m/(m+0.78)` |
 
-Both are capped at `0.95`. The basis is all input fragments.
+Both are capped at `0.95`. The basis is all input reads.
 
-**Low-map rule.** A run is a low-map run when its genome-equivalent mapping rate is below `--low-map-rate-threshold` (default `0.30`). Each mapped fragment counts as the sampling scale of the genome of its first mapping record that is not on a marker genome (`1` for a genome indexed whole, `full size / indexed size` for a sampled one), fragments placed only on marker genes are left out, and the sum over the input fragments is capped at 1. On a low-map run the basis is the mapped fragments, and on a database that is not fractional it is 1.5 times their number when no `--min-chunk-breadth` is given. `--host` turns this rule off.
+**Low-map rule.** A run is a low-map run when its genome-equivalent mapping rate is below `--low-map-rate-threshold` (default `0.30`). Each mapped read counts as the sampling scale of the genome of its first mapping record that is not on a marker genome (`1` for a genome indexed whole, `full size / indexed size` for a sampled one), reads placed only on marker genes are left out, and the sum over the input reads is capped at 1. On a low-map run the basis is the mapped reads, and on a database that is not fractional it is 1.5 times their number when no `--min-chunk-breadth` is given. `--host` turns this rule off.
 
-- `--by-mapped` uses the mapped fragments as the basis on every run.
+- `--by-mapped` uses the mapped reads as the basis on every run.
 - `--chunk-breadth-scale F` multiplies the automatic cutoff, capped at `1`. It cannot be combined with `--min-chunk-breadth` or `--low-biomass`.
-- In `recall` mode, above one million fragments in the basis, the automatic cutoff is also multiplied by `0.70 + 0.30/m` for Illumina (at least `0.70`) and by `0.80` for long reads.
+- In `recall` mode, above one million reads in the basis, the automatic cutoff is also multiplied by `0.70 + 0.30/m` for Illumina (at least `0.70`) and by `0.80` for long reads.
 - `-c, --min-chunk-breadth` sets the cutoff directly and is not scaled.
 - `-l, --low-biomass` is the shorthand for `--min-chunk-breadth 0`, which removes the amount test's cutoff. It cannot be combined with `--min-chunk-breadth` or `--chunk-breadth-scale`.
 
 ### 7.7 Second judgment of the species
 
-**Second look.** Sister species that tie on most fragments can split them so that neither resolves them, and both are removed. Removed units are judged again, largest first-EM weight first, and named units before a unit labelled above species of their taxon. A removed unit takes the read groups on which no other removed unit is more likely and that it holds with a posterior of at least `0.9` against the kept units. It is kept if it then passes the tests, and competes with the units judged after it.
+**Second look.** Sister species that tie on most reads can split them so that neither resolves them, and both are removed. Removed units are judged again, largest first-EM weight first, and named units before a unit labelled above species of their taxon. A removed unit takes the read groups on which no other removed unit is more likely and that it holds with a posterior of at least `0.9` against the kept units. It is kept if it then passes the tests, and competes with the units judged after it.
 
-**Own-evidence look.** A removed unit that covers a genome well enough but wins too small a share is examined next. If the fragments it shares with a kept species alone span one of its genomes above the cutoff, it stays removed. Otherwise it is kept when the fragments it won with no kept species among their candidates pass the coverage tests on one of its genomes alone. It is reported at its genus when the fragments where it ties with another species for the best match alone span one of its genomes.
+**Own-evidence look.** A removed unit that covers a genome well enough but wins too small a share is examined next. If the reads it shares with a kept species alone span one of its genomes above the cutoff, it stays removed. Otherwise it is kept when the reads it won with no kept species among their candidates pass the coverage tests on one of its genomes alone. It is reported at its genus when the reads where it ties with another species for the best match alone span one of its genomes.
 
-**Prophage check.** A virus integrated in a host genome collects the reads of that region. A kept virus is removed when its own fragments, those that list no kept bacterium or archaeon and no taxon labelled above species in their lineages, do not pass the coverage tests over the rest of its genome. Its reads go to the kept units in the second EM.
+**Prophage check.** A virus integrated in a host genome collects the reads of that region. A kept virus is removed when its own reads, those that list no kept bacterium or archaeon and no taxon labelled above species in their lineages, do not pass the coverage tests over the rest of its genome. Its reads go to the kept units in the second EM.
 
 **Named units first.** A kept unit labelled above species is judged the same way beside the kept, more specific units of its lineage. A species missing from the database whose genomes are labelled only at the genus covers the rest of its genome and stays; an unnamed copy of a named species is removed, and its reads go to that species.
 
-**Even coverage.** A removed species is kept at species when no taxon of its genus is kept and its fragments on its strongest genome meet all of: at least `200` fragments, OEBR and COEBR within `[0.9, 1.1]`, reads in at least `90 %` of the genome's windows, both p-values at least `1e-5`, and a fixed chunk breadth below the cutoff. The genome is cut into `min(100, n/5)` equal windows for its `n` fragments; with fewer than 4 windows the rule does not apply. This keeps large genomes at low depth. Species represented only by marker genes do not take part. The rule is off with `--strict-coverage` and on a fractional database.
+**Even coverage.** A removed species is kept at species when no taxon of its genus is kept and its reads on its strongest genome meet all of: at least `200` reads, OEBR and COEBR within `[0.9, 1.1]`, reads in at least `90 %` of the genome's windows, both p-values at least `1e-5`, and a fixed chunk breadth below the cutoff. The genome is cut into `min(100, n/5)` equal windows for its `n` reads; with fewer than 4 windows the rule does not apply. This keeps large genomes at low depth. Species represented only by marker genes do not take part. The rule is off with `--strict-coverage` and on a fractional database.
 
 ### 7.8 Levels above species
 
-The fragments that no kept unit takes, placed on genome references or on marker genomes, go to the lowest rank their matches and evidence support. `--strict-coverage` turns this off, and these fragments are then dropped.
+The reads that no kept unit takes, placed on genome references or on marker genomes, go to the lowest rank their matches and evidence support. `--strict-coverage` turns this off, and these reads are then dropped.
 
-Two kinds of fragments come here:
+Two kinds of reads come here:
 
 - **Without a species-level match.** They fail the species gates (§5.2) but pass the floor gates: identity of at least `--genus-identity` (default `0.80`), a mapped fraction of at least `0.60`, and at least 50 mapped bases on short reads. On long reads they need that fraction or the species length gate.
 - **Of species not kept.** They pass the species gates, but none of their candidates is kept.
 
-`--genus-identity` is a per-read minimum for fragments without a species-level match; fragments of species not kept have already passed the species gates. A genus row has its own, stricter tests on the mean of its fragments.
+`--genus-identity` is a per-read minimum for reads without a species-level match; reads of species not kept have already passed the species gates. A genus row has its own, stricter tests on the mean of its reads.
 
-A fragment's *tie set* holds the taxa whose placements lie within the tie margin of its best one.
+A read's *tie set* holds the taxa whose placements lie within the tie margin of its best one.
 
-A candidate row is measured on its *evidence genome*, the genome holding most of its fragments' best placements, with that genome's model (§7.4), and its tests depend on the model:
+A candidate row is measured on its *evidence genome*, the genome holding most of its reads' best placements, with that genome's model (§7.4), and its tests depend on the model:
 
 | Test | Evidence on a genome reference | Evidence on a marker genome |
 | --- | --- | --- |
-| Amount | at least `200` fragments | at least `10` genes hit (a fragment counts on every gene it covers) |
+| Amount | at least `200` reads | at least `10` genes hit (a read counts on every gene it covers) |
 | Genus row: mean identity | at least the species identity cutoff minus `0.09` | at least the species identity cutoff minus `0.09` |
 | Genus row: COEBR | at least `0.40` | at least `0.40` over the genes |
 | Row above genus: spread | reads in at least `50 %` of the genome's windows | COEBR of at least `0.40` over the genes |
 
-1. **Genus rows.** A fragment whose tie set lies in one genus is unique to it. The two kinds of fragments unique to a genus are judged separately, never added together: the genus gets a row when its unique fragments without a species-level match, or its unique fragments of species not kept, pass the amount, mean identity and COEBR tests on their own, each on its own evidence genome. Once the genus has a row, its unique fragments of both kinds join it, also those of a kind that failed or was too few to judge.
-2. **Ties between genera.** A fragment tied across several genera, at least one with a genus row, is shared by an EM over the genera with a row among all its candidates.
-3. **Lowest common ancestor rows.** The other fragments go to the lowest common ancestor of their tie set, or the first taxon above it at family, order, class, phylum or domain rank. A taxon gets a row when the fragments that reach it pass the amount and spread tests. Otherwise they move up one of these ranks, and they stay unexplained above domain.
+1. **Genus rows.** A read whose tie set lies in one genus is unique to it. The two kinds of reads unique to a genus are judged separately, never added together: the genus gets a row when its unique reads without a species-level match, or its unique reads of species not kept, pass the amount, mean identity and COEBR tests on their own, each on its own evidence genome. Once the genus has a row, its unique reads of both kinds join it, also those of a kind that failed or was too few to judge.
+2. **Ties between genera.** A read tied across several genera, at least one with a genus row, is shared by an EM over the genera with a row among all its candidates.
+3. **Lowest common ancestor rows.** The other reads go to the lowest common ancestor of their tie set, or the first taxon above it at family, order, class, phylum or domain rank. A taxon gets a row when the reads that reach it pass the amount and spread tests. Otherwise they move up one of these ranks, and they stay unexplained above domain.
 
-**Kept species on marker genes.** The marker genes of a kept species miss most of its genome and clip reads at their ends, and those reads land on relatives. A taxon holding kept species represented by marker genes therefore gets a row only when its fragments number at least `0.15` times the fragments of those species; otherwise its fragments move up like those of any taxon without a row. For a genus this counts its unique fragments of both kinds together, unlike the other tests. When the row's evidence genome is a genome reference, each fragment of those species counts as `placements(G) / Σ placements(L_i)` whole-genome fragments for the declared size `G` of the marker genome the species is reported on and its genes of lengths `L_i` (§7.12), or as one fragment when that genome declares no size. A kept unit labelled at a genus or higher taxon bounds the row of that taxon too.
+**Kept species on marker genes.** The marker genes of a kept species miss most of its genome and clip reads at their ends, and those reads land on relatives. A taxon holding kept species represented by marker genes therefore gets a row only when its reads number at least `0.15` times the reads of those species; otherwise its reads move up like those of any taxon without a row. For a genus this counts its unique reads of both kinds together, unlike the other tests. When the row's evidence genome is a genome reference, each read of those species counts as `placements(G) / Σ placements(L_i)` whole-genome reads for the declared size `G` of the marker genome the species is reported on and its genes of lengths `L_i` (§7.12), or as one read when that genome declares no size. A kept unit labelled at a genus or higher taxon bounds the row of that taxon too.
 
-A row's depth is that of its evidence genome; for a genus row, that genome comes from the unique fragments of the kind its row shows, the passing kind with most of them. On a genome reference it is the first-read bases of all its fragments over the indexed length; on a marker genome each fragment adds its read length on every gene it covers over the placements of the genes, as for a species (§7.11). Genomes tied exactly on that number share the depth.
+A row's depth is that of its evidence genome; for a genus row, that genome comes from the unique reads of the kind its row shows, the passing kind with most of them. On a genome reference it is the bases of all its reads, for a pair those of the first mate, over the indexed length; on a marker genome each read adds its length, for a pair that of its first mate, on every gene it covers over the placements of the genes, as for a species (§7.11). Genomes tied exactly on that number share the depth.
 
-**Noisy long reads.** A fragment without a species-level match whose best match, or one tied with it, is a kept species counts for that species and does not go above species. `--strict-coverage` turns this off.
+**Noisy long reads.** A read without a species-level match whose best match, or one tied with it, is a kept species counts for that species and does not go above species. `--strict-coverage` turns this off.
 
-**Limitation.** The reads of a genus missing from the database land on its closest genera. When a sister genus takes them as unique fragments and passes the tests, the missing genus is reported as that sister genus. This holds for rows on marker genomes as for rows on genome references.
+**Limitation.** The reads of a genus missing from the database land on its closest genera. When a sister genus takes them as unique reads and passes the tests, the missing genus is reported as that sister genus. This holds for rows on marker genomes as for rows on genome references.
 
 **References labelled above species.** A genome whose most specific label is a genus, family or higher taxon belongs to a unit of that taxon, judged like a species and reported at that rank and taxid. It has no identity rules of §7.10. A row above species of the same taxon is merged with it. When the genomes of a species are only partly labelled at species, and the sample's strain is closest to a genome labelled only at the genus, its reads can be reported at the genus.
 
 ### 7.9 Genome level (`--strain`)
 
-The fragments the second EM gives to a species are shared among its genomes by the same EM, with a tie margin of `0.1 %` of the longest placement for long reads. The genome with the largest share is the species' best-fit genome. If that genome was not measured, the species is reported on its best-fit genome of the species level: columns 7 to 15 then describe that genome and columns 16 and 17 the genome EM's. The mean identity is taken over the fragments whose best species match, within the tie margin, is this species, at any identity the mapper reports, and that align to the genome. Relative to the sample's baseline (the median over the species, weighted by fragments), it gives `estimated_ani`.
+The reads the second EM gives to a species are shared among its genomes by the same EM, with a tie margin of `0.1 %` of the longest placement for long reads. The genome with the largest share is the species' best-fit genome. If that genome was not measured, the species is reported on its best-fit genome of the species level: columns 7 to 15 then describe that genome and columns 16 and 17 the genome EM's. The mean identity is taken over the reads whose best species match, within the tie margin, is this species, at any identity the mapper reports, and that align to the genome. Relative to the sample's baseline (the median over the species, weighted by reads), it gives `estimated_ani`.
 
 With `--strain`, the mapper keeps at least 50 mappings per read or mate, so that the genomes of a species can be compared, and a genome gets a row of rank `strain` when:
 
-1. the fragments that the genome EM gives to it (posterior of at least `0.9`) and that match it at strain-level identity, the sample's identity to its own genomes less `0.005`, pass the coverage tests: chunk breadth above the cutoff, OEBR from `0.70` to `1.50`, and COEBR from `0.75` (short reads) or `0.70` (long reads) to `1.50`; and
-2. in a second genome EM over the genomes passing step 1, its estimated average nucleotide identity, its fragments' mean identity relative to the median over strain-level fragments, is at least `0.999`. A genome below it is dropped and this EM runs again over the rest.
+1. the reads that the genome EM gives to it (posterior of at least `0.9`) and that match it at strain-level identity, the sample's identity to its own genomes less `0.005`, pass the coverage tests: chunk breadth above the cutoff, OEBR from `0.70` to `1.50`, and COEBR from `0.75` (short reads) or `0.70` (long reads) to `1.50`; and
+2. in a second genome EM over the genomes passing step 1, its estimated average nucleotide identity, its reads' mean identity relative to the median over strain-level reads, is at least `0.999`. A genome below it is dropped and this EM runs again over the rest.
 
 `--min-oebr` and `--min-coebr` set the bounds of this level too. A marker genome never gets a genome row.
 
 A genome row is named by its strain taxid. Without one, it is named `<species name> <accession>` and carries the species' taxid.
 
-The rows of a species are exclusive: a genome row counts each of its fragments by the species' share of it times the genome EM's posterior, and the species row keeps the rest. **When genome rows exist and less than one read is left, the species has no row of its own**, and its reads are all in its genome rows.
+The rows of a species are exclusive: a genome row counts each of its reads by the species' share of it times the genome EM's posterior, and the species row keeps the rest. **When genome rows exist and less than one read is left, the species has no row of its own**, and its reads are all in its genome rows.
 
 ### 7.10 Identity rules on fractional databases
 
-On a fractional database, the reads of a genome's unindexed part land on the indexed segments of its relatives, and such a relative can pass every coverage test. Two rules compare the mean identity of the kept species' fragments to their best-fit genome. Units labelled above species are not judged.
+On a fractional database, the reads of a genome's unindexed part land on the indexed segments of its relatives, and such a relative can pass every coverage test. Two rules compare the mean identity of the kept species' reads to their best-fit genome. Units labelled above species are not judged.
 
-**Identity margin** (`--identity-margin F`). The baseline is the median of the species' mean identities, weighted by their fragments. A species more than `F` below the baseline is left out when a species of its genus within the margin is kept, and otherwise reported at its genus; a species without a genus stays. The rule needs at least 3 species with a measured identity. It applies only when some genome is indexed in part, and has no effect on a full database. The default is `0.025` for Illumina reads, paired or single-end; other inputs use it only when it is given. `--no-identity-margin` turns it off.
+**Identity margin** (`--identity-margin F`). The baseline is the median of the species' mean identities, weighted by their reads. A species more than `F` below the baseline is left out when a species of its genus within the margin is kept, and otherwise reported at its genus; a species without a genus stays. The rule needs at least 3 species with a measured identity. It applies only when some genome is indexed in part, and has no effect on a full database. The default is `0.025` for Illumina reads, paired or single-end; other inputs use it only when it is given. `--no-identity-margin` turns it off.
 
 **Relative identity gap** (`--relative-identity-gap F`). A species is left out when a species of the same genus with more depth has a mean identity at least `F` higher. This also removes a species that is present but much less abundant than a close relative. It is off by default, except `0.01` for single-end Illumina reads on a fractional database; `--no-relative-identity-gap` turns it off. It can be given for any database.
 
-On a fractional database, fragments not placed at a species are not reported above species, and no species is kept for even coverage: the reads of a genome missing from the database land on the indexed segments of many relatives and cannot be counted as full-index equivalents.
+On a fractional database, reads not placed at a species are not reported above species, and no species is kept for even coverage: the reads of a genome missing from the database land on the indexed segments of many relatives and cannot be counted as full-index equivalents.
 
 ### 7.11 Abundance and report filters
 
-Each fragment adds depth to its candidates: the mapped bases of its read (mate 1 of a pair) over the genome size, which for a fractional index is the effective indexed size. For a taxon kept by the coverage evidence this is the size of its best-fit genome (§7.9), whichever of its genomes the fragment placed best on, so that its abundance comes from the genome its presence is reported on. A fragment on a marker gene adds the length of its read, also when the read is clipped at the end of the gene, over `Σ placements(L_i)` for the genome's genes of lengths `L_i` (§7.4); for a long read these are the placements of its own length rather than of the median, since long reads differ widely in length, and a fragment adds this for every gene of the genome it covers. A genome of `G` bases offers about `G` placements, so this is the depth of the whole genome, comparable with the depth of a genome taxon. When no gene of a marker genome can hold a read of the sample's length, its fragments add mapped bases over the summed gene length.
+Each read adds depth to its candidates: its mapped bases, for a pair those of its first mate, over the genome size, which for a fractional index is the effective indexed size. For a taxon kept by the coverage evidence this is the size of its best-fit genome (§7.9), whichever of its genomes the read placed best on, so that its abundance comes from the genome its presence is reported on. A read on a marker gene adds its length, for a pair that of its first mate, also when it is clipped at the end of the gene, over `Σ placements(L_i)` for the genome's genes of lengths `L_i` (§7.4); for a long read these are the placements of its own length rather than of the median, since long reads differ widely in length, and a read adds this for every gene of the genome it covers. A genome of `G` bases offers about `G` placements, so this is the depth of the whole genome, comparable with the depth of a genome taxon. When no gene of a marker genome can hold a read of the sample's length, its reads add mapped bases over the summed gene length.
 
 Abundance is the depth of each row, normalised over the rows left after the filters. Read counts are full-index equivalents.
 
@@ -840,19 +840,19 @@ Abundance is the depth of each row, normalised over the rows left after the filt
 
 ### 7.12 Unclassified estimate
 
-With `--estimate-unclassified`, Metax estimates how much of the input the profile does not explain. Every row explains the fragments in its column 4, which for a fractional database are already full-index equivalents. A species represented only by marker genomes explains more than its fragments on the marker genes: a genome of declared size `G` offers `placements(G)` fragment placements against `Σ placements(L_i)` for its genes of lengths `L_i`, with the placements per sequence of §7.4. The placements of the genes count a fragment on every gene it covers, so the ratio is multiplied by the gene hits per fragment of the fragments resolved to the genome (above 1 where the two mates of a pair lie on two genes). Its fragments are multiplied by that ratio, averaged over its marker genomes. Long reads differ in length and can cover several genes, so for them the ratio is measured on the reads resolved to the species' marker genomes. Only genes that need all `a` bases from a read (`⌊L/2⌋ + 1 ≥ a`, §7.4) count: a read's hits on them are found reliably, while hits on shorter genes, which need only more than half of the gene, are often missed. Each hit of a read of length `R` on such a gene stands for `placements(G) / Σ placements(L_i)` whole-genome reads at that length, summed over these genes, and the ratio is their sum over the number of reads. A species that also has genome references counts its fragments as they are. Then
+With `--estimate-unclassified`, Metax estimates how much of the input the profile does not explain. Every row explains the reads in its column 4, which for a fractional database are already full-index equivalents. A species represented only by marker genomes explains more than its reads on the marker genes: a genome of declared size `G` offers `placements(G)` read placements against `Σ placements(L_i)` for its genes of lengths `L_i`, with the placements per sequence of §7.4. The placements of the genes count a read on every gene it covers, so the ratio is multiplied by the gene hits per read of the reads resolved to the genome (above 1 where the two mates of a pair lie on two genes). Its reads are multiplied by that ratio, averaged over its marker genomes. Long reads differ in length and can cover several genes, so for them the ratio is measured on the reads resolved to the species' marker genomes. Only genes that need all `a` bases from a read (`⌊L/2⌋ + 1 ≥ a`, §7.4) count: a read's hits on them are found reliably, while hits on shorter genes, which need only more than half of the gene, are often missed. Each hit of a read of length `R` on such a gene stands for `placements(G) / Σ placements(L_i)` whole-genome reads at that length, summed over these genes, and the ratio is their sum over the number of reads. A species that also has genome references counts its reads as they are. Then
 
 ```text
-unclassified share = 1 − min(1, explained fragments / input fragments)
+unclassified share = 1 − min(1, explained reads / input reads)
 ```
 
-The estimate is taken over the rows of the profile, after every filter; a species counts once with its genome rows. Rows above species (§7.8) explain their fragments, those on a marker evidence genome times that genome's whole-genome ratio, computed as for a species on it; other fragments of removed species, fragments of dropped rows, and fragments that fail the read-level gates count as unexplained. For short reads the estimate is unavailable when any marker genome of a reported marker species has no declared size or no gene that can hold a read of the sample's length; for long reads, when one of its genomes with resolved reads has no declared size or no read is resolved to its marker genomes. It is also unavailable when the evidence genome of a row above species is a marker genome without a whole-genome ratio: it declares no size, no gene can hold a read of the sample's length, or, for long reads, no read placed there hits a gene that needs all `a` bases. The log names the taxon, and `estimated_unclassified_percent` is `NA`. The share is also written to the log. The option cannot be combined with `--host`.
+The estimate is taken over the rows of the profile, after every filter; a species counts once with its genome rows. Rows above species (§7.8) explain their reads, those on a marker evidence genome times that genome's whole-genome ratio, computed as for a species on it; other reads of removed species, reads of dropped rows, and reads that fail the read-level gates count as unexplained. For short reads the estimate is unavailable when any marker genome of a reported marker species has no declared size or no gene that can hold a read of the sample's length; for long reads, when one of its genomes with resolved reads has no declared size or no read is resolved to its marker genomes. It is also unavailable when the evidence genome of a row above species is a marker genome without a whole-genome ratio: it declares no size, no gene can hold a read of the sample's length, or, for long reads, no read placed there hits a gene that needs all `a` bases. The log names the taxon, and `estimated_unclassified_percent` is `NA`. The share is also written to the log. The option cannot be combined with `--host`.
 
 ### 7.13 Fixed values
 
 | Value | Setting |
 | --- | --- |
-| posterior at which a fragment resolves to a unit | `0.9` |
+| posterior at which a read resolves to a unit | `0.9` |
 | lowest won share of a kept unit | `0.3` |
 | upper bound of OEBR and COEBR | `1.5` |
 | lower OEBR bound of a species | `0.6` |
@@ -862,15 +862,15 @@ The estimate is taken over the rows of the profile, after every filter; a specie
 | tie margin, short reads, in errors | `0.5` |
 | tie margin, long reads, share of aligned bases | `0.005` |
 | fixed chunk radius in bases | `1000` |
-| fewest fragments of an even-coverage species | `200` |
+| fewest reads of an even-coverage species | `200` |
 | lowest window spread of an even-coverage species | `0.9` |
-| fewest fragments of a row above species on a genome reference | `200` |
+| fewest reads of a row above species on a genome reference | `200` |
 | fewest genes hit of a row above species on a marker genome | `10` |
 | distance of a genus row's mean identity below the species cutoff | `0.09` |
 | lowest COEBR of a genus row | `0.4` |
 | lowest window spread of a row above genus on a genome reference | `0.5` |
 | lowest COEBR of a row above genus on a marker genome | `0.4` |
-| share of the fragments of kept species on marker genes that a row above them needs | `0.15` |
+| share of the reads of kept species on marker genes that a row above them needs | `0.15` |
 | floor mapped bases of a short read | `50` |
 | floor mapped fraction | `0.6` |
 | strain-level identity margin | `0.005` |

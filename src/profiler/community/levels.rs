@@ -268,7 +268,7 @@ fn profile_levels(profiler: &Profiler, data: MappingData) -> Result<()> {
     };
     log::info!(
         target: "PROFILER",
-        "{} fragments with candidates; error rate {:.5}, error penalty {:.3}.",
+        "{} reads with candidates; error rate {:.5}, error penalty {:.3}.",
         fragments.len(),
         error_rate,
         em.penalty
@@ -369,7 +369,7 @@ fn profile_levels(profiler: &Profiler, data: MappingData) -> Result<()> {
         )?;
         log::info!(
             target: "PROFILER",
-            "{written} fragments written to the per-read classifications."
+            "{written} reads written to the per-read classifications."
         );
     }
     let profile_rows = blocks
@@ -377,7 +377,6 @@ fn profile_levels(profiler: &Profiler, data: MappingData) -> Result<()> {
         .flat_map(|block| block.taxon.into_iter().chain(block.genomes))
         .collect::<Vec<_>>();
     let unclassified = estimate_unclassified(
-        cfg,
         &data,
         &profile_rows,
         &amounts.genome_reads,
@@ -625,7 +624,7 @@ impl Run<'_> {
         );
         log::info!(
             target: "PROFILER",
-            "Second look kept {} removed species on {} fragments their removed sisters tied on.",
+            "Second look kept {} removed species on {} reads their removed sisters tied on.",
             taken.len(),
             taken.values().map(Vec::len).sum::<usize>()
         );
@@ -635,7 +634,7 @@ impl Run<'_> {
             });
         log::info!(
             target: "PROFILER",
-            "{} removed species kept on fragments that no kept species explains; {} of them \
+            "{} removed species kept on reads that no kept species explains; {} of them \
              reported at their genus, as their reads tie with other species along their genome.",
             rescued.len(),
             rescued.values().filter(|&&genus| genus).count()
@@ -653,7 +652,7 @@ impl Run<'_> {
         );
         log::info!(
             target: "PROFILER",
-            "{} kept virus species removed: their own fragments do not cover the rest of their \
+            "{} kept virus species removed: their own reads do not cover the rest of their \
              genome, beyond the part that kept cellular species explain.",
             removed_viruses.len()
         );
@@ -670,7 +669,7 @@ impl Run<'_> {
             );
             log::info!(
                 target: "PROFILER",
-                "{} kept units labelled above species removed: their own fragments do not cover \
+                "{} kept units labelled above species removed: their own reads do not cover \
                  the rest of their genome, beyond the part that kept named units of their taxon explain.",
                 named_first.len()
             );
@@ -748,7 +747,7 @@ impl Run<'_> {
         let without_kept = shared.group_of.iter().filter(|g| g.is_none()).count();
         log::info!(
             target: "PROFILER",
-            "{} species kept, {} read groups, EM {} + {} iterations; {} fragments without a kept \
+            "{} species kept, {} read groups, EM {} + {} iterations; {} reads without a kept \
              species.",
             species.best_fit.len(),
             shared.groups.len(),
@@ -835,9 +834,9 @@ impl Run<'_> {
                 .count();
             log::info!(
                 target: "PROFILER",
-                "{} species kept for even coverage; above species, {} fragments without a \
+                "{} species kept for even coverage; above species, {} reads without a \
                  species-level match and {} of species not kept: {} genus rows ({} candidates), {} rows above \
-                 genus ({} candidates), {} fragments unexplained.",
+                 genus ({} candidates), {} reads unexplained.",
                 even,
                 found.fragments[0],
                 found.fragments[1],
@@ -927,7 +926,7 @@ impl Run<'_> {
             );
             log::info!(
                 target: "PROFILER",
-                "{} fragments without a species-level candidate credited to the kept species \
+                "{} reads without a species-level candidate credited to the kept species \
                  that match them best.",
                 credited.count
             );
@@ -2990,7 +2989,6 @@ fn add_marker_genome_reads(
 /// The unclassified estimate (`--estimate-unclassified`), `None` when not
 /// requested.
 fn estimate_unclassified(
-    cfg: &ProfilerConfig,
     data: &MappingData,
     rows: &[ProfileRow],
     marker_genome_reads: &HashMap<u32, GenomeReads>,
@@ -3017,10 +3015,9 @@ fn estimate_unclassified(
         match share {
             Ok(share) => log::info!(
                 target: "PROFILER",
-                "Unclassified estimate: {:.2}% of {} input {} are not explained by the profile.",
+                "Unclassified estimate: {:.2}% of {} input reads are not explained by the profile.",
                 share * 100.0,
-                data.total_reads,
-                if cfg.is_paired { "fragments" } else { "reads" }
+                data.total_reads
             ),
             Err(taxid) => match above.and_then(|found| found.row(taxid)) {
                 Some(row) => log::warn!(

@@ -1405,7 +1405,7 @@ Paired-end mapping:
       When one taxon already forms a proper pair, also search, for each mate,
       for the missing mate of up to N other taxa placed on that mate only, and
       keep it if that pair matches at least as many bases. With 0, mate rescue
-      is limited to fragments without any proper pair (default
+      is limited to reads whose mates form no proper pair (default
       {mate_rescue_taxa}).
 
 Long-read mapping:

@@ -615,11 +615,6 @@ impl Profiler {
         marker_model: Option<&MarkerModel>,
     ) -> f64 {
         let (total_reads, aligned_reads) = (records.total_reads, records.read_alignments.len());
-        let mapped_unit = if self.cfg.is_paired {
-            "fragments"
-        } else {
-            "reads"
-        };
         let mapping_rate = if total_reads == 0 {
             0.0
         } else {
@@ -646,19 +641,13 @@ impl Profiler {
 
         log::info!(target: "PROFILER", "Total number of reads: {}", total_reads);
         log::info!(target: "PROFILER", "Number of mapping records: {}", records.mapping_records);
-        log::info!(
-            target: "PROFILER",
-            "Number of mapped {}: {}",
-            mapped_unit,
-            aligned_reads
-        );
+        log::info!(target: "PROFILER", "Number of mapped reads: {}", aligned_reads);
         log::info!(target: "PROFILER", "Metam reported mapped read records: {}", records.profile.mapped_reads);
         log::info!(target: "PROFILER", "Metam emitted mapping records: {}", records.profile.emitted_records);
         match chunk_cutoff.source {
             ChunkSource::Automatic if basis.mapped => log::info!(
                 target: "PROFILER",
-                "Minimum chunk breadth estimated from mapped {} ({}).",
-                mapped_unit,
+                "Minimum chunk breadth estimated from mapped reads ({}).",
                 aligned_reads
             ),
             ChunkSource::Automatic => log::info!(

@@ -520,7 +520,7 @@ impl fmt::Display for Failure {
             } => write!(f, "window spread: {spread:.4} < {bound}"),
             Self::Spill { fragments, bound } => write!(
                 f,
-                "spill of kept units beneath: {fragments} fragments < {bound:.1}"
+                "spill of kept units beneath: {fragments} reads < {bound:.1}"
             ),
         }
     }
@@ -836,7 +836,7 @@ impl Placing<'_> {
             .values()
             .copied()
             .max()
-            .expect("a candidate row has fragments");
+            .expect("a candidate row has reads");
         let mut tied = counts
             .into_iter()
             .filter(|&(_, n)| n == most)
@@ -1134,7 +1134,7 @@ impl Placing<'_> {
         }
         let (em, groups) = share_tied(self.level, placed, &tied, with_row, lineages);
         for (i, group) in groups {
-            let group = group.expect("a fragment with a genus row among its tie set's genera");
+            let group = group.expect("a read with a genus row among its tie set's genera");
             self.destination[i as usize] = Destination::Shared(group as u32);
         }
         em.posteriors
@@ -1741,7 +1741,7 @@ mod tests {
         );
         assert_eq!(
             candidate.failures[0].to_string(),
-            "spill of kept units beneath: 72 fragments < 100.0"
+            "spill of kept units beneath: 72 reads < 100.0"
         );
         let found = Setup::markers(marker_reads(24, 3))
             .beside(bound(72.0))
