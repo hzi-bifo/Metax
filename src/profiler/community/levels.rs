@@ -307,7 +307,7 @@ fn profile_levels(profiler: &Profiler, data: MappingData) -> Result<()> {
     );
     log::info!(
         target: "PROFILER",
-        "baseline identity {:.5} (median identity of the species to their best-fit genome); \
+        "Baseline identity {:.5} (median identity of the species to their best-fit genome); \
          {:.5} over strain-level matches.",
         genome_result.baseline_identity,
         genome_result.strain_baseline_identity
@@ -617,7 +617,7 @@ impl Run<'_> {
         );
         log::info!(
             target: "PROFILER",
-            "second look kept {} removed species on {} fragments their removed sisters tied on.",
+            "Second look kept {} removed species on {} fragments their removed sisters tied on.",
             taken.len(),
             taken.values().map(Vec::len).sum::<usize>()
         );
@@ -783,7 +783,7 @@ impl Run<'_> {
         if above.is_some() && data.fractional {
             log::info!(
                 target: "PROFILER",
-                "on a fractional database, reads not placed at a species are not reported \
+                "On a fractional database, reads not placed at a species are not reported \
                  above species."
             );
         }
