@@ -17,7 +17,9 @@ use rayon::prelude::*;
 use tempfile::{Builder, TempPath};
 
 use metam::format::format_mapping;
-use metam::index::{read_index_with_cache_progress, IndexCacheBuildProgress, LoadedIndex};
+use metam::index::{
+    read_index_with_cache_progress, IndexCacheBuildProgress, LoadedIndex, INDEX_VERSION,
+};
 use metam::io::{Record, SequenceReader};
 use metam::mapper::{
     apply_pair_awareness, has_proper_pair, limit_mappings_with_workspace, map_read_with_workspace,
@@ -960,6 +962,9 @@ impl Mapper {
                 "Mapping index ready in {:.2}s.",
                 index_load_start.elapsed().as_secs_f64()
             );
+        }
+        if let Some(warning) = older_index_format_warning(loaded_index.header().version) {
+            log::warn!(target: "MAPPER", "{warning}");
         }
         let reference_candidate_groups =
             build_reference_candidate_groups(&loaded_index, &db, config.genome_level)?;
@@ -2586,9 +2591,27 @@ fn split_long_option(arg: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// The warning for an index in an older format than `metax index` builds. Such
+/// an index is read as built, but identical sequence in different genomes can
+/// keep different seeds, so close genomes are told apart less reliably.
+fn older_index_format_warning(version: u32) -> Option<String> {
+    (version < INDEX_VERSION).then(|| {
+        format!(
+            "The index is in format {version}; `metax index` now builds format {INDEX_VERSION}, which keeps the same seeds in identical sequence of different genomes and so tells close genomes and strains apart more reliably. Build the index again for the most accurate profiles."
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_older_index_format_is_warned_about() {
+        let warning = older_index_format_warning(7).expect("format 7 is older");
+        assert!(warning.starts_with("The index is in format 7;"));
+        assert!(older_index_format_warning(INDEX_VERSION).is_none());
+    }
     use metam::mapper::MateRefStatus;
 
     struct IntentionalWriteFailure;

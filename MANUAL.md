@@ -85,7 +85,7 @@ metax profile -d metax2_refseq_202607_k16w37 \
 
 The archive holds `metax_db.mxi`, `metax_db.tsv.gz`, and `md5sums.txt` with the checksums of both. It holds no taxonomy dump, so profiling uses `--dmp-dir` or the managed NCBI dump (§2) and does not check it against the database. The first run writes an index cache of about 50 GiB into the unpacked folder, which must therefore be writable; to keep the folder read-only, place the cache elsewhere with the mapper option `--index-cache PATH`, given after `--` (§5.4).
 
-A database in another index format cannot be read; build it again with `metax index`.
+Databases built by earlier Metax 2 releases are read as they are, and the log warns that their index format is older. Build such a database again with `metax index` for the current format, which keeps the same seeds in identical sequence of different genomes and so tells close genomes and strains apart more reliably. Databases of Metax 0.9 and earlier cannot be read; build them again with `metax index`.
 
 ### 3.2 Reference FASTA header format
 
