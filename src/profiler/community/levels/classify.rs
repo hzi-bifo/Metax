@@ -44,6 +44,9 @@ use crate::profiler::output::{
     create_classification_writer, finish_classification_writer, format_five,
 };
 
+/// Columns of the per-read classifications, named on their second line.
+pub(super) const CLASSIFY_COLUMNS: [&str; 5] = ["read_id", "taxid", "rank", "taxids", "shares"];
+
 /// A fragment's shares: taxid and rank of a profile row, and the share.
 type Shares<'r> = Vec<(u32, &'r str, f64)>;
 
@@ -103,14 +106,17 @@ pub(super) struct Classifications<'a> {
 }
 
 impl Classifications<'_> {
-    /// Write `path` for the profile's `blocks`; returns the fragments written.
+    /// Write `path` for the profile's `blocks`, after the `header` lines;
+    /// returns the fragments written.
     pub(super) fn write(
         &self,
         path: &str,
+        header: &str,
         blocks: &[TaxonBlock],
         data: &MappingData,
     ) -> Result<usize> {
         let mut writer = create_classification_writer(path)?;
+        writer.write_all(header.as_bytes())?;
         let written = self.for_each_row(blocks, |read, shares| {
             write_row(&mut writer, &data.read_alignments[read].read_name, shares)
         })?;
@@ -433,6 +439,11 @@ mod tests {
         let mut line = Vec::new();
         write_row(&mut line, "r", &shares[..1].to_vec()).unwrap();
         assert_eq!(String::from_utf8(line).unwrap(), "r\t7\tspecies\t7\t1\n");
+        // The names of these five fields, on the file's second line.
+        assert_eq!(
+            CLASSIFY_COLUMNS.join("\t"),
+            "read_id\ttaxid\trank\ttaxids\tshares"
+        );
     }
 
     #[test]

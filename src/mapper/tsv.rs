@@ -152,7 +152,7 @@ impl MetamMappingRecord<'_> {
 
     pub fn validate(self) -> Result<()> {
         nonempty(self.read_id, "read_id")?;
-        nonempty(self.ref_id, "ref_id")?;
+        nonempty(self.ref_id, "reference_name")?;
         if self.end_1based_exclusive < self.start_1based {
             bail!(
                 "mapping end {} is smaller than start {}",
@@ -174,7 +174,7 @@ impl MetamMappingRecord<'_> {
         }
         if self.mapped_bases > self.read_len {
             bail!(
-                "mapped_bases {} is greater than read_len {}",
+                "mapped_bases {} is greater than read_length {}",
                 self.mapped_bases,
                 self.read_len
             );
@@ -270,6 +270,20 @@ const MAPPING_METADATA_PREFIX: &str = "#metax_mapping";
 const DATABASE_SUMMARY_PREFIX: &str = "#metax_mapping_database";
 const SAMPLE_METADATA_PREFIX: &str = "#metax_mapping_sample";
 const MAPPING_FILE_VERSION: &str = "5";
+/// Columns of a mapping record, named on the line after the metadata.
+const MAPPING_COLUMNS: [&str; 11] = [
+    "read_id",
+    "reference_name",
+    "start",
+    "end",
+    "identity",
+    "read_length",
+    "mapped_bases",
+    "mate_reference",
+    "mate",
+    "pair_id",
+    "candidate_boundary",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MappingDatabaseSummary {
@@ -346,8 +360,9 @@ pub struct MappingRunMetadata {
     pub database: MappingDatabaseSummary,
 }
 
-/// Write only run-level metadata. Reference metadata remains authoritative in
-/// metax_db.tsv.gz and is never copied into a mapping file.
+/// Write the run-level metadata and the column names. Reference metadata
+/// remains authoritative in metax_db.tsv.gz and is never copied into a mapping
+/// file.
 pub fn write_mapping_run_metadata(
     writer: &mut dyn Write,
     sequencer: Sequencer,
@@ -376,6 +391,7 @@ pub fn write_mapping_run_metadata(
         "{DATABASE_SUMMARY_PREFIX}\tfractional={}\tsequences={}\tgenomes={}\tfingerprint={:032x}",
         summary.is_fractional, summary.sequences, summary.genomes, summary.fingerprint
     )?;
+    writeln!(writer, "#{}", MAPPING_COLUMNS.join("\t"))?;
     Ok(())
 }
 
@@ -817,15 +833,11 @@ fn parse_mapping_line(line: &str) -> Result<MetamMapping> {
 fn parse_mapping_record(line: &str) -> Result<MetamMappingRecord<'_>> {
     let mut fields = line.split('\t');
     let read_id = nonempty(next_field(&mut fields, "read_id")?, "read_id")?;
-    let ref_id = nonempty(next_field(&mut fields, "ref_id")?, "ref_id")?;
-    let ref_start: usize = parse_nonnegative(next_field(&mut fields, "ref_start")?, "ref_start")?;
-    let ref_end: usize = parse_nonnegative(next_field(&mut fields, "ref_end")?, "ref_end")?;
+    let ref_id = nonempty(next_field(&mut fields, "reference_name")?, "reference_name")?;
+    let ref_start: usize = parse_nonnegative(next_field(&mut fields, "start")?, "start")?;
+    let ref_end: usize = parse_nonnegative(next_field(&mut fields, "end")?, "end")?;
     if ref_end < ref_start {
-        bail!(
-            "ref_end {} is smaller than ref_start {}",
-            ref_end,
-            ref_start
-        );
+        bail!("end {} is smaller than start {}", ref_end, ref_start);
     }
     let identity_field = next_field(&mut fields, "identity")?;
     let identity: f64 = identity_field
@@ -835,19 +847,16 @@ fn parse_mapping_record(line: &str) -> Result<MetamMappingRecord<'_>> {
         bail!("identity must be finite and within [0,1], got {}", identity);
     }
     let identity = canonical_mapping_identity(identity);
-    let read_len = parse_positive(next_field(&mut fields, "read_len")?, "read_len")?;
+    let read_len = parse_positive(next_field(&mut fields, "read_length")?, "read_length")?;
     let mapped_bases = parse_positive(next_field(&mut fields, "mapped_bases")?, "mapped_bases")?;
     if mapped_bases > read_len {
         bail!(
-            "mapped_bases {} is greater than read_len {}",
+            "mapped_bases {} is greater than read_length {}",
             mapped_bases,
             read_len
         );
     }
-    let mate_ref_status = nonempty(
-        next_field(&mut fields, "mate_ref_status")?,
-        "mate_ref_status",
-    )?;
+    let mate_ref_status = nonempty(next_field(&mut fields, "mate_reference")?, "mate_reference")?;
     let mate_ref = MateRef::parse(mate_ref_status);
     let mate_number = u8::try_from(parse_nonnegative(next_field(&mut fields, "mate")?, "mate")?)
         .context("mate does not fit in u8")?;
@@ -1096,10 +1105,10 @@ mod tests {
         file.flush().unwrap();
 
         let text = std::fs::read_to_string(file.path()).unwrap();
-        assert_eq!(text.lines().count(), 3);
+        assert_eq!(text.lines().count(), 4);
         let fingerprint = test_database(false).fingerprint();
         assert!(text.starts_with(&format!(
-            "#metax_mapping\tversion=5\tsequencer=Illumina\tpaired=true\tmapper_mode=recall\tstrain=false\tprofiler_identity=0.96\tprofiler_mapped_len=50\tprofiler_fraction=0.6\tsampled_mean_base_accuracy=0.92\n#metax_mapping_database\tfractional=false\tsequences=1\tgenomes=1\tfingerprint={fingerprint:032x}\n"
+            "#metax_mapping\tversion=5\tsequencer=Illumina\tpaired=true\tmapper_mode=recall\tstrain=false\tprofiler_identity=0.96\tprofiler_mapped_len=50\tprofiler_fraction=0.6\tsampled_mean_base_accuracy=0.92\n#metax_mapping_database\tfractional=false\tsequences=1\tgenomes=1\tfingerprint={fingerprint:032x}\n#read_id\treference_name\tstart\tend\tidentity\tread_length\tmapped_bases\tmate_reference\tmate\tpair_id\tcandidate_boundary\n"
         )));
         assert!(!text.contains("#metax_mapping_reference"));
 

@@ -593,22 +593,23 @@ Every decisions table has these 31 columns, whatever the reads, the database and
 
 ### 6.3 Per-read classification
 
-`<prefix>.classify.txt.gz` is gzip-compressed and tab-separated. It has one row per fragment and five columns: read id, the taxid and rank of its largest share, the taxids of its shares, and the shares in the same order, largest first, with five decimals. Several taxids or shares are separated by `;`, and a fragment with a single share has share `1`.
+`<prefix>.classify.txt.gz` is gzip-compressed and tab-separated. It opens with a `#metax_classify` line with the fields of §6.1 from `version` to `host`, then the column names. It has one row per fragment and five columns: `read_id`; `taxid` and `rank` of its largest share; `taxids`, the taxids of its shares; and `shares`, in the same order, largest first, with five decimals. Several taxids or shares are separated by `;`, and a fragment with a single share has share `1`.
 
 The shares are the ones the profile's rows count the fragment with. Shares on taxa without a profile row are dropped and the others renormalised, and a fragment without any share is not written. For a species represented by marker genes, the file lists only the reads placed on those genes, and the log says so. The file is not written for a fractional database.
 
 ### 6.4 Mapping file
 
-`<prefix>.mapping.tsv.gz` is tab-separated, with two header lines, one row per retained mapping, and one final line of sample counts:
+`<prefix>.mapping.tsv.gz` is tab-separated. It opens with three header lines, for the run, the database and the column names, then has one row per retained mapping and a final line of sample counts:
 
 ```text
 #metax_mapping  version=5  sequencer=Illumina  paired=true  mapper_mode=default  strain=false  profiler_identity=0.97  profiler_mapped_len=50  profiler_fraction=0.7  sampled_mean_base_accuracy=NA
 #metax_mapping_database  fractional=false  sequences=71442  genomes=33533  fingerprint=0123456789abcdef0123456789abcdef
+#read_id  reference_name  start  end  identity  read_length  mapped_bases  mate_reference  mate  pair_id  candidate_boundary
 S0R0  GCF_000001405.40|NC_000001.11|s:9606|3298430636  1872848  1872998  0.99333  150  150  =  1  1  0
 #metax_mapping_sample  total_reads=33237808  mapped_reads=23098244  emitted_records=85758065
 ```
 
-Mapping columns, eleven for every kind of read: read id, reference id, start, end, identity, read length, mapped bases, mate reference status (`=` mate on the same reference, `>` mate may lie beyond the end of this reference, `*` mate unmapped, `NA` single read, or the reference of the mate), mate number (`0`, `1` or `2`), read-local pair id, and a candidate-boundary mask (`0` to `3`) that shows, for single-end and long reads, whether further endpoints may have been omitted by the candidate cap; it is `0` for pairs. The profiler does not read it. Reference, genome, taxonomy and size tables are not copied into the file; they come from the database, whose fingerprint is checked on reuse. A file without this header is rejected.
+Mapping columns, eleven for every kind of read: `read_id`; `reference_name`, as in `metax_db.tsv.gz`; `start` and `end`; `identity`; `read_length`; `mapped_bases`; `mate_reference`, where the mate maps (`=` on the same reference, `>` possibly beyond the end of this reference, `*` unmapped, `NA` for a single read, or the mate's reference); `mate`, the mate number (`0`, `1` or `2`); `pair_id`, a pair id local to the read; and `candidate_boundary`, a mask (`0` to `3`) that shows, for single-end and long reads, whether further endpoints may have been omitted by the candidate cap, `0` for pairs. The profiler does not read the mask. Reference, genome, taxonomy and size tables are not copied into the file; they come from the database, whose fingerprint is checked on reuse. A file without the run and database lines is rejected; a file without the line of column names, as written by earlier releases, is read as well.
 
 ## 7. Method
 

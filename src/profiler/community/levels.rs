@@ -349,6 +349,7 @@ fn profile_levels(profiler: &Profiler, data: MappingData) -> Result<()> {
     set_abundance(&mut blocks);
 
     // The outputs.
+    let header = TableHeader::of(cfg);
     let finals = cfg.save_decisions.then(|| FinalRows::of(&blocks));
     if let Some(path) = &classify_path {
         let written = classify::Classifications {
@@ -360,7 +361,12 @@ fn profile_levels(profiler: &Profiler, data: MappingData) -> Result<()> {
             higher: above.as_ref().map_or(&[][..], |found| &found.shares),
             credited: &amounts.credited.fragments,
         }
-        .write(path, &blocks, &data)?;
+        .write(
+            path,
+            &header.lines("classify", &classify::CLASSIFY_COLUMNS),
+            &blocks,
+            &data,
+        )?;
         log::info!(
             target: "PROFILER",
             "{written} fragments written to the per-read classifications."
@@ -378,7 +384,6 @@ fn profile_levels(profiler: &Profiler, data: MappingData) -> Result<()> {
         above.as_ref(),
         run.long_reads,
     );
-    let header = TableHeader::of(cfg);
     let columns = if cfg.host.is_some() {
         [&PROFILE_COLUMNS[..], &HOST_COLUMNS[..]].concat()
     } else {
