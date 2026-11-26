@@ -88,9 +88,11 @@ Run `metax profile --help` for every option.
 
 ## Output
 
-- `<prefix>.profile.txt`: the profile, with two header lines and one row per reported taxon. Its columns are name, taxid, rank, reads, depth, abundance, seven coverage columns, the depth of the coverage evidence, the best-fit genome, its mean identity and the estimated identity of the sample's strain to it. `--host` adds three annotation columns.
+- `<prefix>.profile.txt`: the profile, with two header lines and one row per reported taxon. Its 17 columns are name, taxid, rank, reads, depth, abundance, seven coverage columns, the depth of the coverage evidence, the best-fit genome, its mean identity and the estimated identity of the sample's strain to it. They are the same for every kind of read, database and option, except that `--host` adds three annotation columns. Options add rows instead: `--strain` genome rows and `--estimate-unclassified` an `unclassified` row. A value that does not apply to a row, such as the identity of a genus row, is `NA`.
 - `<prefix>.log`: the run log.
-- `<prefix>.decisions.tsv`, `<prefix>.classify.txt.gz` and `<prefix>.mapping.tsv.gz`: optional tables, written with the options above.
+- `<prefix>.decisions.tsv`, `<prefix>.classify.txt.gz` and `<prefix>.mapping.tsv.gz`: optional tables, written with the options above, each with the same columns in every run.
+
+The [manual](MANUAL.md#6-output-files) explains every column.
 
 ## Manual
 

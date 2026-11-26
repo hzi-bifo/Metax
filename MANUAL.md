@@ -528,6 +528,17 @@ Columns, with `NA` where a value does not apply. Numbers have five decimals, and
 | 16 | `mean_identity` | mean identity of the taxon's fragments to its best-fit genome (§7.9 says which fragments count) |
 | 17 | `estimated_ani` | estimated average nucleotide identity of the sample's strain to that genome, at most 1: the mean identity relative to the sample's baseline identity |
 
+Every profile has these 17 columns, whatever the reads, the database and the options; only `--host` adds columns. The options and the database change the rows instead: `--strain` adds genome rows of rank `strain` (§7.9), `--estimate-unclassified` adds the unclassified row (below), and on a marker-gene or fractional database columns 4, 10 and 11 count as stated above.
+
+What columns 7 to 17 describe depends on the row:
+
+| Row | Columns 7 to 15 | Columns 16 and 17 |
+| --- | --- | --- |
+| species, or a unit labelled above species (§7.8) | its best-fit genome | its identity to that genome; `NA` when none of its fragments has it as best match (§7.9) |
+| genome row (rank `strain`) | the genome itself | its identity to the genome |
+| row above species, built from the fragments that no kept unit takes (§7.8), or a species reported at its genus (§7.10) | the genome its evidence is measured on | `NA` |
+| `unclassified` | `NA` | `NA` |
+
 With `--host`, three columns follow:
 
 | Column | Name | Meaning |
@@ -579,9 +590,11 @@ Columns, with `NA` where a value does not apply:
 | `reported_as` | rank of the profile rows holding the taxon's reads, or `none` |
 | `final_reads`, `final_abundance` | columns 4 and 6 of the taxon's profile row; for a species, with its genome rows; `NA` for a genus whose reads are in the row of a unit labelled at that genus |
 
+Every decisions table has these 31 columns, whatever the reads, the database and the options. `--strain` adds rows of kind `strain`, and with `--host` the table is named `<prefix>.pathogen.decisions.tsv`.
+
 ### 6.3 Per-read classification
 
-`<prefix>.classify.txt.gz` is gzip-compressed and tab-separated. It has one row per fragment: read id, the taxid and rank of its largest share, the taxids of its shares, and the shares, largest first. A fragment with a single share has share `1`.
+`<prefix>.classify.txt.gz` is gzip-compressed and tab-separated. It has one row per fragment and five columns: read id, the taxid and rank of its largest share, the taxids of its shares, and the shares in the same order, largest first, with five decimals. Several taxids or shares are separated by `;`, and a fragment with a single share has share `1`.
 
 The shares are the ones the profile's rows count the fragment with. Shares on taxa without a profile row are dropped and the others renormalised, and a fragment without any share is not written. For a species represented by marker genes, the file lists only the reads placed on those genes, and the log says so. The file is not written for a fractional database.
 
@@ -596,7 +609,7 @@ S0R0  GCF_000001405.40|NC_000001.11|s:9606|3298430636  1872848  1872998  0.99333
 #metax_mapping_sample  total_reads=33237808  mapped_reads=23098244  emitted_records=85758065
 ```
 
-Mapping columns: read id, reference id, start, end, identity, read length, mapped bases, mate reference status (`=` mate on the same reference, `>` mate may lie beyond the end of this reference, `*` mate unmapped, `NA` single read, or the reference of the mate), mate number (`0`, `1` or `2`), read-local pair id, and a candidate-boundary mask (`0` to `3`) that shows, for single-end and long reads, whether further endpoints may have been omitted by the candidate cap; it is `0` for pairs. The profiler does not read it. Reference, genome, taxonomy and size tables are not copied into the file; they come from the database, whose fingerprint is checked on reuse. A file without this header is rejected.
+Mapping columns, eleven for every kind of read: read id, reference id, start, end, identity, read length, mapped bases, mate reference status (`=` mate on the same reference, `>` mate may lie beyond the end of this reference, `*` mate unmapped, `NA` single read, or the reference of the mate), mate number (`0`, `1` or `2`), read-local pair id, and a candidate-boundary mask (`0` to `3`) that shows, for single-end and long reads, whether further endpoints may have been omitted by the candidate cap; it is `0` for pairs. The profiler does not read it. Reference, genome, taxonomy and size tables are not copied into the file; they come from the database, whose fingerprint is checked on reuse. A file without this header is rejected.
 
 ## 7. Method
 
