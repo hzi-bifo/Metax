@@ -180,6 +180,28 @@ Gzip-compressed input is accepted. The output directory contains:
 - `taxdmp.tar.gz`: the taxonomy dump the database was built with, from `--dmp-dir` or, without it, from the managed NCBI dump (§2.1), as one archive. `metax profile` uses it when `--dmp-dir` is omitted;
 - `metax_taxonomy.tsv.gz`: a hash of the scientific name, rank and lineage of every reference taxid in that dump, against which `metax profile` checks the dump it uses (§2).
 
+**`metax_db.tsv.gz`** opens with lines starting with `#`: `#metax_db_version`, the layout of the table (below); `#mapping_index`, the index file; `#fractional`, `true` or `false`; `#reference_type`, `markers` or `mixed`, in layouts 3 and 4 only; and `#columns`, the column names. Then it has one row per indexed sequence, which is a contig, a marker gene or, in a fractional index, a sampled segment:
+
+| Column | Meaning |
+| --- | --- |
+| `reference_name` | name of the sequence; the mapping file names references by it (§6.4) |
+| `reference_length` | its length in bases |
+| `full_genome_size` | size of its genome; for a marker genome, the summed length of its genes |
+| `effective_indexed_size` | the indexed part of the genome, smaller than `full_genome_size` only in a fractional index |
+| `genome` | genome identifier |
+| `contig` | sequence identifier; in a fractional index, the contig and the coordinates of the segment |
+| `taxonomy` | the taxonomy labels of the FASTA header (§3.2) |
+| `reference_type` | `genome` or `markers`; layouts 3 and 4 only |
+| `declared_genome_size` | whole-genome size that the FASTA header of a marker genome declares, `NA` without one; layout 4 only |
+
+Layout 2 is written for databases of genomes only, so that earlier Metax 2 releases can read them; layout 3 when some genome is of type `markers`, and layout 4 when some marker genome declares its whole-genome size. The database fingerprint in the output files (§6) is a hash of these rows as read, so recompressing the file does not change it.
+
+**`metax_taxonomy.tsv.gz`** opens with `#metax_taxonomy_version`; then, for a dump stored with the database, `#metax_version` and `#created`, the Metax version and UTC time that recorded it, and one `#dump_file` line per dump file with its size in bytes and SHA-256 checksum; then `#columns`. It has one row per taxid that the references name, their strain and reporting taxids, with `lineage_hash`, a 64-bit hash of the taxid, rank and name of every taxon in its lineage. It holds no names: these come from the dump, and the record only tells whether a dump gives these taxa the same names, ranks and lineages (§2).
+
+**`metax_db.mxi`** is binary. Its header holds the index format, 9 for indexes built by this release, the seed settings (§4.4) and the numbers of references, bases and seeds; `metax info -i` prints them (§4.5).
+
+**`metax_db.mxi.metamcache`**, the index cache, is written by `metax profile` beside the index on first use. It records the size and modification time of the index it was made from, and it is made again when these or its format no longer match.
+
 The strain taxid and the reporting taxid of every reference must be in the taxonomy dump. `metax index` checks them before it builds the index and stops with the missing taxids otherwise, so index with the dump the FASTA headers were written for, for example a GTDB dump for GTDB taxids:
 
 ```bash
@@ -609,7 +631,9 @@ S0R0  GCF_000001405.40|NC_000001.11|s:9606|3298430636  1872848  1872998  0.99333
 #metax_mapping_sample  total_reads=33237808  mapped_reads=23098244  emitted_records=85758065
 ```
 
-Mapping columns, eleven for every kind of read: `read_id`; `reference_name`, as in `metax_db.tsv.gz`; `start` and `end`; `identity`; `read_length`; `mapped_bases`; `mate_reference`, where the mate maps (`=` on the same reference, `>` possibly beyond the end of this reference, `*` unmapped, `NA` for a single read, or the mate's reference); `mate`, the mate number (`0`, `1` or `2`); `pair_id`, a pair id local to the read; and `candidate_boundary`, a mask (`0` to `3`) that shows, for single-end and long reads, whether further endpoints may have been omitted by the candidate cap, `0` for pairs. The profiler does not read the mask. Reference, genome, taxonomy and size tables are not copied into the file; they come from the database, whose fingerprint is checked on reuse. A file without the run and database lines is rejected; a file without the line of column names, as written by earlier releases, is read as well.
+Mapping columns, eleven for every kind of read: `read_id`; `reference_name`, as in `metax_db.tsv.gz`; `start` and `end`; `identity`; `read_length`; `mapped_bases`; `mate_reference`, where the mate maps (`=` on the same reference, `>` possibly beyond the end of this reference, `*` unmapped, `NA` for a single read, or the mate's reference); `mate`, the mate number (`0`, `1` or `2`); `pair_id`, a pair id local to the read; and `candidate_boundary`, a mask (`0` to `3`) that shows, for single-end and long reads, whether further endpoints may have been omitted by the candidate cap, `0` for pairs. The profiler does not read the mask. Reference, genome, taxonomy and size tables are not copied into the file; they come from the database, whose fingerprint is checked on reuse. The first line records the run: `version`, the layout of the file; `sequencer` and `paired`; `mapper_mode`, the `--mode` the reads were mapped in (§5.2); `strain`, whether the run kept the extra mappings of `--strain` (§7.9); `profiler_identity`, `profiler_mapped_len` and `profiler_fraction`, the read-level gates of the run (§5.2); and `sampled_mean_base_accuracy`, the mean base accuracy measured from the reads' quality scores, `NA` when it was not measured. `--reuse-mapping` profiles with these settings unless the command line sets others; it warns when `--mode` differs, since the saved mappings cannot be made again, and when `--strain` is given for mappings made without it. The second line describes the database: whether it is fractional, its numbers of sequences and genomes, and its fingerprint, which must equal that of the database given with `--reuse-mapping`. The last line counts the input: `total_reads` and `mapped_reads` count every read as sequenced, both mates of a pair separately, unlike the profile, where a read pair counts once; `emitted_records` is the number of mapping rows.
+
+A file without the run and database lines is rejected; a file without the line of column names, as written by earlier releases, is read as well.
 
 ## 7. Method
 
