@@ -82,13 +82,13 @@ Useful options:
 - `--save-classification`: write per-read assignments.
 - `--save-mapping`, then `--reuse-mapping`: map once and profile several ways.
 - `--host` with `--pathogen-table`: filter and annotate the profile for one host.
-- `--estimate-unclassified`: add the share of the input that the profile does not explain.
+- `--estimate-unclassified`: estimate the share of the input reads that the profile does not explain.
 
 Run `metax profile --help` for every option.
 
 ## Output
 
-- `<prefix>.profile.txt`: the profile, with two header lines and one row per reported taxon. Its 17 columns are name, taxid, rank, reads, depth, abundance, seven coverage columns, the depth of the coverage evidence, the best-fit genome, its mean identity and the estimated identity of the sample's strain to it. They are the same for every kind of read, database and option, except that `--host` adds three annotation columns. Options add rows instead: `--strain` genome rows and `--estimate-unclassified` an `unclassified` row. A value that does not apply to a row, such as the identity of a genus row, is `NA`.
+- `<prefix>.profile.txt`: the profile, with two header lines and one row per reported taxon. Its 17 columns are name, taxid, rank, reads, depth, abundance, seven coverage columns, the depth of the coverage evidence, the best-fit genome, its mean identity and the estimated identity of the sample's strain to it. They are the same for every kind of read, database and option, except that `--host` adds three annotation columns. Options add rows instead: `--strain` adds genome rows. `--estimate-unclassified` adds the estimated share of unexplained input reads to the first header line. A value that does not apply to a row, such as the identity of a genus row, is `NA`.
 - `<prefix>.log`: the run log.
 - `<prefix>.decisions.tsv`, `<prefix>.classify.txt.gz` and `<prefix>.mapping.tsv.gz`: optional tables, written with the options above, each with the same columns in every run.
 

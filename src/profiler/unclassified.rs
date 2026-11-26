@@ -12,12 +12,9 @@
 //! their hits on the genes that need all the bases the gates ask of a read.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::Write;
-
-use csv::Writer;
 
 use super::markers::MarkerModel;
-use super::output::{ProfileRow, PROFILE_COLUMNS};
+use super::output::ProfileRow;
 use crate::db::ReferenceType;
 
 /// Whole-genome fragments per fragment on marker genes, by species; `None` for
@@ -160,21 +157,38 @@ pub(crate) fn marker_scales(
         .collect()
 }
 
+/// The unclassified estimate of a run, written on the first line of its
+/// profile.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct UnclassifiedEstimate {
-    /// Input fragments that no row explains.
-    pub(crate) fragments: f64,
-    /// Their share of the input, between 0 and 1.
-    pub(crate) share: f64,
+    /// Input reads, a read pair counting once, as in the profile's `reads`
+    /// column.
+    pub(crate) input_reads: usize,
+    /// Their share that the profile does not explain, between 0 and 1;
+    /// `None` when it cannot be estimated.
+    pub(crate) share: Option<f64>,
 }
 
-/// The estimate for `rows`, or the first species (by taxid) without a marker
-/// scale.
-pub(crate) fn estimate(
+impl UnclassifiedEstimate {
+    /// Its fields on the first line of the profile, each led by a tab.
+    pub(crate) fn header_fields(&self) -> String {
+        let percent = self
+            .share
+            .map_or_else(|| "NA".to_string(), |share| format!("{:.5}", share * 100.0));
+        format!(
+            "\tinput_reads={}\testimated_unclassified_percent={percent}",
+            self.input_reads
+        )
+    }
+}
+
+/// The share of `input_reads` that `rows` do not explain, between 0 and 1, or
+/// the first species (by taxid) without a marker scale.
+pub(crate) fn unexplained_share(
     rows: &[ProfileRow],
     scales: &MarkerScales,
-    input_fragments: usize,
-) -> Result<UnclassifiedEstimate, u32> {
+    input_reads: usize,
+) -> Result<f64, u32> {
     let mut explained = 0.0;
     let mut missing: Option<u32> = None;
     for row in rows {
@@ -187,42 +201,12 @@ pub(crate) fn estimate(
     if let Some(taxid) = missing {
         return Err(taxid);
     }
-    let input = input_fragments as f64;
-    let explained_share = if input > 0.0 {
-        (explained / input).min(1.0)
+    let input = input_reads as f64;
+    Ok(if input > 0.0 {
+        1.0 - (explained / input).min(1.0)
     } else {
-        1.0
-    };
-    Ok(UnclassifiedEstimate {
-        fragments: (input - explained).max(0.0),
-        share: 1.0 - explained_share,
+        0.0
     })
-}
-
-/// The `unclassified` profile row; NA throughout when the estimate is
-/// unavailable, and NA in the columns of a row's coverage, best-fit genome and
-/// identity.
-pub(crate) fn write_row<W: Write>(
-    writer: &mut Writer<W>,
-    estimate: Option<UnclassifiedEstimate>,
-) -> csv::Result<()> {
-    let mut fields = vec![
-        "unclassified".to_string(),
-        "0".to_string(),
-        "unclassified".to_string(),
-    ];
-    let (fragments, share) = match estimate {
-        Some(estimate) => (
-            format!("{:.5}", estimate.fragments),
-            format!("{:.5}", estimate.share * 100.0),
-        ),
-        None => ("NA".to_string(), "NA".to_string()),
-    };
-    fields.push(fragments);
-    fields.push("NA".to_string());
-    fields.push(share);
-    fields.resize(PROFILE_COLUMNS.len(), "NA".to_string());
-    writer.write_record(fields)
 }
 
 #[cfg(test)]
@@ -262,19 +246,21 @@ mod tests {
         // Species 1 has a genome reference, species 2 marker genes only.
         let scales = MarkerScales::from([(2, Some(50.0))]);
         let rows = [row(1, 600.0), row(2, 4.0)];
-        let estimate = estimate(&rows, &scales, 1_000).unwrap();
-        assert!((estimate.fragments - 200.0).abs() < 1e-9);
-        assert!((estimate.share - 0.2).abs() < 1e-12);
+        // 600 + 4 x 50 of 1,000 input reads explained.
+        let share = unexplained_share(&rows, &scales, 1_000).unwrap();
+        assert!((share - 0.2).abs() < 1e-12);
         // More explained than the input: nothing is unclassified.
-        let full = super::estimate(&[row(1, 1_200.0)], &scales, 1_000).unwrap();
-        assert_eq!((full.fragments, full.share), (0.0, 0.0));
+        assert_eq!(
+            unexplained_share(&[row(1, 1_200.0)], &scales, 1_000),
+            Ok(0.0)
+        );
     }
 
     #[test]
     fn a_marker_species_without_a_genome_size_makes_the_estimate_unavailable() {
         let scales = MarkerScales::from([(2, None), (3, None)]);
         assert_eq!(
-            estimate(&[row(3, 1.0), row(2, 1.0), row(1, 1.0)], &scales, 10),
+            unexplained_share(&[row(3, 1.0), row(2, 1.0), row(1, 1.0)], &scales, 10),
             Err(2)
         );
     }
@@ -365,28 +351,22 @@ mod tests {
     }
 
     #[test]
-    fn the_row_shows_fragments_and_share_or_na() {
-        let mut writer = csv::WriterBuilder::new()
-            .delimiter(b'\t')
-            .from_writer(Vec::new());
-        write_row(
-            &mut writer,
-            Some(UnclassifiedEstimate {
-                fragments: 200.0,
-                share: 0.2,
-            }),
-        )
-        .unwrap();
-        write_row(&mut writer, None).unwrap();
-        let text = String::from_utf8(writer.into_inner().unwrap()).unwrap();
-        let na = ["NA"; 11].join("\t");
+    fn the_header_fields_give_the_input_and_the_percent_or_na() {
+        let estimate = UnclassifiedEstimate {
+            input_reads: 1_000,
+            share: Some(0.2),
+        };
         assert_eq!(
-            text,
-            format!(
-                "unclassified\t0\tunclassified\t200.00000\tNA\t20.00000\t{na}\n\
-                 unclassified\t0\tunclassified\tNA\tNA\tNA\t{na}\n"
-            )
+            estimate.header_fields(),
+            "\tinput_reads=1000\testimated_unclassified_percent=20.00000"
         );
-        assert!(text.lines().all(|line| line.split('\t').count() == 17));
+        let unavailable = UnclassifiedEstimate {
+            share: None,
+            ..estimate
+        };
+        assert_eq!(
+            unavailable.header_fields(),
+            "\tinput_reads=1000\testimated_unclassified_percent=NA"
+        );
     }
 }

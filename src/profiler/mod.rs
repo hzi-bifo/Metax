@@ -659,7 +659,7 @@ pub struct ProfilerConfig {
     pub above_species: bool,
 
     /// Estimate the share of the input that the profile does not explain and
-    /// append it as an `unclassified` row.
+    /// write it on the profile's first line.
     pub estimate_unclassified: bool,
 
     /// On a fractional database, leave out a species, or report it at its

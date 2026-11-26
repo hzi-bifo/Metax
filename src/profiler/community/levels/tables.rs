@@ -96,6 +96,7 @@ use super::{
 use crate::db::DatabaseMetadata;
 use crate::profiler::evidence::EvidenceCoverage;
 use crate::profiler::output::format_five;
+use crate::profiler::unclassified::UnclassifiedEstimate;
 use crate::profiler::{ProfileRank, ProfilerConfig};
 use crate::sequencer::Sequencer;
 use crate::taxonomy::Taxonomy;
@@ -144,6 +145,8 @@ pub(super) struct TableHeader {
     pub(super) paired: bool,
     /// `--host`, named only when given.
     pub(super) host: Option<u32>,
+    /// `--estimate-unclassified`, on the profile only.
+    pub(super) unclassified: Option<UnclassifiedEstimate>,
 }
 
 impl TableHeader {
@@ -156,6 +159,7 @@ impl TableHeader {
             sequencer: cfg.sequencer,
             paired: cfg.is_paired,
             host: cfg.host.as_ref().map(|host| host.taxid),
+            unclassified: None,
         }
     }
 
@@ -168,8 +172,11 @@ impl TableHeader {
         let host = self
             .host
             .map_or_else(String::new, |host| format!("\thost={host}"));
+        let unclassified = self
+            .unclassified
+            .map_or_else(String::new, |estimate| estimate.header_fields());
         format!(
-            "#metax_{table}\tversion={}\tdatabase_fingerprint={fingerprint}\tsequencer={}\tpaired={}{host}\n#{}\n",
+            "#metax_{table}\tversion={}\tdatabase_fingerprint={fingerprint}\tsequencer={}\tpaired={}{host}{unclassified}\n#{}\n",
             env!("CARGO_PKG_VERSION"),
             self.sequencer,
             self.paired,
@@ -1190,7 +1197,6 @@ mod tests {
     use super::*;
     use crate::profiler::evidence::PresenceAssembly;
     use crate::profiler::output::{ProfileRow, HOST_COLUMNS, PROFILE_COLUMNS};
-    use crate::profiler::unclassified;
 
     fn header() -> TableHeader {
         TableHeader {
@@ -1198,6 +1204,7 @@ mod tests {
             sequencer: Sequencer::Illumina,
             paired: true,
             host: None,
+            unclassified: None,
         }
     }
 
@@ -1599,7 +1606,7 @@ mod tests {
         let lines = text.lines().collect::<Vec<_>>();
         assert!(lines[0].ends_with("\tpaired=true\thost=9606"));
         assert!(lines[1].ends_with("\testimated_ani\thost_names\thost_taxids\tdiseases"));
-        // Every row has a column per name: a species row and the unclassified row, also when no row precedes it.
+        // Every row has a column per name.
         let mut writer = csv::WriterBuilder::new()
             .has_headers(false)
             .delimiter(b'\t')
@@ -1607,13 +1614,8 @@ mod tests {
         final_row(1, "species", 10, 5.0, 100.0)
             .write(&mut writer)
             .unwrap();
-        unclassified::write_row(&mut writer, None).unwrap();
         let text = String::from_utf8(writer.into_inner().unwrap()).unwrap();
-        let rows = text.lines().collect::<Vec<_>>();
-        assert_eq!(rows.len(), 2);
-        assert!(rows
-            .iter()
-            .all(|row| row.split('\t').count() == PROFILE_COLUMNS.len()));
+        assert_eq!(text.split('\t').count(), PROFILE_COLUMNS.len());
     }
 
     #[test]
@@ -1643,6 +1645,18 @@ mod tests {
                 "host"
             ]
         );
+        // The unclassified estimate closes the line.
+        header.host = None;
+        header.unclassified = Some(UnclassifiedEstimate {
+            input_reads: 99_903,
+            share: Some(0.025_074_3),
+        });
+        let text = header.lines("profile", &PROFILE_COLUMNS);
+        assert!(text
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with("\tpaired=true\tinput_reads=99903\testimated_unclassified_percent=2.50743"));
     }
 
     #[test]

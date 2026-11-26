@@ -314,7 +314,7 @@ struct ProfileArgs {
         action = ArgAction::SetTrue,
         conflicts_with = "host",
         help_heading = "Above-species and low-map behavior",
-        help = "Estimate the share of input reads or fragments that the profile does not explain and append it as an 'unclassified' row (taxid 0; column 4 the unexplained fragments, column 6 their share in percent). Species represented by marker genes count as their whole genome, from the genome size declared in the reference FASTA. Off by default; not with --host."
+        help = "Estimate the share of the input reads, a read pair counting once, that the profile does not explain, and write it on the profile's first line (input_reads, estimated_unclassified_percent). Species represented by marker genes count as their whole genome, from the genome size declared in the reference FASTA. Off by default; not with --host."
     )]
     estimate_unclassified: bool,
 

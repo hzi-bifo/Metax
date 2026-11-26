@@ -384,11 +384,14 @@ fn profile_levels(profiler: &Profiler, data: MappingData) -> Result<()> {
     } else {
         PROFILE_COLUMNS.to_vec()
     };
+    let profile_header = TableHeader {
+        unclassified,
+        ..header
+    };
     write_profile(
         cfg,
-        &header.lines("profile", &columns),
+        &profile_header.lines("profile", &columns),
         &profile_rows,
-        unclassified,
     )?;
     if let Some(finals) = finals {
         let decisions_table = Decisions {
@@ -2979,8 +2982,8 @@ fn add_marker_genome_reads(
     }
 }
 
-/// The unclassified share (`--estimate-unclassified`): `None` when not
-/// requested, `Some(None)` when it cannot be estimated.
+/// The unclassified estimate (`--estimate-unclassified`), `None` when not
+/// requested.
 fn estimate_unclassified(
     cfg: &ProfilerConfig,
     data: &MappingData,
@@ -2988,7 +2991,7 @@ fn estimate_unclassified(
     marker_genome_reads: &HashMap<u32, GenomeReads>,
     above: Option<&higher::HigherLevels>,
     long_reads: bool,
-) -> Option<Option<unclassified::UnclassifiedEstimate>> {
+) -> Option<unclassified::UnclassifiedEstimate> {
     data.unclassified_species.as_ref().map(|species| {
         // Long reads differ in length and in the genes each covers, so
         // their scales come from the reads themselves.
@@ -3005,12 +3008,12 @@ fn estimate_unclassified(
                 .flat_map(|found| &found.rows)
                 .filter_map(|row| Some((row.taxid, row.measured.unclassified_scale()?))),
         );
-        let estimate = unclassified::estimate(rows, &scales, data.total_reads);
-        match estimate {
-            Ok(estimate) => log::info!(
+        let share = unclassified::unexplained_share(rows, &scales, data.total_reads);
+        match share {
+            Ok(share) => log::info!(
                 target: "PROFILER",
                 "Unclassified estimate: {:.2}% of {} input {} are not explained by the profile.",
-                estimate.share * 100.0,
+                share * 100.0,
                 data.total_reads,
                 if cfg.is_paired { "fragments" } else { "reads" }
             ),
@@ -3026,7 +3029,10 @@ fn estimate_unclassified(
                 ),
             },
         }
-        estimate.ok()
+        unclassified::UnclassifiedEstimate {
+            input_reads: data.total_reads,
+            share: share.ok(),
+        }
     })
 }
 
@@ -3039,14 +3045,8 @@ fn profile_prefix(cfg: &ProfilerConfig) -> String {
     }
 }
 
-/// Write `<prefix>.profile.txt`: the `header` text, then the rows and, with
-/// `--estimate-unclassified`, the unclassified row.
-fn write_profile(
-    cfg: &ProfilerConfig,
-    header: &str,
-    rows: &[ProfileRow],
-    unclassified: Option<Option<unclassified::UnclassifiedEstimate>>,
-) -> Result<()> {
+/// Write `<prefix>.profile.txt`: the `header` text, then the rows.
+fn write_profile(cfg: &ProfilerConfig, header: &str, rows: &[ProfileRow]) -> Result<()> {
     let mut file = File::create(format!("{}.profile.txt", profile_prefix(cfg)))?;
     file.write_all(header.as_bytes())?;
     let mut profile_writer = WriterBuilder::new()
@@ -3055,9 +3055,6 @@ fn write_profile(
         .from_writer(file);
     for row in rows {
         row.write(&mut profile_writer)?;
-    }
-    if let Some(estimate) = unclassified {
-        unclassified::write_row(&mut profile_writer, estimate)?;
     }
     profile_writer.flush()?;
     Ok(())
@@ -3332,11 +3329,10 @@ mod tests {
             row(100, "genus", 40.0),
             row(1000, "family", 10.0),
         ];
-        let estimate =
-            crate::profiler::unclassified::estimate(&rows, &HashMap::new(), 200).unwrap();
+        let share =
+            crate::profiler::unclassified::unexplained_share(&rows, &HashMap::new(), 200).unwrap();
         // 200 input fragments, 150 explained.
-        assert!((estimate.fragments - 50.0).abs() < 1e-9);
-        assert!((estimate.share - 0.25).abs() < 1e-12);
+        assert!((share - 0.25).abs() < 1e-12);
     }
 
     #[test]

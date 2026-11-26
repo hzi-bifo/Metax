@@ -350,7 +350,7 @@ Options before `--` configure the profiler. Rows without a default have none or 
 | `-m, --mapped-len` | §5.2 | Mapped-bases gate for species evidence. |
 | `-f, --min-mapped-fraction` | §5.2 | Mapped-fraction gate for species evidence. |
 | `--strict-coverage` | off | Report only species kept by the species tests (§7.8). |
-| `--estimate-unclassified` | off | Append the unclassified row (§7.12). Not with `--host`. |
+| `--estimate-unclassified` | off | Estimate the share of the input reads that the profile does not explain, written on its first line (§6.1, §7.12). Not with `--host`. |
 | `--identity-margin` | §7.10 | Identity margin on fractional databases; without a value `0.025`. |
 | `--no-identity-margin` | off | Turn the identity margin off. |
 | `--genus-identity` | `0.8` | Identity a read without a species-level match needs to count above species (§7.8). |
@@ -505,6 +505,8 @@ The first line starts with `#metax_profile` and holds these fields:
 | `sequencer` | `Illumina`, `Nanopore` or `PacBio` |
 | `paired` | `true` or `false` |
 | `host` | the `--host` taxid, only with `--host` |
+| `input_reads` | the input reads, a read pair counting once, only with `--estimate-unclassified` |
+| `estimated_unclassified_percent` | the estimated share of the input reads that the profile does not explain, in percent, only with `--estimate-unclassified`; `NA` when it cannot be estimated (§7.12) |
 
 Columns, with `NA` where a value does not apply. Numbers have five decimals, and p-values below `1e-4` are in scientific notation:
 
@@ -528,7 +530,7 @@ Columns, with `NA` where a value does not apply. Numbers have five decimals, and
 | 16 | `mean_identity` | mean identity of the taxon's fragments to its best-fit genome (§7.9 says which fragments count) |
 | 17 | `estimated_ani` | estimated average nucleotide identity of the sample's strain to that genome, at most 1: the mean identity relative to the sample's baseline identity |
 
-Every profile has these 17 columns, whatever the reads, the database and the options; only `--host` adds columns. The options and the database change the rows instead: `--strain` adds genome rows of rank `strain` (§7.9), `--estimate-unclassified` adds the unclassified row (below), and on a marker-gene or fractional database columns 4, 10 and 11 count as stated above.
+Every profile has these 17 columns, whatever the reads, the database and the options; only `--host` adds columns. The options and the database change the rows instead: `--strain` adds genome rows of rank `strain` (§7.9), `--estimate-unclassified` adds two fields to the first line, and on a marker-gene or fractional database columns 4, 10 and 11 count as stated above.
 
 What columns 7 to 17 describe depends on the row:
 
@@ -537,7 +539,6 @@ What columns 7 to 17 describe depends on the row:
 | species, or a unit labelled above species (§7.8) | its best-fit genome | its identity to that genome; `NA` when none of its fragments has it as best match (§7.9) |
 | genome row (rank `strain`) | the genome itself | its identity to the genome |
 | row above species, built from the fragments that no kept unit takes (§7.8), or a species reported at its genus (§7.10) | the genome its evidence is measured on | `NA` |
-| `unclassified` | `NA` | `NA` |
 
 With `--host`, three columns follow:
 
@@ -549,11 +550,9 @@ With `--host`, three columns follow:
 
 Rows are sorted by the depth of their taxon. A species is followed by its genome rows. Abundance is normalised once over all rows, not per rank, and a row above species does not include the species listed separately.
 
-**Unclassified row.** With `--estimate-unclassified`, the profile ends with one more row: name and rank `unclassified`, taxid `0`, column 4 the input fragments that no row explains, column 6 their share of the input in percent, and `NA` elsewhere (§7.12). Column 6 of this row is a share of the input and is not part of the normalised abundance of the other rows.
-
 ### 6.2 Decisions table
 
-`<prefix>.decisions.tsv` (`--save-decisions`, `-k`) has one row per taxon judged at each rank, kept or not. It opens with a `#metax_decisions` line with the fields of §6.1, then the column names.
+`<prefix>.decisions.tsv` (`--save-decisions`, `-k`) has one row per taxon judged at each rank, kept or not. It opens with a `#metax_decisions` line with the fields of §6.1 from `version` to `host`, then the column names.
 
 Row kinds:
 
@@ -822,7 +821,7 @@ With `--estimate-unclassified`, Metax estimates how much of the input the profil
 unclassified share = 1 − min(1, explained fragments / input fragments)
 ```
 
-The estimate is taken over the rows of the profile, after every filter; a species counts once with its genome rows. Rows above species (§7.8) explain their fragments, those on a marker evidence genome times that genome's whole-genome ratio, computed as for a species on it; other fragments of removed species, fragments of dropped rows, and fragments that fail the read-level gates count as unexplained. For short reads the estimate is unavailable when any marker genome of a reported marker species has no declared size or no gene that can hold a read of the sample's length; for long reads, when one of its genomes with resolved reads has no declared size or no read is resolved to its marker genomes. It is also unavailable when the evidence genome of a row above species is a marker genome without a whole-genome ratio: it declares no size, no gene can hold a read of the sample's length, or, for long reads, no read placed there hits a gene that needs all `a` bases. The log names the taxon, and the row holds `NA`. The share is also written to the log. The option cannot be combined with `--host`.
+The estimate is taken over the rows of the profile, after every filter; a species counts once with its genome rows. Rows above species (§7.8) explain their fragments, those on a marker evidence genome times that genome's whole-genome ratio, computed as for a species on it; other fragments of removed species, fragments of dropped rows, and fragments that fail the read-level gates count as unexplained. For short reads the estimate is unavailable when any marker genome of a reported marker species has no declared size or no gene that can hold a read of the sample's length; for long reads, when one of its genomes with resolved reads has no declared size or no read is resolved to its marker genomes. It is also unavailable when the evidence genome of a row above species is a marker genome without a whole-genome ratio: it declares no size, no gene can hold a read of the sample's length, or, for long reads, no read placed there hits a gene that needs all `a` bases. The log names the taxon, and `estimated_unclassified_percent` is `NA`. The share is also written to the log. The option cannot be combined with `--host`.
 
 ### 7.13 Fixed values
 
