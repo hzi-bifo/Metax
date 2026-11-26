@@ -29,7 +29,7 @@ const CONSECUTIVE_RUN_INDEX_VERSION: u32 = 9;
 const UNRELEASED_INDEX_VERSION: u32 = 8;
 const MIN_SUPPORTED_INDEX_VERSION: u32 = 4;
 const INDEX_CACHE_MAGIC: [u8; 8] = *b"METAMMC1";
-const INDEX_CACHE_VERSION: u32 = 7;
+const INDEX_CACHE_VERSION: u32 = 8;
 const INDEX_CACHE_IO_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const INDEX_SEQUENCE_CHUNK: usize = 1_000_000;
 const MAX_OPEN_PARTITION_WRITERS: usize = 4_096;
@@ -95,6 +95,21 @@ impl Reference {
 pub struct SeedOccurrence {
     pub ref_id: u32,
     pub pos: u32,
+}
+
+impl SeedOccurrence {
+    /// The word an in-memory index stores: `ref_id << 32 | pos`.
+    fn word(ref_id: u32, pos: u32) -> u64 {
+        (u64::from(ref_id) << 32) | u64::from(pos)
+    }
+
+    #[inline]
+    fn from_word(word: u64) -> Self {
+        Self {
+            ref_id: (word >> 32) as u32,
+            pos: word as u32,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -180,7 +195,7 @@ impl SeedTable {
         self.occurrences.extend(
             occurrences
                 .iter()
-                .map(|occurrence| OccurrenceLayout::WORD.pack(occurrence.ref_id, occurrence.pos)),
+                .map(|occurrence| SeedOccurrence::word(occurrence.ref_id, occurrence.pos)),
         );
         Ok(())
     }
@@ -202,7 +217,7 @@ impl SeedTable {
         self.occurrences.extend(
             seeds
                 .iter()
-                .map(|seed| OccurrenceLayout::WORD.pack(seed.ref_id, seed.pos)),
+                .map(|seed| SeedOccurrence::word(seed.ref_id, seed.pos)),
         );
         Ok(())
     }
@@ -574,7 +589,7 @@ enum Positions<'a> {
     Packed {
         bytes: &'a [u8],
         len: usize,
-        reader: PackedReader,
+        reader: PackedReader<'a>,
     },
 }
 
@@ -591,7 +606,7 @@ impl Positions<'_> {
     #[inline]
     unsafe fn get_unchecked(&self, i: usize) -> SeedOccurrence {
         match *self {
-            Self::Words(words) => OccurrenceLayout::WORD.unpack(words[i]),
+            Self::Words(words) => SeedOccurrence::from_word(words[i]),
             // SAFETY: `bytes` holds eight bytes from the start of each of the `len` positions, and i < len.
             Self::Packed { bytes, reader, .. } => unsafe { reader.read_unchecked(bytes, i) },
         }
@@ -944,7 +959,9 @@ pub struct MappedSeedTable {
     group_offset_len: usize,
     occurrences: std::ops::Range<usize>,
     occurrence_len: usize,
-    occurrence_reader: PackedReader,
+    occurrence_layout: OccurrenceLayout,
+    /// The layout's [`OccurrenceLayout::block_table`] for the cache's references.
+    occurrence_blocks: BlockTable,
     fingerprint_bits: u8,
     fingerprints: std::ops::Range<usize>,
     fingerprint_len: usize,
@@ -2152,14 +2169,13 @@ fn transcode_index_cache<R: Read>(
     let reference_metadata_len = pos
         .checked_sub(reference_metadata_offset)
         .context("index cache reference-metadata length underflow")?;
-    let longest_reference = reference_metadata
+    let reference_lengths: Vec<u64> = reference_metadata
         .iter()
         .map(|reference| reference.len)
-        .max()
-        .unwrap_or(0);
-    let occurrence_layout =
-        OccurrenceLayout::for_references(reference_count_u64, longest_reference);
+        .collect();
     drop(reference_metadata);
+    let occurrence_layout = OccurrenceLayout::for_references(&reference_lengths);
+    let further_starts = occurrence_layout.further_starts(&reference_lengths);
 
     let occurrence_count_u64 = read_varint(reader)?;
     let group_count_u64 = read_varint(reader)?;
@@ -2262,7 +2278,7 @@ fn transcode_index_cache<R: Read>(
 
     write_u64_le(writer, &mut pos, occurrence_count_u64)?;
     write_u8(writer, &mut pos, occurrence_layout.width)?;
-    write_u8(writer, &mut pos, occurrence_layout.pos_bits)?;
+    write_u8(writer, &mut pos, occurrence_layout.block_bits)?;
     let occurrence_bytes =
         cache_array_bytes(occurrence_count, usize::from(occurrence_layout.width))?;
     let occurrences = reserve_cache_range(
@@ -2389,13 +2405,13 @@ fn transcode_index_cache<R: Read>(
             } else {
                 pos_delta_or_abs
             };
-            if reference_pos >= longest_reference {
+            if reference_pos >= reference_lengths[ref_id as usize] {
                 bail!("reference position out of range in index");
             }
             previous_ref = ref_id as u32;
             previous_pos = reference_pos as u32;
             let packed = occurrence_layout
-                .pack(previous_ref, previous_pos)
+                .store(&further_starts, previous_ref, reference_pos)
                 .to_le_bytes();
             append_cache_bytes(
                 &mut occurrence_writer,
@@ -2811,19 +2827,32 @@ fn write_mapped_index_cache<W: Write>(
             }
         }
     }
-    let longest_reference = index
+    let reference_lengths: Vec<u64> = index
         .references
         .iter()
         .map(|reference| reference.len)
-        .max()
-        .unwrap_or(0);
-    let layout = OccurrenceLayout::for_references(index.references.len() as u64, longest_reference);
+        .collect();
+    let layout = OccurrenceLayout::for_references(&reference_lengths);
+    let further_starts = layout.further_starts(&reference_lengths);
     write_u64_le(writer, &mut pos, index.seed_table.occurrences.len() as u64)?;
     write_u8(writer, &mut pos, layout.width)?;
-    write_u8(writer, &mut pos, layout.pos_bits)?;
+    write_u8(writer, &mut pos, layout.block_bits)?;
     for &word in &index.seed_table.occurrences {
-        let occurrence = OccurrenceLayout::WORD.unpack(word);
-        let packed = layout.pack(occurrence.ref_id, occurrence.pos).to_le_bytes();
+        let occurrence = SeedOccurrence::from_word(word);
+        let ref_id = occurrence.ref_id as usize;
+        let Some(&len) = reference_lengths.get(ref_id) else {
+            bail!("reference ID out of range in index");
+        };
+        if u64::from(occurrence.pos) >= len {
+            bail!("reference position out of range in index");
+        }
+        let packed = layout
+            .store(
+                &further_starts,
+                occurrence.ref_id,
+                u64::from(occurrence.pos),
+            )
+            .to_le_bytes();
         write_raw(writer, &mut pos, &packed[..usize::from(layout.width)])?;
     }
     write_raw(writer, &mut pos, &[0; 8][..layout.padding()])?;
@@ -2968,13 +2997,13 @@ impl MappedIndex {
         let mut reference_metadata =
             CacheCursor::new(&mmap.as_slice()[reference_metadata_offset..reference_metadata_end]);
         let mut references = Vec::with_capacity(ref_count);
+        let mut reference_lengths = Vec::with_capacity(ref_count);
         let mut found_total_reference_bases = 0u64;
-        let mut longest_reference = 0u64;
         for _ in 0..ref_count {
             let id = reference_metadata.read_str_range()?;
             let id = reference_metadata_offset + id.start..reference_metadata_offset + id.end;
             let len = reference_metadata.read_u64()?;
-            longest_reference = longest_reference.max(len);
+            reference_lengths.push(len);
             let packed_len = reference_metadata.read_u64()?;
             if packed_len != len.div_ceil(4) {
                 bail!("index cache reference has an invalid packed sequence length");
@@ -3036,12 +3065,10 @@ impl MappedIndex {
         let occurrence_len = cursor.read_u64()? as usize;
         let occurrence_layout = OccurrenceLayout {
             width: cursor.read_u8()?,
-            pos_bits: cursor.read_u8()?,
+            block_bits: cursor.read_u8()?,
         };
-        if occurrence_layout
-            != OccurrenceLayout::for_references(ref_count as u64, longest_reference)
-        {
-            bail!("index cache seed positions have a non-canonical width");
+        if occurrence_layout != OccurrenceLayout::for_references(&reference_lengths) {
+            bail!("index cache seed positions have a non-canonical layout");
         }
         let occurrences = cursor.read_range(
             occurrence_len
@@ -3088,7 +3115,8 @@ impl MappedIndex {
                 group_offset_len,
                 occurrences,
                 occurrence_len,
-                occurrence_reader: PackedReader::new(occurrence_layout),
+                occurrence_layout,
+                occurrence_blocks: occurrence_layout.block_table(&reference_lengths),
                 fingerprint_bits,
                 fingerprints,
                 fingerprint_len,
@@ -3356,12 +3384,12 @@ impl MappedSeedTable {
     }
 
     #[cfg(test)]
-    fn lookup<'a>(&self, bytes: &'a [u8], key: u64, hash: u64) -> SeedOccurrences<'a> {
+    fn lookup<'a>(&'a self, bytes: &'a [u8], key: u64, hash: u64) -> SeedOccurrences<'a> {
         self.lookup_with_mode(bytes, key, hash, SeedLookupMode::IndexDefault)
     }
 
     fn lookup_with_mode<'a>(
-        &self,
+        &'a self,
         bytes: &'a [u8],
         key: u64,
         hash: u64,
@@ -3420,7 +3448,7 @@ impl MappedSeedTable {
     }
 
     fn seed_occurrences<'a>(
-        &self,
+        &'a self,
         bytes: &'a [u8],
         hash: u64,
         start: usize,
@@ -3438,7 +3466,7 @@ impl MappedSeedTable {
         } else {
             &self.fingerprints(bytes)[start * width..end * width]
         };
-        let reader = self.occurrence_reader;
+        let reader = PackedReader::new(self.occurrence_layout, &self.occurrence_blocks);
         SeedOccurrences {
             positions: Positions::Packed {
                 bytes: reader.lookup_bytes(self.occurrences(bytes), start, end),
@@ -3817,26 +3845,32 @@ fn partition_for_hash(hash: u64, hash_bits: u8, partition_count: usize) -> usize
     partition.min(partition_count - 1)
 }
 
-/// A seed position packed as `ref_id << pos_bits | pos` into `width` bytes.
+/// How a cache stores seed positions. Every reference is cut into blocks of `2^block_bits` bases, and a position is
+/// stored as `block << block_bits | offset in the block` in the `width` low bytes of a little-endian word. A
+/// reference's first block has the reference's id; the further blocks of references longer than one block are
+/// numbered after all references, in reference order, and only they are listed in the [`BlockTable`] that is built from
+/// the reference lengths whenever the cache is written or opened.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OccurrenceLayout {
     width: u8,
-    pos_bits: u8,
+    block_bits: u8,
 }
 
 impl OccurrenceLayout {
-    /// The in-memory index's words.
-    const WORD: Self = Self {
-        width: 8,
-        pos_bits: 32,
-    };
-
-    /// The fewest whole bytes that hold every reference number and position of these references.
-    fn for_references(reference_count: u64, longest_reference: u64) -> Self {
-        let bits_below = |n: u64| (u64::BITS - n.saturating_sub(1).leading_zeros()) as u8;
-        let pos_bits = bits_below(longest_reference);
-        let width = (pos_bits + bits_below(reference_count)).div_ceil(8).max(1);
-        Self { width, pos_bits }
+    /// The fewest whole bytes that hold every position of references of these lengths, with the largest blocks that
+    /// keep that width, so that the fewest further blocks are listed. Halving the blocks at most doubles their number,
+    /// so smaller blocks never need more bits: one-base blocks give the fewest bytes. One block per reference is one of
+    /// the choices, so the width is never more than that of a reference id beside a position.
+    fn for_references(lengths: &[u64]) -> Self {
+        let width = bits_below(block_count(lengths, 0)).div_ceil(8).max(1);
+        let longest = lengths.iter().copied().max().unwrap_or(0);
+        let block_bits = (0..=bits_below(longest))
+            .rev()
+            .find(|&block_bits| {
+                block_bits + bits_below(block_count(lengths, block_bits)) <= 8 * width
+            })
+            .unwrap_or(0);
+        Self { width, block_bits }
     }
 
     /// Zero bytes after the last position, so that it too can be read as a whole word.
@@ -3844,35 +3878,96 @@ impl OccurrenceLayout {
         8 - usize::from(self.width)
     }
 
-    fn pack(self, ref_id: u32, pos: u32) -> u64 {
-        (u64::from(ref_id) << self.pos_bits) | u64::from(pos)
+    /// For each reference, what a position past its first block is stored as, less the position: the reference's
+    /// further blocks are numbered on from those of the references before it.
+    fn further_starts(self, lengths: &[u64]) -> Vec<u64> {
+        let mut next_block = lengths.len() as u64;
+        lengths
+            .iter()
+            .map(|&len| {
+                // Position `2^block_bits`, the start of the second block, is stored in block `next_block`.
+                let start = (next_block - 1) << self.block_bits;
+                next_block += further_blocks(len, self.block_bits);
+                start
+            })
+            .collect()
     }
 
-    #[inline]
-    fn unpack(self, packed: u64) -> SeedOccurrence {
-        SeedOccurrence {
-            ref_id: (packed >> self.pos_bits) as u32,
-            pos: (packed & ((1u64 << self.pos_bits) - 1)) as u32,
+    /// The stored value of position `pos` of reference `ref_id`; `further_starts` is [`Self::further_starts`].
+    fn store(self, further_starts: &[u64], ref_id: u32, pos: u64) -> u64 {
+        if pos >> self.block_bits == 0 {
+            (u64::from(ref_id) << self.block_bits) | pos
+        } else {
+            further_starts[ref_id as usize] + pos
+        }
+    }
+
+    fn block_table(self, lengths: &[u64]) -> BlockTable {
+        let block = 1u64 << self.block_bits;
+        BlockTable {
+            references: lengths.len() as u64,
+            further: lengths
+                .iter()
+                .enumerate()
+                .flat_map(|(ref_id, &len)| {
+                    (block..len)
+                        .step_by(block as usize)
+                        .map(move |start| SeedOccurrence::word(ref_id as u32, start as u32))
+                })
+                .collect(),
         }
     }
 }
 
-/// Reads the positions of a cache; the masks and the shift are worked out once from its layout.
-#[derive(Clone, Copy, Debug)]
-struct PackedReader {
-    width: usize,
-    pos_bits: u32,
-    word_mask: u64,
-    pos_mask: u64,
+/// The blocks of an [`OccurrenceLayout`]: block id `i` below `references` is the first block of reference `i`; block
+/// id `references + j` is `further[j]`, the word [`SeedOccurrence::word`] of its reference and first base.
+#[derive(Debug)]
+struct BlockTable {
+    references: u64,
+    further: Vec<u64>,
 }
 
-impl PackedReader {
-    fn new(layout: OccurrenceLayout) -> Self {
+/// The bits that number `0..n`.
+fn bits_below(n: u64) -> u8 {
+    (u64::BITS - n.saturating_sub(1).leading_zeros()) as u8
+}
+
+/// The blocks of `2^block_bits` bases after its first that a reference of `len` bases takes.
+fn further_blocks(len: u64, block_bits: u8) -> u64 {
+    len.saturating_sub(1) >> block_bits
+}
+
+/// The blocks of `2^block_bits` bases of references of these lengths: a first block for each and their further blocks.
+fn block_count(lengths: &[u64], block_bits: u8) -> u64 {
+    lengths.len() as u64
+        + lengths
+            .iter()
+            .map(|&len| further_blocks(len, block_bits))
+            .sum::<u64>()
+}
+
+/// Reads the positions of a cache: one unaligned load, a mask and a shift give a position's block and its offset in
+/// the block; a first block is its reference's id, a further block is looked up in the block table, and the offset is
+/// added to the block's first base.
+#[derive(Clone, Copy, Debug)]
+struct PackedReader<'a> {
+    width: usize,
+    block_bits: u32,
+    word_mask: u64,
+    offset_mask: u64,
+    references: u64,
+    further: &'a [u64],
+}
+
+impl<'a> PackedReader<'a> {
+    fn new(layout: OccurrenceLayout, blocks: &'a BlockTable) -> Self {
         Self {
             width: usize::from(layout.width),
-            pos_bits: u32::from(layout.pos_bits),
+            block_bits: u32::from(layout.block_bits),
             word_mask: u64::MAX >> (8 * layout.padding()),
-            pos_mask: (1u64 << layout.pos_bits) - 1,
+            offset_mask: (1u64 << layout.block_bits) - 1,
+            references: blocks.references,
+            further: &blocks.further,
         }
     }
 
@@ -3893,17 +3988,20 @@ impl PackedReader {
     #[inline]
     unsafe fn read_unchecked(self, bytes: &[u8], i: usize) -> SeedOccurrence {
         // SAFETY: the caller guarantees the eight bytes; the read needs no alignment.
-        let word = u64::from_le(unsafe {
+        let stored = u64::from_le(unsafe {
             bytes
                 .as_ptr()
                 .add(i * self.width)
                 .cast::<u64>()
                 .read_unaligned()
         }) & self.word_mask;
-        SeedOccurrence {
-            ref_id: (word >> self.pos_bits) as u32,
-            pos: (word & self.pos_mask) as u32,
-        }
+        let block = stored >> self.block_bits;
+        let block_start = if block < self.references {
+            SeedOccurrence::word(block as u32, 0)
+        } else {
+            self.further[(block - self.references) as usize]
+        };
+        SeedOccurrence::from_word(block_start + (stored & self.offset_mask))
     }
 }
 
@@ -4247,7 +4345,7 @@ fn write_seed_table<W: Write>(writer: &mut W, seed_table: &SeedTable) -> Result<
             seed_table.occurrences[start..end]
                 .iter()
                 .copied()
-                .map(|word| OccurrenceLayout::WORD.unpack(word)),
+                .map(SeedOccurrence::from_word),
         )?;
         start = end;
     }
@@ -4397,7 +4495,7 @@ fn read_seed_table<R: Read>(
             previous_pos = pos as u32;
             seed_table
                 .occurrences
-                .push(OccurrenceLayout::WORD.pack(previous_ref, previous_pos));
+                .push(SeedOccurrence::word(previous_ref, previous_pos));
         }
     }
     if seed_table.occurrence_count() != seed_count {
@@ -4581,8 +4679,8 @@ mod tests {
         }
     }
 
-    fn with_test_references(mut index: Index, count: usize) -> Index {
-        index.references = (0..count)
+    fn with_test_references(index: Index, count: usize) -> Index {
+        let references = (0..count)
             .map(|i| {
                 let mut sequence = b"ACGT".repeat(32);
                 if i % 2 == 1 {
@@ -4596,6 +4694,11 @@ mod tests {
                 }
             })
             .collect();
+        with_references(index, references)
+    }
+
+    fn with_references(mut index: Index, references: Vec<Reference>) -> Index {
+        index.references = references;
         index.header.reference_count = index.references.len();
         index.header.total_reference_bases = index.references.iter().map(|r| r.len).sum();
         index.header.reference_storage_bytes = index
@@ -4661,50 +4764,239 @@ mod tests {
     }
 
     #[test]
-    fn cached_positions_use_the_fewest_whole_bytes() {
-        let layout = |width, pos_bits| OccurrenceLayout { width, pos_bits };
-        // Fewer than 2^18 references, the longest 248,956,422 bases (human chromosome 1): 18 + 28 bits.
-        assert_eq!(
-            OccurrenceLayout::for_references(150_000, 248_956_422),
-            layout(6, 28)
-        );
-        assert_eq!(OccurrenceLayout::for_references(1, 1), layout(1, 0));
-        assert_eq!(OccurrenceLayout::for_references(256, 256), layout(2, 8));
-        assert_eq!(OccurrenceLayout::for_references(257, 256), layout(3, 8));
-        assert_eq!(
-            OccurrenceLayout::for_references(1 << 32, 1 << 32),
-            OccurrenceLayout::WORD
-        );
-        for (count, longest) in [
-            (1u64, 1u64),
-            (257, 256),
-            (150_000, 248_956_422),
-            (1 << 32, 1 << 32),
-        ] {
-            let layout = OccurrenceLayout::for_references(count, longest);
-            let positions = [
-                (0, 0),
-                ((count - 1) as u32, (longest - 1) as u32),
-                (0, (longest - 1) as u32),
-            ];
-            let mut bytes = Vec::new();
-            for (ref_id, pos) in positions {
-                bytes.extend_from_slice(
-                    &layout.pack(ref_id, pos).to_le_bytes()[..usize::from(layout.width)],
+    fn cached_position_layout_uses_the_fewest_whole_bytes() {
+        let layout = |width, block_bits| OccurrenceLayout { width, block_bits };
+        assert_eq!(OccurrenceLayout::for_references(&[]), layout(1, 0));
+        assert_eq!(OccurrenceLayout::for_references(&[1]), layout(1, 0));
+        // 2^16 bases in 2^8 references of 2^8 bases: one block per reference is as small, and no block is listed.
+        assert_eq!(OccurrenceLayout::for_references(&[256; 256]), layout(2, 8));
+        assert!(layout(2, 8).block_table(&[256; 256]).further.is_empty());
+        assert_eq!(OccurrenceLayout::for_references(&[256; 257]), layout(3, 8));
+        // 90.2 Gbp in 150,000 references of 600,000 bases and one of 248,956,422 (human chromosome 1) need 37 bits;
+        // blocks of 2^22 bases keep their 150,060 block numbers (59 of them further blocks of the long reference) in
+        // the other 18 bits of 5 bytes. One block per reference would take 28 + 18 bits, 6 bytes.
+        let mut lengths = vec![600_000; 150_000];
+        lengths.push(248_956_422);
+        assert_eq!(OccurrenceLayout::for_references(&lengths), layout(5, 22));
+        // 2^40 + 2^32 + 2^16 bases need 41 bits, 6 bytes; one block per reference would take 32 + 17 bits.
+        let mut lengths = vec![(1 << 24) + 1; 1 << 16];
+        lengths.push(1 << 32);
+        assert_eq!(OccurrenceLayout::for_references(&lengths), layout(6, 31));
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..200 {
+            let count = 1 + next() % 2_000;
+            let longest_bits = next() % 33;
+            let lengths: Vec<u64> = (0..count)
+                .map(|_| next() % ((1 << longest_bits) + 1))
+                .collect();
+            let chosen = OccurrenceLayout::for_references(&lengths);
+            let bits = |block_bits| block_bits + bits_below(block_count(&lengths, block_bits));
+            let longest_bits = bits_below(lengths.iter().copied().max().unwrap());
+            let one_block_per_reference = longest_bits + bits_below(count);
+            assert!(chosen.width <= one_block_per_reference.div_ceil(8).max(1));
+            assert!(bits(chosen.block_bits) <= 8 * chosen.width);
+            assert!((0..=longest_bits)
+                .all(|block_bits| bits(block_bits).div_ceil(8).max(1) >= chosen.width));
+            assert!((chosen.block_bits + 1..=longest_bits)
+                .all(|block_bits| bits(block_bits) > 8 * chosen.width));
+        }
+    }
+
+    /// The layout chosen for some references, its block table, and which block ids the stored positions used.
+    struct StoredBlocks {
+        layout: OccurrenceLayout,
+        table: BlockTable,
+        used: Vec<bool>,
+    }
+
+    impl StoredBlocks {
+        /// The last first block, the first further block and the last block were used.
+        fn used_boundary_blocks(&self) -> bool {
+            let references = self.table.references as usize;
+            self.used[references - 1] && self.used[references] && self.used[self.used.len() - 1]
+        }
+    }
+
+    /// Stores every group of positions as the cache stores one seed's positions and reads each back, from lookups
+    /// that start at the group's first and middle position.
+    fn assert_positions_read_back(
+        lengths: &[u64],
+        groups: impl IntoIterator<Item = Vec<SeedOccurrence>>,
+    ) -> StoredBlocks {
+        let layout = OccurrenceLayout::for_references(lengths);
+        let further_starts = layout.further_starts(lengths);
+        let table = layout.block_table(lengths);
+        let reader = PackedReader::new(layout, &table);
+        let mut used = vec![false; table.references as usize + table.further.len()];
+        assert_eq!(used.len() as u64, block_count(lengths, layout.block_bits));
+        let mut bytes = Vec::new();
+        for group in groups {
+            bytes.clear();
+            for occurrence in &group {
+                assert!(u64::from(occurrence.pos) < lengths[occurrence.ref_id as usize]);
+                let stored = layout.store(
+                    &further_starts,
+                    occurrence.ref_id,
+                    u64::from(occurrence.pos),
                 );
+                assert_eq!(
+                    stored & !reader.word_mask,
+                    0,
+                    "{occurrence:?} exceeds the width"
+                );
+                used[(stored >> layout.block_bits) as usize] = true;
+                bytes.extend_from_slice(&stored.to_le_bytes()[..usize::from(layout.width)]);
             }
             bytes.resize(bytes.len() + layout.padding(), 0);
-            let reader = PackedReader::new(layout);
-            assert!(reader.lookup_bytes(&bytes, 1, 1).is_empty());
-            for start in 0..positions.len() {
-                let lookup = reader.lookup_bytes(&bytes, start, positions.len());
-                for (i, &(ref_id, pos)) in positions[start..].iter().enumerate() {
+            assert!(reader
+                .lookup_bytes(&bytes, group.len(), group.len())
+                .is_empty());
+            for start in [0, group.len() / 2] {
+                let lookup = reader.lookup_bytes(&bytes, start, group.len());
+                for (i, &expected) in group[start..].iter().enumerate() {
                     // SAFETY: lookup_bytes holds eight bytes from the start of each looked-up position.
-                    let found = unsafe { reader.read_unchecked(lookup, i) };
-                    assert_eq!(found, SeedOccurrence { ref_id, pos });
+                    assert_eq!(unsafe { reader.read_unchecked(lookup, i) }, expected);
                 }
             }
         }
+        StoredBlocks {
+            layout,
+            table,
+            used,
+        }
+    }
+
+    fn every_position(lengths: &[u64]) -> impl Iterator<Item = Vec<SeedOccurrence>> + '_ {
+        lengths.iter().enumerate().map(|(ref_id, &len)| {
+            (0..len as u32)
+                .map(|pos| SeedOccurrence {
+                    ref_id: ref_id as u32,
+                    pos,
+                })
+                .collect()
+        })
+    }
+
+    /// The first two and the last base of every block of each reference, and its last base.
+    fn block_edges(
+        lengths: &[u64],
+        block_bits: u8,
+    ) -> impl Iterator<Item = Vec<SeedOccurrence>> + '_ {
+        lengths.iter().enumerate().map(move |(ref_id, &len)| {
+            let block = 1u64 << block_bits;
+            let mut positions: Vec<u64> = (0..len)
+                .step_by(block as usize)
+                .flat_map(|start| [start, start + 1, start + block - 1])
+                .chain([len.saturating_sub(1)])
+                .filter(|&pos| pos < len)
+                .collect();
+            positions.sort_unstable();
+            positions.dedup();
+            positions
+                .into_iter()
+                .map(|pos| SeedOccurrence {
+                    ref_id: ref_id as u32,
+                    pos: pos as u32,
+                })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn cached_positions_of_millions_of_short_references_read_back_exactly() {
+        // Every reference fits its first block: no block is listed and every position reads back without a lookup.
+        let lengths: Vec<u64> = (0..1u64 << 21).map(|i| 1 + i * 37 % 31).collect();
+        let stored = assert_positions_read_back(&lengths, every_position(&lengths));
+        assert_eq!(
+            stored.layout,
+            OccurrenceLayout {
+                width: 4,
+                block_bits: 5
+            }
+        );
+        assert!(stored.table.further.is_empty());
+        assert_eq!(stored.used.len(), lengths.len());
+        assert!(stored.used.iter().all(|&used| used));
+
+        // A reference of many blocks among short ones: its first block keeps its id, the other 7,812 are listed.
+        let mut lengths: Vec<u64> = (0..100_000).map(|i| 1 + i % 100).collect();
+        lengths.insert(50_000, 1_000_003);
+        let stored = assert_positions_read_back(&lengths, every_position(&lengths));
+        assert_eq!(
+            stored.layout,
+            OccurrenceLayout {
+                width: 3,
+                block_bits: 7
+            }
+        );
+        assert_eq!(stored.table.references, 100_001);
+        assert_eq!(stored.table.further.len(), 7_812);
+        assert!(stored.used.iter().all(|&used| used));
+        assert!(stored.used_boundary_blocks());
+    }
+
+    #[test]
+    fn cached_positions_of_very_long_references_read_back_exactly() {
+        let long = [3 << 28, (1 << 31) + 12_345, 5, 1 << 32];
+        // One block per reference, the largest blocks a 32-bit position allows.
+        let stored = assert_positions_read_back(&long, block_edges(&long, 20));
+        assert_eq!(
+            stored.layout,
+            OccurrenceLayout {
+                width: 5,
+                block_bits: 32
+            }
+        );
+        assert!(stored.table.further.is_empty());
+        // Among 2^20 short references, the long ones are cut into blocks of 2^19 bases.
+        let lengths: Vec<u64> = (0..1u64 << 20).map(|i| 1 + i % 8).chain(long).collect();
+        let stored = assert_positions_read_back(&lengths, block_edges(&lengths, 19));
+        assert_eq!(
+            stored.layout,
+            OccurrenceLayout {
+                width: 5,
+                block_bits: 19
+            }
+        );
+        assert_eq!(stored.table.further.len(), 13_822);
+        assert!(stored.used.iter().all(|&used| used));
+        assert!(stored.used_boundary_blocks());
+        let stored = assert_positions_read_back(&lengths, every_position(&lengths[..1 << 20]));
+        assert_eq!(stored.layout.block_bits, 19);
+    }
+
+    #[test]
+    fn cached_positions_wider_than_five_bytes_read_back_exactly() {
+        let mut lengths = vec![(1 << 24) + 1; 1 << 16];
+        lengths.push(1 << 32);
+        let stored = assert_positions_read_back(&lengths, block_edges(&lengths, 31));
+        assert_eq!(
+            stored.layout,
+            OccurrenceLayout {
+                width: 6,
+                block_bits: 31
+            }
+        );
+        assert_eq!(
+            stored
+                .table
+                .further
+                .iter()
+                .map(|&word| SeedOccurrence::from_word(word))
+                .collect::<Vec<_>>(),
+            [SeedOccurrence {
+                ref_id: 1 << 16,
+                pos: 1 << 31
+            }]
+        );
+        assert!(stored.used_boundary_blocks());
     }
 
     #[cfg(unix)]
@@ -5229,7 +5521,7 @@ mod tests {
         let mut seed_table = SeedTable::new_with_exact_randstrobe_match(32, true);
         seed_table.push_group(key, &seeds).unwrap();
         seed_table.rebuild_lookup_index();
-        let index = test_index(seed_table, SeedMode::Randstrobe);
+        let index = with_test_references(test_index(seed_table, SeedMode::Randstrobe), 4);
         let source = IndexSourceFingerprint {
             size: 123,
             modified_secs: 456,
@@ -5377,6 +5669,60 @@ mod tests {
             second_occurrences
         );
         assert!(mapped.lookup(first_key + 1).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_cache_reads_positions_across_blocks() {
+        // 4,160 bases need 13 bits. With blocks of 2^9 bases every reference has its first block (ids 0 to 64) and
+        // the first one 7 further blocks (ids 65 to 71): 72 block numbers in the other 7 bits of 2 bytes.
+        let references = std::iter::once(4096usize)
+            .chain(std::iter::repeat_n(1, 64))
+            .enumerate()
+            .map(|(i, len)| {
+                let sequence = b"ACGT".repeat(len.div_ceil(4))[..len].to_vec();
+                Reference {
+                    id: format!("ref-{i}"),
+                    len: len as u64,
+                    packed_bases: pack_dna_2bit(&sequence),
+                    ambiguous: BitMask::from_ambiguous(&sequence),
+                }
+            })
+            .collect();
+        let key = 0x1234_5678u64;
+        let occurrences: Vec<SeedOccurrence> = [0, 1, 511, 512, 513, 1023, 1024, 4095]
+            .into_iter()
+            .map(|pos| SeedOccurrence { ref_id: 0, pos })
+            .chain((1..=64).map(|ref_id| SeedOccurrence { ref_id, pos: 0 }))
+            .collect();
+        let mut seed_table = SeedTable::new(32);
+        seed_table.push_occurrence_group(key, &occurrences).unwrap();
+        seed_table.rebuild_lookup_index();
+        let index = with_references(test_index(seed_table, SeedMode::Minimizer), references);
+        assert_streaming_cache_matches_owned_writer(&index);
+
+        let source = IndexSourceFingerprint {
+            size: 11,
+            modified_secs: 12,
+            modified_nanos: 13,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache_path = dir.path().join("blocks.metamcache");
+        write_index_cache(cache_path.to_str().unwrap(), source, &index).unwrap();
+        let mapped = MappedIndex::open(cache_path.to_str().unwrap(), source).unwrap();
+        assert_eq!(
+            mapped.seed_table.occurrence_layout,
+            OccurrenceLayout {
+                width: 2,
+                block_bits: 9
+            }
+        );
+        assert_eq!(mapped.seed_table.occurrence_blocks.references, 65);
+        assert_eq!(mapped.seed_table.occurrence_blocks.further.len(), 7);
+        assert_eq!(
+            mapped.lookup(key << 32).iter().collect::<Vec<_>>(),
+            occurrences
+        );
     }
 
     #[cfg(unix)]
