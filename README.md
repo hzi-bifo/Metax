@@ -28,14 +28,14 @@ The binary is `target/release/metax`.
 
 ### Pre-built database
 
-A pre-built [RefSeq database](https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2_refseq_202607_k16w37.tar.gz) (38 GiB) covers bacteria, archaea, viruses, fungi, protozoa and the human reference genome. Unpack it and pass the folder to `-d`:
+A pre-built [RefSeq database](https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2.1_refseq_202607_k16w37.tar.gz) (40 GiB) covers bacteria, archaea, viruses, fungi, protozoa and the human reference genome. Unpack it and pass the folder to `-d`:
 
 ```shell
-tar -xzf metax2_refseq_202607_k16w37.tar.gz
-metax profile -d metax2_refseq_202607_k16w37 -i reads_1.fq.gz -I reads_2.fq.gz -o sample -t 20
+tar -xzf metax2.1_refseq_202607_k16w37.tar.gz
+metax profile -d metax2.1_refseq_202607_k16w37 -i reads_1.fq.gz -I reads_2.fq.gz -o sample -t 20
 ```
 
-The archive holds no taxonomy dump, so Metax uses `--dmp-dir` or downloads the NCBI dump to `~/.metax/taxdmp`. The first run writes an index cache of about 50 GiB into the folder, which must be writable; to place the cache elsewhere, see the [manual](MANUAL.md#31-pre-built-database).
+The archive holds the taxonomy dump the database was built with, which Metax reads in place. The first run writes an index cache of about 42 GiB into the folder, which must be writable; to place the cache elsewhere, see the [manual](MANUAL.md#31-pre-built-database).
 
 ### Custom database
 

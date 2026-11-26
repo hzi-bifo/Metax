@@ -74,16 +74,16 @@ An explicit directory, like a dump stored with a database, is never downloaded, 
 
 ### 3.1 Pre-built database
 
-A pre-built database is available [here](https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2_refseq_202607_k16w37.tar.gz) (38 GiB). It is based on the July 2026 NCBI RefSeq snapshot and covers bacteria, archaea, viruses, fungi, protozoa and the human reference genome (GRCh38), with up to three genomes per species for bacteria and archaea. Unnamed "sp." isolates are included only where GTDB (release 232) places them in a species of their own. In total, it contains 29,112 genomes.
+A pre-built database is available [here](https://s3.bi.denbi.de/swift/v1/cami3/metax/metax2.1_refseq_202607_k16w37.tar.gz) (40 GiB). It is based on the July 2026 NCBI RefSeq snapshot and covers bacteria, archaea, viruses, fungi, protozoa and the human reference genome (GRCh38), with up to three genomes per species for bacteria and archaea. Unnamed "sp." isolates are included only where GTDB (release 232) places them in a species of their own. In total, it contains 29,112 genomes.
 
 ```bash
-tar -xzf metax2_refseq_202607_k16w37.tar.gz
-metax profile -d metax2_refseq_202607_k16w37 \
+tar -xzf metax2.1_refseq_202607_k16w37.tar.gz
+metax profile -d metax2.1_refseq_202607_k16w37 \
   -i sample_R1.fastq.gz -I sample_R2.fastq.gz \
   -o sample_pe -t 32
 ```
 
-The archive holds `metax_db.mxi`, `metax_db.tsv.gz`, and `md5sums.txt` with the checksums of both. It holds no taxonomy dump, so profiling uses `--dmp-dir` or the managed NCBI dump (§2) and does not check it against the database. The first run writes an index cache of about 50 GiB into the unpacked folder, which must therefore be writable; to keep the folder read-only, place the cache elsewhere with the mapper option `--index-cache PATH`, given after `--` (§5.4).
+The archive holds `metax_db.mxi`, `metax_db.tsv.gz`, `metax_taxonomy.tsv.gz`, the taxonomy dump `taxdmp.tar.gz` that the database was built with, and `md5sums.txt` with the checksums of these four files. Profiling reads this dump in place unless `--dmp-dir` is given, and checks the dump it uses against the database (§2). The first run writes an index cache of about 42 GiB into the unpacked folder, which must therefore be writable; to keep the folder read-only, place the cache elsewhere with the mapper option `--index-cache PATH`, given after `--` (§5.4).
 
 Databases built by earlier Metax 2 releases are read as they are, and the log warns that their index format is older. Build such a database again with `metax index` for the current format, which keeps the same seeds in identical sequence of different genomes and so tells close genomes and strains apart more reliably. Databases of Metax 0.9 and earlier cannot be read; build them again with `metax index`.
 
